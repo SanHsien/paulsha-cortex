@@ -87,7 +87,7 @@ def _make_workspace(root: Path, project_name: str, todo_body: str) -> Path:
     proj = root / project_name
     ws = proj / "docs" / "superpowers" / "workstreams" / "stage1-demo"
     ws.mkdir(parents=True, exist_ok=True)
-    (proj / ".paul-project.yml").write_text("policy_profile: stage-driven\n")
+    (proj / ".project-policy.yml").write_text("policy_profile: stage-driven\n")
     (ws / "todo.md").write_text(textwrap.dedent(todo_body))
     return proj
 
@@ -224,7 +224,7 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
 
         import shutil
 
-        (proj / ".paul-project.yml").unlink()
+        (proj / ".project-policy.yml").unlink()
         shutil.rmtree(proj / "docs")
 
         events = store.refresh_projects(("projA",))
