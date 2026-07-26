@@ -10,6 +10,7 @@ from paulsha_cortex.monitor.scanner import (
     classify_project_detailed,
 )
 from paulsha_cortex.project_policy import (
+    CANONICAL_NAME,
     LEGACY_NAME,
     ProjectPolicyError,
     resolve_project_policy,
@@ -88,4 +89,17 @@ def test_malformed_canonical_manifest_fails_closed(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ProjectPolicyError, match="unreadable"):
+        resolve_project_policy(tmp_path)
+
+
+@pytest.mark.parametrize("manifest_name", [CANONICAL_NAME, LEGACY_NAME])
+def test_symlinked_manifest_is_rejected_fail_closed(
+    tmp_path: Path,
+    manifest_name: str,
+) -> None:
+    outside = tmp_path / "outside.yml"
+    _write(outside)
+    (tmp_path / manifest_name).symlink_to(outside)
+
+    with pytest.raises(ProjectPolicyError, match="must not be a symlink"):
         resolve_project_policy(tmp_path)

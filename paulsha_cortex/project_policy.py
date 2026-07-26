@@ -25,13 +25,15 @@ class ProjectPolicyResolution:
 
 def _read_mapping(path: Path) -> dict[str, object]:
     try:
-        mode = path.stat().st_mode
+        mode = path.lstat().st_mode
     except FileNotFoundError:
         raise
     except OSError as exc:
         raise ProjectPolicyError(
             f"project policy unreadable: {path} ({type(exc).__name__})"
         ) from exc
+    if stat.S_ISLNK(mode):
+        raise ProjectPolicyError(f"project policy must not be a symlink: {path}")
     if not stat.S_ISREG(mode):
         raise ProjectPolicyError(f"project policy is not a regular file: {path}")
     try:
