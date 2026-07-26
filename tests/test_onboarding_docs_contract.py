@@ -15,8 +15,10 @@ ONBOARDING_DOCS = (
 )
 README_GUIDE_HEADING = "## 新手上手"
 README_GUIDE_LINKS = tuple(ONBOARDING_DOCS)
-BASH_FENCE_RE = re.compile(r"```bash\n(.*?)```", flags=re.DOTALL)
-PERSONAL_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/(?:home|Users)/[A-Za-z0-9._-]+")
+BASH_FENCE_RE = re.compile(r"```bash[ \t]*\r?\n(.*?)```", flags=re.DOTALL)
+PERSONAL_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9._-])(?:/(?:home|Users)|[A-Za-z]:\\Users)(?:\\[A-Za-z0-9._-]+)+"
+)
 ABSOLUTE_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9.+:/_~-])/(?!/)[^\s`\"')]+")
 
 
@@ -95,3 +97,16 @@ def test_onboarding_docs_use_repo_safe_paths_only() -> None:
         _assert_repo_safe_bash_paths(text, relpath=relpath)
 
     assert not PERSONAL_ABSOLUTE_PATH_RE.search(guide), "README onboarding guide must avoid personal absolute paths"
+
+
+def test_bash_fence_re_captures_crlf_fence_and_trailing_whitespace_markers() -> None:
+    crlf_text = "```bash\r\necho hi\r\n```\n"
+    trailing_ws_text = "```bash   \r\necho hi\r\n```\n"
+
+    assert BASH_FENCE_RE.search(crlf_text), "CRLF fence should be captured by BASH_FENCE_RE"
+    assert BASH_FENCE_RE.search(trailing_ws_text), "Fence with trailing whitespace should be captured by BASH_FENCE_RE"
+
+
+def test_personal_abs_path_re_captures_windows_users_path() -> None:
+    windows_path = r"C:\Users\alice\project\notes.txt"
+    assert PERSONAL_ABSOLUTE_PATH_RE.search(windows_path), "Windows Users path should be flagged by PERSONAL_ABSOLUTE_PATH_RE"
