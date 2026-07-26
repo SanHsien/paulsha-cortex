@@ -74,7 +74,7 @@ def make_workspace(root: Path, projects: dict[str, dict]) -> Path:
     """Create a synthetic workspace directory tree under `root`.
 
     `projects` maps directory name → spec dict:
-      {"kind": "tracked-paul-yml" | "tracked-workstream" | "legacy",
+      {"kind": "tracked-policy-yml" | "tracked-workstream" | "legacy",
        "todo": str | None, "blockers": str | None}
     """
     root.mkdir(parents=True, exist_ok=True)
@@ -82,11 +82,11 @@ def make_workspace(root: Path, projects: dict[str, dict]) -> Path:
         proj = root / name
         proj.mkdir(parents=True, exist_ok=True)
         kind = spec["kind"]
-        if kind == "tracked-paul-yml":
-            (proj / ".paul-project.yml").write_text(
+        if kind == "tracked-policy-yml":
+            (proj / ".project-policy.yml").write_text(
                 "policy_profile: stage-driven\npolicy_version: 1.0.0\n"
             )
-        if kind in ("tracked-workstream", "tracked-paul-yml"):
+        if kind in ("tracked-workstream", "tracked-policy-yml"):
             ws = proj / "docs" / "superpowers" / "workstreams" / "stage1-demo"
             ws.mkdir(parents=True, exist_ok=True)
             todo = spec.get("todo") or DEFAULT_TODO
@@ -272,7 +272,7 @@ class Stage9ClassifierTests(unittest.TestCase):
     def test_project_with_paul_project_yml_is_tracked(self) -> None:
         ws = make_workspace(
             self.tmp / "ws",
-            {"projA": {"kind": "tracked-paul-yml"}},
+            {"projA": {"kind": "tracked-policy-yml"}},
         )
         result = classify_project(ws / "projA")
         self.assertEqual(result, ProjectClassification.TRACKED)
@@ -298,7 +298,7 @@ class Stage9ClassifierTests(unittest.TestCase):
         make_workspace(
             ws_root,
             {
-                "projT": {"kind": "tracked-paul-yml"},
+                "projT": {"kind": "tracked-policy-yml"},
                 "projL": {"kind": "legacy"},
             },
         )
@@ -316,7 +316,7 @@ class Stage9ClassifierTests(unittest.TestCase):
         make_workspace(
             ws_root,
             {
-                "projT": {"kind": "tracked-paul-yml"},
+                "projT": {"kind": "tracked-policy-yml"},
                 "projL": {"kind": "legacy"},
             },
         )
@@ -334,8 +334,8 @@ class Stage9ClassifierTests(unittest.TestCase):
         make_workspace(
             ws_root,
             {
-                "projT": {"kind": "tracked-paul-yml"},
-                "skipme": {"kind": "tracked-paul-yml"},
+                "projT": {"kind": "tracked-policy-yml"},
+                "skipme": {"kind": "tracked-policy-yml"},
             },
         )
         cfg = MonitorConfig(
@@ -350,7 +350,7 @@ class Stage9ClassifierTests(unittest.TestCase):
         ws_root = self.tmp / "ws"
         make_workspace(
             ws_root,
-            {"projT": {"kind": "tracked-paul-yml"}},
+            {"projT": {"kind": "tracked-policy-yml"}},
         )
         cfg = MonitorConfig(
             workspaces=(WorkspaceConfig(path=ws_root, name="ws"),),
@@ -369,11 +369,11 @@ class Stage9ClassifierTests(unittest.TestCase):
     def test_duplicate_project_names_are_qualified_in_snapshot(self) -> None:
         west = make_workspace(
             self.tmp / "west",
-            {"same": {"kind": "tracked-paul-yml"}},
+            {"same": {"kind": "tracked-policy-yml"}},
         )
         east = make_workspace(
             self.tmp / "east",
-            {"same": {"kind": "tracked-paul-yml"}},
+            {"same": {"kind": "tracked-policy-yml"}},
         )
         cfg = MonitorConfig(
             workspaces=(
@@ -407,7 +407,7 @@ class Stage9ParserTests(unittest.TestCase):
         proj = self.tmp / "proj"
         ws = proj / "docs" / "superpowers" / "workstreams" / "stage1-demo"
         ws.mkdir(parents=True, exist_ok=True)
-        (proj / ".paul-project.yml").write_text("policy_profile: stage-driven\n")
+        (proj / ".project-policy.yml").write_text("policy_profile: stage-driven\n")
         (ws / "todo.md").write_text(textwrap.dedent(todo_body))
         return proj
 
@@ -464,7 +464,7 @@ class Stage9ParserTests(unittest.TestCase):
         proj = self.tmp / "proj-bad"
         ws = proj / "docs" / "superpowers" / "workstreams" / "stage1-demo"
         ws.mkdir(parents=True, exist_ok=True)
-        (proj / ".paul-project.yml").write_text("policy_profile: stage-driven\n")
+        (proj / ".project-policy.yml").write_text("policy_profile: stage-driven\n")
         # Binary-ish payload that will reasonably trip the parser
         (ws / "todo.md").write_bytes(b"\xff\xfe not utf-8 \xff\xfe")
 
@@ -561,7 +561,7 @@ class Stage9CliTests(unittest.TestCase):
         make_workspace(
             ws_root,
             {
-                "projT": {"kind": "tracked-paul-yml"},
+                "projT": {"kind": "tracked-policy-yml"},
                 "projL": {"kind": "legacy"},
             },
         )

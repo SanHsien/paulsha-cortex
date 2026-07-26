@@ -56,7 +56,7 @@ def test_refresh_preserves_last_good_state_when_scan_is_degraded(tmp_path: Path)
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
     project.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(
         workspaces=(WorkspaceConfig(path=workspace, name="test"),),
     )
@@ -97,7 +97,7 @@ def test_refresh_does_not_assign_unrelated_global_diagnostic(tmp_path: Path) -> 
     ):
         project = root / project_name
         project.mkdir(parents=True)
-        (project / ".paul-project.yml").write_text(
+        (project / ".project-policy.yml").write_text(
             "policy_profile: flat\n",
             encoding="utf-8",
         )
@@ -145,7 +145,7 @@ def test_refresh_uses_structured_root_diagnostic_without_prefix_collision(
     ):
         project = root / project_name
         project.mkdir(parents=True)
-        (project / ".paul-project.yml").write_text(
+        (project / ".project-policy.yml").write_text(
             "policy_profile: flat\n",
             encoding="utf-8",
         )
@@ -197,7 +197,7 @@ def test_refresh_diagnostic_does_not_cross_nested_workspace_identity(
     child_project = nested_root / "child-project"
     for project in (parent_project, child_project):
         project.mkdir(parents=True)
-        (project / ".paul-project.yml").write_text(
+        (project / ".project-policy.yml").write_text(
             "policy_profile: flat\n",
             encoding="utf-8",
         )
@@ -256,7 +256,7 @@ def test_outer_workspace_degradation_does_not_freeze_healthy_nested_removal(
     child_project = nested_root / "child-project"
     for project in (parent_project, child_project):
         project.mkdir(parents=True)
-        (project / ".paul-project.yml").write_text(
+        (project / ".project-policy.yml").write_text(
             "policy_profile: flat\n",
             encoding="utf-8",
         )
@@ -295,13 +295,13 @@ def test_targeted_refresh_defers_missing_project_until_parent_scan(tmp_path: Pat
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
     project.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(
         workspaces=(WorkspaceConfig(path=workspace, name="test"),),
     )
     store = SnapshotStore(config=config)
     store.load()
-    (project / ".paul-project.yml").unlink()
+    (project / ".project-policy.yml").unlink()
     project.rmdir()
 
     events = store.refresh_projects(("demo",))
@@ -355,7 +355,7 @@ def test_targeted_refresh_preserves_state_on_classification_error(tmp_path: Path
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
     project.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(
         workspaces=(WorkspaceConfig(path=workspace, name="test"),),
         legacy_policy="hide",
@@ -381,7 +381,7 @@ def test_refresh_keeps_stable_duplicate_ids_when_one_root_is_degraded(tmp_path: 
     for root in (west_root, east_root):
         project = root / "same"
         project.mkdir(parents=True)
-        (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+        (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(
         workspaces=(
             WorkspaceConfig(path=west_root, name="west"),
@@ -416,7 +416,7 @@ def test_scan_race_after_parent_listing_is_degraded_not_empty(tmp_path: Path) ->
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
     project.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(
         workspaces=(WorkspaceConfig(path=workspace, name="test"),),
     )
@@ -445,7 +445,7 @@ def test_todo_stat_error_preserves_last_good_for_full_and_targeted_refresh(
     project = workspace / "demo"
     todo = project / "docs" / "superpowers" / "workstreams" / "stage1-demo" / "todo.md"
     todo.parent.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     todo.write_text("## Current Sprint\n- [ ] keep task\n", encoding="utf-8")
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
     store = SnapshotStore(config=config)
@@ -472,7 +472,7 @@ def test_project_stat_error_preserves_targeted_last_good(tmp_path: Path) -> None
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
     project.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
     store = SnapshotStore(config=config)
     store.load()
@@ -494,14 +494,14 @@ def test_broken_symlink_does_not_freeze_workspace_removals(tmp_path: Path) -> No
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
     project.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     (workspace / "broken").symlink_to(workspace / "missing-target")
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
     store = SnapshotStore(config=config)
     store.load()
 
     assert store.refresh() == ()
-    (project / ".paul-project.yml").unlink()
+    (project / ".project-policy.yml").unlink()
     project.rmdir()
 
     events = store.refresh()
@@ -516,7 +516,7 @@ def test_project_symlink_target_outage_retains_last_good_until_link_removed(
     workspace.mkdir()
     target = tmp_path / "mounted-project"
     target.mkdir()
-    (target / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (target / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     project_link = workspace / "project-link"
     project_link.symlink_to(target, target_is_directory=True)
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
@@ -524,7 +524,7 @@ def test_project_symlink_target_outage_retains_last_good_until_link_removed(
     store.load()
     state = store.current_snapshot()[0]
     project_id = state.project_id
-    (target / ".paul-project.yml").unlink()
+    (target / ".project-policy.yml").unlink()
     target.rmdir()
 
     outage_events = store.refresh()
@@ -552,7 +552,7 @@ def test_watch_refresh_retains_existing_keys_on_transient_stat_error(
     refs.mkdir(parents=True)
     head = git_dir / "HEAD"
     head.write_text("ref: refs/heads/main\n", encoding="utf-8")
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
     store = SnapshotStore(config=config)
     store.load()
@@ -588,7 +588,7 @@ def test_watch_schedule_race_is_retried_without_claiming_key(tmp_path: Path) -> 
     project = workspace / "demo"
     refs = project / ".git" / "refs"
     refs.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
     store = SnapshotStore(config=config)
     store.load()
@@ -648,7 +648,7 @@ def test_project_resolve_error_marks_workspace_degraded(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
     project.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
     original_resolve = Path.resolve
 
@@ -669,7 +669,7 @@ def test_snapshot_resolve_error_preserves_last_good(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
     project.mkdir(parents=True)
-    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (project / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
     store = SnapshotStore(config=config)
     store.load()
@@ -700,7 +700,7 @@ def test_external_symlink_resolve_error_freezes_workspace_identity(tmp_path: Pat
     workspace.mkdir()
     target = tmp_path / "outside-target"
     target.mkdir()
-    (target / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    (target / ".project-policy.yml").write_text("policy_profile: flat\n", encoding="utf-8")
     project_link = workspace / "linked-project"
     project_link.symlink_to(target, target_is_directory=True)
     config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))

@@ -11,6 +11,7 @@ from .fs import checked_lstat_mode, checked_resolve, checked_stat_mode, stable_p
 from .models import ProjectState
 from .parser import extract_project_state
 from .registry import ProjectEntry, merge_projects
+from ..project_policy import ProjectPolicyError, resolve_project_policy
 
 # Always-skip directory names that should never be treated as projects.
 IMPLICIT_IGNORE = frozenset({".git", ".hg", ".svn", "node_modules", "__pycache__"})
@@ -42,10 +43,11 @@ class ScanResult:
 def classify_project_detailed(
     project_dir: Path,
 ) -> tuple[ProjectClassification, str | None]:
-    policy_mode, error = checked_stat_mode(project_dir / ".paul-project.yml")
-    if error is not None:
-        return ProjectClassification.LEGACY, error
-    if policy_mode is not None and stat.S_ISREG(policy_mode):
+    try:
+        policy = resolve_project_policy(project_dir)
+    except ProjectPolicyError as error:
+        return ProjectClassification.LEGACY, f"degraded: {error}"
+    if policy.payload is not None:
         return ProjectClassification.TRACKED, None
 
     workstreams = project_dir / "docs" / "superpowers" / "workstreams"

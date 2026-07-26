@@ -10,8 +10,8 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 
-from .._yaml import YAMLError, safe_load
 from ..persona import render
+from ..project_policy import ProjectPolicyError, resolve_project_policy
 from . import model_identities, verification
 
 MODEL_IDENTITY_SCHEMA_VERSION = model_identities.MODEL_IDENTITY_SCHEMA_VERSION
@@ -80,16 +80,13 @@ def load_model_identity_registry(config_root: str | Path | None = None) -> dict[
 
 def read_repo_tier(repo_root: str | Path | None = None) -> str:
     root = Path(repo_root) if repo_root is not None else paths.repo_root()
-    path = root / ".paul-project.yml"
-    if not path.is_file():
-        return "shareable"
     try:
-        payload = safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, YAMLError) as exc:
-        raise ValueError(f"project policy unreadable: {path}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"project policy invalid: {path}")
-    tier = payload.get("tier")
+        resolution = resolve_project_policy(root)
+    except ProjectPolicyError as exc:
+        raise ValueError(str(exc)) from exc
+    if resolution.payload is None:
+        return "shareable"
+    tier = resolution.payload.get("tier")
     if tier not in {"shareable", "work", "personal"}:
         raise ValueError(f"unsupported project tier: {tier!r}")
     return str(tier)
