@@ -1253,7 +1253,20 @@ def _claim_action(
     auto_label: bool | None = None,
     workflow_registry=None,
     workflow_starter=None,
+    readiness_checker=None,
 ) -> dict[str, Any]:
+    """Claim decision for one authority.
+
+    ``readiness_checker``, when supplied, is the #211 pre-claim readiness
+    transaction (see ``claim_readiness.py``): a callable of
+    ``(authority, issue_ref) -> ReadinessOutcome`` run before a
+    ``ClaimCandidate`` is even assembled. Any readiness failure returns here
+    without ever calling ``workflow_starter`` — no workflow job, worktree, or
+    model session may be created until all six checks pass. ``None`` (the
+    default) preserves prior behaviour exactly, so existing callers that do
+    not yet wire a checker are unaffected.
+    """
+
     canonical_run = None
     if workflow_registry is not None:
         all_runs = workflow_registry.list_workflow_runs()
@@ -1300,6 +1313,16 @@ def _claim_action(
     issue = args.get("issue") if args.get("issue") is not None else (
         authority.mapped_issues[0] if authority.mapped_issues else None
     )
+    if readiness_checker is not None:
+        issue_ref = f"{authority.repo}#{issue}" if issue is not None else None
+        readiness = readiness_checker(authority, issue_ref)
+        if not readiness.ready:
+            return {
+                "action": "needs_human" if readiness.terminal else "blocked",
+                "reason": readiness.reason,
+                "run": None,
+                "readiness_failed_check": readiness.failed_check,
+            }
     candidate = ClaimCandidate(
         authority=authority,
         repo=authority.repo,
@@ -1406,6 +1429,8 @@ def _claim_action(
                 ),
             }
         )
+        if readiness_checker is not None:
+            active["frozen_readiness"] = readiness.frozen.to_dict()
     return {"action": decision.action, "reason": decision.reason, "run": active}
 
 
@@ -1734,6 +1759,7 @@ def run_auto_claim_scan(
     runner: Runner = subprocess.run,
     workflow_registry=None,
     workflow_starter=None,
+    readiness_checker=None,
 ) -> list[dict[str, Any]]:
     """Project the durable Monitor snapshot into Manager-owned auto claims."""
 
@@ -1807,6 +1833,7 @@ def run_auto_claim_scan(
             auto_label=live_auto_label,
             workflow_registry=workflow_registry,
             workflow_starter=workflow_starter,
+            readiness_checker=readiness_checker,
         )
         if result["action"] not in {"ignore", "done"}:
             results.append(
@@ -2403,6 +2430,7 @@ def execute_work_action(
     state_path: str | Path | None = None,
     workflow_registry=None,
     workflow_starter=None,
+    readiness_checker=None,
 ) -> dict[str, Any]:
     action = args.get("action")
     repo = args.get("repo")
@@ -2445,6 +2473,7 @@ def execute_work_action(
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
             workflow_starter=workflow_starter,
+            readiness_checker=readiness_checker,
         )
     elif action == "retry-build":
         result = _retry_build_action(
