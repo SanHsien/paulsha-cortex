@@ -26,6 +26,7 @@ from .github_delivery import (
     _SHIP_CAPABILITY,
 )
 from .preflight import PreflightResult
+from paulsha_cortex.deck.schema import BAND_LEVELS
 
 
 CONVENTIONAL_ZH_TW_TITLE_RE = re.compile(
@@ -33,7 +34,43 @@ CONVENTIONAL_ZH_TW_TITLE_RE = re.compile(
 )
 CLOSING_RE_TEMPLATE = r"(?im)^\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{issue}\b"
 REVIEW_TIMEOUT_SECONDS = 15 * 60
+# band 未掛（None）時的向後相容預設值（#222 H.2 fail-soft 既定行為，不得因本次
+# band 參數化而改變既有沒有 sizing_band 的 work item 的既定上限）。
 MAX_FIX_ROUNDS = 2
+
+# #218（design #208 H.3）：work-item repair budget 依 sizing band 參數化——
+# green=1、yellow=2；band 字串沿用 deck.schema.BAND_LEVELS，不得另立常數或大小
+# 寫變體（比照 claim.sizing_band() 的既有慣例）。red 依 #208 判定門檻本不應
+# 進入 build/ship（由 #223 的路由在更早階段攔截），這裡的 red 分支只是防禦性
+# 拒絕，不代表 red 自己另有一組預算。
+REPAIR_BUDGET_BY_BAND: dict[str, int] = {
+    "green": 1,
+    "yellow": 2,
+}
+
+
+def repair_budget_for_band(band: str | None) -> int:
+    """把 work item 的 sizing band 換算成 ship 階段的 repair round 上限（#218 AC1）。
+
+    ``band`` 為 ``None``（尚未掛 sizing_band，#222 既有 work item）時 fail-soft
+    回退到現行 ``MAX_FIX_ROUNDS``（=2，向後相容）。``"red"`` 一律拒絕——red 不
+    得進入 ship 的 repair 迴圈。
+    """
+    if band is None:
+        return MAX_FIX_ROUNDS
+    if band not in BAND_LEVELS:
+        raise ValueError(f"sizing band 非法值: {band!r}")
+    if band == "red":
+        raise ValueError(
+            "red band 不得進入 ship repair budget"
+            "（應由 #223 的路由在更早階段攔截，這裡僅做防禦性拒絕）"
+        )
+    return REPAIR_BUDGET_BY_BAND[band]
+
+
+def _require_repair_budget(value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError("max_fix_rounds must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -94,16 +131,27 @@ class ReviewLoop:
     fix_rounds: int
     epoch_started_at: float
     requested_at: float | None
+    # #218：work-item repair budget，依 sizing band 參數化（repair_budget_for_band）；
+    # 預設沿用既有 MAX_FIX_ROUNDS，向後相容未帶 band 的既有呼叫端。
+    max_fix_rounds: int = MAX_FIX_ROUNDS
 
     @classmethod
-    def start(cls, *, head: str, now_epoch: int | float) -> "ReviewLoop":
+    def start(
+        cls,
+        *,
+        head: str,
+        now_epoch: int | float,
+        max_fix_rounds: int = MAX_FIX_ROUNDS,
+    ) -> "ReviewLoop":
         _require_sha(head)
         _require_finite_epoch(now_epoch, field="review epoch")
+        _require_repair_budget(max_fix_rounds)
         return cls(
             head=head,
             fix_rounds=0,
             epoch_started_at=float(now_epoch),
             requested_at=None,
+            max_fix_rounds=max_fix_rounds,
         )
 
     @property
@@ -133,13 +181,14 @@ class ReviewLoop:
         _require_finite_epoch(now_epoch, field="review fix epoch")
         if head == self.head:
             raise ValueError("fix must produce a new HEAD")
-        if self.fix_rounds >= MAX_FIX_ROUNDS:
+        if self.fix_rounds >= self.max_fix_rounds:
             raise ValueError("Copilot fix budget exhausted")
         return ReviewLoop(
             head=head,
             fix_rounds=self.fix_rounds + 1,
             epoch_started_at=float(now_epoch),
             requested_at=None,
+            max_fix_rounds=self.max_fix_rounds,
         )
 
     def record_review(
@@ -178,7 +227,7 @@ class ReviewLoop:
                 head=self.head,
                 review_id=review_id,
             )
-        if self.fix_rounds >= MAX_FIX_ROUNDS:
+        if self.fix_rounds >= self.max_fix_rounds:
             return ReviewDecision(
                 self,
                 "needs_human",
@@ -363,7 +412,7 @@ class ShipOrchestrator:
                 or copilot.review_id is None
                 or copilot.loop.head != expected_head
                 or copilot.loop.requested_at is None
-                or copilot.loop.fix_rounds > MAX_FIX_ROUNDS
+                or copilot.loop.fix_rounds > copilot.loop.max_fix_rounds
                 or float(now_epoch) - copilot.loop.requested_at < 0
                 or float(now_epoch) - copilot.loop.requested_at > REVIEW_TIMEOUT_SECONDS
             ):

@@ -2165,20 +2165,39 @@ def test_ship_runs_official_archive_before_preflight(tmp_path: Path) -> None:
     assert calls[0][0] == ["openspec", "validate", "demo", "--strict"]
 
 
-def test_review_findings_persist_across_heads_and_third_round_needs_human(
-    monkeypatch, tmp_path: Path
-) -> None:
-    heads = ["a" * 40, "b" * 40, "c" * 40]
+def _drive_repair_budget_cycle(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    heads: list[str],
+    sizing_score: int | None = None,
+    sizing_band: str | None = None,
+) -> tuple[list[dict], Path]:
+    """Push ``len(heads)`` candidates, each reviewed with one blocking finding.
+
+    #218 AC1/AC2：work-item repair budget 依 band 參數化，第 3 次
+    model_repair（第 3 個 head）後強制 needs_human，不建立下一版 run。回傳每
+    輪 review 的結果，供呼叫端依 band 斷言確切的停止點。
+    """
+
     current = {"head": heads[0], "review": False, "submitted": 201.0, "now": 200.0}
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
-    work_actions.execute_work_action(
+    registry = JobRegistry(state_path=state.parent / "jobs.json")
+    started = work_actions.execute_work_action(
         args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
         requested_by="operator",
         snapshot_path=snapshot,
         state_path=state,
         now=lambda: current["now"],
+        workflow_registry=registry,
     )
+    if sizing_band is not None:
+        registry._manager_update_workflow_run(
+            started["result"]["run"]["run_id"],
+            sizing_score=sizing_score,
+            sizing_band=sizing_band,
+        )
 
     class GitHub:
         def __init__(self, *, runner):
@@ -2242,6 +2261,7 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human(
         "todo_paths": ["docs/todo.md"],
         "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
     }
+    results: list[dict] = []
     for index, head in enumerate(heads):
         current.update(head=head, review=False, now=200.0 + index * 20, submitted=201.0 + index * 20)
         requested = work_actions.execute_work_action(
@@ -2250,6 +2270,7 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human(
             snapshot_path=snapshot,
             state_path=state,
             now=lambda: current["now"],
+            workflow_registry=registry,
         )
         assert requested["result"]["action"] == "awaiting-copilot"
         current["review"] = True
@@ -2260,20 +2281,77 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human(
             snapshot_path=snapshot,
             state_path=state,
             now=lambda: current["now"],
+            workflow_registry=registry,
         )
-        if index < 2:
-            assert reviewed["result"]["action"] == "fix-required"
-        else:
-            assert reviewed["result"] == {
-                "action": "needs_human",
-                "reason": "copilot-finding-budget-exhausted",
-            }
+        results.append(reviewed["result"])
+        if reviewed["result"]["action"] == "needs_human":
+            break
+    return results, state
+
+
+def test_review_findings_persist_across_heads_and_third_round_needs_human_default_band(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """band 未掛（None）時沿用現行 MAX_FIX_ROUNDS=2：第 3 輪才 needs_human（#218 AC1）。"""
+
+    heads = ["a" * 40, "b" * 40, "c" * 40]
+    results, state = _drive_repair_budget_cycle(monkeypatch, tmp_path, heads=heads)
+    assert [result["action"] for result in results] == [
+        "fix-required",
+        "fix-required",
+        "needs_human",
+    ]
+    final = results[-1]
+    assert final["reason"] == "copilot-finding-budget-exhausted"
+    assert final["repair_rounds_used"] == 2
+    assert final["repair_rounds_budget"] == 2
+    assert final["repair_rounds_remaining"] == 0
+    assert final["legal_next_steps"] == ("maintainer-review",)
     persisted = _only_journal_row(state)
     assert "status" not in persisted
     assert JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()[0].facets == (
         "needs_human",
     )
-    assert persisted["ship"]["fix_rounds"] == 2
+    # #218：計數提升到 work-item 層（active 頂層），不再只活在 active["ship"] 裡。
+    assert persisted["repair_rounds"] == 2
+
+
+def test_review_findings_green_band_needs_human_after_a_single_fix_round(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#218 AC1：green band 只有 1 次 fix round 預算，第 2 輪即 needs_human。"""
+
+    heads = ["a" * 40, "b" * 40, "c" * 40]
+    results, state = _drive_repair_budget_cycle(
+        monkeypatch, tmp_path, heads=heads, sizing_score=0, sizing_band="green"
+    )
+    assert [result["action"] for result in results] == ["fix-required", "needs_human"]
+    final = results[-1]
+    assert final["reason"] == "copilot-finding-budget-exhausted"
+    assert final["repair_rounds_used"] == 1
+    assert final["repair_rounds_budget"] == 1
+    assert final["repair_rounds_remaining"] == 0
+    persisted = _only_journal_row(state)
+    assert persisted["repair_rounds"] == 1
+
+
+def test_review_findings_yellow_band_matches_default_two_fix_rounds(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#218 AC1：yellow band 明確帶 sizing_band="yellow"，行為與現行預設一致。"""
+
+    heads = ["a" * 40, "b" * 40, "c" * 40]
+    results, state = _drive_repair_budget_cycle(
+        monkeypatch, tmp_path, heads=heads, sizing_score=4, sizing_band="yellow"
+    )
+    assert [result["action"] for result in results] == [
+        "fix-required",
+        "fix-required",
+        "needs_human",
+    ]
+    assert results[-1]["repair_rounds_budget"] == 2
+    persisted = _only_journal_row(state)
+    assert persisted["repair_rounds"] == 2
 
 
 def test_ship_fix_required_persists_capped_reviewer_findings(

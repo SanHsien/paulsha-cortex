@@ -36,6 +36,7 @@ from .delivery import (
     ReviewLoop,
     ShipOrchestrator,
     build_openspec_archive_argv,
+    repair_budget_for_band,
     validate_archive_gate,
     validate_pr_metadata,
     _validate_foreign_review,
@@ -2096,6 +2097,24 @@ def run_auto_claim_scan(
     return results
 
 
+# #218 AC3: needs_human 停止時揭露剩餘 repair scope、已重複 stage、合法下一步
+# 與預估 invalidation 範圍。legal_next_steps 只列出真正已由
+# _recoverable_maintainer_ship_stop 承認的重入路徑（maintainer-review）；
+# invalidation_scope 是若人工仍要求再開一輪會需要重新走的 phase 範圍——ship 階
+# 段的 repair 迴圈只影響 ship 本身，不會回頭讓 build/verify 失效。
+def _repair_budget_status(
+    *, fix_rounds: int, max_fix_rounds: int, current_phase: str
+) -> dict[str, Any]:
+    return {
+        "repair_rounds_used": fix_rounds,
+        "repair_rounds_budget": max_fix_rounds,
+        "repair_rounds_remaining": max(max_fix_rounds - fix_rounds, 0),
+        "repeated_stage": current_phase,
+        "legal_next_steps": ("maintainer-review",),
+        "invalidation_scope": (current_phase,),
+    }
+
+
 def _ship_action(
     *,
     args: dict[str, Any],
@@ -2122,6 +2141,11 @@ def _ship_action(
         authority=authority,
     )
     _validate_current_run_authority(active, authority, canonical_run)
+    # #218 AC1：work-item repair budget 依 sizing band 參數化；band 尚未掛
+    # （None，#222 既有 work item）時 repair_budget_for_band fail-soft 回退到
+    # 現行 MAX_FIX_ROUNDS=2。red 由 repair_budget_for_band 防禦性拒絕——
+    # #223 的路由本應在更早階段攔截，這裡是最後一道防線。
+    max_fix_rounds = repair_budget_for_band(canonical_run.sizing_band)
     if active.get("snapshot_hash") != authority.snapshot_hash:
         active["snapshot_hash"] = authority.snapshot_hash
         _save_runs(state_path, state)
@@ -2454,7 +2478,12 @@ def _ship_action(
     ):
         raise ValueError("ship clock must be finite")
     previous_head = ship.get("head") if ship else None
-    fix_rounds = ship.get("fix_rounds", 0) if ship else 0
+    # #218：repair round 計數提升到 work-item 層（active 頂層，與
+    # delivery_binding／snapshot_hash 平級），不再只存在 active["ship"] 裡
+    # ——後者會在 multiple-delivery-targets-unsupported 復原路徑被整包
+    # pop 掉（見本函式稍早的 active.pop("ship")），若計數留在那裡會被
+    # 一併歸零，形同無上限。
+    fix_rounds = active.get("repair_rounds", 0)
     if not isinstance(fix_rounds, int) or isinstance(fix_rounds, bool) or fix_rounds < 0:
         raise ValueError("ship fix round state malformed")
     if maintainer_recovery or args.get("maintainer_review_path") is not None:
@@ -2477,7 +2506,8 @@ def _ship_action(
         return {"action": "fix-required", "head": preflight.head, "fix_rounds": fix_rounds}
     if previous_head is not None and previous_head != preflight.head:
         fix_rounds += 1
-        if fix_rounds > 2:
+        active["repair_rounds"] = fix_rounds
+        if fix_rounds > max_fix_rounds:
             active["ship"] = {
                 **ship,
                 "phase": "needs_human",
@@ -2489,7 +2519,15 @@ def _ship_action(
             workflow_registry._manager_update_workflow_run(
                 canonical_run.run_id, facets=("needs_human",), gate_status="running"
             )
-            return {"action": "needs_human", "reason": "copilot-finding-budget-exhausted"}
+            return {
+                "action": "needs_human",
+                "reason": "copilot-finding-budget-exhausted",
+                **_repair_budget_status(
+                    fix_rounds=fix_rounds,
+                    max_fix_rounds=max_fix_rounds,
+                    current_phase=canonical_run.current_phase,
+                ),
+            }
     if (
         not ship
         or previous_head != preflight.head
@@ -2539,6 +2577,7 @@ def _ship_action(
         fix_rounds=fix_rounds,
         epoch_started_at=float(ship.get("epoch_started_at", requested_at)),
         requested_at=float(requested_at),
+        max_fix_rounds=max_fix_rounds,
     )
     finding_count = sum(1 for thread in remote.review_threads if thread.blocks_merge)
     findings = [
@@ -2571,7 +2610,16 @@ def _ship_action(
         workflow_registry._manager_update_workflow_run(
             canonical_run.run_id, facets=("needs_human",), gate_status="running"
         )
-        return {"action": "needs_human", "reason": copilot.reason}
+        extra = (
+            _repair_budget_status(
+                fix_rounds=fix_rounds,
+                max_fix_rounds=max_fix_rounds,
+                current_phase=canonical_run.current_phase,
+            )
+            if copilot.reason == "copilot-finding-budget-exhausted"
+            else {}
+        )
+        return {"action": "needs_human", "reason": copilot.reason, **extra}
 
     foreign_review = ForeignReviewEvidence(
         path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),

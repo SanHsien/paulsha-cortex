@@ -15,6 +15,7 @@ from paulsha_cortex.coordinator.delivery import (
     ForeignReviewEvidence,
     ShipOrchestrator,
     build_openspec_archive_argv,
+    repair_budget_for_band,
     validate_archive_gate,
     validate_pr_metadata,
 )
@@ -110,8 +111,11 @@ def test_pr_metadata_requires_zh_tw_conventional_title_and_closing_keywords() ->
     ).allowed
 
 
-def test_review_loop_invalidates_every_push_and_allows_two_fix_rounds() -> None:
+def test_review_loop_default_budget_allows_two_fix_rounds_backward_compat() -> None:
+    """band 未帶時（#222 既有 work item）沿用現行 MAX_FIX_ROUNDS=2（#218 AC1 向後相容）。"""
+
     loop = ReviewLoop.start(head=HEAD1, now_epoch=100)
+    assert loop.max_fix_rounds == 2
     assert loop.needs_request
     loop = loop.mark_requested(head=HEAD1, now_epoch=100)
     first = loop.record_review(
@@ -138,6 +142,78 @@ def test_review_loop_invalidates_every_push_and_allows_two_fix_rounds() -> None:
     )
     assert third.action == "needs_human"
     assert third.reason == "copilot-finding-budget-exhausted"
+
+
+def test_review_loop_green_budget_forces_needs_human_after_a_single_fix_round() -> None:
+    """#218 AC1：green band 只允許 1 次 fix round，第 2 次帶 finding 的 review 即停。"""
+
+    budget = repair_budget_for_band("green")
+    assert budget == 1
+    loop = ReviewLoop.start(head=HEAD1, now_epoch=100, max_fix_rounds=budget)
+    loop = loop.mark_requested(head=HEAD1, now_epoch=100)
+    first = loop.record_review(
+        head=HEAD1, now_epoch=110, finding_count=1, review_id=1, submitted_at_epoch=110
+    )
+    assert first.action == "fix_required"
+    loop = first.loop.advance_after_fix(head=HEAD2, now_epoch=120)
+    second = loop.mark_requested(head=HEAD2, now_epoch=120).record_review(
+        head=HEAD2,
+        now_epoch=130,
+        finding_count=1,
+        review_id=2,
+        submitted_at_epoch=130,
+    )
+    assert second.action == "needs_human"
+    assert second.reason == "copilot-finding-budget-exhausted"
+
+
+def test_review_loop_yellow_budget_matches_two_fix_rounds() -> None:
+    """#218 AC1：yellow band 明確帶 max_fix_rounds=2，行為與現行預設一致。"""
+
+    budget = repair_budget_for_band("yellow")
+    assert budget == 2
+    loop = ReviewLoop.start(head=HEAD1, now_epoch=100, max_fix_rounds=budget)
+    loop = loop.mark_requested(head=HEAD1, now_epoch=100)
+    first = loop.record_review(
+        head=HEAD1, now_epoch=110, finding_count=1, review_id=1, submitted_at_epoch=110
+    )
+    assert first.action == "fix_required"
+    loop = first.loop.advance_after_fix(head=HEAD2, now_epoch=120)
+    second = loop.mark_requested(head=HEAD2, now_epoch=120).record_review(
+        head=HEAD2,
+        now_epoch=130,
+        finding_count=1,
+        review_id=2,
+        submitted_at_epoch=130,
+    )
+    assert second.action == "fix_required"
+    loop = second.loop.advance_after_fix(head=HEAD3, now_epoch=140)
+    third = loop.mark_requested(head=HEAD3, now_epoch=140).record_review(
+        head=HEAD3,
+        now_epoch=150,
+        finding_count=1,
+        review_id=3,
+        submitted_at_epoch=150,
+    )
+    assert third.action == "needs_human"
+    assert third.reason == "copilot-finding-budget-exhausted"
+
+
+def test_repair_budget_for_band_green_yellow_red_and_none() -> None:
+    assert repair_budget_for_band("green") == 1
+    assert repair_budget_for_band("yellow") == 2
+    assert repair_budget_for_band(None) == 2
+    with pytest.raises(ValueError, match="red band"):
+        repair_budget_for_band("red")
+    with pytest.raises(ValueError, match="非法值"):
+        repair_budget_for_band("purple")
+
+
+def test_review_loop_rejects_non_positive_max_fix_rounds() -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        ReviewLoop.start(head=HEAD1, now_epoch=100, max_fix_rounds=0)
+    with pytest.raises(ValueError, match="positive integer"):
+        ReviewLoop.start(head=HEAD1, now_epoch=100, max_fix_rounds=-1)
 
 
 def test_review_loop_accepts_clean_current_head_and_rejects_old_or_error_review() -> None:
@@ -333,6 +409,40 @@ def test_ship_orchestrator_blocks_stale_provider_or_non_exact_preflight(tmp_path
     base["preflight"] = _preflight(head=HEAD3)
     with pytest.raises(RuntimeError, match="exact HEAD/tree"):
         orchestrator.merge_if_ready(**base)
+
+
+def test_ship_orchestrator_gates_final_merge_on_the_loops_own_band_budget(
+    tmp_path: Path,
+) -> None:
+    """#218 AC1：merge_if_ready 讀 copilot.loop.max_fix_rounds，不是模組常數。
+
+    模擬 green band（max_fix_rounds=1）下遭竄改／不一致的 loop 狀態
+    （fix_rounds=2）：若閘門仍讀舊模組常數 MAX_FIX_ROUNDS=2 就會誤放行
+    （2 不大於 2），本測試要求它依 loop 自帶的 band 預算拒絕（2 大於 1）。
+    """
+
+    class GitHub:
+        def merge_if_ready(self, **kwargs):
+            raise AssertionError("over-budget merge must not reach GitHub")
+
+    decision = _copilot_decision()
+    over_budget_copilot = replace(
+        decision,
+        loop=replace(decision.loop, fix_rounds=2, max_fix_rounds=1),
+    )
+    orchestrator = ShipOrchestrator(github=GitHub(), now=lambda: 200)
+    with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
+        orchestrator.merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            expected_head=HEAD1,
+            expected_tree_hash=HEAD2,
+            authority=_authority(tmp_path),
+            preflight=_preflight(),
+            copilot=over_budget_copilot,
+            foreign_review=_foreign_review(tmp_path),
+        )
 
 
 def test_delivery_orchestrator_rejects_multi_target_authority_before_remote_mutation(
