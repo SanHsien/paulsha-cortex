@@ -337,3 +337,32 @@ def _snapshot_authority(tmp_path: Path, *, repo: str, work_id: str, openspec_ref
         encoding="utf-8",
     )
     return load_work_authority(repo=repo, work_id=work_id, snapshot_path=snapshot)
+
+
+def test_yellow_band_without_artifact_classes_declaration_fails_soft_and_is_observable(
+    tmp_path: Path,
+) -> None:
+    """fail-soft 分支（verifier finding 3）：Yellow band 但 plan 未宣告
+    artifact_classes（既有舊 plan 常態）→ gate 不可跑、維持現行為正常推進；
+    可觀測性由 run 狀態導出：yellow + 已進 build + plan_review_passed=False
+    即代表 gate 因輸入不可得被跳過（未通過任何審查）。"""
+    legacy_plan_body = (
+        "---\n"
+        "status: accepted\n"
+        "domain_breadth: 1\n"
+        "state_consistency: 1\n"
+        "invariant_count: 1\n"
+        "---\n"
+        "# plan\n\n## Tasks\n\n- [ ] 舊 plan 沒有 artifact_classes 宣告\n"
+    )
+    registry, run = _make_run(tmp_path, plan_body=legacy_plan_body)
+
+    result = _dispatch(registry, run)
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert result is None
+    assert persisted.current_phase == "build"
+    # 觀測標記：yellow band 進了 build 但 plan_review_passed 仍為 False
+    # → 消費端可據此辨識「gate 被 fail-soft 跳過」而非「審查通過」。
+    assert persisted.sizing_band == "yellow"
+    assert persisted.plan_review_passed is False
