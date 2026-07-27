@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from paulsha_cortex.config import paths
 
@@ -258,6 +258,40 @@ def prepare_review_worktree(
     return worktree
 
 
+def verify_authority_in_input_snapshot(
+    *,
+    authority: Mapping[str, str],
+    input_snapshot: Sequence[Mapping[str, object]],
+) -> None:
+    """Prove every frozen planning authority ref carries its pinned hash in the
+    review job's input snapshot before a reviewer may be dispatched.
+
+    ``authority`` maps a canonical repo-relative ref (e.g. ``WorkflowRun
+    .planning_authority`` entries) to its frozen baseline sha256. A missing
+    row, a row not tagged ``planning-authority``, or a hash mismatch all fail
+    closed — the hippo #41 v3 incident showed a reviewer that never received
+    the frozen plan can still emit a confident PASS, so absence must block
+    dispatch rather than degrade silently.
+    """
+    if not authority:
+        return
+    rows_by_path: dict[str, Mapping[str, object]] = {}
+    for row in input_snapshot:
+        path = row.get("path") if isinstance(row, Mapping) else None
+        if isinstance(path, str) and path not in rows_by_path:
+            rows_by_path[path] = row
+    missing = sorted(
+        ref
+        for ref in authority
+        if rows_by_path.get(ref) is None or rows_by_path[ref].get("authority") != "planning-authority"
+    )
+    if missing:
+        raise ValueError(f"review input snapshot missing frozen authority: {', '.join(missing)}")
+    drifted = sorted(ref for ref in authority if rows_by_path[ref].get("sha256") != authority[ref])
+    if drifted:
+        raise ValueError(f"review input snapshot authority hash drift: {', '.join(drifted)}")
+
+
 def _normalize_evidence_item(item: object, *, field: str) -> dict[str, Any]:
     if not isinstance(item, dict):
         raise ValueError(f"{field} must be an object")
@@ -327,6 +361,20 @@ def _normalize_finding(item: object, *, field: str) -> dict[str, Any]:
     }
 
 
+def _normalize_authority_hashes(value: object, *, expected: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("review verdict authority_hashes must be an object")
+    if set(value) != set(expected):
+        raise ValueError("review verdict authority_hashes ref set mismatch")
+    normalized: dict[str, str] = {}
+    for ref, expected_hash in expected.items():
+        claimed_hash = value.get(ref)
+        if claimed_hash != expected_hash:
+            raise ValueError(f"review verdict authority_hashes drift: {ref}")
+        normalized[ref] = claimed_hash
+    return normalized
+
+
 def validate_review_verdict(
     payload: object,
     *,
@@ -334,6 +382,7 @@ def validate_review_verdict(
     reviewer_job_id: str,
     candidate: str,
     launch_identity: dict[str, str],
+    expected_authority_hashes: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("review verdict must be an object")
@@ -345,6 +394,8 @@ def validate_review_verdict(
         "launch_identity",
         "findings",
     }
+    if expected_authority_hashes:
+        required = required | {"authority_hashes"}
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"review verdict missing keys: {', '.join(missing)}")
@@ -364,6 +415,11 @@ def validate_review_verdict(
     claimed_identity = _normalize_identity(payload.get("launch_identity"), field="launch_identity")
     if claimed_identity != launch_identity:
         raise ValueError("review verdict launch_identity mismatch")
+    authority_hashes: dict[str, str] | None = None
+    if expected_authority_hashes:
+        authority_hashes = _normalize_authority_hashes(
+            payload.get("authority_hashes"), expected=expected_authority_hashes
+        )
     findings_value = payload.get("findings")
     if not isinstance(findings_value, list):
         raise ValueError("review verdict findings must be a list")
@@ -377,7 +433,7 @@ def validate_review_verdict(
             raise ValueError(f"review verdict duplicate finding_id: {finding_id}")
         finding_ids.add(finding_id)
     state = "rejected" if any(row["blocking"] for row in findings) else "passed"
-    return {
+    result = {
         "schema_version": REVIEW_SCHEMA_VERSION,
         "builder_job_id": builder_job_id,
         "reviewer_job_id": reviewer_job_id,
@@ -386,6 +442,9 @@ def validate_review_verdict(
         "findings": copy.deepcopy(findings),
         "state": state,
     }
+    if authority_hashes is not None:
+        result["authority_hashes"] = authority_hashes
+    return result
 
 
 def read_review_verdict_file(

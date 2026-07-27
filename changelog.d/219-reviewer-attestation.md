@@ -1,0 +1,3 @@
+### Added
+
+- **Issue #219：reviewer input attestation**：`review.py` 新增 `verify_authority_in_input_snapshot()`，在 reviewer job 派工前證明 frozen plan/authority 的 exact path＋hash 已在 input snapshot 中（缺席或 hash drift 皆 fail closed）；`validate_review_verdict()` 新增可選 `expected_authority_hashes`，要求 reviewer verdict 回填其實際讀到的 authority hash，缺漏或不符即拒收 PASS。`manager.py` 新增 `_reviewer_input_patterns()`，即使 review card（如 `code-review`）宣告 `requires: []`，仍會把 run 的 frozen planning authority 併入 reviewer 的 input snapshot 派工前驗證，並在 `_workflow_job_prompt`／`terminalize_workflow_job` 同步要求與驗證 `authority_hashes` 回填，堵住 hippo #41 v3（reviewer 未取得 frozen plan 卻誤判 PASS）同型缺口。

@@ -2798,6 +2798,22 @@ def _effective_workflow_inputs(run, step) -> tuple[str, ...]:
     return tuple(patterns)
 
 
+def _reviewer_input_patterns(run, effective_inputs: tuple[str, ...]) -> tuple[str, ...]:
+    """Ensure every frozen planning authority ref is proven into the reviewer's
+    input snapshot even when the review card itself declares no ``requires``
+    (the deck default): #219 closes the gap where a reviewer job could
+    dispatch and PASS a candidate without ever seeing the frozen plan.
+    """
+    missing = tuple(
+        dict.fromkeys(
+            item.ref
+            for item in run.planning_authority
+            if not any(fnmatch.fnmatch(item.ref, pattern) for pattern in effective_inputs)
+        )
+    )
+    return effective_inputs + missing
+
+
 def _safe_input_matches(root: Path, pattern: str) -> tuple[Path, ...]:
     relative = Path(pattern)
     if relative.is_absolute() or ".." in relative.parts:
@@ -3906,7 +3922,14 @@ def terminalize_workflow_job(
         )
         normalized_payload["outputs"] = [ref for ref, _body in inline_reports]
     else:
+        expected_authority_hashes = {
+            row["path"]: row["sha256"]
+            for row in job.get("workflow_input_snapshot", [])
+            if isinstance(row, dict) and row.get("authority") == "planning-authority"
+        }
         required = {"schema_version", "kind", "reason", "findings", "reports"}
+        if expected_authority_hashes:
+            required = required | {"authority_hashes"}
         if (
             set(raw) != required
             or raw.get("schema_version") != 1
@@ -3933,19 +3956,23 @@ def terminalize_workflow_job(
         )
         reviewer_identity = _persisted_job_identity(job, field="reviewer")
         builder_identity = _persisted_job_identity(builder_job, field="builder")
+        verdict_payload = {
+            "schema_version": foreign_review.REVIEW_SCHEMA_VERSION,
+            "builder_job_id": builder_job_id,
+            "reviewer_job_id": str(job["job_id"]),
+            "candidate": candidate,
+            "launch_identity": reviewer_identity,
+            "findings": raw["findings"],
+        }
+        if expected_authority_hashes:
+            verdict_payload["authority_hashes"] = raw.get("authority_hashes")
         verdict = foreign_review.validate_review_verdict(
-            {
-                "schema_version": foreign_review.REVIEW_SCHEMA_VERSION,
-                "builder_job_id": builder_job_id,
-                "reviewer_job_id": str(job["job_id"]),
-                "candidate": candidate,
-                "launch_identity": reviewer_identity,
-                "findings": raw["findings"],
-            },
+            verdict_payload,
             builder_job_id=builder_job_id,
             reviewer_job_id=str(job["job_id"]),
             candidate=candidate,
             launch_identity=reviewer_identity,
+            expected_authority_hashes=expected_authority_hashes or None,
         )
         inline_reports = _inline_terminal_reports(
             raw.get("reports"), phase="review", declared_outputs=declared_outputs
@@ -5005,10 +5032,18 @@ def _workflow_job_prompt(
             "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
         }
     elif step.phase == "review":
+        authority_hashes_expected = {
+            row["path"]: row["sha256"]
+            for row in input_snapshot
+            if row.get("authority") == "planning-authority"
+        }
         terminal_schema = {
             "kind": "workflow-review-result",
             "schema_version": 1,
-            "required": ["schema_version", "kind", "reason", "findings", "reports"],
+            "required": [
+                "schema_version", "kind", "reason", "findings", "reports",
+                *(["authority_hashes"] if authority_hashes_expected else []),
+            ],
             "fixed": {"schema_version": 1, "kind": "workflow-review-result"},
             "finding_keys": ["category", "severity", "summary", "evidence", "recommendation"],
             "finding_evidence_keys": ["path", "line", "detail"],
@@ -5026,6 +5061,15 @@ def _workflow_job_prompt(
             },
             "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
         }
+        if authority_hashes_expected:
+            terminal_schema["authority_hashes"] = {
+                "description": (
+                    "Echo back the pinned sha256 for every frozen planning authority ref you "
+                    "actually opened in source_material; the verdict is rejected unless it "
+                    "matches exactly."
+                ),
+                "expected": dict(authority_hashes_expected),
+            }
     else:
         fixed_terminal_fields: dict[str, object] = {
             "schema_version": 1,
@@ -5351,11 +5395,17 @@ def _dispatch_workflow_card(
     effective_inputs = _effective_workflow_inputs(run, step)
     if step.persona == "reviewer":
         reviewer_target = effective_repo_root
+        authority_map = {item.ref: item.baseline_sha256 for item in run.planning_authority}
+        effective_inputs = _reviewer_input_patterns(run, effective_inputs)
         input_snapshot = _workflow_input_snapshot(
             run=run,
             repo_root=reviewer_target,
             patterns=effective_inputs,
             coordinator_root=coordinator_root,
+        )
+        foreign_review.verify_authority_in_input_snapshot(
+            authority=authority_map,
+            input_snapshot=input_snapshot,
         )
         output_baseline = _workflow_output_baseline(reviewer_target, step.outputs)
         try:
