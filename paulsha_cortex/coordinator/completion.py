@@ -25,6 +25,21 @@ VOLATILE_WORK_AUTHORITY_FIELDS = frozenset(
 # 故整個欄位排除在 semantic match 之外——避免良性 reuse 被誤判為衝突而觸發
 # quarantine（比照 VOLATILE_WORK_AUTHORITY_FIELDS 的做法）。
 REUSED_FROM_FIELDS = frozenset({"run_id", "job_id", "evidence_hash"})
+# retry_classification（#215 retry 分類骨架）同樣只是 provenance：記錄一次
+# retry-build 的性質判斷（model_repair／orchestrator_retry／…），不影響 completion
+# 語意，故排除在 semantic match 之外——避免同一份 candidate 因重試分類不同而被
+# 誤判衝突（比照 REUSED_FROM_FIELDS 的做法）。enum 值須與
+# work_actions.RetryClassification 同步（enum 定案，後波不得改名）；本模組刻意
+# 不 import 該型別以避免 schema 層耦合 coordinator 高階模組。
+RETRY_CLASSIFICATION_VALUES = frozenset(
+    {
+        "model_repair",
+        "orchestrator_retry",
+        "authority_restart",
+        "review_handoff_failure",
+        "source_owner_repair",
+    }
+)
 # #212：final 發現「plan 錯而非 candidate 錯」的訊號欄位，供 #137 度量 plan review
 # 漏檢（plan_review_gate 判定通過，但 final 才發現問題其實出在 plan）。純
 # provenance，不影響既有 completion 語意，semantic match 排除比照 reused_from。
@@ -221,6 +236,12 @@ def _normalize_reused_from(value: object) -> dict[str, str]:
     }
 
 
+def _normalize_retry_classification(value: object) -> str:
+    if not isinstance(value, str) or value not in RETRY_CLASSIFICATION_VALUES:
+        raise ValueError("completion retry_classification invalid")
+    return value
+
+
 def _normalize_final_defect_locus(value: object) -> str:
     if value not in VALID_FINAL_DEFECT_LOCI:
         raise ValueError(f"completion final_defect_locus must be one of {sorted(VALID_FINAL_DEFECT_LOCI)}")
@@ -255,7 +276,9 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"completion record missing keys: {', '.join(missing)}")
-    extras = set(payload) - required - {"work_authority", "reused_from", "final_defect_locus"}
+    extras = set(payload) - required - {
+        "work_authority", "reused_from", "retry_classification", "final_defect_locus"
+    }
     if extras:
         raise ValueError(f"completion record unexpected key: {sorted(extras)[0]}")
     if payload.get("schema_version") != COMPLETION_SCHEMA_VERSION:
@@ -303,6 +326,10 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
         normalized["work_authority"] = _normalize_work_authority(payload["work_authority"])
     if "reused_from" in payload:
         normalized["reused_from"] = _normalize_reused_from(payload["reused_from"])
+    if "retry_classification" in payload:
+        normalized["retry_classification"] = _normalize_retry_classification(
+            payload["retry_classification"]
+        )
     if "final_defect_locus" in payload:
         normalized["final_defect_locus"] = _normalize_final_defect_locus(payload["final_defect_locus"])
 
@@ -359,6 +386,8 @@ def completion_records_semantically_match(existing: object, incoming: object) ->
     incoming_authority = _semantic_work_authority(incoming_normalized.pop("work_authority", None))
     existing_normalized.pop("reused_from", None)
     incoming_normalized.pop("reused_from", None)
+    existing_normalized.pop("retry_classification", None)
+    incoming_normalized.pop("retry_classification", None)
     existing_normalized.pop("final_defect_locus", None)
     incoming_normalized.pop("final_defect_locus", None)
     return existing_normalized == incoming_normalized and existing_authority == incoming_authority

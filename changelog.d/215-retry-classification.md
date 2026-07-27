@@ -1,0 +1,3 @@
+### Added
+
+- **Issue #215：retry 分類骨架**：`work_actions.py` 新增 `RetryClassification` enum（`model_repair`／`orchestrator_retry`／`authority_restart`／`review_handoff_failure`／`source_owner_repair`，enum 定案，後波不得改名）與 `_classify_retry()`，依 run.current_phase 與 builder job 的乾淨終止／evidence 綁定狀態判斷一次 retry-build 屬 candidate 內容缺陷（`model_repair`）還是 provider/stale base/claim sequencing 等非模型原因（`orchestrator_retry`），不再只看 vN 世代數；`_retry_build_action` 回傳結果攜帶分類。`completion.py` 的 `CompletionRecord` 同步新增可選欄位 `retry_classification`（比照 `reused_from` 的 provenance 模式，排除於 semantic match 之外），供未來 `cortex stat` 依分類彙總。`authority_restart`／`review_handoff_failure`／`source_owner_repair` 的判準留供 #216 補齊。
