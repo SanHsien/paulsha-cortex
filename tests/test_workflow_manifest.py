@@ -57,7 +57,24 @@ def test_feature_oneshot_emits_card_bound_personas_not_global_builder() -> None:
 
     assert isinstance(result.workflow_manifest, WorkflowManifest)
     steps = result.workflow_manifest.steps
-    assert [step.card for step in steps] == [entry.ref for entry in combo.cards]
+    # gate_spine 兩層制（#221）：combo.cards 只含必要核心，adversarial-review 現在是
+    # band_triggered 加掛層——band 未傳入（None）時 compile_combo 保守地併入，行為
+    # 與改動前一致，故完整卡序仍含它，不能只比對 combo.cards（核心層）。
+    expected_card_order = [
+        "workflow-claim",
+        "brainstorming",
+        "openspec-propose",
+        "writing-plans",
+        "worktree-isolation",
+        "tdd-red",
+        "subagent-build",
+        "verification",
+        "code-review",
+        "adversarial-review",
+        "openspec-archive",
+        "policy-commit",
+    ]
+    assert [step.card for step in steps] == expected_card_order
     assert [(step.card, step.phase, step.persona) for step in steps] == [
         ("workflow-claim", "claim", "manager"),
         ("brainstorming", "define", "planner"),

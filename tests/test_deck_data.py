@@ -53,18 +53,29 @@ def test_interactive_headless_typing():
     assert cards["policy-commit"].slice_group == "ship"
 
 
+# gate_spine 兩層制（#221）：adversarial-review 搬到 band_triggered 加掛層，
+# 核心層（combo.cards / combo.gate_spine）不再含它。
+CORE_PHASE_CARDS = [cid for cid in PHASE_CARDS if cid != "adversarial-review"]
+
+
 def test_feature_oneshot_combo_loads():
     cards = load_cards(DEFAULT_CARDS_PATH)
     combo = load_combo(DEFAULT_COMBOS_DIR / "feature-oneshot.yaml", cards)
     assert combo.id == "feature-oneshot"
     assert combo.task_type == "feature"
-    assert [c.ref for c in combo.cards] == PHASE_CARDS
+    assert [c.ref for c in combo.cards] == CORE_PHASE_CARDS
     assert [(gate.after, gate.exists) for gate in combo.gate_spine] == [
         ("writing-plans", ("docs/superpowers/plans/*<task-slug>*.md",)),
         ("verification", ("reports/verify/*<task-slug>*.md",)),
         ("code-review", ("reports/review/*<task-slug>*.md",)),
-        ("adversarial-review", ("reports/review/*<task-slug>*-adversarial.md",)),
         ("openspec-archive", ("openspec/changes/archive/*<change>*",)),
+    ]
+    assert combo.band_triggered is not None
+    assert combo.band_triggered.trigger == "yellow"
+    assert [entry.ref for entry in combo.band_triggered.cards] == ["adversarial-review"]
+    assert combo.band_triggered.cards[0].depends_on == ("code-review",)
+    assert [(gate.after, gate.exists) for gate in combo.band_triggered.gate_spine] == [
+        ("adversarial-review", ("reports/review/*<task-slug>*-adversarial.md",)),
     ]
 
 
@@ -79,6 +90,7 @@ def test_mcu_feature_combo_loads():
     assert [(gate.after, gate.exists) for gate in combo.gate_spine] == [
         ("mcu-hw-evidence", ("docs/superpowers/specs/*<task-slug>*-hw-evidence.md",)),
     ]
+    assert combo.band_triggered is None
 
 
 def test_mcu_feature_real_data_compiles_to_hold_specs(tmp_path):

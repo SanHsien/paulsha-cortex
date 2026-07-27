@@ -41,9 +41,12 @@ _CARD_KEYS = frozenset(
 )
 _EXECUTION_KEYS = frozenset({"action", "commit_policy", "test_policy"})
 _COMBO_FILE_KEYS = frozenset({"combo"})
-_COMBO_KEYS = frozenset({"id", "task_type", "cards", "gate_spine"})
+_COMBO_KEYS = frozenset({"id", "task_type", "cards", "gate_spine", "band_triggered"})
 _COMBO_ENTRY_KEYS = frozenset({"ref", "depends_on"})
 _GATE_CHECK_KEYS = frozenset({"after", "exists"})
+_BAND_TRIGGERED_KEYS = frozenset({"trigger", "cards", "gate_spine"})
+# gate_spine 兩層制（#208 H.1 / #221）：band 依嚴重度單調遞增，band_triggered.trigger 必須是其中之一。
+BAND_LEVELS = ("green", "yellow", "red")
 _PLACEHOLDER_RE = re.compile(r"<([^<>]+)>")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
@@ -86,11 +89,25 @@ class GateCheck:
 
 
 @dataclass(frozen=True)
+class BandTriggeredSpine:
+    """gate_spine 加掛層（band 觸發後才併入的 cards/gate_spine）。
+
+    只有 Combo.gate_spine（必要核心）計入 acceptance_surfaces；本層資料
+    刻意放在獨立欄位，讓下游（H.1 sizing）不會誤把加掛層算進去。
+    """
+
+    trigger: str
+    cards: tuple[ComboEntry, ...] = ()
+    gate_spine: tuple[GateCheck, ...] = ()
+
+
+@dataclass(frozen=True)
 class Combo:
     id: str
     task_type: str
     cards: tuple[ComboEntry, ...]
     gate_spine: tuple[GateCheck, ...] = ()
+    band_triggered: BandTriggeredSpine | None = None
 
 
 def _check_placeholders(card_id: str, globs: tuple[str, ...], errors: list[str]) -> None:
@@ -320,9 +337,78 @@ def load_combo(path: str | Path, cards: Mapping[str, Card]) -> Combo:
             errors.append(f"{g['after']}: gate_spine.exists 不得為空")
         spine.append(GateCheck(after=g["after"], exists=exists))
 
+    # band_triggered（gate_spine 兩層制加掛層，#221）：與上面 gate_spine 對稱解析，
+    # 但 ref／after 允許指向核心層（seen）或加掛層自身（band_seen），且加掛層卡片
+    # 不得與核心層重複（維持「必要核心 vs 加掛層」互斥，避免下游 acceptance_surfaces
+    # 誤重複計算）。
+    band_triggered: BandTriggeredSpine | None = None
+    raw_band = rec.get("band_triggered")
+    if raw_band is not None:
+        if not isinstance(raw_band, Mapping):
+            errors.append(f"combo: band_triggered 必須是 mapping，實際 {type(raw_band).__name__}")
+            raw_band = {}
+        _check_unknown_keys("combo.band_triggered", raw_band, _BAND_TRIGGERED_KEYS, errors)
+
+        trigger = raw_band.get("trigger")
+        if trigger not in BAND_LEVELS:
+            errors.append(f"combo.band_triggered: trigger 非法值 {trigger!r}（允許 {list(BAND_LEVELS)}）")
+            trigger = None
+
+        band_entries: list[ComboEntry] = []
+        raw_band_cards = raw_band.get("cards")
+        if raw_band_cards is not None and not isinstance(raw_band_cards, list):
+            errors.append(f"combo.band_triggered: cards 必須是清單，實際 {type(raw_band_cards).__name__}")
+            raw_band_cards = []
+        band_seen: set[str] = set()
+        for item in raw_band_cards or []:
+            if not isinstance(item, Mapping) or not isinstance(item.get("ref"), str):
+                errors.append("combo.band_triggered.cards 項目缺 ref")
+                continue
+            ref = item["ref"]
+            _check_unknown_keys(f"band_triggered.{ref}", item, _COMBO_ENTRY_KEYS, errors)
+            if ref not in cards:
+                errors.append(f"未知卡片引用: {ref}")
+            if ref in seen or ref in band_seen:
+                errors.append(f"band_triggered 卡片與骨幹重複: {ref}")
+            band_seen.add(ref)
+            band_deps = _str_tuple(item.get("depends_on"), ref, "depends_on", errors)
+            for d in band_deps:
+                if d not in seen and d not in band_seen:
+                    errors.append(f"{ref}: depends_on 指向 combo 外卡片 {d}")
+            band_entries.append(ComboEntry(ref=ref, depends_on=band_deps))
+
+        band_spine: list[GateCheck] = []
+        raw_band_spine = raw_band.get("gate_spine")
+        if raw_band_spine is not None and not isinstance(raw_band_spine, list):
+            errors.append(f"combo.band_triggered: gate_spine 必須是清單，實際 {type(raw_band_spine).__name__}")
+            raw_band_spine = []
+        for g in raw_band_spine or []:
+            if not isinstance(g, Mapping) or not isinstance(g.get("after"), str):
+                errors.append("band_triggered.gate_spine 項目缺 after")
+                continue
+            _check_unknown_keys(g["after"], g, _GATE_CHECK_KEYS, errors)
+            if g["after"] not in seen and g["after"] not in band_seen:
+                errors.append(f"band_triggered.gate_spine.after 指向不存在卡片: {g['after']}")
+            exists = _str_tuple(g.get("exists"), g["after"], "gate_spine.exists", errors)
+            _check_placeholders(g["after"], exists, errors)
+            if not exists:
+                errors.append(f"{g['after']}: gate_spine.exists 不得為空")
+            band_spine.append(GateCheck(after=g["after"], exists=exists))
+
+        if trigger is not None:
+            band_triggered = BandTriggeredSpine(
+                trigger=trigger, cards=tuple(band_entries), gate_spine=tuple(band_spine)
+            )
+
     if errors:
         raise DeckSchemaError(f"combo 驗證失敗: {source}: " + "; ".join(errors))
 
-    combo = Combo(id=combo_id, task_type=task_type, cards=tuple(entries), gate_spine=tuple(spine))
+    combo = Combo(
+        id=combo_id,
+        task_type=task_type,
+        cards=tuple(entries),
+        gate_spine=tuple(spine),
+        band_triggered=band_triggered,
+    )
     _detect_combo_cycles(combo.cards)
     return combo

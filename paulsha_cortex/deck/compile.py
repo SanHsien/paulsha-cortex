@@ -12,7 +12,7 @@ from typing import Mapping, Sequence
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator.workflow import WorkflowManifest, WorkflowStep
 
-from .schema import Card, Combo, ComboEntry
+from .schema import BAND_LEVELS, BandTriggeredSpine, Card, Combo, ComboEntry
 
 
 class DeckCompileError(ValueError):
@@ -134,6 +134,11 @@ class CompileResult:
     # Optional only for source compatibility with callers that construct a
     # CompileResult solely to exercise emit(); compile_combo always populates it.
     workflow_manifest: WorkflowManifest | None = None
+    # gate_spine 兩層制（#221）：verify_commands 為合併總覽（沿用既有行為），這兩個
+    # 欄位額外標示哪些 gate verify 指令屬於必要核心層、哪些屬於 band 觸發加掛層，
+    # 供下游（H.1 sizing/acceptance_surfaces）只讀核心層而不必重新解析 combo。
+    core_gate_verify_commands: tuple[str, ...] = ()
+    band_gate_verify_commands: tuple[str, ...] = ()
 
 
 _LEGACY_CARD_PHASES = {
@@ -432,14 +437,14 @@ def _verify_command(card: Card, slug: str, change: str | None) -> str:
 
 
 def _gate_verify_commands(
-    combo: Combo,
+    gate_spine: Sequence,
     cards: Mapping[str, Card],
     slug: str,
     change: str | None,
     selected_refs: frozenset[str],
 ) -> list[str]:
     commands: list[str] = []
-    for gate in combo.gate_spine:
+    for gate in gate_spine:
         if gate.after not in selected_refs:
             continue
         card = cards.get(gate.after)
@@ -453,6 +458,42 @@ def _gate_verify_commands(
     return commands
 
 
+def _band_meets_trigger(band: str, trigger: str) -> bool:
+    return BAND_LEVELS.index(band) >= BAND_LEVELS.index(trigger)
+
+
+def _apply_band_triggered(
+    hand: list[ComboEntry],
+    band_spine: BandTriggeredSpine | None,
+    band: str | None,
+) -> tuple[list[ComboEntry], bool]:
+    """band 兩層制（#221 maintainer 裁決）：band 未知（None）時保守地包含加掛層
+    （行為與今日一致）；band 已知時依 BAND_LEVELS 順序與 trigger 比較。加掛卡片
+    依其 depends_on 插入骨幹中最後一個依賴之後，未宣告 depends_on 則附加於尾端。
+    """
+    if band_spine is None:
+        return hand, False
+    if band is not None and band not in BAND_LEVELS:
+        raise DeckCompileError(f"band 非法值 {band!r}（允許 {list(BAND_LEVELS)}）")
+    if band is not None and not _band_meets_trigger(band, band_spine.trigger):
+        return hand, False
+
+    refs = {entry.ref for entry in hand}
+    result = list(hand)
+    for entry in band_spine.cards:
+        if entry.ref in refs:
+            raise DeckCompileError(f"band_triggered 卡片與骨幹重複: {entry.ref}")
+        current_refs = [e.ref for e in result]
+        if entry.depends_on:
+            positions = [current_refs.index(dep) for dep in entry.depends_on if dep in current_refs]
+            pos = max(positions) + 1 if positions else len(result)
+        else:
+            pos = len(result)
+        result.insert(pos, entry)
+        refs.add(entry.ref)
+    return result, True
+
+
 def compile_combo(
     combo: Combo,
     cards: Mapping[str, Card],
@@ -463,11 +504,16 @@ def compile_combo(
     only: Sequence[str] = (),
     allow_external: bool = False,
     plan_ref: str | None = None,
+    band: str | None = None,
 ) -> CompileResult:
     slug = slugify_task(task)
     if change is not None:
         change = _validate_change_name(change)
     entries = _resolve_hand(combo, cards, with_cards, only)
+    # --only 明確選卡時尊重使用者選擇，不再併入 band 加掛層（#221）。
+    band_applied = False
+    if not only:
+        entries, band_applied = _apply_band_triggered(entries, combo.band_triggered, band)
     external = _check_requires_coverage(entries, cards, allow_external)
     workflow_manifest = _compile_workflow_manifest(combo, entries, cards, slug, change)
 
@@ -488,7 +534,13 @@ def compile_combo(
     explicit_deps = {entry.ref: entry.depends_on for entry in entries}
     selected_refs = frozenset(entry.ref for entry in entries)
     slices: list[SliceDoc] = []
-    verify_commands = _gate_verify_commands(combo, cards, slug, change, selected_refs)
+    core_gate_commands = _gate_verify_commands(combo.gate_spine, cards, slug, change, selected_refs)
+    band_gate_commands: list[str] = (
+        _gate_verify_commands(combo.band_triggered.gate_spine, cards, slug, change, selected_refs)
+        if band_applied and combo.band_triggered is not None
+        else []
+    )
+    verify_commands = core_gate_commands + band_gate_commands
     previous_slice_id: str | None = None
 
     for slice_id, members in _group_slices(entries, cards, slug):
@@ -546,6 +598,8 @@ def compile_combo(
         verify_commands=tuple(dict.fromkeys(verify_commands)),
         external=external,
         workflow_manifest=workflow_manifest,
+        core_gate_verify_commands=tuple(dict.fromkeys(core_gate_commands)),
+        band_gate_verify_commands=tuple(dict.fromkeys(band_gate_commands)),
     )
 
 
