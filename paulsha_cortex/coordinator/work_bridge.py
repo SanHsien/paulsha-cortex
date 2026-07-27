@@ -169,6 +169,36 @@ def _write_manifest(root: Path, claim_key: str, manifest) -> Path:
     return target
 
 
+def _other_owner_ongoing_runs(registry, authority: WorkAuthority) -> list:
+    """Ongoing runs owned by a *different* work_id that still claim one of
+    this authority's mapped issues.
+
+    Source-owner transfers (issue #217, design #208 D) move ``mapped_issues``
+    from one work_id to another through the ``.cortex/work-items.yaml``
+    unlink/link override. ``JobRegistry._manager_create_workflow_run`` only
+    auto-supersedes an *ongoing* run for the same ``(repo, work_id)`` pair, so
+    a different work_id's stale claim on the same issue is never protected
+    there. Without this guard a new-owner claim could start while the old
+    owner's run is still live — the exact "舊 owner 仍在 snapshot 而新 run 已
+    start" intermediate state hippo #41 (v3→v4) hit as a missing_issue /
+    human-intervention-required run.
+    """
+
+    expected_issue_refs = {
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    }
+    if not expected_issue_refs:
+        return []
+    return [
+        run
+        for run in registry.list_workflow_runs()
+        if run.repo == authority.repo
+        and run.work_id != authority.work_id
+        and run.status == "ongoing"
+        and expected_issue_refs & set(run.issue_refs)
+    ]
+
+
 def start_canonical_workflow(
     *,
     registry,
@@ -192,6 +222,13 @@ def start_canonical_workflow(
             return existing_run
         if existing_run.current_phase != "define":
             return existing_run
+    stale_owners = _other_owner_ongoing_runs(registry, authority)
+    if stale_owners:
+        blocking = ", ".join(sorted({run.work_id for run in stale_owners}))
+        raise RuntimeError(
+            "source-owner transfer incomplete: "
+            f"{blocking} still owns an overlapping issue"
+        )
     root = resolve_trusted_repo_root(authority.repo, explicit=explicit_repo_root)
     change = authority.mapped_openspec[0] if authority.mapped_openspec else authority.work_id
     manifest = default_workflow_manifest(authority.work_id, change=change)
