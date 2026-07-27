@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import time
+from enum import Enum
 from pathlib import Path
 from pathlib import PurePosixPath
 from types import SimpleNamespace
@@ -1434,6 +1435,56 @@ def _claim_action(
     return {"action": decision.action, "reason": decision.reason, "run": active}
 
 
+class RetryClassification(str, Enum):
+    """#208 根因3 定案的 retry 分類（enum 定案，後波不得改名）。
+
+    本單（#215）只落地 MODEL_REPAIR／ORCHESTRATOR_RETRY 兩類的判準：
+    AUTHORITY_RESTART／REVIEW_HANDOFF_FAILURE／SOURCE_OWNER_REPAIR 留供 #216
+    依各自根因補齊——`_classify_retry` 目前不會回傳這三類。
+    """
+
+    MODEL_REPAIR = "model_repair"
+    ORCHESTRATOR_RETRY = "orchestrator_retry"
+    AUTHORITY_RESTART = "authority_restart"
+    REVIEW_HANDOFF_FAILURE = "review_handoff_failure"
+    SOURCE_OWNER_REPAIR = "source_owner_repair"
+
+
+def _classify_retry(run, workflow_registry) -> RetryClassification:
+    """判斷一次 retry-build 的性質（#208 根因3）。
+
+    model_repair：candidate 已產出可被下游評估的內容——run 已離開 build phase
+    進入 verify/review，或 build phase 已有一顆乾淨終止（status=='exited'、
+    exit_code==0）且已綁定 workflow_evidence 的 builder job。此後任何
+    needs_human 都是下游對 candidate 內容本身的判斷，屬需要模型修的內容缺陷。
+
+    orchestrator_retry：build phase 尚未有前述「乾淨終止且已綁定 evidence」的
+    builder job（job 缺席、未乾淨終止，或乾淨終止卻沒有 evidence）——中斷發生
+    在 provider／stale base／claim sequencing 等 orchestrator 層，不是模型內容
+    問題，不得計入模型 failure 指標。
+
+    判準只看 run.current_phase 與 JobRegistry 的 job status/exit_code/
+    workflow_evidence，刻意不看 run.attempts 世代數（不再只以 vN 判斷重試性質）。
+    """
+    if run.current_phase != "build":
+        return RetryClassification.MODEL_REPAIR
+    build_steps = [step for step in run.steps if step.phase == "build"]
+    repair_card = build_steps[-1].card if build_steps else None
+    terminal_with_evidence = [
+        job
+        for job in workflow_registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_phase") == "build"
+        and job.get("workflow_card") == repair_card
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+        and job.get("workflow_evidence") is not None
+    ]
+    if terminal_with_evidence:
+        return RetryClassification.MODEL_REPAIR
+    return RetryClassification.ORCHESTRATOR_RETRY
+
+
 def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
@@ -1472,6 +1523,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
+    retry_classification = _classify_retry(run, workflow_registry)
     archive_applied = any(
         step.phase == "ship"
         and step.card == "openspec-archive"
@@ -1512,6 +1564,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         "reason": "candidate-repair-dispatched",
         "expected_candidate": expected_candidate.lower(),
         "run": updated.to_dict(),
+        "retry_classification": retry_classification,
     }
 
 
