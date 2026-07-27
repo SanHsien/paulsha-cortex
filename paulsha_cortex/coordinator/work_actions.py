@@ -1401,6 +1401,25 @@ def _claim_action(
     if decision.action == "claim":
         if workflow_starter is None:
             raise RuntimeError("canonical workflow starter unavailable")
+        # #218 AC2（design #208 E）：語意 re-claim 的世代熔斷——同一 (repo, work_id)
+        # 已累積 SEMANTIC_RECLAIM_LIMIT 個 superseded 世代（v1..v3）時，不得自動
+        # 建立下一版 run（v4），強制 needs_human。計數以 registry 的 run 歷史為準
+        # （跨 run_id，不受 active dict 換代歸零影響）。
+        if workflow_registry is not None:
+            superseded_generations = [
+                run
+                for run in workflow_registry.list_workflow_runs()
+                if run.repo == authority.repo
+                and run.work_id == authority.work_id
+                and run.status == "superseded"
+            ]
+            if len(superseded_generations) >= SEMANTIC_RECLAIM_LIMIT:
+                return {
+                    "action": "needs_human",
+                    "reason": "semantic-reclaim-budget-exhausted",
+                    "run": None,
+                    "superseded_generations": len(superseded_generations),
+                }
         try:
             run = workflow_starter(authority, str(decision.claim_key), None)
         except RuntimeError as error:
@@ -2095,6 +2114,11 @@ def run_auto_claim_scan(
                 }
             )
     return results
+
+
+# #218 AC2：語意 re-claim 世代上限——v1..v3 共三個 superseded 世代後熔斷，
+# 不得自動建立 v4（design #208 E 原文）。
+SEMANTIC_RECLAIM_LIMIT = 3
 
 
 # #218 AC3: needs_human 停止時揭露剩餘 repair scope、已重複 stage、合法下一步

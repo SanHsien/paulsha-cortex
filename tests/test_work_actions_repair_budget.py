@@ -160,3 +160,56 @@ def test_repair_budget_gates_on_round_count_and_elapsed_time_only() -> None:
     )
     assert timed_out.action == "needs_human"
     assert timed_out.reason == "copilot-review-timeout"
+
+
+def test_semantic_reclaim_budget_forces_needs_human_and_never_creates_v4(tmp_path):
+    """#218 AC2（design #208 E）：同一 work item 累積 3 個 superseded 世代後，
+    語意 re-claim 熔斷為 needs_human，不得自動建立 v4；計數跨 run_id，
+    不受 active dict 換代歸零影響。"""
+    from paulsha_cortex.coordinator import work_actions
+    from paulsha_cortex.coordinator.registry import JobRegistry
+    from paulsha_cortex.coordinator.workflow import WorkflowStep
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    step = WorkflowStep(
+        phase="claim", persona="manager", card="workflow-claim",
+        executor=None, model=None, domain=None, inputs=(), outputs=(),
+        gate_result="pending",
+    )
+    # v1..v3：同 (repo, work_id) 連建三代，前兩代自動被 supersede，最後一代手動終結。
+    for gen in range(3):
+        registry._manager_create_workflow_run(
+            repo="acme/demo", work_id="demo",
+            claim_key=f"claim:v1:{str(gen) * 64}",
+            source_revision=f"rev-{gen}",
+            workspace_root="/tmp/workspace", combo="feature-oneshot",
+            current_phase="claim", steps=(step,),
+            issue_refs=("acme/demo#12",),
+        )
+    runs = registry.list_workflow_runs()
+    last_ongoing = [r for r in runs if r.status == "ongoing"]
+    assert len(last_ongoing) == 1
+    registry._manager_abandon_workflow_run(
+        last_ongoing[0].run_id, evidence_ref="abandon:test-semantic-reclaim"
+    )
+    assert (
+        len([r for r in registry.list_workflow_runs() if r.status == "superseded"]) >= 3
+    )
+
+    def _never_start(authority, claim_key, reason):
+        raise AssertionError("semantic re-claim 熔斷後不得建立 v4 run")
+
+    outcome = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo", "actor": "operator"},
+        requested_by="operator",
+        now=lambda: 150.0,
+        snapshot_path=snapshot,
+        state_path=tmp_path / "journal.jsonl",
+        workflow_registry=registry,
+        workflow_starter=_never_start,
+    )
+    result = outcome["result"]
+    assert result["action"] == "needs_human"
+    assert result["reason"] == "semantic-reclaim-budget-exhausted"
+    assert result["superseded_generations"] >= 3

@@ -2307,6 +2307,10 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human_defaul
     assert final["repair_rounds_budget"] == 2
     assert final["repair_rounds_remaining"] == 0
     assert final["legal_next_steps"] == ("maintainer-review",)
+    # #218 AC3：已重複 stage 與預估 invalidation 範圍（ship 階段 repair 迴圈
+    # 不回頭讓 build/verify 失效，範圍即當前 phase）。
+    assert final["repeated_stage"]
+    assert final["invalidation_scope"] == (final["repeated_stage"],)
     persisted = _only_journal_row(state)
     assert "status" not in persisted
     assert JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()[0].facets == (
