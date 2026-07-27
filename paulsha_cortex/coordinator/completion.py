@@ -8,7 +8,9 @@ from typing import Any
 from uuid import uuid4
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.deck.schema import BAND_LEVELS
 
+from . import claim
 from . import review as foreign_review
 from . import verification
 
@@ -44,6 +46,15 @@ RETRY_CLASSIFICATION_VALUES = frozenset(
 # 漏檢（plan_review_gate 判定通過，但 final 才發現問題其實出在 plan）。純
 # provenance，不影響既有 completion 語意，semantic match 排除比照 reused_from。
 VALID_FINAL_DEFECT_LOCI = frozenset({"plan", "candidate"})
+# #222（design #208 H.2）：五維 sizing 總分／band／宣告-實際模組數落差記錄。
+# sizing_score/sizing_band 是 work item 狀態（WorkflowRun，見 workflow.py）在
+# completion 當下的快照，band 門檻判定委派給 claim.sizing_band()（claim.py／
+# registry.py／completion.py 三處共用同一份純函式，避免各自硬編碼漂移）；
+# sizing_declaration_drift 記錄宣告模組數 vs candidate 實際變更數（供 #210
+# 後驗）。比照 #215 的 reused_from/retry_classification/final_defect_locus：
+# 可選欄位＋_normalize_*＋extras 白名單聯集；三者皆屬 work item 狀態快照／
+# provenance，不影響既有 completion 語意，semantic match 排除。
+SIZING_DECLARATION_DRIFT_FIELDS = frozenset({"declared_modules", "actual_modules"})
 
 
 def classify_completion(*, exit_code: int, last_jsonl_line: str | None) -> str:
@@ -248,6 +259,30 @@ def _normalize_final_defect_locus(value: object) -> str:
     return value
 
 
+def _normalize_sizing_score(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= 10):
+        raise ValueError("completion sizing_score must be an int in [0, 10]")
+    return value
+
+
+def _normalize_sizing_band(value: object) -> str:
+    if value not in BAND_LEVELS:
+        raise ValueError(f"completion sizing_band must be one of {list(BAND_LEVELS)}")
+    return value
+
+
+def _normalize_sizing_declaration_drift(value: object) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != SIZING_DECLARATION_DRIFT_FIELDS:
+        raise ValueError("completion sizing_declaration_drift malformed")
+    declared = value.get("declared_modules")
+    actual = value.get("actual_modules")
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 0:
+        raise ValueError("completion sizing_declaration_drift.declared_modules invalid")
+    if not isinstance(actual, int) or isinstance(actual, bool) or actual < 0:
+        raise ValueError("completion sizing_declaration_drift.actual_modules invalid")
+    return {"declared_modules": declared, "actual_modules": actual}
+
+
 def validate_completion_record(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("completion record must be an object")
@@ -277,7 +312,8 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
     if missing:
         raise ValueError(f"completion record missing keys: {', '.join(missing)}")
     extras = set(payload) - required - {
-        "work_authority", "reused_from", "retry_classification", "final_defect_locus"
+        "work_authority", "reused_from", "retry_classification", "final_defect_locus",
+        "sizing_score", "sizing_band", "sizing_declaration_drift",
     }
     if extras:
         raise ValueError(f"completion record unexpected key: {sorted(extras)[0]}")
@@ -332,6 +368,21 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
         )
     if "final_defect_locus" in payload:
         normalized["final_defect_locus"] = _normalize_final_defect_locus(payload["final_defect_locus"])
+    if ("sizing_score" in payload) != ("sizing_band" in payload):
+        raise ValueError("completion sizing_score/sizing_band must be supplied together")
+    if "sizing_score" in payload:
+        normalized["sizing_score"] = _normalize_sizing_score(payload["sizing_score"])
+        normalized["sizing_band"] = _normalize_sizing_band(payload["sizing_band"])
+        expected_band = claim.sizing_band(normalized["sizing_score"])
+        if normalized["sizing_band"] != expected_band:
+            raise ValueError(
+                "completion sizing_band does not match sizing_score threshold "
+                f"(#222 H.2): expected {expected_band!r}, got {normalized['sizing_band']!r}"
+            )
+    if "sizing_declaration_drift" in payload:
+        normalized["sizing_declaration_drift"] = _normalize_sizing_declaration_drift(
+            payload["sizing_declaration_drift"]
+        )
 
     reviewer_job_id = normalized["reviewer_job_id"]
     review_path = normalized["review_evaluation_path"]
@@ -390,6 +441,12 @@ def completion_records_semantically_match(existing: object, incoming: object) ->
     incoming_normalized.pop("retry_classification", None)
     existing_normalized.pop("final_defect_locus", None)
     incoming_normalized.pop("final_defect_locus", None)
+    existing_normalized.pop("sizing_score", None)
+    incoming_normalized.pop("sizing_score", None)
+    existing_normalized.pop("sizing_band", None)
+    incoming_normalized.pop("sizing_band", None)
+    existing_normalized.pop("sizing_declaration_drift", None)
+    incoming_normalized.pop("sizing_declaration_drift", None)
     return existing_normalized == incoming_normalized and existing_authority == incoming_authority
 
 

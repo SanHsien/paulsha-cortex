@@ -372,6 +372,8 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         # #216：retry_classification（provenance-only，比照 pr_candidate／
         # merge_revision 的可選欄位模式）。
         "retry_classification",
+        # #222（design #208 H.2）：五維 sizing 總分／band 的 work item 快照。
+        "sizing_score", "sizing_band",
     }
 )
 
