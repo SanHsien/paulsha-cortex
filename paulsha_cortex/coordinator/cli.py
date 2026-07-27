@@ -66,8 +66,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("jobs", help="列出所有 Job 執行紀錄")
 
-    p_stat = sub.add_parser("stat", help="查單一 Job 執行紀錄")
-    p_stat.add_argument("job_id")
+    p_stat = sub.add_parser(
+        "stat", help="查單一 Job 執行紀錄；--retry-classifications 依 retry 分類彙總 workflow runs"
+    )
+    p_stat.add_argument("job_id", nargs="?", default=None)
+    p_stat.add_argument(
+        "--retry-classifications",
+        action="store_true",
+        help="依 retry_classification 彙總 workflow runs（#208：cortex stat 可依原因分類彙總）",
+    )
 
     p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
     p_ready.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
@@ -116,8 +123,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument(
         "action",
         choices=[
-            "link", "unlink", "start", "resume", "retry-build", "abandon", "auto", "ship",
-            "review-attest",
+            "link", "unlink", "start", "resume", "retry-build", "retry-verify",
+            "retry-review", "abandon", "auto", "ship", "review-attest",
         ],
     )
     p_work.add_argument("work_id")
@@ -343,6 +350,16 @@ def main(
         return 0
 
     if args.cmd == "stat":
+        if args.retry_classifications:
+            counts: dict[str, int] = {}
+            for run in reg.list_workflow_runs():
+                key = run.retry_classification or "unclassified"
+                counts[key] = counts.get(key, 0) + 1
+            print(json.dumps({"retry_classifications": counts}, ensure_ascii=False))
+            return 0
+        if args.job_id is None:
+            print("錯誤: stat 需要 job_id（或 --retry-classifications）", file=sys.stderr)
+            return 1
         try:
             job = reg.get_job(args.job_id)
         except KeyError as exc:
