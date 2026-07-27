@@ -500,7 +500,7 @@ Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 b
 ## 開發備註
 
 - repo 宣告 `tier: shareable`，所有範例與測試都必須維持去識別化。
-- repo policy 由 canonical `.project-policy.yml` 宣告，並 pin paulsha-conventions v1.0.14。
+- repo policy 由 canonical `.project-policy.yml` 宣告，並 pin paulsha-conventions v1.0.15。
 - agent 慣例檔採 symlink 模式：`AGENTS.md`、`GEMINI.md`、`.github/copilot-instructions.md` 都指向 `CLAUDE.md`。
 
 ## Version

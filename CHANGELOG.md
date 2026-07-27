@@ -3,12 +3,16 @@
 本專案所有重大變更都會記錄在此檔案。
 
 格式基於 [Keep a Changelog 1.1.0](https://keepachangelog.com/zh-TW/1.1.0/)，
-本專案遵循 hamanpaul project policy v1.0.12。
+本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
 
 ### Added
 - **Issue #177：driving-cortex skill**：新增 `skills/driving-cortex/SKILL.md`，提供 agent 編排 coordinator 視角下的 cortex dogfood 批次驅動與交付操作指南（含 seven-section 實務骨架）。
+
+### Changed
+- **同步 policy 1.0.14 → 1.0.15**：`.project-policy.yml` 與 `CLAUDE.md`（`managed-by`／`policy_version`／profile 段）皆 bump 至 `1.0.15`；`Policy Check` workflow 的 `uses:` 與 `policy_engine_ref` 重新雙重釘選至 `hamanpaul/paulsha-conventions@a764806046c410eb4f254ac0b6a8aec8b7559dab`（= engine tag `v1.0.15`，尾註 `# v1.0.15` 供 R-23 對齊）；`README.md` 開發備註的引擎版號字樣同步更新。本次升版 1.0.14→1.0.15 未新增規則編號（僅新增 tag 觸發的 runtime bundle release workflow），故 `CLAUDE.md` 不需新增「新增規則」段落。
+- **本機部署 paulsha-conventions v1.0.15 runtime bundle**：依 release 說明下載 `paulsha-conventions-v1.0.15-cp312.tar.gz`、驗證 SHA-256 後執行 `install.sh`，`~/.agents/skills/preflight-ci` 改為指向新 runtime release 的受管 symlink；既有 skill 目錄已先備份（不影響本 repo 版控內容，屬本機環境變更）。
 
 ### Fixed
 - **Issue #98：修正 dispatch spec root 推斷**：`_infer_repo_root()` 在 `PSC_REPO_ROOT` 設定且 spec 位於 repo 外部時，改回傳 `paths.repo_root()`，避免沿 spec 路徑 `.git` 向上尋找導致誤判。
