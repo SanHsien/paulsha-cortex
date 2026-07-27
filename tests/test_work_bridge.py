@@ -1145,6 +1145,10 @@ identities:
     authority = work_bridge._authority_with_manager_pr(
         load_work_authority(repo="acme/demo", work_id="work"), 17
     )
+    # #208 收口 wiring 4：sizing 是 work item 屬性，_completion_draft 必須把
+    # run 上已算好的 sizing_score/sizing_band 帶進 CompletionRecord（比照既有
+    # retry_classification 的 provenance-only 可選欄位模式）。
+    run = registry._manager_update_workflow_run(run_id, sizing_score=8, sizing_band="red")
     draft = work_bridge._completion_draft(
         registry=registry,
         state_root=coordinator_root,
@@ -1161,6 +1165,8 @@ identities:
     assert completion_payload["work_authority"]["run_id"] == run_id
     assert completion_payload["work_authority"]["merge_commit"] == "e" * 40
     assert completion_payload["target_ref_sha"] == "d" * 40
+    assert completion_payload["sizing_score"] == 8
+    assert completion_payload["sizing_band"] == "red"
     assert completion.read_completion_record(draft) == completion_payload
 
     # Retry reuses the first immutable draft when only completed_at changes.

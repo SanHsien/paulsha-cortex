@@ -22,6 +22,7 @@ from .claim import (
     ClaimCandidate,
     build_claim_key,
     build_label_argv,
+    claim_identity_digest,
     decide_auto_claim,
     decide_manual_start,
     load_work_authorities,
@@ -48,7 +49,7 @@ from .github_delivery import (
 )
 from . import verification
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
-from .work_bridge import resolve_trusted_repo_root, workflow_status
+from .work_bridge import current_sizing_snapshot, resolve_trusted_repo_root, workflow_status
 from .workflow import GateEvidenceRef
 
 
@@ -1350,6 +1351,18 @@ def _claim_action(
         active_authority_digest=(
             work_authority_digest(authority) if canonical_run is not None else None
         ),
+        # #213（design #208 A.1）freeze 接線：Yellow band 的 freeze point 移到
+        # plan_review_gate ready=True 之後——run.plan_review_passed 是 dispatch
+        # 掛載點寫入的持久化基準。Green/Red/None band 從沒呼叫過 gate，比照
+        # pre-#213 立即凍結行為（視為已通過，#223 已定案的 fail-soft 慣例）。
+        active_plan_review_passed=(
+            True
+            if canonical_run is None or getattr(canonical_run, "sizing_band", None) != "yellow"
+            else getattr(canonical_run, "plan_review_passed", False)
+        ),
+        active_claim_identity_digest=(
+            claim_identity_digest(authority) if canonical_run is not None else None
+        ),
     )
     if (
         canonical_run is not None
@@ -1472,8 +1485,24 @@ def _claim_action(
                 ),
             }
         )
+        # #208 收口 wiring 1：sizing 是否算得出來的可觀測標記，比照
+        # claim_readiness.capability_probe 的 envelope_unavailable bypass 模式
+        # ——輸入不可得（無 plan artifact／combo／宣告欄位）時 sizing_score 為
+        # None，這裡如實反映，不掩蓋。
+        active["sizing_unavailable"] = active.get("sizing_score") is None
         if readiness_checker is not None:
-            active["frozen_readiness"] = readiness.frozen.to_dict()
+            frozen_dict = readiness.frozen.to_dict()
+            active["frozen_readiness"] = frozen_dict
+            # #208 收口 wiring 5：把凍結集持久化到 run 本身（#211 掛在 run dict
+            # 只是 API 回應層的浮動增補，dispatch 建 builder worktree 時讀的是
+            # registry 裡的 WorkflowRun，必須實際寫回才能被消費）。builder
+            # worktree 一旦建立就不再讀這個欄位，重複凍結不會造成陳舊 base。
+            run_id_to_persist = active.get("run_id")
+            if workflow_registry is not None and isinstance(run_id_to_persist, str):
+                persisted = workflow_registry._manager_update_workflow_run(
+                    run_id_to_persist, frozen_readiness=frozen_dict
+                )
+                active["frozen_readiness"] = persisted.frozen_readiness
     return {"action": decision.action, "reason": decision.reason, "run": active}
 
 
@@ -1555,6 +1584,31 @@ def _classify_retry(
     return RetryClassification.ORCHESTRATOR_RETRY
 
 
+def _recompute_and_persist_sizing(workflow_registry, run):
+    """#208 收口 wiring 3：repair／re-claim 成功路徑重算 sizing band。
+
+    輸入條件與 wiring 1（claim 時計算）共用同一份 ``current_sizing_snapshot``
+    fail-soft helper——重算得出來就寫回 run（``_manager_update_workflow_run``），
+    算不出來（plan 缺宣告欄位、combo 無法解析等）維持現值不動，不得讓既有測試
+    變紅。band 若因此跨帶升到 red，由 #223 既有的 dispatch 攔截在下次 dispatch
+    時自然生效，這裡不重複路由。
+    """
+
+    artifact_rows = [
+        {"kind": item.kind, "ref": item.ref} for item in run.planning_authority
+    ]
+    score, band = current_sizing_snapshot(
+        workspace_root=run.workspace_root,
+        combo_name=run.combo,
+        artifact_rows=artifact_rows,
+    )
+    if score is None:
+        return run
+    return workflow_registry._manager_update_workflow_run(
+        run.run_id, sizing_score=score, sizing_band=band
+    )
+
+
 def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
@@ -1630,6 +1684,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         repair_action=repair_action,
         retry_classification=retry_classification.value,
     )
+    updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
         "action": "retry-build",
         "reason": "candidate-repair-dispatched",
@@ -1690,6 +1745,7 @@ def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) 
         expected_candidate=expected_candidate.lower(),
         retry_classification=retry_classification.value,
     )
+    updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
         "action": "retry-verify",
         "reason": "verification-rerun-dispatched",
@@ -1756,6 +1812,7 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
         expected_candidate=expected_candidate.lower(),
         retry_classification=retry_classification.value,
     )
+    updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
         "action": "retry-review",
         "reason": "foreign-review-rerun-dispatched",

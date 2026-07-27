@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import verification
 from .claim import sizing_band as compute_sizing_band
 
 
@@ -321,6 +322,19 @@ class WorkflowRun:
     # 由呼叫端轉 needs_human 而非再拆一層；本欄位只負責持有快照，不做遞增邏輯
     # （遞增屬呼叫端建立子 work item run 時的責任）。
     decomposition_depth: int = 0
+    # #213（design #208 A.1）：freeze point 移至 plan review 通過之後。此欄位是
+    # claim.ClaimCandidate.active_plan_review_passed 讀回的持久化基準——Yellow
+    # band 的 run 在 manager._dispatch_workflow_card 的 plan phase 完成掛載點跑
+    # planning.plan_review_gate() ready=True 時才寫入 True；Green/Red/None band
+    # 從不呼叫 gate，沿用 pre-#213 立即凍結行為（呼叫端一律視為已通過）。只負責
+    # 持有最新一次的判定快照，不在本模組做判定本身。
+    plan_review_passed: bool = False
+    # #211（design #208 A.2）：pre-claim readiness 六道關卡通過後凍結的
+    # base_sha／monitor_snapshot_revision 等集合（claim_readiness.FrozenReadinessSet
+    # 的 dict 投影），供 builder worktree 建立時消費（#211 收斂）；不得由
+    # dispatch 自行重新推導一個可能更新鮮（或更陳舊）的 base。``None`` 表示尚未
+    # 凍結或呼叫端未接上 readiness transaction，維持既有行為。
+    frozen_readiness: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -440,6 +454,20 @@ class WorkflowRun:
             raise ValueError(
                 "workflow run decomposition_depth 必須為 0–2 的整數（#223 拆分深度上限）"
             )
+        if not isinstance(self.plan_review_passed, bool):
+            raise ValueError("workflow run plan_review_passed 必須為bool")
+        if self.frozen_readiness is not None:
+            base_sha = (
+                self.frozen_readiness.get("base_sha")
+                if isinstance(self.frozen_readiness, dict)
+                else None
+            )
+            if (
+                not isinstance(self.frozen_readiness, dict)
+                or not isinstance(base_sha, str)
+                or verification.SAFE_SHA_RE.fullmatch(base_sha) is None
+            ):
+                raise ValueError("workflow run frozen_readiness base_sha 格式錯誤")
         if self.gate_status == "passed":
             required_kinds = ["foreign-review"]
             if self.brainstorm_required:
@@ -515,6 +543,10 @@ class WorkflowRun:
             "sizing_score": self.sizing_score,
             "sizing_band": self.sizing_band,
             "decomposition_depth": self.decomposition_depth,
+            "plan_review_passed": self.plan_review_passed,
+            "frozen_readiness": (
+                dict(self.frozen_readiness) if self.frozen_readiness is not None else None
+            ),
         }
 
     @classmethod
@@ -591,6 +623,8 @@ class WorkflowRun:
             sizing_score=payload.get("sizing_score"),
             sizing_band=payload.get("sizing_band"),
             decomposition_depth=payload.get("decomposition_depth", 0),
+            plan_review_passed=payload.get("plan_review_passed", False),
+            frozen_readiness=payload.get("frozen_readiness"),
         )
 
 

@@ -16,7 +16,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 from uuid import uuid4
 
 from paulsha_cortex.config import paths
@@ -29,9 +29,15 @@ from paulsha_cortex.deck.schema import (
 )
 
 from . import verification
-from .claim import WorkAuthority, load_work_authority, work_authority_digest
+from .claim import WorkAuthority, load_work_authority, sizing_band, work_authority_digest
 from .github_delivery import GitHubDeliveryClient
 from .model_identities import IdentityRegistry, load_model_identities
+from .planning import (
+    ACCEPTANCE_SURFACE_RULES,
+    PlanningArtifact,
+    assess_planning_completeness,
+    compute_sizing_score,
+)
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
 
 
@@ -151,6 +157,63 @@ def _artifact_rows(root: Path, authority: WorkAuthority) -> list[dict[str, str]]
     return rows
 
 
+def current_sizing_snapshot(
+    *,
+    workspace_root: str | Path,
+    combo_name: str,
+    artifact_rows: Iterable[Mapping[str, str]],
+) -> tuple[int | None, str | None]:
+    """五維 sizing 重算的共用 fail-soft helper（#208 收口 wiring 1/3）。
+
+    ``artifact_rows`` 是 ``_artifact_rows()``／``PlanningArtifactAuthority`` 已產出
+    的 ``{"kind": ..., "ref": ...}`` 形狀——從 ``workspace_root`` 讀出內容餵給
+    ``planning.compute_sizing_score()``。任何一步不可得（檔案缺席、讀取失敗、
+    plan 缺 domain_breadth／state_consistency 宣告欄位、combo 無法解析）一律
+    fail-soft 回傳 ``(None, None)``——呼叫端維持現行為，不掛 band（#208 紅線）。
+
+    ``applicable_contract_rules`` 固定餵 ``planning.ACCEPTANCE_SURFACE_RULES``
+    全集：R-09（changelog fragment）／R-16（CLI help 同步）／R-19（CI 測試）三條
+    process-level 規則對本 repo 任何程式碼變動類工作項目皆適用，不需要每個呼叫端
+    重新從 scope/code_paths 反推一次適用子集。
+    """
+
+    try:
+        root = Path(workspace_root)
+        artifacts: list[PlanningArtifact] = []
+        plan_artifact: PlanningArtifact | None = None
+        for row in artifact_rows:
+            kind = row["kind"]
+            ref = row["ref"]
+            text = (root / ref).read_text(encoding="utf-8")
+            artifact = PlanningArtifact(kind=kind, ref=ref, text=text)
+            artifacts.append(artifact)
+            if kind == "plan":
+                plan_artifact = artifact
+        if plan_artifact is None:
+            return None, None
+        cards = load_cards(DEFAULT_CARDS_PATH)
+        combo = load_combo(DEFAULT_COMBOS_DIR / f"{combo_name}.yaml", cards)
+        # combo.cards 只存 ComboEntry(ref, depends_on)——persona_binding 是card
+        # 本身（load_cards 的字典）的欄位，須用 ref 查表，見 deck/schema.py。
+        persona_binding_count = sum(
+            1
+            for entry in combo.cards
+            if cards.get(entry.ref) is not None and cards[entry.ref].persona_binding is not None
+        )
+        completeness_report = assess_planning_completeness(artifacts)
+        score = compute_sizing_score(
+            plan_artifact=plan_artifact,
+            completeness_report=completeness_report,
+            gate_spine_count=len(combo.gate_spine),
+            applicable_contract_rules=ACCEPTANCE_SURFACE_RULES,
+            cards_count=len(combo.cards),
+            persona_binding_count=persona_binding_count,
+        )
+        return score.total, sizing_band(score.total)
+    except (OSError, UnicodeDecodeError, ValueError, KeyError):
+        return None, None
+
+
 def _write_manifest(root: Path, claim_key: str, manifest) -> Path:
     directory = root / "workflow-manifests"
     directory.mkdir(parents=True, exist_ok=True)
@@ -232,6 +295,13 @@ def start_canonical_workflow(
     root = resolve_trusted_repo_root(authority.repo, explicit=explicit_repo_root)
     change = authority.mapped_openspec[0] if authority.mapped_openspec else authority.work_id
     manifest = default_workflow_manifest(authority.work_id, change=change)
+    # #208 收口 wiring 1：claim 時嘗試算 sizing（若能取得既有 plan artifact 與
+    # combo 資訊——多半是 openspec-propose 已先在 disk 上落地 tasks.md 的情境）。
+    # fail-soft：拿不到就維持 None，run 不掛 band，行為與現行完全相同。
+    artifact_rows = _artifact_rows(root, authority)
+    claim_sizing_score, claim_sizing_band = current_sizing_snapshot(
+        workspace_root=root, combo_name=manifest.combo, artifact_rows=artifact_rows
+    )
     if needs_human_reason is not None:
         if existing_run is not None:
             return existing_run
@@ -250,6 +320,8 @@ def start_canonical_workflow(
             attempts={"claim": 1},
             facets=("needs_human",),
             gate_status="running",
+            sizing_score=claim_sizing_score,
+            sizing_band=claim_sizing_band,
         )
         return run
     manifest_path = _write_manifest(Path(coordinator_root), claim_key, manifest)
@@ -274,7 +346,9 @@ def start_canonical_workflow(
             "artifact_root": str(root),
             "evidence_dir": str(Path(coordinator_root) / "evidence" / "planning"),
             "manifest_path": str(manifest_path),
-            "planning_artifacts": _artifact_rows(root, authority),
+            "planning_artifacts": artifact_rows,
+            "sizing_score": claim_sizing_score,
+            "sizing_band": claim_sizing_band,
             "primary_executor": primary.executor,
             "primary_model": primary.model_id,
             "primary_domain": primary.independence_domain,
@@ -1200,6 +1274,13 @@ def _completion_draft(
     # schema 原本「該欄位不存在」的可選語意，不強塞 None。
     if run.retry_classification is not None:
         payload["retry_classification"] = run.retry_classification
+    # #208 收口 wiring 4：sizing 是 work item 屬性（#222 H.2 已進 CompletionRecord
+    # schema），比照 retry_classification 的 provenance-only 可選欄位模式寫入。
+    # sizing_declaration_drift 需要的 declared_modules（plan 宣告的模組數）目前
+    # plan frontmatter 沒有這個宣告欄位，fail-soft 省略整個欄位（見 PR body）。
+    if run.sizing_score is not None:
+        payload["sizing_score"] = run.sizing_score
+        payload["sizing_band"] = run.sizing_band
     normalized = completion.validate_completion_record(payload)
     directory = state_root / "evidence" / "completion-drafts"
     directory.mkdir(parents=True, exist_ok=True)
