@@ -276,6 +276,131 @@ def assess_planning_completeness(artifacts: Iterable[PlanningArtifact]) -> Compl
     return CompletenessReport(not missing_kinds and not has_blockers, assessments, missing_kinds, pack)
 
 
+# --- #208 設計 H.1／#221：五維 sizing 評分 -----------------------------------
+#
+# 五維量表（每維 0-2 分，總分 0-10）：
+#   機械三維 —— acceptance_surfaces / spec_stability / orchestration，由
+#   compute_sizing_score() 依注入參數純函式計算；
+#   宣告二維 —— domain_breadth / state_consistency，由 planner 寫在 plan
+#   frontmatter（可證偽，供 #210/#137 後驗）。
+#
+# band 判定（Green/Yellow/Red 閾值套用）屬 #222，本模組只產生分數本身；
+# 全程不啟動任何 model session（純函式，不 import model_identities 的
+# CLI 呼叫路徑，也不對 planning_runtime.py 產生依賴）。
+SIZING_DIMENSIONS = (
+    "domain_breadth",
+    "state_consistency",
+    "acceptance_surfaces",
+    "spec_stability",
+    "orchestration",
+)
+# acceptance_surfaces 讀取的 contract 規則白名單（policy checklist R-09/R-16/R-19：
+# changelog fragment／CLI help 同步／CI 測試）；呼叫端算好「這個 work item 碰了哪些
+# 規則」後以 frozenset 注入，避免 planning.py 反向 import policy_check 或 deck。
+ACCEPTANCE_SURFACE_RULES = frozenset({"R-09", "R-16", "R-19"})
+# plan frontmatter 宣告欄位骨架（可擴充）：#212 會再掛 invariant_count／artifact_classes
+# 等自己的宣告欄位，沿用同一個「讀 frontmatter → 嚴格範圍檢查」helper 即可，不必
+# 各自重造一次驗證邏輯。
+_SIZING_DECLARED_FIELDS = ("domain_breadth", "state_consistency")
+
+
+def _declared_dimension(frontmatter: Mapping[str, object], field: str) -> int:
+    """讀取 plan frontmatter 宣告欄位，嚴格驗證為 0–2 整數（fail-closed，
+    比照 PlanningScope.__post_init__ 風格）。"""
+    value = frontmatter.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= 2):
+        raise ValueError(f"plan frontmatter 缺少合法的 {field}（需為 0–2 整數宣告）")
+    return value
+
+
+@dataclass(frozen=True)
+class SizingScore:
+    domain_breadth: int
+    state_consistency: int
+    acceptance_surfaces: int
+    spec_stability: int
+    orchestration: int
+
+    def __post_init__(self) -> None:
+        for name in SIZING_DIMENSIONS:
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= 2):
+                raise ValueError(f"sizing dimension {name} must be an int in [0, 2], got {value!r}")
+
+    @property
+    def total(self) -> int:
+        return sum(getattr(self, name) for name in SIZING_DIMENSIONS)
+
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {name: getattr(self, name) for name in SIZING_DIMENSIONS}
+        payload["total"] = self.total
+        return payload
+
+
+def compute_sizing_score(
+    *,
+    plan_artifact: PlanningArtifact,
+    completeness_report: CompletenessReport,
+    gate_spine_count: int,
+    applicable_contract_rules: frozenset[str],
+    cards_count: int,
+    persona_binding_count: int,
+) -> SizingScore:
+    """五維 sizing 評分（#208 H.1）：三維機械算 + 二維宣告，純函式、不啟動 model session。
+
+    gate_spine_count／applicable_contract_rules／cards_count／persona_binding_count
+    皆由呼叫端算好注入（deck combo 的必要核心 gate_spine 計數、R-09/R-16/R-19 適用性、
+    combo.cards 數與其中填了 persona_binding 的卡片數）——planning.py 刻意不反向
+    import deck 模組，維持既有模組邊界。
+    """
+    if plan_artifact.kind != "plan":
+        raise ValueError(f"compute_sizing_score 需要 kind='plan' 的 artifact，實際 {plan_artifact.kind!r}")
+    frontmatter, _, _ = _frontmatter_and_body(plan_artifact.text)
+    domain_breadth = _declared_dimension(frontmatter, "domain_breadth")
+    state_consistency = _declared_dimension(frontmatter, "state_consistency")
+
+    if gate_spine_count < 0:
+        raise ValueError("gate_spine_count 不得為負")
+    unknown_rules = applicable_contract_rules - ACCEPTANCE_SURFACE_RULES
+    if unknown_rules:
+        raise ValueError(f"applicable_contract_rules 含未知規則: {sorted(unknown_rules)}")
+    if cards_count < 0 or persona_binding_count < 0 or persona_binding_count > cards_count:
+        raise ValueError("cards_count/persona_binding_count 不合法")
+
+    # acceptance_surfaces：核心 gate_spine 計數 + 適用規則數的組合訊號，門檻切三級。
+    acceptance_signal = gate_spine_count + len(applicable_contract_rules)
+    if acceptance_signal == 0:
+        acceptance_surfaces = 0
+    elif acceptance_signal <= 2:
+        acceptance_surfaces = 1
+    else:
+        acceptance_surfaces = 2
+
+    # spec_stability：deterministic completeness 結果——缺的 kind 數與是否有
+    # blocking markers 各扣一分，不只取 CompletenessReport.complete 的布林值。
+    missing_penalty = len(completeness_report.missing_kinds)
+    blocking_penalty = 1 if any(
+        assessment.blocking_markers for assessment in completeness_report.assessments
+    ) else 0
+    spec_stability = max(0, 2 - missing_penalty - blocking_penalty)
+
+    # orchestration：card 清單規模 + 有填 persona_binding 的卡片數。
+    if cards_count <= 1:
+        orchestration = 0
+    elif persona_binding_count <= 1:
+        orchestration = 1
+    else:
+        orchestration = 2
+
+    return SizingScore(
+        domain_breadth=domain_breadth,
+        state_consistency=state_consistency,
+        acceptance_surfaces=acceptance_surfaces,
+        spec_stability=spec_stability,
+        orchestration=orchestration,
+    )
+
+
 def _strict_string_list(value: object, field: str, *, allow_empty: bool = False) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
         raise ValueError(f"{field} must be a string list")

@@ -11,7 +11,6 @@ combo:
     - ref: subagent-build
     - ref: verification
     - ref: code-review
-    - ref: adversarial-review
     - ref: openspec-archive
     - ref: policy-commit
   gate_spine:
@@ -21,7 +20,16 @@ combo:
       exists: ["reports/verify/*<task-slug>*.md"]
     - after: code-review
       exists: ["reports/review/*<task-slug>*.md"]
-    - after: adversarial-review
-      exists: ["reports/review/*<task-slug>*-adversarial.md"]
     - after: openspec-archive
       exists: ["openspec/changes/archive/*<change>*"]
+  # gate_spine 兩層制（#208 H.1 / #221）：adversarial-review 為 band 觸發加掛層，
+  # 只有上面的 gate_spine（必要核心）計入 acceptance_surfaces；預設 Yellow 起掛，
+  # Green 不掛。band 未知（未傳入 compile_combo）時保守地視為已觸發（沿用現行行為）。
+  band_triggered:
+    trigger: yellow
+    cards:
+      - ref: adversarial-review
+        depends_on: [code-review]
+    gate_spine:
+      - after: adversarial-review
+        exists: ["reports/review/*<task-slug>*-adversarial.md"]
