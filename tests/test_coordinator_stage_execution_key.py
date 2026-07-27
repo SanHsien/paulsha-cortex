@@ -204,9 +204,23 @@ class TestFindReusableStageEvidence:
             "run_id": "run-job-first",
             "job_id": first_job["job_id"],
             "evidence": {"kind": "gate", "path": "evidence/workflow/job-first.json", "hash": "f" * 64},
+            "evidence_hash": "f" * 64,
         }
         # 沒有因為「第二次執行」而多出任何 job（= 沒有多一次 model invocation）。
         assert jobs_after == jobs_before
+
+        # 形狀相容：registry 回傳可直接組出 completion reused_from payload，
+        # 不需任何欄位轉換（consumer 接線時不會在 _normalize_reused_from 掛掉）。
+        from paulsha_cortex.coordinator.completion import _normalize_reused_from
+
+        normalized = _normalize_reused_from(
+            {
+                "run_id": reused["run_id"],
+                "job_id": reused["job_id"],
+                "evidence_hash": reused["evidence_hash"],
+            }
+        )
+        assert normalized["evidence_hash"] == "f" * 64
 
     def test_authority_candidate_model_change_invalidates_reuse(self, tmp_path: Path) -> None:
         """AC4：authority／candidate／model 任一變更都必須精準 invalidate，

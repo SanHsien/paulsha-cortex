@@ -861,10 +861,20 @@ class JobRegistry:
                 continue
             if not still_valid:
                 continue
+            evidence_hash = evidence.get("hash")
+            if (
+                not isinstance(evidence_hash, str)
+                or len(evidence_hash) != 64
+                or any(char not in "0123456789abcdef" for char in evidence_hash)
+            ):
+                continue
+            # evidence_hash 直接對齊 completion.py reused_from schema 的
+            # {run_id, job_id, evidence_hash}，消費端不需再自行拆 locator。
             return {
                 "run_id": job.get("workflow_run_id"),
                 "job_id": job.get("job_id"),
                 "evidence": dict(evidence),
+                "evidence_hash": evidence_hash,
             }
         return None
 

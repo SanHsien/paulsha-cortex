@@ -127,6 +127,7 @@ def test_start_reuses_stage_evidence_and_does_not_dispatch_a_new_job(
         "run_id": "prior-run",
         "job_id": prior_job["job_id"],
         "evidence": {"kind": "gate", "path": "evidence/workflow/prior-build.json", "hash": "e" * 64},
+        "evidence_hash": "e" * 64,
     }
     assert "job_id" not in result
     # model invocation count 不增加：沒有因為這次「reuse」而多出任何 job。
