@@ -561,6 +561,19 @@ def plan_review_gate(
     )
 
 
+def plan_review_freezes_authority(outcome: PlanReviewOutcome) -> bool:
+    """#213（design #208 A.1）：freeze point 移至 plan review 通過之後。
+
+    把 :func:`plan_review_gate` 的判定結果對應到「呼叫端現在可以 freeze 了嗎」——
+    只有 ``ready=True`` 才可以，不論不通過的原因是可重試（回派 planner 修訂）還是
+    terminal（policy-scope-conflict，轉 needs_human）：兩者都代表 plan 尚未定案，
+    freeze 都不該發生。這是 ``claim.ClaimCandidate.active_plan_review_passed``
+    該填入的值，讓 plan review 前的 plan 修訂不會被 claim.py 誤判成 authority
+    變更（避免觸發 supersede、產生新世代，hippo #18 第 3、7 條）。
+    """
+    return outcome.ready
+
+
 # --- #208 設計 H.1／#221：五維 sizing 評分 -----------------------------------
 #
 # 五維量表（每維 0-2 分，總分 0-10）：

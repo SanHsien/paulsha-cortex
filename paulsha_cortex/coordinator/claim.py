@@ -384,6 +384,35 @@ def work_authority_digest(authority: WorkAuthority) -> str:
     return verification.canonical_json_hash(payload)
 
 
+def claim_identity_digest(authority: WorkAuthority) -> str:
+    """Stable claim identity, excluding the planning-artifact-driven fields
+    (#213, design #208 A.1: freeze point moves to *after* plan review passes).
+
+    ``work_authority_digest`` folds in ``mapped_openspec``/``mapped_todo_paths``/
+    ``source_revisions`` — exactly the fields a plan -> plan review -> revision
+    loop touches as planning artifacts are drafted and rewritten. Comparing
+    against the *full* digest while ``planning.plan_review_gate`` has not yet
+    returned ``ready=True`` makes every plan revision look like a changed
+    authority, so ``_existing()`` treats an active workflow as unmatched and
+    the caller mints a fresh claim — the mechanism behind hippo #18's #3/#7
+    v3->v4->... authority generation growth. This digest is the light,
+    GitHub-anchored identity (``mapped_issues``/``mapped_prs``/``confirmed_todo``)
+    a plan revision alone cannot change, used by ``_existing()`` while an
+    active run's plan review has not passed yet.
+    """
+    if not isinstance(authority, WorkAuthority):
+        raise ValueError("confirmed WorkAuthority is required")
+    payload = {
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "provider_id": authority.github_provider_id,
+        "mapped_issues": list(authority.mapped_issues),
+        "mapped_prs": list(authority.mapped_prs),
+        "confirmed_todo": authority.confirmed_todo,
+    }
+    return verification.canonical_json_hash(payload)
+
+
 def load_work_authorities(
     *, snapshot_path: str | Path | None = None
 ) -> tuple[WorkAuthority, ...]:
@@ -445,6 +474,8 @@ class ClaimCandidate:
     active_source_revisions: tuple[str, ...] | None = None
     active_provider_revision: str | None = None
     active_authority_digest: str | None = None
+    active_plan_review_passed: bool = True
+    active_claim_identity_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -467,6 +498,7 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
     for field, value in (
         ("confirmed_todo", candidate.confirmed_todo),
         ("auto_label", candidate.auto_label),
+        ("active_plan_review_passed", candidate.active_plan_review_passed),
     ):
         if not isinstance(value, bool):
             raise ValueError(f"{field} must be boolean")
@@ -518,6 +550,13 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
             or re.fullmatch(r"[0-9a-f]{64}", candidate.active_authority_digest) is None
         ):
             raise ValueError("active workflow authority metadata missing")
+        if not candidate.active_plan_review_passed and (
+            not isinstance(candidate.active_claim_identity_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", candidate.active_claim_identity_digest) is None
+        ):
+            # #213：plan review 尚未通過（freeze 未發生）時，_existing() 改用
+            # claim_identity_digest 比對，這個欄位就是它比對的持久化基準。
+            raise ValueError("active workflow pre-freeze identity digest missing")
 
 
 def build_claim_key(candidate: ClaimCandidate) -> str:
@@ -536,6 +575,17 @@ def build_claim_key(candidate: ClaimCandidate) -> str:
 def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
     if candidate.active_run_id is None:
         return None
+    if not candidate.active_plan_review_passed:
+        # #213（design #208 A.1）：freeze point 位於 plan review 通過之後。
+        # 這個 run 的 plan 仍在 plan -> revision 迴圈裡（尚未 freeze），只比對
+        # 穩定 identity（claim_identity_digest，不含 mapped_openspec/
+        # mapped_todo_paths/source_revisions）——plan 修訂造成這些欄位飄移不算
+        # authority 變更，不觸發 supersede、不生出新世代（hippo #18 #3/#7）。
+        # 持久化的 claim_key 是在 plan 存在之前鎖定的，此時不得拿（帶有目前飄移
+        # 欄位的）完整 digest 反向驗證它，所以不做 expected_key 比對。
+        if candidate.active_claim_identity_digest != claim_identity_digest(candidate.authority):
+            return None
+        return _resume_decision(candidate)
     authority_changed = (
         candidate.active_authority_digest != work_authority_digest(candidate.authority)
         or tuple(sorted(candidate.active_source_revisions or ()))
@@ -557,6 +607,10 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
     )
     if candidate.active_claim_key != expected_key:
         raise ValueError("persisted claim key does not match authority")
+    return _resume_decision(candidate)
+
+
+def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
     if candidate.active_status == "done":
         return ClaimDecision(
             action="done",
