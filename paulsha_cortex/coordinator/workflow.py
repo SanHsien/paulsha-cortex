@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .claim import sizing_band as compute_sizing_band
+
 
 DEFAULT_WORKFLOW_COMBO = "feature-oneshot"
 WORKFLOW_MANIFEST_VERSION = 1
@@ -306,6 +308,13 @@ class WorkflowRun:
     completion_source_revisions: dict[str, str] = field(default_factory=dict)
     pr_candidate: str | None = None
     merge_revision: str | None = None
+    # #222（design #208 H.2）：五維 sizing 總分／band 的 work item 快照，供中途
+    # 查詢。band 字串沿用 deck.schema.BAND_LEVELS，不得另立常數或大小寫變體；
+    # 門檻判定的純函式在 claim.sizing_band()（claim.py／registry.py／
+    # completion.py 三處共用）。每次 repair／re-claim 都須由呼叫端重新算過再
+    # 寫入，這裡只負責持有最新一次的快照，不做「沿用舊值」的隱含保證。
+    sizing_score: int | None = None
+    sizing_band: str | None = None
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -399,6 +408,19 @@ class WorkflowRun:
             raise ValueError("workflow completion source revisions require completion fields")
         if self.status == "done" and not all(completion_values):
             raise ValueError("done workflow requires bound completion evidence")
+        if (self.sizing_score is None) != (self.sizing_band is None):
+            raise ValueError("workflow run sizing_score/sizing_band must be supplied together")
+        if self.sizing_score is not None:
+            # compute_sizing_band()（claim.sizing_band，#222 H.2）同時完成型別／
+            # 範圍檢查與門檻判定；sizing_band 若與門檻算出的預期值不符（含大小寫
+            # 變體、非法字串）在此一併 fail-closed，不必另外重複驗證 BAND_LEVELS
+            # 成員資格。
+            expected_band = compute_sizing_band(self.sizing_score)
+            if self.sizing_band != expected_band:
+                raise ValueError(
+                    "workflow run sizing_band 與 sizing_score 門檻不符"
+                    f"（預期 {expected_band!r}，實得 {self.sizing_band!r}）"
+                )
         if self.gate_status == "passed":
             required_kinds = ["foreign-review"]
             if self.brainstorm_required:
@@ -470,6 +492,8 @@ class WorkflowRun:
             "completion_source_revisions": dict(self.completion_source_revisions),
             "pr_candidate": self.pr_candidate,
             "merge_revision": self.merge_revision,
+            "sizing_score": self.sizing_score,
+            "sizing_band": self.sizing_band,
         }
 
     @classmethod
@@ -542,6 +566,8 @@ class WorkflowRun:
             completion_source_revisions=dict(payload.get("completion_source_revisions", {})),
             pr_candidate=payload.get("pr_candidate"),
             merge_revision=payload.get("merge_revision"),
+            sizing_score=payload.get("sizing_score"),
+            sizing_band=payload.get("sizing_band"),
         )
 
 

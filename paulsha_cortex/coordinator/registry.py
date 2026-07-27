@@ -1215,6 +1215,8 @@ class JobRegistry:
         facets: tuple[str, ...] = (),
         gate_status: str = "pending",
         planning_authority: tuple[PlanningArtifactAuthority, ...] = (),
+        sizing_score: int | None = None,
+        sizing_band: str | None = None,
     ) -> WorkflowRun:
         for existing in self._workflows:
             if existing.claim_key != claim_key:
@@ -1253,6 +1255,8 @@ class JobRegistry:
             updated_at=now,
             planning_authority=tuple(planning_authority),
             planning_source_revision=source_revision,
+            sizing_score=sizing_score,
+            sizing_band=sizing_band,
         )
         superseded_at = _now_iso()
         next_workflows = [
@@ -1300,6 +1304,8 @@ class JobRegistry:
         completion_source_revisions: dict[str, str] | None = None,
         pr_candidate: str | None = None,
         merge_revision: str | None = None,
+        sizing_score: int | None = None,
+        sizing_band: str | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -1366,6 +1372,8 @@ class JobRegistry:
             ),
             pr_candidate=current.pr_candidate if pr_candidate is None else pr_candidate,
             merge_revision=current.merge_revision if merge_revision is None else merge_revision,
+            sizing_score=current.sizing_score if sizing_score is None else sizing_score,
+            sizing_band=current.sizing_band if sizing_band is None else sizing_band,
         )
         self._workflows[index] = updated
         self._persist()

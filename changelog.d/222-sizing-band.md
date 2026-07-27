@@ -1,0 +1,3 @@
+### Added
+
+- **Issue #222：band 判定與 CompletionRecord 記錄**：`claim.py` 新增 `sizing_band()` 純函式，把 #221 `compute_sizing_score()` 的五維總分（0–10）依門檻（Green 0–3／Yellow 4–6／Red 7–10，沿用 `deck.schema.BAND_LEVELS`）換算成 band，供 `claim.py`／`registry.py`／`completion.py` 三處共用同一份門檻；`workflow.py` 的 `WorkflowRun` 新增可選欄位 `sizing_score`／`sizing_band` 作為 work item 快照（`registry.py` 的 `_manager_create_workflow_run`／`_manager_update_workflow_run` 同步支援，每次 repair／re-claim 都由呼叫端重新算過寫入，不沿用 claim 當時判定）；`completion.py` 的 `CompletionRecord` 同步新增可選欄位 `sizing_score`／`sizing_band`（比照 `reused_from` 的 provenance 模式，band 需與 score 門檻一致，排除於 semantic match 之外）與 `sizing_declaration_drift`（記錄宣告模組數 vs candidate 實際變更數，供 #210 後驗）。

@@ -13,6 +13,7 @@ from pathlib import PurePosixPath
 from urllib.parse import quote
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.deck.schema import BAND_LEVELS
 
 from . import verification
 
@@ -711,3 +712,27 @@ def build_label_argv(*, repo: str, issue: int, enabled: bool) -> list[str]:
         "DELETE",
         f"repos/{repo}/issues/{issue}/labels/{quote(AUTO_LABEL, safe='')}",
     ]
+
+
+# --- #222（design #208 H.2）：五維 sizing 總分 → band 判定 -------------------
+#
+# band 字串沿用 deck.schema.BAND_LEVELS（green/yellow/red），不得另立常數或大小
+# 寫變體。閾值 Green 0–3／Yellow 4–6／Red 7–10，對應 planning.SizingScore.total
+# （五維、每維 0–2、總分 0–10，見 #221）。claim.py／registry.py／completion.py
+# 三處共用這份純函式，避免各自硬編碼門檻造成漂移。band 本身只負責重算與記錄
+# （#222）；跨帶上升後的拆分「路由」屬 #223，不在本模組範圍。
+SIZING_BAND_GREEN_MAX = 3
+SIZING_BAND_YELLOW_MAX = 6
+
+
+def sizing_band(total: int) -> str:
+    """五維 sizing 總分（0–10）→ band。呼叫端每次 repair／re-claim 都須重新
+    傳入當下算出的 total，不得沿用 claim 當時判定的舊值（#222 驗收條件 3）。
+    """
+    if not isinstance(total, int) or isinstance(total, bool) or not (0 <= total <= 10):
+        raise ValueError("sizing total 必須為 0–10 的整數")
+    if total <= SIZING_BAND_GREEN_MAX:
+        return BAND_LEVELS[0]
+    if total <= SIZING_BAND_YELLOW_MAX:
+        return BAND_LEVELS[1]
+    return BAND_LEVELS[2]
