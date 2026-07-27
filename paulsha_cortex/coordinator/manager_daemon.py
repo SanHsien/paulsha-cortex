@@ -273,6 +273,7 @@ def build_request_executor(
     workflow_runtime_factory=None,
     workflow_ship_validator=None,
     work_action_fn: Callable[..., dict[str, Any]] | None = None,
+    stage_evidence_validator: Callable[[dict[str, str]], bool] | None = None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
@@ -354,15 +355,31 @@ def build_request_executor(
             )
             if args.get("action") == "start":
                 run = registry.get_workflow_run(str(result["run_id"]))
-                job = manager.dispatch_workflow_card(
-                    dispatcher,
-                    run=run,
-                    identities=identities,
-                    launcher_factory=launcher_factory,
-                    coordinator_root=coordinator_root,
-                )
-                if job is not None:
-                    result["job_id"] = job["job_id"]
+                # #214：呼叫端可預先算好本次 stage 的 content-addressed
+                # execution key；若既有 job 用同一把 key 留下完整且仍然有效
+                # 的 evidence（由 stage_evidence_validator 判定），就直接
+                # reuse，短路掉這個「唯一觸發處」，不重啟 model session。
+                # 沒帶 key、或找不到可 reuse 的 evidence 時，行為與過去完全
+                # 相同（fail-closed：預設照樣派新 job）。
+                stage_execution_key = args.get("stage_execution_key")
+                reused_from = None
+                if isinstance(stage_execution_key, str) and stage_execution_key:
+                    reused_from = registry.find_reusable_stage_evidence(
+                        stage_execution_key,
+                        is_evidence_still_valid=stage_evidence_validator,
+                    )
+                if reused_from is not None:
+                    result["reused_from"] = reused_from
+                else:
+                    job = manager.dispatch_workflow_card(
+                        dispatcher,
+                        run=run,
+                        identities=identities,
+                        launcher_factory=launcher_factory,
+                        coordinator_root=coordinator_root,
+                    )
+                    if job is not None:
+                        result["job_id"] = job["job_id"]
             return result
         if request["type"] == "work-action":
             registry = getattr(dispatcher, "_registry", None)
