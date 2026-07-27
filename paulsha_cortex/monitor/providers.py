@@ -376,6 +376,9 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "sizing_score", "sizing_band",
         # #223（design #208 H.3）：Red band 拆分次數快照。
         "decomposition_depth",
+        # #208 收口 wiring：#213 freeze 接線持久化欄位／#211 pre-claim readiness
+        # 凍結集，供 builder worktree 建立消費。
+        "plan_review_passed", "frozen_readiness",
     }
 )
 

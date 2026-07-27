@@ -272,3 +272,50 @@ def test_passing_readiness_attaches_frozen_set_to_the_claimed_run(tmp_path: Path
     assert len(started) == 1
     assert result["run"]["frozen_readiness"] == outcome.frozen.to_dict()
     assert result["run"]["frozen_readiness"]["base_sha"] == "a" * 40
+
+
+def test_passing_readiness_persists_frozen_set_into_workflow_registry(tmp_path: Path) -> None:
+    """#211 閉環另一半（verifier finding 2）：readiness 通過且給了真實
+    workflow_registry 時，凍結集必須實際寫回 registry 的 WorkflowRun
+    （dispatch 建 worktree 讀的是 registry，不是 API 回應 dict）。"""
+    from paulsha_cortex.coordinator.registry import JobRegistry
+    from paulsha_cortex.coordinator.workflow import WorkflowStep
+
+    authority = _authority(tmp_path)
+    outcome = _passing_outcome(authority)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+
+    def starter(authority_arg, claim_key, reason):
+        return registry._manager_create_workflow_run(
+            repo=authority_arg.repo,
+            work_id=authority_arg.work_id,
+            claim_key=claim_key,
+            source_revision="rev-frozen",
+            workspace_root=str(tmp_path),
+            combo="feature-oneshot",
+            current_phase="claim",
+            steps=(
+                WorkflowStep(
+                    phase="claim", persona="manager", card="workflow-claim",
+                    executor=None, model=None, domain=None, inputs=(), outputs=(),
+                    gate_result="pending",
+                ),
+            ),
+            issue_refs=tuple(
+                f"{authority_arg.repo}#{n}" for n in authority_arg.mapped_issues
+            ),
+        )
+
+    result = work_actions._claim_action(
+        args={"action": "start", "issue": 211},
+        authority=authority,
+        now_epoch=200,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+        workflow_starter=starter,
+        readiness_checker=lambda _authority, _issue_ref: outcome,
+    )
+    assert result["action"] == "claim"
+    persisted = registry.list_workflow_runs()[0]
+    assert persisted.frozen_readiness == outcome.frozen.to_dict()
+    assert persisted.frozen_readiness["base_sha"] == "a" * 40

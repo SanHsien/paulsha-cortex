@@ -37,10 +37,12 @@ from .model_identities import (
     load_model_identities,
 )
 from .planning import (
+    ACCEPTANCE_SURFACE_RULES,
     PlanningArtifact,
     PlanningScope,
     assess_planning_artifact,
     assess_planning_completeness,
+    plan_review_gate,
     run_heterogeneous_brainstorm,
 )
 from .workflow import (
@@ -5169,6 +5171,69 @@ def _workflow_job_prompt(
     )
 
 
+def _plan_frontmatter_artifact_classes(text: str) -> frozenset[str] | None:
+    """讀 plan 自己宣告的 ``artifact_classes``（複用 ``_report_binding`` 的 frontmatter
+    抽取手法），供 ``planning.plan_review_gate()`` 的 ``acceptance_surfaces`` 輸入
+    ——與 ``_plan_review_envelope`` 消費同一個宣告欄位語意一致：plan 說它覆蓋哪些
+    artifact classes，completeness 檢查 Tasks 是否真的每個都有對應項目。缺席或
+    格式錯誤一律回傳 ``None``（fail-soft，呼叫端據此判斷 gate 是否可跑）。
+    """
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        closing = next(
+            index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"
+        )
+    except StopIteration:
+        return None
+    try:
+        payload = safe_load("\n".join(lines[1:closing]))
+    except YAMLError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    classes = payload.get("artifact_classes")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or any(not isinstance(item, str) or not item.strip() for item in classes)
+    ):
+        return None
+    return frozenset(item.strip() for item in classes)
+
+
+def _evaluate_yellow_plan_review(
+    artifacts: tuple[PlanningArtifact, ...] | None,
+):
+    """#208 收口 wiring 2：Yellow band 推進 build 前的機械 plan review 判定。
+
+    輸入不可得（沒有 plan artifact、或它缺少 ``artifact_classes`` 宣告）一律
+    fail-soft 回傳 ``None``——呼叫端據此維持現行為（正常推進），不得讓既有
+    測試變紅。``applicable_contract_rules`` 固定餵 ``ACCEPTANCE_SURFACE_RULES``
+    全集，理由同 ``work_bridge.current_sizing_snapshot``。
+    """
+
+    if artifacts is None:
+        return None
+    plan_artifact = next((item for item in artifacts if item.kind == "plan"), None)
+    if plan_artifact is None:
+        return None
+    acceptance_surfaces = _plan_frontmatter_artifact_classes(plan_artifact.text)
+    if acceptance_surfaces is None:
+        return None
+    try:
+        return plan_review_gate(
+            plan_artifact=plan_artifact,
+            acceptance_surfaces=acceptance_surfaces,
+            applicable_contract_rules=ACCEPTANCE_SURFACE_RULES,
+            envelope_lookup=None,
+        )
+    except ValueError:
+        return None
+
+
 def _dispatch_workflow_card(
     dispatcher,
     *,
@@ -5278,6 +5343,36 @@ def _dispatch_workflow_card(
                         else "needs-decomposition"
                     ),
                 }
+            plan_review_passed_now = False
+            if is_last_pending and run.current_phase == "plan" and run.sizing_band == "yellow":
+                # #208 收口 wiring 2：Yellow 先機械 plan review 再放行進 build
+                # （#212 的判定機制，這裡只接線）。Green／Red／None band 不呼叫
+                # gate（Red 已在上面攔下；Green/None 維持現行為，#223 已定案的
+                # fail-soft 慣例）。
+                gate_outcome = _evaluate_yellow_plan_review(artifacts)
+                if gate_outcome is not None and not gate_outcome.ready:
+                    if gate_outcome.terminal:
+                        updated = registry._manager_update_workflow_run(
+                            run.run_id, facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+                        )
+                        return {
+                            "run_id": updated.run_id,
+                            "current_phase": updated.current_phase,
+                            "reason": f"plan-review-{gate_outcome.failed_check}",
+                        }
+                    # non-terminal：不推進，記錄可重試原因；不動 run（下次
+                    # dispatch 對同一份 plan 重跑同一個判定，plan 修訂後即可
+                    # 通過——與 Red 的 needs_decomposition 不同，這裡不是終局
+                    # 路由，run 狀態原樣保留）。
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "reason": f"plan-review-retry-{gate_outcome.failed_check}",
+                    }
+                if gate_outcome is not None and gate_outcome.ready:
+                    plan_review_passed_now = True
+                # gate_outcome is None：輸入不可得（fail-soft），落到下面正常推進，
+                # 維持現行為，不掛 plan_review_passed。
             next_phase = run.current_phase
             attempts = run.attempts
             if is_last_pending:
@@ -5299,6 +5394,7 @@ def _dispatch_workflow_card(
                     card_id=step.card,
                 ),
                 attempts=attempts,
+                **({"plan_review_passed": True} if plan_review_passed_now else {}),
             )
             return None
     identity = _select_workflow_identity(run, step, identities)
@@ -5411,7 +5507,20 @@ def _dispatch_workflow_card(
             if primary_issue is not None
             else f"feature/{run.work_id}"
         )
-        worktree = str(creator.create(builder_branch))
+        # #208 收口 wiring 5（#211 閉環）：凍結集存在時 worktree 必須以
+        # frozen_readiness["base_sha"] 為基底，不得讓 dispatch 自行重新推導
+        # 一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2 的 stale-base
+        # 缺陷）。無凍結集時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
+        # WorktreeCreator 實作 without base_sha 亦不受影響）。
+        frozen_base_sha = None
+        if isinstance(run.frozen_readiness, dict):
+            candidate_base_sha = run.frozen_readiness.get("base_sha")
+            if isinstance(candidate_base_sha, str) and candidate_base_sha:
+                frozen_base_sha = candidate_base_sha
+        if frozen_base_sha is not None:
+            worktree = str(creator.create(builder_branch, base_sha=frozen_base_sha))
+        else:
+            worktree = str(creator.create(builder_branch))
     else:
         worktree = run.workspace_root
     effective_repo_root = Path(worktree).resolve()
@@ -6510,6 +6619,11 @@ def apply_workflow_action(
 
     manifest = _load_workflow_manifest(_required_workflow_string(args, "manifest_path"))
     manifest.validate_manager_spine()
+    # #208 收口 wiring 1：work_bridge.start_canonical_workflow 在呼叫端已算好
+    # （fail-soft，可能是 None）的 claim-time sizing 快照透過 args 帶進來，這裡
+    # 只負責原樣轉交給 _manager_create_workflow_run；不在 manager.py 重算。
+    start_sizing_score = args.get("sizing_score")
+    start_sizing_band = args.get("sizing_band")
     run = registry._manager_create_workflow_run(
         work_id=_required_workflow_string(args, "work_id"),
         repo=_required_workflow_string(args, "repo"),
@@ -6531,6 +6645,8 @@ def apply_workflow_action(
             outputs=(),
         ),
         gate_status="running",
+        sizing_score=start_sizing_score,
+        sizing_band=start_sizing_band,
     )
     artifact_root = Path(_required_workflow_string(args, "artifact_root")).resolve()
     transaction_root = (

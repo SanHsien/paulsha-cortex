@@ -1218,6 +1218,8 @@ class JobRegistry:
         sizing_score: int | None = None,
         sizing_band: str | None = None,
         decomposition_depth: int = 0,
+        plan_review_passed: bool = False,
+        frozen_readiness: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         for existing in self._workflows:
             if existing.claim_key != claim_key:
@@ -1259,6 +1261,8 @@ class JobRegistry:
             sizing_score=sizing_score,
             sizing_band=sizing_band,
             decomposition_depth=decomposition_depth,
+            plan_review_passed=plan_review_passed,
+            frozen_readiness=frozen_readiness,
         )
         superseded_at = _now_iso()
         next_workflows = [
@@ -1310,6 +1314,8 @@ class JobRegistry:
         sizing_score: int | None = None,
         sizing_band: str | None = None,
         decomposition_depth: int | None = None,
+        plan_review_passed: bool | None = None,
+        frozen_readiness: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -1387,6 +1393,14 @@ class JobRegistry:
                 current.decomposition_depth
                 if decomposition_depth is None
                 else decomposition_depth
+            ),
+            plan_review_passed=(
+                current.plan_review_passed
+                if plan_review_passed is None
+                else plan_review_passed
+            ),
+            frozen_readiness=(
+                current.frozen_readiness if frozen_readiness is None else frozen_readiness
             ),
         )
         self._workflows[index] = updated
