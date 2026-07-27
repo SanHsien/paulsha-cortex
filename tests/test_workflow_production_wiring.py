@@ -2433,6 +2433,11 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
                     "findings": findings,
                     "reports": [{"path": report_ref, "body": "# Review\n\nPassed."}],
                 }
+                authority_hashes = (
+                    contract_payload.get("terminal_schema", {}).get("authority_hashes", {}).get("expected")
+                )
+                if authority_hashes:
+                    evidence["authority_hashes"] = authority_hashes
             log_path = Path(log_dir) / f"{slice_id}.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
