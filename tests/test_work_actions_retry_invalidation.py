@@ -246,8 +246,10 @@ def test_retry_verify_reruns_only_verification_without_rebuilding_candidate(
     assert by_phase["verify"]["gate_result"] == "pending"
     assert updated["candidate_head"] == HEAD
     assert "needs_human" not in updated["facets"]
-    assert result["result"]["retry_classification"] == "model_repair"
-    assert updated["retry_classification"] == "model_repair"
+    # candidate 完全不變的 verification 重跑不是模型修復（#208 根因3）：
+    # 不得計入 model failure 指標，也不得吃 #218 的 repair budget。
+    assert result["result"]["retry_classification"] == "orchestrator_retry"
+    assert updated["retry_classification"] == "orchestrator_retry"
 
 
 def test_retry_verify_rejects_candidate_mismatch(tmp_path: Path) -> None:
@@ -367,8 +369,9 @@ def test_retry_review_reruns_only_review_without_rebuilding_or_reverifying(
     assert run.attempts.get("verify", 0) == updated["attempts"].get("verify", 0)
     assert updated["candidate_head"] == HEAD
     assert updated["verified_head"] == HEAD
-    assert result["result"]["retry_classification"] == "model_repair"
-    assert updated["retry_classification"] == "model_repair"
+    # 重跑 review 本身即是 review 交接修復：candidate 未變，非 model repair。
+    assert result["result"]["retry_classification"] == "review_handoff_failure"
+    assert updated["retry_classification"] == "review_handoff_failure"
 
 
 def test_retry_review_without_frozen_plan_fails_pre_dispatch(tmp_path: Path) -> None:
@@ -619,3 +622,54 @@ def test_classify_retry_trigger_returns_expected_classification(trigger, expecte
 def test_classify_retry_rejects_unknown_trigger() -> None:
     with pytest.raises(ValueError, match="不支援的 trigger"):
         work_actions._classify_retry(None, None, trigger="not-a-real-trigger")
+
+
+def test_stat_retry_classifications_aggregates_workflow_runs(tmp_path: Path) -> None:
+    """#208 驗收：「retry 分類欄位落地，cortex stat 可依原因分類彙總」的最小彙總面。"""
+    import io
+    from contextlib import redirect_stdout
+
+    from paulsha_cortex.coordinator import cli as coordinator_cli
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    for idx, classification in enumerate(
+        ["model_repair", "model_repair", "orchestrator_retry", None]
+    ):
+        run = registry._manager_create_workflow_run(
+            repo="hamanpaul/paulsha-cortex",
+            work_id=f"agg-{idx}",
+            claim_key=f"claim:v1:{str(idx) * 64}",
+            source_revision="rev-agg",
+            workspace_root="/tmp/workspace",
+            combo="feature-oneshot",
+            current_phase="build",
+            steps=(_step("build", "subagent-build", gate_result="pending"),),
+            issue_refs=(f"hamanpaul/paulsha-cortex#{900 + idx}",),
+        )
+        if classification is not None:
+            registry._manager_update_workflow_run(
+                run.run_id, retry_classification=classification
+            )
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        exit_code = coordinator_cli.main(
+            ["stat", "--retry-classifications"], registry=registry
+        )
+    assert exit_code == 0
+    payload = json.loads(buffer.getvalue())
+    assert payload == {
+        "retry_classifications": {
+            "model_repair": 2,
+            "orchestrator_retry": 1,
+            "unclassified": 1,
+        }
+    }
+
+
+def test_stat_without_job_id_and_without_flag_errors(tmp_path: Path) -> None:
+    from paulsha_cortex.coordinator import cli as coordinator_cli
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    exit_code = coordinator_cli.main(["stat"], registry=registry)
+    assert exit_code == 1

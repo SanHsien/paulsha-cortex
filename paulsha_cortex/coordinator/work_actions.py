@@ -1501,6 +1501,9 @@ _RETRY_TRIGGER_CLASSIFICATIONS: dict[str, RetryClassification] = {
     "authority-restart": RetryClassification.AUTHORITY_RESTART,
     "review-handoff-failure": RetryClassification.REVIEW_HANDOFF_FAILURE,
     "source-owner-repair": RetryClassification.SOURCE_OWNER_REPAIR,
+    # retry-verify：candidate 完全不變的 verification 重跑不是模型修復，
+    # 依 #208 根因3 不得計入 model failure 指標（也不得吃 #218 repair budget）。
+    "verification-rerun": RetryClassification.ORCHESTRATOR_RETRY,
 }
 
 
@@ -1678,7 +1681,10 @@ def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) 
         raise RuntimeError("retry-verify requires verify-phase workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-verify expected Candidate CAS mismatch")
-    retry_classification = _classify_retry(run, workflow_registry)
+    # candidate 不變的 verification 重跑屬 orchestration 層原因，非模型修復。
+    retry_classification = _classify_retry(
+        run, workflow_registry, trigger="verification-rerun"
+    )
     updated = workflow_registry._manager_reset_workflow_for_retry_verify(
         run.run_id,
         expected_candidate=expected_candidate.lower(),
@@ -1741,7 +1747,10 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
         raise RuntimeError("retry-review expected Candidate CAS mismatch")
     if not any(item.kind == "plan" for item in run.planning_authority):
         raise RuntimeError("retry-review requires frozen plan authority pre-dispatch")
-    retry_classification = _classify_retry(run, workflow_registry)
+    # 重跑 review 本身即是 review 交接修復：candidate 未變，不是 model repair。
+    retry_classification = _classify_retry(
+        run, workflow_registry, trigger="review-handoff-failure"
+    )
     updated = workflow_registry._manager_reset_workflow_for_retry_review(
         run.run_id,
         expected_candidate=expected_candidate.lower(),
