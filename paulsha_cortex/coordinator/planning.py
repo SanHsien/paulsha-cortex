@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
@@ -274,6 +274,291 @@ def assess_planning_completeness(artifacts: Iterable[PlanningArtifact]) -> Compl
     pack = _build_default_question_pack(assessments, missing_kinds)
     has_blockers = any(assessment.blocking_markers for assessment in assessments)
     return CompletenessReport(not missing_kinds and not has_blockers, assessments, missing_kinds, pack)
+
+
+# --- #208 設計 A.1 第 3 點／#212：plan review gate（三項判定） ----------------
+#
+# 三份文件皆 accepted（assess_planning_completeness 通過）之後才跑的一層語意審查，
+# 是「唯一需要模型的前置閘」，但本函式落地的只是機械骨架與判定契約——三項判定中
+# 可機械判定的部分（契約相容性、封套查表）直接機械做；plan review 的 model
+# dispatch（effort=high、prompt cache）沿用既有 planning 流程身分，不在此模組。
+#
+# 三項判定（cost order，任一不過即 fail closed）：
+#   1. completeness            —— plan 為每個 acceptance surface 備有對應 task
+#   2. contract_compatibility  —— plan scope 與呼叫端算好的 R-09/R-16/R-19/R-22
+#                                  等 applicable_contract_rules 相容；plan
+#                                  frontmatter 明確排除的項目與規則要求衝突時，
+#                                  是 hippo #18 第 9 條要在此攔截的 terminal case
+#   3. envelope                —— plan 宣告的 invariant_count／artifact_classes
+#                                  落在 #209 builder 封套內；封套資料缺席
+#                                  （#209 未落地）時記 envelope_unavailable 並以
+#                                  可觀測 bypass 通過（對齊 #202 定案），有資料
+#                                  而超封套才 fail closed
+#
+# 失敗分類比照 claim_readiness.ReadinessOutcome：只有 policy-scope-conflict 是
+# terminal（回傳給呼叫端轉 needs_human），其餘（含 envelope 超界）都是可重試
+# 訊號（回派 planner）——這與 claim_readiness.capability_probe 對「capability
+# 不足」同樣視為可重試、而非 terminal 的既有先例一致。
+PLAN_REVIEW_CHECK_ORDER = ("completeness", "contract_compatibility", "envelope")
+
+# 契約相容性的規則→Tasks 關鍵字對照（啟發式子字串比對，大小寫不敏感）。
+# 只涵蓋 policy checklist 目前對「plan 尚未有程式碼變更」語意有意義的四條規則；
+# 是否適用（哪些規則命中）由呼叫端依 scope/code_paths 算好以 frozenset[str] 餵入，
+# 與 #221 compute_sizing_score 的 applicable_contract_rules 共用同一份計算結果。
+_CONTRACT_RULE_TASK_KEYWORDS: dict[str, frozenset[str]] = {
+    "R-09": frozenset({"changelog"}),
+    "R-16": frozenset({"cli"}),
+    "R-19": frozenset({"test", "測試"}),
+    "R-22": frozenset({"doc", "docs", "文件"}),
+}
+CONTRACT_COMPATIBILITY_RULES = frozenset(_CONTRACT_RULE_TASK_KEYWORDS)
+
+
+def _collect_task_items(body: str) -> tuple[str, ...]:
+    """收集 Tasks/Task heading 下的清單項目文字。
+
+    比照 _headings_and_markers() 對 Open Questions 的 heading-level 追蹤手法
+    （鎖定 heading、往下收集清單項目、遇到同級或更高層 heading 才停止），
+    抽出一個 Tasks 版本；152-156 行 _has_required_heading 已有的 task heading
+    判斷（"task"/"tasks" 或 "task " 前綴）在這裡重用同一組字面比對規則。
+    """
+    items: list[str] = []
+    in_fence = False
+    fence_token: str | None = None
+    task_level: int | None = None
+    for raw in body.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(("```", "~~~")):
+            token = stripped[:3]
+            if not in_fence:
+                in_fence = True
+                fence_token = token
+            elif token == fence_token:
+                in_fence = False
+                fence_token = None
+            continue
+        if in_fence:
+            continue
+        heading = _HEADING_RE.match(stripped)
+        if heading:
+            level = len(heading.group(1))
+            title = heading.group(2).strip().casefold()
+            title = re.sub(r"^\d+(?:\.\d+)*[.)]?\s+", "", title).rstrip(":：")
+            if title in {"task", "tasks"} or title.startswith("task "):
+                task_level = level
+            elif task_level is not None and level <= task_level:
+                task_level = None
+            continue
+        if task_level is None:
+            continue
+        item = _LIST_ITEM_RE.match(stripped)
+        if item:
+            items.append(item.group(1).strip())
+    return tuple(items)
+
+
+@dataclass(frozen=True)
+class PlanReviewCheckResult:
+    """一項 plan review 判定的結果。``terminal`` 只在 ``passed`` 為 False 時有意義。"""
+
+    name: str
+    passed: bool
+    reason: str | None = None
+    terminal: bool = False
+    observation: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.name not in PLAN_REVIEW_CHECK_ORDER:
+            raise ValueError(f"unknown plan review check: {self.name!r}")
+        if self.passed and (self.reason is not None or self.terminal):
+            raise ValueError("a passed plan review check must not carry reason/terminal")
+        if not self.passed and not self.reason:
+            raise ValueError("a failed plan review check requires a reason")
+
+
+@dataclass(frozen=True)
+class PlanReviewOutcome:
+    """跑完（或短路於）三項判定後的結果，比照 ReadinessOutcome 的 ready/terminal 語意。"""
+
+    ready: bool
+    failed_check: str | None
+    reason: str | None
+    terminal: bool
+    checks_run: tuple[str, ...]
+    observations: Mapping[str, Mapping[str, object]]
+
+
+def _plan_review_completeness(
+    plan_artifact: PlanningArtifact, acceptance_surfaces: frozenset[str]
+) -> PlanReviewCheckResult:
+    _, body, _ = _frontmatter_and_body(plan_artifact.text)
+    haystack = "\n".join(_collect_task_items(body)).casefold()
+    missing = tuple(
+        sorted(surface for surface in acceptance_surfaces if surface.casefold() not in haystack)
+    )
+    if missing:
+        return PlanReviewCheckResult(
+            "completeness",
+            False,
+            reason=f"missing-task-for-surface: {', '.join(missing)}",
+            observation={"missing_surfaces": missing},
+        )
+    return PlanReviewCheckResult(
+        "completeness", True, observation={"acceptance_surfaces": tuple(sorted(acceptance_surfaces))}
+    )
+
+
+def _plan_review_contract_compatibility(
+    plan_artifact: PlanningArtifact, applicable_contract_rules: frozenset[str]
+) -> PlanReviewCheckResult:
+    unknown_rules = applicable_contract_rules - CONTRACT_COMPATIBILITY_RULES
+    if unknown_rules:
+        raise ValueError(f"applicable_contract_rules 含未知規則: {sorted(unknown_rules)}")
+    frontmatter, body, _ = _frontmatter_and_body(plan_artifact.text)
+    excludes_raw = frontmatter.get("scope_excludes", [])
+    if not isinstance(excludes_raw, list) or any(not isinstance(item, str) for item in excludes_raw):
+        raise ValueError("plan frontmatter scope_excludes 必須為字串列表")
+    excludes = frozenset(item.strip().casefold() for item in excludes_raw if item.strip())
+    haystack = "\n".join(_collect_task_items(body)).casefold()
+
+    conflicts: list[str] = []
+    missing: list[str] = []
+    for rule in sorted(applicable_contract_rules):
+        keywords = _CONTRACT_RULE_TASK_KEYWORDS[rule]
+        if keywords & excludes:
+            conflicts.append(rule)
+        elif not any(keyword in haystack for keyword in keywords):
+            missing.append(rule)
+
+    if conflicts:
+        # hippo #18 第 9 條：plan 自身宣告的 scope_excludes 與規則要求互斥，
+        # 是本判定唯一的 terminal case（回傳 needs_human，不回派 planner重試）。
+        return PlanReviewCheckResult(
+            "contract_compatibility",
+            False,
+            reason=f"policy-scope-conflict: {', '.join(conflicts)}",
+            terminal=True,
+            observation={"conflicts": tuple(conflicts)},
+        )
+    if missing:
+        return PlanReviewCheckResult(
+            "contract_compatibility",
+            False,
+            reason=f"missing-task-for-rule: {', '.join(missing)}",
+            observation={"missing_rules": tuple(missing)},
+        )
+    return PlanReviewCheckResult(
+        "contract_compatibility",
+        True,
+        observation={"applicable_contract_rules": tuple(sorted(applicable_contract_rules))},
+    )
+
+
+def _plan_review_envelope(
+    plan_artifact: PlanningArtifact,
+    envelope_lookup: Callable[[], Mapping[str, object] | None] | None,
+) -> PlanReviewCheckResult:
+    frontmatter, _, _ = _frontmatter_and_body(plan_artifact.text)
+    invariant_count = frontmatter.get("invariant_count")
+    if not isinstance(invariant_count, int) or isinstance(invariant_count, bool) or invariant_count < 0:
+        raise ValueError("plan frontmatter 缺少合法的 invariant_count（需為 >=0 整數宣告）")
+    artifact_classes_raw = frontmatter.get("artifact_classes")
+    if (
+        not isinstance(artifact_classes_raw, list)
+        or not artifact_classes_raw
+        or any(not isinstance(item, str) or not item.strip() for item in artifact_classes_raw)
+    ):
+        raise ValueError("plan frontmatter 缺少合法的 artifact_classes（需為非空字串列表宣告）")
+    artifact_classes = frozenset(item.strip() for item in artifact_classes_raw)
+
+    # #209（能力封套）未落地：可插拔 provider，缺席時可觀測 bypass 通過。
+    envelope = envelope_lookup() if envelope_lookup is not None else None
+    if envelope is None:
+        return PlanReviewCheckResult(
+            "envelope", True, observation={"bypass": "envelope_unavailable"}
+        )
+
+    envelope_invariant_count = envelope.get("invariant_count")
+    envelope_artifact_classes_raw = envelope.get("artifact_classes")
+    if (
+        not isinstance(envelope_invariant_count, int)
+        or isinstance(envelope_invariant_count, bool)
+        or envelope_invariant_count < 0
+        or not isinstance(envelope_artifact_classes_raw, list)
+        or any(not isinstance(item, str) for item in envelope_artifact_classes_raw)
+    ):
+        raise ValueError("builder envelope 格式錯誤")
+    envelope_artifact_classes = frozenset(str(item).strip() for item in envelope_artifact_classes_raw)
+    over_budget = artifact_classes - envelope_artifact_classes
+    if invariant_count > envelope_invariant_count or over_budget:
+        return PlanReviewCheckResult(
+            "envelope",
+            False,
+            reason="envelope-exceeded",
+            observation={
+                "invariant_count": invariant_count,
+                "envelope_invariant_count": envelope_invariant_count,
+                "over_budget_artifact_classes": tuple(sorted(over_budget)),
+            },
+        )
+    return PlanReviewCheckResult(
+        "envelope",
+        True,
+        observation={
+            "bypass": None,
+            "invariant_count": invariant_count,
+            "artifact_classes": tuple(sorted(artifact_classes)),
+        },
+    )
+
+
+def plan_review_gate(
+    *,
+    plan_artifact: PlanningArtifact,
+    acceptance_surfaces: frozenset[str],
+    applicable_contract_rules: frozenset[str],
+    envelope_lookup: Callable[[], Mapping[str, object] | None] | None = None,
+) -> PlanReviewOutcome:
+    """三項判定（完整性／契約相容性／封套相符），依 cost order 短路於首個失敗。
+
+    ``acceptance_surfaces``／``applicable_contract_rules`` 皆由呼叫端算好注入
+    （不在此模組反向推導 scope/code_paths），``envelope_lookup`` 是 #209 封套查表
+    的占位 provider（``None`` 或回傳 ``None`` 皆視為封套資料缺席）。
+    """
+    if plan_artifact.kind != "plan":
+        raise ValueError(f"plan_review_gate 需要 kind='plan' 的 artifact，實際 {plan_artifact.kind!r}")
+
+    checks: tuple[tuple[str, Callable[[], PlanReviewCheckResult]], ...] = (
+        ("completeness", lambda: _plan_review_completeness(plan_artifact, acceptance_surfaces)),
+        (
+            "contract_compatibility",
+            lambda: _plan_review_contract_compatibility(plan_artifact, applicable_contract_rules),
+        ),
+        ("envelope", lambda: _plan_review_envelope(plan_artifact, envelope_lookup)),
+    )
+    checks_run: list[str] = []
+    observations: dict[str, Mapping[str, object]] = {}
+    for name, probe in checks:
+        checks_run.append(name)
+        result = probe()
+        if not result.passed:
+            return PlanReviewOutcome(
+                ready=False,
+                failed_check=name,
+                reason=result.reason,
+                terminal=result.terminal,
+                checks_run=tuple(checks_run),
+                observations=observations,
+            )
+        observations[name] = result.observation
+    return PlanReviewOutcome(
+        ready=True,
+        failed_check=None,
+        reason=None,
+        terminal=False,
+        checks_run=tuple(checks_run),
+        observations=observations,
+    )
 
 
 # --- #208 設計 H.1／#221：五維 sizing 評分 -----------------------------------
