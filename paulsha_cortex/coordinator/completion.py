@@ -40,6 +40,10 @@ RETRY_CLASSIFICATION_VALUES = frozenset(
         "source_owner_repair",
     }
 )
+# #212：final 發現「plan 錯而非 candidate 錯」的訊號欄位，供 #137 度量 plan review
+# 漏檢（plan_review_gate 判定通過，但 final 才發現問題其實出在 plan）。純
+# provenance，不影響既有 completion 語意，semantic match 排除比照 reused_from。
+VALID_FINAL_DEFECT_LOCI = frozenset({"plan", "candidate"})
 
 
 def classify_completion(*, exit_code: int, last_jsonl_line: str | None) -> str:
@@ -238,6 +242,12 @@ def _normalize_retry_classification(value: object) -> str:
     return value
 
 
+def _normalize_final_defect_locus(value: object) -> str:
+    if value not in VALID_FINAL_DEFECT_LOCI:
+        raise ValueError(f"completion final_defect_locus must be one of {sorted(VALID_FINAL_DEFECT_LOCI)}")
+    return value
+
+
 def validate_completion_record(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("completion record must be an object")
@@ -266,7 +276,9 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"completion record missing keys: {', '.join(missing)}")
-    extras = set(payload) - required - {"work_authority", "reused_from", "retry_classification"}
+    extras = set(payload) - required - {
+        "work_authority", "reused_from", "retry_classification", "final_defect_locus"
+    }
     if extras:
         raise ValueError(f"completion record unexpected key: {sorted(extras)[0]}")
     if payload.get("schema_version") != COMPLETION_SCHEMA_VERSION:
@@ -318,6 +330,8 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
         normalized["retry_classification"] = _normalize_retry_classification(
             payload["retry_classification"]
         )
+    if "final_defect_locus" in payload:
+        normalized["final_defect_locus"] = _normalize_final_defect_locus(payload["final_defect_locus"])
 
     reviewer_job_id = normalized["reviewer_job_id"]
     review_path = normalized["review_evaluation_path"]
@@ -374,6 +388,8 @@ def completion_records_semantically_match(existing: object, incoming: object) ->
     incoming_normalized.pop("reused_from", None)
     existing_normalized.pop("retry_classification", None)
     incoming_normalized.pop("retry_classification", None)
+    existing_normalized.pop("final_defect_locus", None)
+    incoming_normalized.pop("final_defect_locus", None)
     return existing_normalized == incoming_normalized and existing_authority == incoming_authority
 
 
