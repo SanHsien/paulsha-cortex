@@ -397,6 +397,19 @@ def load_work_authorities(
     identities = [(authority.repo, authority.work_id) for authority in authorities]
     if len(set(identities)) != len(identities):
         raise ValueError("confirmed work authority missing or ambiguous")
+    # Source-owner transfers (#217, design #208 D) move an issue's mapped_issues
+    # from one work_id to another. If the durable snapshot is ever read back
+    # while two different work_ids both confirm the same issue — the mid-
+    # transfer state that must never surface — refuse rather than silently
+    # picking a "winner": every claim/ship/abandon caller loads authority
+    # through here, so this closes the ambiguity at the single choke point.
+    owners: dict[tuple[str, int], str] = {}
+    for authority in authorities:
+        for issue in authority.mapped_issues:
+            key = (authority.repo, issue)
+            owner = owners.setdefault(key, authority.work_id)
+            if owner != authority.work_id:
+                raise ValueError("confirmed work authority missing or ambiguous")
     return authorities
 
 
