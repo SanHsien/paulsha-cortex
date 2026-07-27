@@ -1217,6 +1217,7 @@ class JobRegistry:
         planning_authority: tuple[PlanningArtifactAuthority, ...] = (),
         sizing_score: int | None = None,
         sizing_band: str | None = None,
+        decomposition_depth: int = 0,
     ) -> WorkflowRun:
         for existing in self._workflows:
             if existing.claim_key != claim_key:
@@ -1257,6 +1258,7 @@ class JobRegistry:
             planning_source_revision=source_revision,
             sizing_score=sizing_score,
             sizing_band=sizing_band,
+            decomposition_depth=decomposition_depth,
         )
         superseded_at = _now_iso()
         next_workflows = [
@@ -1307,6 +1309,7 @@ class JobRegistry:
         retry_classification: str | None = None,
         sizing_score: int | None = None,
         sizing_band: str | None = None,
+        decomposition_depth: int | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -1380,6 +1383,11 @@ class JobRegistry:
             ),
             sizing_score=current.sizing_score if sizing_score is None else sizing_score,
             sizing_band=current.sizing_band if sizing_band is None else sizing_band,
+            decomposition_depth=(
+                current.decomposition_depth
+                if decomposition_depth is None
+                else decomposition_depth
+            ),
         )
         self._workflows[index] = updated
         self._persist()

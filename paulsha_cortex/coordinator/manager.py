@@ -26,6 +26,7 @@ from . import seams
 from . import review as foreign_review
 from . import verification
 from ..config.paths import worktree_root_for
+from .claim import decomposition_route
 from .model_identities import (
     AGY_DOMAIN,
     AGY_LIVE_PROBE,
@@ -5255,6 +5256,28 @@ def _dispatch_workflow_card(
                 if item.phase == run.current_phase and item.gate_result != "passed"
             ]
             is_last_pending = bool(pending_phase_steps) and step.card == pending_phase_steps[-1].card
+            if is_last_pending and run.current_phase == "plan" and run.sizing_band == "red":
+                # #223（design #208 H.3）：Red band 收斂到 needs_decomposition，
+                # 不推進到 build；current_phase 刻意保持在 plan
+                # （validate_workflow_phase_transition 只允許單調 +1，Red 決策
+                # 不是合法的 phase transition，見 #223 讀碼地圖）。拆分深度逾限
+                # （decomposition_depth 已達上限）改轉 needs_human（驗收條件
+                # 3）。每次 dispatch 都會重新檢查 sizing_band，band 跨帶上升
+                # 至 red 時同樣在此攔下、不會以原身分繼續推進（驗收條件 4）。
+                route = decomposition_route(decomposition_depth=run.decomposition_depth)
+                updated = registry._manager_update_workflow_run(
+                    run.run_id,
+                    facets=tuple(dict.fromkeys((*run.facets, route))),
+                )
+                return {
+                    "run_id": updated.run_id,
+                    "current_phase": updated.current_phase,
+                    "reason": (
+                        "decomposition-depth-exceeded"
+                        if route == "needs_human"
+                        else "needs-decomposition"
+                    ),
+                }
             next_phase = run.current_phase
             attempts = run.attempts
             if is_last_pending:
