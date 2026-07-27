@@ -399,3 +399,14 @@ def test_retry_build_result_carries_model_repair_after_review_needs_human(
         workflow_registry=registry,
     )
     assert result["result"]["retry_classification"] == "model_repair"
+
+
+def test_enum_values_stay_in_sync_with_completion_schema() -> None:
+    """completion.RETRY_CLASSIFICATION_VALUES 刻意不 import 本模組的 enum
+    （避免 schema 層耦合 coordinator 高階模組），這條測試是兩處字串集合的
+    唯一同步保證——#216 增修分類值時必須同時改兩處，否則在此示警。"""
+    from paulsha_cortex.coordinator.completion import RETRY_CLASSIFICATION_VALUES
+
+    assert RETRY_CLASSIFICATION_VALUES == frozenset(
+        member.value for member in work_actions.RetryClassification
+    )
