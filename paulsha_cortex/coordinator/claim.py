@@ -538,7 +538,13 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
             or any(ch not in "0123456789abcdef" for ch in candidate.active_claim_key[-64:])
         ):
             raise ValueError("active workflow requires its persisted claim key")
-        if candidate.active_status not in {"ongoing", "needs_human", "blocked", "done"}:
+        if candidate.active_status not in {
+            "ongoing",
+            "needs_human",
+            "blocked",
+            "done",
+            "needs_decomposition",
+        }:
             raise ValueError("active workflow status invalid")
         if (
             not isinstance(candidate.active_snapshot_hash, str)
@@ -630,6 +636,17 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
         return ClaimDecision(
             action="blocked",
             reason="persisted-block",
+            claim_key=candidate.active_claim_key,
+            run_id=candidate.active_run_id,
+        )
+    if candidate.active_status == "needs_decomposition":
+        # #223（design #208 H.3）：run 已因 Red band 轉入拆分路由（見
+        # workflow_status()／manager._dispatch_workflow_card）。resume 掃描
+        # 不得把它當成一般 in-flight run 續跑，必須原樣浮現給呼叫端另行處理
+        # （回派 planner 拆分或人工介入），不得以原身分繼續重試。
+        return ClaimDecision(
+            action="needs_decomposition",
+            reason="decomposition-required",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
         )
@@ -736,3 +753,32 @@ def sizing_band(total: int) -> str:
     if total <= SIZING_BAND_YELLOW_MAX:
         return BAND_LEVELS[1]
     return BAND_LEVELS[2]
+
+
+# --- #223（design #208 H.3）：Red band 拆分路由 -----------------------------
+#
+# sizing_band()=='red' 的 work item 不得直接進 build，也不得帶著原 run 身分
+# 繼續重試（#223 驗收條件 4）：收斂路徑是 needs_decomposition（回派 planner
+# 拆分，拆分屬 Yellow 級 planning 工作，在 planner 封套內，design #208 原文）。
+# 拆分深度（WorkflowRun.decomposition_depth，根 work item 為 0）每拆一層 +1，
+# 上限 DECOMPOSITION_DEPTH_LIMIT 層；逾限改轉 needs_human，不得無限拆分下去
+# （#223 驗收條件 3）。呼叫端（manager._dispatch_workflow_card 的 plan phase
+# 完成掛載點）只需傳入目前的 decomposition_depth，不必自行重複這條門檻判定。
+DECOMPOSITION_DEPTH_LIMIT = 2
+
+
+def decomposition_route(*, decomposition_depth: int) -> str:
+    """Red band 的路由決策：回傳 ``"needs_decomposition"`` 或 ``"needs_human"``。
+
+    只在呼叫端已確認 ``sizing_band(total) == "red"`` 時呼叫；Green/Yellow 不
+    經過此函式。
+    """
+    if (
+        not isinstance(decomposition_depth, int)
+        or isinstance(decomposition_depth, bool)
+        or decomposition_depth < 0
+    ):
+        raise ValueError("decomposition_depth 必須為非負整數")
+    if decomposition_depth >= DECOMPOSITION_DEPTH_LIMIT:
+        return "needs_human"
+    return "needs_decomposition"

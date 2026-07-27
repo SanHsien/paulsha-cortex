@@ -67,13 +67,22 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("jobs", help="列出所有 Job 執行紀錄")
 
     p_stat = sub.add_parser(
-        "stat", help="查單一 Job 執行紀錄；--retry-classifications 依 retry 分類彙總 workflow runs"
+        "stat",
+        help=(
+            "查單一 Job 執行紀錄；--retry-classifications 依 retry 分類彙總 workflow runs；"
+            "--decomposition-depths 依拆分深度彙總"
+        ),
     )
     p_stat.add_argument("job_id", nargs="?", default=None)
     p_stat.add_argument(
         "--retry-classifications",
         action="store_true",
         help="依 retry_classification 彙總 workflow runs（#208：cortex stat 可依原因分類彙總）",
+    )
+    p_stat.add_argument(
+        "--decomposition-depths",
+        action="store_true",
+        help="依 decomposition_depth 彙總 workflow runs（#223：拆分深度可觀測面）",
     )
 
     p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
@@ -357,8 +366,20 @@ def main(
                 counts[key] = counts.get(key, 0) + 1
             print(json.dumps({"retry_classifications": counts}, ensure_ascii=False))
             return 0
+        if args.decomposition_depths:
+            # #223：decomposition_depth 進可觀測面，比照既有 retry_classifications
+            # 彙總模式（key 為字串化深度，方便與 JSON 輸出對齊）。
+            depth_counts: dict[str, int] = {}
+            for run in reg.list_workflow_runs():
+                key = str(run.decomposition_depth)
+                depth_counts[key] = depth_counts.get(key, 0) + 1
+            print(json.dumps({"decomposition_depths": depth_counts}, ensure_ascii=False))
+            return 0
         if args.job_id is None:
-            print("錯誤: stat 需要 job_id（或 --retry-classifications）", file=sys.stderr)
+            print(
+                "錯誤: stat 需要 job_id（或 --retry-classifications／--decomposition-depths）",
+                file=sys.stderr,
+            )
             return 1
         try:
             job = reg.get_job(args.job_id)

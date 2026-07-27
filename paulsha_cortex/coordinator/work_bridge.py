@@ -296,6 +296,10 @@ def workflow_status(run) -> str:
         return "blocked"
     if "needs_human" in run.facets:
         return "needs_human"
+    if "needs_decomposition" in run.facets:
+        # #223（design #208 H.3）：Red band 收斂路由；claim.py 是唯一消費此
+        # active_status 的呼叫端（透過 work_actions._claim_action）。
+        return "needs_decomposition"
     if "blocked" in run.facets:
         return "blocked"
     return "ongoing"

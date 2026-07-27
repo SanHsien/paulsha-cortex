@@ -374,6 +374,8 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "retry_classification",
         # #222（design #208 H.2）：五維 sizing 總分／band 的 work item 快照。
         "sizing_score", "sizing_band",
+        # #223（design #208 H.3）：Red band 拆分次數快照。
+        "decomposition_depth",
     }
 )
 

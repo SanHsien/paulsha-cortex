@@ -12,7 +12,7 @@ DEFAULT_WORKFLOW_COMBO = "feature-oneshot"
 WORKFLOW_MANIFEST_VERSION = 1
 WORKFLOW_PHASES = ("claim", "define", "plan", "build", "verify", "review", "ship")
 WORKFLOW_GATE_STATUSES = frozenset({"pending", "running", "passed", "failed"})
-WORKFLOW_FACETS = frozenset({"needs_human", "blocked", "degraded"})
+WORKFLOW_FACETS = frozenset({"needs_human", "blocked", "degraded", "needs_decomposition"})
 STEP_GATE_RESULTS = frozenset({"pending", "running", "passed", "failed", "needs_human", "blocked", "skipped"})
 
 
@@ -316,6 +316,11 @@ class WorkflowRun:
     # 寫入，這裡只負責持有最新一次的快照，不做「沿用舊值」的隱含保證。
     sizing_score: int | None = None
     sizing_band: str | None = None
+    # #223（design #208 H.3）：Red band 拆分次數快照——run 本身是第幾層拆分產物
+    # （根 work item 為 0）。上限 2 層（claim.DECOMPOSITION_DEPTH_LIMIT），逾限
+    # 由呼叫端轉 needs_human 而非再拆一層；本欄位只負責持有快照，不做遞增邏輯
+    # （遞增屬呼叫端建立子 work item run 時的責任）。
+    decomposition_depth: int = 0
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -427,6 +432,14 @@ class WorkflowRun:
                     "workflow run sizing_band 與 sizing_score 門檻不符"
                     f"（預期 {expected_band!r}，實得 {self.sizing_band!r}）"
                 )
+        if (
+            not isinstance(self.decomposition_depth, int)
+            or isinstance(self.decomposition_depth, bool)
+            or not (0 <= self.decomposition_depth <= 2)
+        ):
+            raise ValueError(
+                "workflow run decomposition_depth 必須為 0–2 的整數（#223 拆分深度上限）"
+            )
         if self.gate_status == "passed":
             required_kinds = ["foreign-review"]
             if self.brainstorm_required:
@@ -501,6 +514,7 @@ class WorkflowRun:
             "retry_classification": self.retry_classification,
             "sizing_score": self.sizing_score,
             "sizing_band": self.sizing_band,
+            "decomposition_depth": self.decomposition_depth,
         }
 
     @classmethod
@@ -576,6 +590,7 @@ class WorkflowRun:
             retry_classification=payload.get("retry_classification"),
             sizing_score=payload.get("sizing_score"),
             sizing_band=payload.get("sizing_band"),
+            decomposition_depth=payload.get("decomposition_depth", 0),
         )
 
 
