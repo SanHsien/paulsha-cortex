@@ -285,8 +285,11 @@ def test_ship_orchestrator_is_single_exact_evidence_merge_admission(tmp_path: Pa
         def __init__(self):
             self.policy = None
 
-        def merge_if_ready(self, **kwargs):
+        def evaluate_final_gate(self, **kwargs):
             self.policy = kwargs["policy"]
+            return kwargs["policy"]
+
+        def commit_merge(self, **kwargs):
             return object()
 
     github = GitHub()

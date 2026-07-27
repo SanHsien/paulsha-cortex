@@ -98,6 +98,28 @@ class GateResult:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class FinalGateVerdict:
+    """Attested proof the delivery gate passed for an exact candidate.
+
+    Produced only by ``GitHubDeliveryClient.evaluate_final_gate`` after a
+    fresh remote reread and gate evaluation — never by the merge mutation
+    itself. Binding ``authority_digest``/``expected_head`` here lets a caller
+    (e.g. ``ShipOrchestrator``) persist this verdict as an attestation before
+    ``commit_merge`` fires, and lets ``commit_merge`` refuse a stale or
+    substituted verdict rather than merge first and reconcile afterwards
+    (the hippo #18 inversion).
+    """
+
+    repo: str
+    pr_number: int
+    change: str
+    expected_head: str
+    review_kind: str
+    authority_digest: str
+    facts: DeliveryFacts
+
+
 def _unique_reasons(reasons: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(reasons))
 
@@ -1039,6 +1061,83 @@ class GitHubDeliveryClient:
             expect_json=False,
         )
 
+    def evaluate_final_gate(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        change: str,
+        policy: DeliveryPolicy,
+        authority_digest: str,
+        _capability: object | None = None,
+    ) -> FinalGateVerdict:
+        """Reread remote facts and evaluate the merge gate without merging.
+
+        Returns an immutable :class:`FinalGateVerdict` a caller may persist as
+        an attestation *before* invoking :meth:`commit_merge` — the exact
+        candidate final verdict must already exist prior to any merge
+        mutation (issue #220).
+        """
+
+        if _capability is not _SHIP_CAPABILITY:
+            raise PermissionError("merge admission is restricted to ShipOrchestrator")
+        facts = self.fetch_delivery_facts(
+            repo=repo,
+            pr_number=pr_number,
+            change=change,
+        )
+        result = evaluate_delivery_gate(facts=facts, policy=policy)
+        if not result.allowed:
+            raise RuntimeError(f"delivery gate blocked: {', '.join(result.reasons)}")
+        return FinalGateVerdict(
+            repo=repo,
+            pr_number=pr_number,
+            change=change,
+            expected_head=policy.expected_head,
+            review_kind=policy.review_kind,
+            authority_digest=authority_digest,
+            facts=facts,
+        )
+
+    def commit_merge(
+        self,
+        *,
+        verdict: FinalGateVerdict,
+        repo: str,
+        pr_number: int,
+        change: str,
+        expected_head: str,
+        authority_digest: str,
+        _capability: object | None = None,
+    ) -> DeliveryFacts:
+        """Merge only against an already-evaluated, exact-candidate verdict.
+
+        The caller must supply the same repo/PR/head/authority identity the
+        verdict was evaluated against; a stale, forged, or substituted
+        verdict fails closed before any merge mutation is attempted.
+        """
+
+        if _capability is not _SHIP_CAPABILITY:
+            raise PermissionError("merge admission is restricted to ShipOrchestrator")
+        if (
+            not isinstance(verdict, FinalGateVerdict)
+            or verdict.repo != repo
+            or verdict.pr_number != pr_number
+            or verdict.change != change
+            or verdict.expected_head != expected_head
+            or verdict.authority_digest != authority_digest
+        ):
+            raise RuntimeError(
+                "final gate verdict does not authorize this exact candidate merge"
+            )
+        self.merge(
+            repo=repo,
+            pr_number=pr_number,
+            expected_head=expected_head,
+            _capability=_capability,
+        )
+        return verdict.facts
+
     def merge_if_ready(
         self,
         *,
@@ -1050,18 +1149,20 @@ class GitHubDeliveryClient:
     ) -> DeliveryFacts:
         if _capability is not _SHIP_CAPABILITY:
             raise PermissionError("merge admission is restricted to ShipOrchestrator")
-        facts = self.fetch_delivery_facts(
+        verdict = self.evaluate_final_gate(
             repo=repo,
             pr_number=pr_number,
             change=change,
-        )
-        result = evaluate_delivery_gate(facts=facts, policy=policy)
-        if not result.allowed:
-            raise RuntimeError(f"delivery gate blocked: {', '.join(result.reasons)}")
-        self.merge(
-            repo=repo,
-            pr_number=pr_number,
-            expected_head=policy.expected_head,
+            policy=policy,
+            authority_digest="",
             _capability=_capability,
         )
-        return facts
+        return self.commit_merge(
+            verdict=verdict,
+            repo=repo,
+            pr_number=pr_number,
+            change=change,
+            expected_head=policy.expected_head,
+            authority_digest="",
+            _capability=_capability,
+        )

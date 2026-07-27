@@ -378,17 +378,32 @@ class ShipOrchestrator:
             )
             review_kind = "maintainer-review"
         _validate_foreign_review(foreign_review, expected_head=expected_head)
-        facts = self._github.merge_if_ready(
+        authority_digest = work_authority_digest(authority)
+        policy = DeliveryPolicy(
+            expected_head=expected_head,
+            required_closing_issues=authority.mapped_issues,
+            copilot_review_id=copilot.review_id if copilot is not None else None,
+            copilot_requested_at_epoch=(copilot.loop.requested_at if copilot is not None else None),
+            review_kind=review_kind,
+        )
+        # The exact-candidate final verdict must be evaluated and already
+        # exist before the merge mutation is attempted — never the reverse
+        # (issue #220; hippo #18 was the inverted, merge-then-attest case).
+        verdict = self._github.evaluate_final_gate(
             repo=repo,
             pr_number=pr_number,
             change=change,
-            policy=DeliveryPolicy(
-                expected_head=expected_head,
-                required_closing_issues=authority.mapped_issues,
-                copilot_review_id=copilot.review_id if copilot is not None else None,
-                copilot_requested_at_epoch=(copilot.loop.requested_at if copilot is not None else None),
-                review_kind=review_kind,
-            ),
+            policy=policy,
+            authority_digest=authority_digest,
+            _capability=_SHIP_CAPABILITY,
+        )
+        facts = self._github.commit_merge(
+            verdict=verdict,
+            repo=repo,
+            pr_number=pr_number,
+            change=change,
+            expected_head=expected_head,
+            authority_digest=authority_digest,
             _capability=_SHIP_CAPABILITY,
         )
         return ShipResult(
