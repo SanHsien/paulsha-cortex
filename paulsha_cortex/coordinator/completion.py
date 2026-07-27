@@ -25,6 +25,10 @@ VOLATILE_WORK_AUTHORITY_FIELDS = frozenset(
 # 故整個欄位排除在 semantic match 之外——避免良性 reuse 被誤判為衝突而觸發
 # quarantine（比照 VOLATILE_WORK_AUTHORITY_FIELDS 的做法）。
 REUSED_FROM_FIELDS = frozenset({"run_id", "job_id", "evidence_hash"})
+# #212：final 發現「plan 錯而非 candidate 錯」的訊號欄位，供 #137 度量 plan review
+# 漏檢（plan_review_gate 判定通過，但 final 才發現問題其實出在 plan）。純
+# provenance，不影響既有 completion 語意，semantic match 排除比照 reused_from。
+VALID_FINAL_DEFECT_LOCI = frozenset({"plan", "candidate"})
 
 
 def classify_completion(*, exit_code: int, last_jsonl_line: str | None) -> str:
@@ -217,6 +221,12 @@ def _normalize_reused_from(value: object) -> dict[str, str]:
     }
 
 
+def _normalize_final_defect_locus(value: object) -> str:
+    if value not in VALID_FINAL_DEFECT_LOCI:
+        raise ValueError(f"completion final_defect_locus must be one of {sorted(VALID_FINAL_DEFECT_LOCI)}")
+    return value
+
+
 def validate_completion_record(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("completion record must be an object")
@@ -245,7 +255,7 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"completion record missing keys: {', '.join(missing)}")
-    extras = set(payload) - required - {"work_authority", "reused_from"}
+    extras = set(payload) - required - {"work_authority", "reused_from", "final_defect_locus"}
     if extras:
         raise ValueError(f"completion record unexpected key: {sorted(extras)[0]}")
     if payload.get("schema_version") != COMPLETION_SCHEMA_VERSION:
@@ -293,6 +303,8 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
         normalized["work_authority"] = _normalize_work_authority(payload["work_authority"])
     if "reused_from" in payload:
         normalized["reused_from"] = _normalize_reused_from(payload["reused_from"])
+    if "final_defect_locus" in payload:
+        normalized["final_defect_locus"] = _normalize_final_defect_locus(payload["final_defect_locus"])
 
     reviewer_job_id = normalized["reviewer_job_id"]
     review_path = normalized["review_evaluation_path"]
@@ -347,6 +359,8 @@ def completion_records_semantically_match(existing: object, incoming: object) ->
     incoming_authority = _semantic_work_authority(incoming_normalized.pop("work_authority", None))
     existing_normalized.pop("reused_from", None)
     incoming_normalized.pop("reused_from", None)
+    existing_normalized.pop("final_defect_locus", None)
+    incoming_normalized.pop("final_defect_locus", None)
     return existing_normalized == incoming_normalized and existing_authority == incoming_authority
 
 
