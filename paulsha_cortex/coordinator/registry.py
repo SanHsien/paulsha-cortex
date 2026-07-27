@@ -1300,6 +1300,7 @@ class JobRegistry:
         completion_source_revisions: dict[str, str] | None = None,
         pr_candidate: str | None = None,
         merge_revision: str | None = None,
+        retry_classification: str | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -1366,6 +1367,11 @@ class JobRegistry:
             ),
             pr_candidate=current.pr_candidate if pr_candidate is None else pr_candidate,
             merge_revision=current.merge_revision if merge_revision is None else merge_revision,
+            retry_classification=(
+                current.retry_classification
+                if retry_classification is None
+                else retry_classification
+            ),
         )
         self._workflows[index] = updated
         self._persist()
@@ -1421,6 +1427,7 @@ class JobRegistry:
         *,
         expected_candidate: str,
         repair_action: str,
+        retry_classification: str | None = None,
     ) -> WorkflowRun:
         """Atomically reopen only the final builder card after an explicit human stop."""
 
@@ -1522,6 +1529,195 @@ class JobRegistry:
                 facet for facet in current.facets if facet != "needs_human"
             ),
             gate_status="running",
+            retry_classification=(
+                current.retry_classification
+                if retry_classification is None
+                else retry_classification
+            ),
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_reset_workflow_for_retry_verify(
+        self,
+        run_id: str,
+        *,
+        expected_candidate: str,
+        retry_classification: str | None = None,
+    ) -> WorkflowRun:
+        """Atomically rerun verification only, keeping the exact unchanged Candidate (#216).
+
+        比照 `_manager_reset_workflow_for_retry_build` 的 CAS／admission 風格，但只
+        把 verify step 打回 pending——build phase（已產出的 Candidate）完全不動，
+        不重建 candidate、不消耗 build attempts。
+        """
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.status != "ongoing"
+            or current.current_phase != "verify"
+            or "needs_human" not in current.facets
+        ):
+            raise ValueError(
+                "retry-verify reset requires active needs_human verify workflow"
+            )
+        if current.candidate_head != expected_candidate:
+            raise ValueError("retry-verify reset Candidate CAS mismatch")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("retry-verify reset refuses active workflow job")
+        build_steps = [step for step in current.steps if step.phase == "build"]
+        if not build_steps or any(step.gate_result != "passed" for step in build_steps):
+            raise ValueError("retry-verify reset requires completed build phase")
+        steps = tuple(
+            replace(step, gate_result="pending") if step.phase == "verify" else step
+            for step in current.steps
+        )
+        updated = replace(
+            current,
+            current_phase="verify",
+            steps=steps,
+            attempts={
+                **current.attempts,
+                "verify": current.attempts.get("verify", 0) + 1,
+            },
+            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            verified_head=None,
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            gate_status="running",
+            retry_classification=(
+                current.retry_classification
+                if retry_classification is None
+                else retry_classification
+            ),
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_reset_workflow_for_retry_review(
+        self,
+        run_id: str,
+        *,
+        expected_candidate: str,
+        retry_classification: str | None = None,
+    ) -> WorkflowRun:
+        """Atomically relaunch foreign review only, keeping the verified Candidate (#216).
+
+        build／verify phase 保持不動（verified_head 也保留）——只重開 review
+        step，不重跑 builder、不重建 candidate。
+        """
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.status != "ongoing"
+            or current.current_phase != "review"
+            or "needs_human" not in current.facets
+        ):
+            raise ValueError(
+                "retry-review reset requires active needs_human review workflow"
+            )
+        if (
+            current.candidate_head != expected_candidate
+            or current.verified_head != expected_candidate
+        ):
+            raise ValueError("retry-review reset Candidate CAS mismatch")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("retry-review reset refuses active workflow job")
+        verify_steps = [step for step in current.steps if step.phase == "verify"]
+        if not verify_steps or any(step.gate_result != "passed" for step in verify_steps):
+            raise ValueError("retry-review reset requires completed verify phase")
+        steps = tuple(
+            replace(step, gate_result="pending") if step.phase == "review" else step
+            for step in current.steps
+        )
+        updated = replace(
+            current,
+            current_phase="review",
+            steps=steps,
+            attempts={
+                **current.attempts,
+                "review": current.attempts.get("review", 0) + 1,
+            },
+            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            gate_status="running",
+            retry_classification=(
+                current.retry_classification
+                if retry_classification is None
+                else retry_classification
+            ),
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_reset_workflow_for_authority_restart(
+        self,
+        run_id: str,
+        *,
+        authority_digest: str,
+    ) -> WorkflowRun:
+        """Atomically invalidate stale verify/review gates after a bound WorkAuthority
+        declaration changes (#216).
+
+        只精準 invalidate 依賴 authority 內容（issue/PR/OpenSpec 宣告）的 verify/
+        review gate——比照 `_manager_reset_workflow_after_archive` 的『只清 verify/
+        review』模式，build phase 已產出的 Candidate 維持不變，不是
+        `_manager_reset_workflow_for_retry_build` 那種整個 build phase 級重置。
+        """
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current.status != "ongoing" or current.current_phase not in {"verify", "review"}:
+            raise ValueError(
+                "authority-restart reset requires ongoing verify/review workflow"
+            )
+        if (
+            not isinstance(authority_digest, str)
+            or len(authority_digest) != 64
+            or any(char not in "0123456789abcdef" for char in authority_digest)
+        ):
+            raise ValueError("authority-restart reset requires exact authority digest")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("authority-restart reset refuses active workflow job")
+        steps = tuple(
+            replace(step, gate_result="pending")
+            if step.phase in {"verify", "review"}
+            else step
+            for step in current.steps
+        )
+        updated = replace(
+            current,
+            current_phase="verify",
+            steps=steps,
+            attempts={
+                **current.attempts,
+                "verify": current.attempts.get("verify", 0) + 1,
+            },
+            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            source_revision=authority_digest,
+            verified_head=None,
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            gate_status="running",
+            retry_classification="authority_restart",
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated

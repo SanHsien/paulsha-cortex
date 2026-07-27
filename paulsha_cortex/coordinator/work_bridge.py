@@ -1190,6 +1190,12 @@ def _completion_draft(
             "trusted_evidence_refs": [dict(item) for item in trusted_refs],
         },
     }
+    # #216：把整趟 run 期間最後一次 retry 的分類（#215/#216 落地在
+    # WorkflowRun.retry_classification 上的 provenance）帶進 CompletionRecord，
+    # 讓 cortex stat 之類的彙總面可依原因分類；沒有發生過 retry 的 run 保持
+    # schema 原本「該欄位不存在」的可選語意，不強塞 None。
+    if run.retry_classification is not None:
+        payload["retry_classification"] = run.retry_classification
     normalized = completion.validate_completion_record(payload)
     directory = state_root / "evidence" / "completion-drafts"
     directory.mkdir(parents=True, exist_ok=True)

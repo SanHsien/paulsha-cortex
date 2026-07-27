@@ -495,6 +495,11 @@ def _load_work_run(
     return state, active, run
 
 
+# #216 AC4：work_bridge.start_canonical_workflow（#217）在 source-owner transfer
+# 尚未完成時 raise 的訊息前綴；_claim_action 靠它辨識並轉成結構化 blocked 結果。
+_SOURCE_OWNER_CONFLICT_PREFIX = "source-owner transfer incomplete"
+
+
 def _expected_claim_key(authority) -> str:
     return build_claim_key(
         ClaimCandidate(
@@ -1351,16 +1356,37 @@ def _claim_action(
         and canonical_run.claim_key != _expected_claim_key(authority)
         and (automatic or args.get("action") == "resume")
     ):
+        # #216 AC5：authority 宣告已變更（claim_key 不比對即代表 authority_digest
+        # 不同）——只 invalidate 依賴該 authority 內容的 verify/review gate，
+        # build phase 已產出的 Candidate 保持不變。僅在 verify/review phase 且
+        # 沒有 in-flight job 時才符合精準 invalidation 的前置條件；不符合時
+        # （build/claim/define/plan phase、或有 active job）維持既有『原樣
+        # resume』行為，不強行 invalidate。
+        new_digest = work_authority_digest(authority)
+        authority_restart_classification = None
+        if canonical_run.current_phase in {"verify", "review"}:
+            try:
+                canonical_run = workflow_registry._manager_reset_workflow_for_authority_restart(
+                    canonical_run.run_id,
+                    authority_digest=new_digest,
+                )
+                authority_restart_classification = _classify_retry(
+                    canonical_run, workflow_registry, trigger="authority-restart"
+                )
+            except ValueError:
+                pass
         active = canonical_run.to_dict()
         active.update(
             {
                 "snapshot_hash": authority.snapshot_hash,
                 "source_revisions": list(authority.source_revisions),
                 "provider_revision": authority.github_provider_revision,
-                "authority_digest": work_authority_digest(authority),
+                "authority_digest": new_digest,
                 "status": workflow_status(canonical_run),
             }
         )
+        if authority_restart_classification is not None:
+            active["retry_classification"] = authority_restart_classification
         return {
             "action": "resume",
             "reason": "active-workflow",
@@ -1374,7 +1400,23 @@ def _claim_action(
     if decision.action == "claim":
         if workflow_starter is None:
             raise RuntimeError("canonical workflow starter unavailable")
-        run = workflow_starter(authority, str(decision.claim_key), None)
+        try:
+            run = workflow_starter(authority, str(decision.claim_key), None)
+        except RuntimeError as error:
+            # #216 AC4：source-owner transfer 尚未完成（`start_canonical_workflow`
+            # 的 `_other_owner_ongoing_runs` 防線，#217）——fail-closed 轉成結構化
+            # blocked 結果，明確標記 source_owner_repair 分類；builder 從未被
+            # 呼叫（workflow_starter 在建立任何 job 前就先 raise）。
+            if not str(error).startswith(_SOURCE_OWNER_CONFLICT_PREFIX):
+                raise
+            return {
+                "action": "blocked",
+                "reason": "source-owner-repair-pending",
+                "run": None,
+                "retry_classification": _classify_retry(
+                    None, None, trigger="source-owner-repair"
+                ),
+            }
         active = run.to_dict()
     elif decision.action == "needs_human":
         claim_key = build_claim_key(
@@ -1438,9 +1480,12 @@ def _claim_action(
 class RetryClassification(str, Enum):
     """#208 根因3 定案的 retry 分類（enum 定案，後波不得改名）。
 
-    本單（#215）只落地 MODEL_REPAIR／ORCHESTRATOR_RETRY 兩類的判準：
-    AUTHORITY_RESTART／REVIEW_HANDOFF_FAILURE／SOURCE_OWNER_REPAIR 留供 #216
-    依各自根因補齊——`_classify_retry` 目前不會回傳這三類。
+    #215 落地 MODEL_REPAIR／ORCHESTRATOR_RETRY 兩類判準——純看 run/job 狀態即可
+    反推。#216 補齊後三類：AUTHORITY_RESTART／REVIEW_HANDOFF_FAILURE／
+    SOURCE_OWNER_REPAIR 的觸發情境（WorkAuthority 宣告變更、review 交接本身
+    失敗、claim 所有權轉移中）不是 run/job 狀態能反推的資訊，而是呼叫端在
+    觸發當下就已經知道的情境，故由 `_classify_retry` 的 `trigger` 參數直接
+    指定，見其docstring。
     """
 
     MODEL_REPAIR = "model_repair"
@@ -1450,8 +1495,25 @@ class RetryClassification(str, Enum):
     SOURCE_OWNER_REPAIR = "source_owner_repair"
 
 
-def _classify_retry(run, workflow_registry) -> RetryClassification:
-    """判斷一次 retry-build 的性質（#208 根因3）。
+# #216：trigger 對映的三類是呼叫端已知、run/job 狀態無法反推的觸發情境，見
+# `_classify_retry` docstring。
+_RETRY_TRIGGER_CLASSIFICATIONS: dict[str, RetryClassification] = {
+    "authority-restart": RetryClassification.AUTHORITY_RESTART,
+    "review-handoff-failure": RetryClassification.REVIEW_HANDOFF_FAILURE,
+    "source-owner-repair": RetryClassification.SOURCE_OWNER_REPAIR,
+}
+
+
+def _classify_retry(
+    run, workflow_registry, *, trigger: str | None = None
+) -> RetryClassification:
+    """判斷一次 retry 的性質（#208 根因3；#216 補齊後三類）。
+
+    ``trigger``（#216）：呼叫端已知、run/job 狀態無法反推的觸發情境——
+    ``'authority-restart'``／``'review-handoff-failure'``／
+    ``'source-owner-repair'``。指定時直接採信呼叫端判斷、略過以下的狀態推論；
+    ``None``（預設）維持 #215 既有的 MODEL_REPAIR／ORCHESTRATOR_RETRY 狀態推論
+    行為不變，呼叫端不需改動。
 
     model_repair：candidate 已產出可被下游評估的內容——run 已離開 build phase
     進入 verify/review，或 build phase 已有一顆乾淨終止（status=='exited'、
@@ -1466,6 +1528,11 @@ def _classify_retry(run, workflow_registry) -> RetryClassification:
     判準只看 run.current_phase 與 JobRegistry 的 job status/exit_code/
     workflow_evidence，刻意不看 run.attempts 世代數（不再只以 vN 判斷重試性質）。
     """
+    if trigger is not None:
+        try:
+            return _RETRY_TRIGGER_CLASSIFICATIONS[trigger]
+        except KeyError:
+            raise ValueError(f"retry classify 不支援的 trigger: {trigger!r}") from None
     if run.current_phase != "build":
         return RetryClassification.MODEL_REPAIR
     build_steps = [step for step in run.steps if step.phase == "build"]
@@ -1558,10 +1625,131 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         run.run_id,
         expected_candidate=expected_candidate.lower(),
         repair_action=repair_action,
+        retry_classification=retry_classification.value,
     )
     return {
         "action": "retry-build",
         "reason": "candidate-repair-dispatched",
+        "expected_candidate": expected_candidate.lower(),
+        "run": updated.to_dict(),
+        "retry_classification": retry_classification,
+    }
+
+
+def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+    """Rerun verification only for the exact unchanged Candidate after a human stop（#216 AC2）。
+
+    build phase 完全不動：不重派 builder、不重建 candidate，只把 verify step
+    打回 pending 讓 verification runner 針對既有 Candidate 重跑。
+    """
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "expected_candidate",
+    }
+    if extras:
+        raise ValueError(f"retry-verify rejects caller evidence/input: {sorted(extras)[0]}")
+    expected_candidate = args.get("expected_candidate")
+    if (
+        not isinstance(expected_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+    ):
+        raise ValueError("retry-verify requires exact expected_candidate")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("retry-verify issue is not authorized by WorkAuthority")
+    expected_issues = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    )
+    active = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo
+        and run.work_id == authority.work_id
+        and run.status == "ongoing"
+        and run.issue_refs == expected_issues
+        and run.openspec_refs == authority.mapped_openspec
+    ]
+    if len(active) != 1:
+        raise RuntimeError("retry-verify requires one active canonical WorkflowRun")
+    run = active[0]
+    if "needs_human" not in run.facets:
+        raise RuntimeError("retry-verify requires needs_human workflow")
+    if run.current_phase != "verify":
+        raise RuntimeError("retry-verify requires verify-phase workflow")
+    if run.candidate_head != expected_candidate.lower():
+        raise RuntimeError("retry-verify expected Candidate CAS mismatch")
+    retry_classification = _classify_retry(run, workflow_registry)
+    updated = workflow_registry._manager_reset_workflow_for_retry_verify(
+        run.run_id,
+        expected_candidate=expected_candidate.lower(),
+        retry_classification=retry_classification.value,
+    )
+    return {
+        "action": "retry-verify",
+        "reason": "verification-rerun-dispatched",
+        "expected_candidate": expected_candidate.lower(),
+        "run": updated.to_dict(),
+        "retry_classification": retry_classification,
+    }
+
+
+def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+    """Relaunch foreign review only for the exact verified Candidate（#216 AC3）。
+
+    build／verify phase 完全不動：不重跑 builder、不重建 candidate。若 run 缺少
+    冷凍 plan authority（尚未經 plan review freeze），在任何狀態變更前直接
+    fail-closed（pre-dispatch fail），不派任何 review job。
+    """
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "expected_candidate",
+    }
+    if extras:
+        raise ValueError(f"retry-review rejects caller evidence/input: {sorted(extras)[0]}")
+    expected_candidate = args.get("expected_candidate")
+    if (
+        not isinstance(expected_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+    ):
+        raise ValueError("retry-review requires exact expected_candidate")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("retry-review issue is not authorized by WorkAuthority")
+    expected_issues = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    )
+    active = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo
+        and run.work_id == authority.work_id
+        and run.status == "ongoing"
+        and run.issue_refs == expected_issues
+        and run.openspec_refs == authority.mapped_openspec
+    ]
+    if len(active) != 1:
+        raise RuntimeError("retry-review requires one active canonical WorkflowRun")
+    run = active[0]
+    if "needs_human" not in run.facets:
+        raise RuntimeError("retry-review requires needs_human workflow")
+    if run.current_phase != "review":
+        raise RuntimeError("retry-review requires review-phase workflow")
+    if (
+        run.candidate_head != expected_candidate.lower()
+        or run.verified_head != expected_candidate.lower()
+    ):
+        raise RuntimeError("retry-review expected Candidate CAS mismatch")
+    if not any(item.kind == "plan" for item in run.planning_authority):
+        raise RuntimeError("retry-review requires frozen plan authority pre-dispatch")
+    retry_classification = _classify_retry(run, workflow_registry)
+    updated = workflow_registry._manager_reset_workflow_for_retry_review(
+        run.run_id,
+        expected_candidate=expected_candidate.lower(),
+        retry_classification=retry_classification.value,
+    )
+    return {
+        "action": "retry-review",
+        "reason": "foreign-review-rerun-dispatched",
         "expected_candidate": expected_candidate.lower(),
         "run": updated.to_dict(),
         "retry_classification": retry_classification,
@@ -2489,8 +2677,8 @@ def execute_work_action(
     repo = args.get("repo")
     work_id = args.get("work_id")
     if action not in {
-        "link", "unlink", "start", "resume", "retry-build", "abandon", "auto", "ship",
-        "review-attest",
+        "link", "unlink", "start", "resume", "retry-build", "retry-verify",
+        "retry-review", "abandon", "auto", "ship", "review-attest",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -2530,6 +2718,18 @@ def execute_work_action(
         )
     elif action == "retry-build":
         result = _retry_build_action(
+            args=args,
+            authority=authority,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "retry-verify":
+        result = _retry_verify_action(
+            args=args,
+            authority=authority,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "retry-review":
+        result = _retry_review_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,

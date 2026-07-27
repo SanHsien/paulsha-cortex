@@ -116,8 +116,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument(
         "action",
         choices=[
-            "link", "unlink", "start", "resume", "retry-build", "abandon", "auto", "ship",
-            "review-attest",
+            "link", "unlink", "start", "resume", "retry-build", "retry-verify",
+            "retry-review", "abandon", "auto", "ship", "review-attest",
         ],
     )
     p_work.add_argument("work_id")

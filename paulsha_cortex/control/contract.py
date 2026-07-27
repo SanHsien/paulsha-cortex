@@ -15,8 +15,8 @@ REQUEST_TYPES = frozenset(
 )
 WORK_ACTIONS = frozenset(
     {
-        "link", "unlink", "start", "resume", "retry-build", "abandon",
-        "auto", "ship", "review-attest",
+        "link", "unlink", "start", "resume", "retry-build", "retry-verify",
+        "retry-review", "abandon", "auto", "ship", "review-attest",
     }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
@@ -100,11 +100,11 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             typed = kind in WORK_SOURCE_KINDS and isinstance(ref, str) and bool(ref.strip())
             if legacy == typed:
                 raise ValueError("work-action link requires exactly one of --issue or --kind/--ref")
-        if action == "retry-build" and (
+        if action in {"retry-build", "retry-verify", "retry-review"} and (
             not isinstance(args.get("expected_candidate"), str)
             or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
         ):
-            raise ValueError("work-action retry-build requires exact expected_candidate")
+            raise ValueError(f"work-action {action} requires exact expected_candidate")
         if action == "abandon":
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")

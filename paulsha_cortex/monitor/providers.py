@@ -369,6 +369,9 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "brainstorm_required", "primary_domain", "candidate_head",
         "verified_head", "gate_status", "completion_source_revisions",
         "planning_authority", "planning_source_revision",
+        # #216：retry_classification（provenance-only，比照 pr_candidate／
+        # merge_revision 的可選欄位模式）。
+        "retry_classification",
     }
 )
 

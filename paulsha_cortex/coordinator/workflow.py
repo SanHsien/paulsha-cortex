@@ -306,6 +306,7 @@ class WorkflowRun:
     completion_source_revisions: dict[str, str] = field(default_factory=dict)
     pr_candidate: str | None = None
     merge_revision: str | None = None
+    retry_classification: str | None = None
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -359,6 +360,11 @@ class WorkflowRun:
             ("primary_domain", self.primary_domain),
             ("candidate_head", self.candidate_head),
             ("verified_head", self.verified_head),
+            # #216：retry_classification 只是 provenance（比照 completion.py
+            # reused_from 的做法），刻意不在此收斂成封閉集合——閉集合驗證交給
+            # work_actions.RetryClassification／completion.py
+            # RETRY_CLASSIFICATION_VALUES，避免第三處需要手動同步的列舉。
+            ("retry_classification", self.retry_classification),
         ):
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"workflow run {field} 必須為null或非空字串")
@@ -470,6 +476,7 @@ class WorkflowRun:
             "completion_source_revisions": dict(self.completion_source_revisions),
             "pr_candidate": self.pr_candidate,
             "merge_revision": self.merge_revision,
+            "retry_classification": self.retry_classification,
         }
 
     @classmethod
@@ -542,6 +549,7 @@ class WorkflowRun:
             completion_source_revisions=dict(payload.get("completion_source_revisions", {})),
             pr_candidate=payload.get("pr_candidate"),
             merge_revision=payload.get("merge_revision"),
+            retry_classification=payload.get("retry_classification"),
         )
 
 
