@@ -7,9 +7,10 @@ import tempfile
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from paulsha_cortex.config import paths
+from . import verification
 from .workflow import (
     GateEvidenceRef,
     PlanningArtifactAuthority,
@@ -64,6 +65,69 @@ GATE_STATE_TRANSITIONS = {
     "failed": frozenset({"failed", "needs_human"}),
     "needs_human": frozenset({"needs_human", "pending", "passed", "failed"}),
 }
+
+# StageExecutionKey 涵蓋的內容定址欄位（#214）：repo/work_id/card/phase/executor/
+# model/base_sha/candidate_sha/frozen_input_hashes/action/test_policy 任一改變都必須
+# 產生不同 key，讓 authority／candidate／model 任一變更精準 invalidate reuse 判定。
+STAGE_EXECUTION_KEY_STRING_FIELDS = (
+    "repo",
+    "work_id",
+    "card",
+    "phase",
+    "executor",
+    "model",
+    "base_sha",
+    "candidate_sha",
+    "action",
+    "test_policy",
+)
+
+
+def compute_stage_execution_key(
+    *,
+    repo: str,
+    work_id: str,
+    card: str,
+    phase: str,
+    executor: str,
+    model: str,
+    base_sha: str,
+    candidate_sha: str,
+    frozen_input_hashes: tuple[str, ...] | list[str],
+    action: str,
+    test_policy: str,
+) -> str:
+    """把 stage 執行的內容定址欄位收斂成單一雜湊 key（建立在既有 phase 級
+    checkpoint／claim key 之上，只是把顆粒度從 phase 降到 stage）。
+
+    涵蓋 repo/work_id/card/phase/executor/model/base_sha/candidate_sha/
+    frozen_input_hashes/action/test_policy；任一欄位變更都會產生不同的
+    64-hex key，讓 authority／candidate／model 任一變更即精準 invalidate
+    既有 reuse 判定，不需要額外的比對邏輯。
+    """
+    values = {
+        "repo": repo,
+        "work_id": work_id,
+        "card": card,
+        "phase": phase,
+        "executor": executor,
+        "model": model,
+        "base_sha": base_sha,
+        "candidate_sha": candidate_sha,
+        "action": action,
+        "test_policy": test_policy,
+    }
+    for field_name in STAGE_EXECUTION_KEY_STRING_FIELDS:
+        value = values[field_name]
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"stage execution key {field_name} 必須為非空字串")
+    if not isinstance(frozen_input_hashes, (list, tuple)) or any(
+        not isinstance(item, str) or not item for item in frozen_input_hashes
+    ):
+        raise ValueError("stage execution key frozen_input_hashes 必須為非空字串的 list/tuple")
+    payload = dict(values)
+    payload["frozen_input_hashes"] = sorted(frozen_input_hashes)
+    return verification.canonical_json_hash(payload)
 
 
 def _default_state_path() -> Path:
@@ -395,7 +459,7 @@ class JobRegistry:
             "executor", "session_name", "log_path", "model_id", "independence_domain",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
-            "workflow_sandbox_hash", "workflow_builder_job_id",
+            "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
@@ -407,6 +471,14 @@ class JobRegistry:
         ):
             raise ValueError(
                 f"coordinator 狀態檔 workflow_sandbox_hash 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        stage_execution_key = job.get("workflow_stage_execution_key")
+        if stage_execution_key is not None and (
+            len(stage_execution_key) != 64
+            or any(char not in "0123456789abcdef" for char in stage_execution_key)
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 workflow_stage_execution_key 格式錯誤（fail-closed）: {self._state_path}"
             )
         for field in ("pid", "exit_code"):
             value = job.get(field)
@@ -642,6 +714,7 @@ class JobRegistry:
         workflow_sandbox_hash: str | None = None,
         workflow_output_baseline: tuple[dict[str, str], ...] = (),
         workflow_builder_job_id: str | None = None,
+        workflow_stage_execution_key: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -689,6 +762,7 @@ class JobRegistry:
             "workflow_sandbox_hash": workflow_sandbox_hash,
             "workflow_output_baseline": [dict(row) for row in workflow_output_baseline],
             "workflow_builder_job_id": workflow_builder_job_id,
+            "workflow_stage_execution_key": workflow_stage_execution_key,
             "workflow_evidence": None,
             "created_at": _now_iso(),
         }
@@ -747,6 +821,62 @@ class JobRegistry:
             job["subject_head"] = subject_head
         self._persist()
         return _deepcopy_json(job)
+
+    def find_reusable_stage_evidence(
+        self,
+        stage_execution_key: str,
+        *,
+        is_evidence_still_valid: Callable[[dict[str, str]], bool] | None = None,
+    ) -> dict[str, Any] | None:
+        """依 StageExecutionKey 查找可重用的既有 workflow evidence（#214）。
+
+        只有『同一個 stage_execution_key』、成功結束（exited/exit_code==0）且
+        已綁定 canonical evidence 的既有 job 才是候選；`is_evidence_still_valid`
+        是呼叫端注入的驗證 callback（例如確認 evidence 完整、未撤銷、通過
+        ResultVerification），本方法不預設任何 evidence 語意。fail-closed：
+        key 格式錯誤、找不到候選、或未提供 callback（無法確認 evidence 仍然
+        有效）時一律回傳 None，交由呼叫端照原路徑重新派工，不會誤判可以
+        reuse。找到多筆候選時取最近一筆（列表尾端）。
+        """
+        if (
+            not isinstance(stage_execution_key, str)
+            or len(stage_execution_key) != 64
+            or any(char not in "0123456789abcdef" for char in stage_execution_key)
+        ):
+            return None
+        if is_evidence_still_valid is None:
+            return None
+        self._reload_if_changed()
+        for job in reversed(self._jobs):
+            if job.get("workflow_stage_execution_key") != stage_execution_key:
+                continue
+            if job.get("status") != "exited" or job.get("exit_code") != 0:
+                continue
+            evidence = job.get("workflow_evidence")
+            if not isinstance(evidence, dict):
+                continue
+            try:
+                still_valid = is_evidence_still_valid(dict(evidence))
+            except Exception:
+                continue
+            if not still_valid:
+                continue
+            evidence_hash = evidence.get("hash")
+            if (
+                not isinstance(evidence_hash, str)
+                or len(evidence_hash) != 64
+                or any(char not in "0123456789abcdef" for char in evidence_hash)
+            ):
+                continue
+            # evidence_hash 直接對齊 completion.py reused_from schema 的
+            # {run_id, job_id, evidence_hash}，消費端不需再自行拆 locator。
+            return {
+                "run_id": job.get("workflow_run_id"),
+                "job_id": job.get("job_id"),
+                "evidence": dict(evidence),
+                "evidence_hash": evidence_hash,
+            }
+        return None
 
     def update_status(self, job_id: str, status: str) -> dict[str, Any]:
         if status not in VALID_JOB_STATUSES:

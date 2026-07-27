@@ -20,6 +20,11 @@ VALID_REVIEW_POLICIES = frozenset({"required", "not-required"})
 VOLATILE_WORK_AUTHORITY_FIELDS = frozenset(
     {"snapshot_hash", "provider_revision", "source_revisions"}
 )
+# reused_from（#214 StageExecutionKey reuse）只是 provenance：記錄本次 stage
+# 是 reuse 既有 run/job/evidence 而非重新呼叫 model，不影響 completion 語意，
+# 故整個欄位排除在 semantic match 之外——避免良性 reuse 被誤判為衝突而觸發
+# quarantine（比照 VOLATILE_WORK_AUTHORITY_FIELDS 的做法）。
+REUSED_FROM_FIELDS = frozenset({"run_id", "job_id", "evidence_hash"})
 
 
 def classify_completion(*, exit_code: int, last_jsonl_line: str | None) -> str:
@@ -200,6 +205,18 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
     }
 
 
+def _normalize_reused_from(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != REUSED_FROM_FIELDS:
+        raise ValueError("completion reused_from malformed")
+    return {
+        "run_id": _require_non_empty_string(value.get("run_id"), field="reused_from.run_id"),
+        "job_id": _require_non_empty_string(value.get("job_id"), field="reused_from.job_id"),
+        "evidence_hash": _normalize_digest_hash(
+            value.get("evidence_hash"), field="reused_from.evidence_hash"
+        ),
+    }
+
+
 def validate_completion_record(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("completion record must be an object")
@@ -228,7 +245,7 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"completion record missing keys: {', '.join(missing)}")
-    extras = set(payload) - required - {"work_authority"}
+    extras = set(payload) - required - {"work_authority", "reused_from"}
     if extras:
         raise ValueError(f"completion record unexpected key: {sorted(extras)[0]}")
     if payload.get("schema_version") != COMPLETION_SCHEMA_VERSION:
@@ -274,6 +291,8 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
     }
     if "work_authority" in payload:
         normalized["work_authority"] = _normalize_work_authority(payload["work_authority"])
+    if "reused_from" in payload:
+        normalized["reused_from"] = _normalize_reused_from(payload["reused_from"])
 
     reviewer_job_id = normalized["reviewer_job_id"]
     review_path = normalized["review_evaluation_path"]
@@ -326,6 +345,8 @@ def completion_records_semantically_match(existing: object, incoming: object) ->
         return False
     existing_authority = _semantic_work_authority(existing_normalized.pop("work_authority", None))
     incoming_authority = _semantic_work_authority(incoming_normalized.pop("work_authority", None))
+    existing_normalized.pop("reused_from", None)
+    incoming_normalized.pop("reused_from", None)
     return existing_normalized == incoming_normalized and existing_authority == incoming_authority
 
 
