@@ -232,7 +232,10 @@ def test_identity_probe_uses_runtime_schema_validator(monkeypatch, tmp_path: Pat
     [
         ("model-identities missing", ("missing", "model-identities")),
         ("model-identities unreadable: /private/operator/config/model-identities.yaml", ("unreadable", "model-identities")),
-        ("schema/contract invalid in model-identities", ("schema", "contract", "model-identities")),
+        (
+            "model-identities schema_version must be one of [1, 2], got 99",
+            ("schema", "contract", "model-identities"),
+        ),
         ("canonical agy planning identity missing", ("canonical", "agy", "planning")),
     ],
 )

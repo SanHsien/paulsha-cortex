@@ -156,7 +156,14 @@ def _identity_failure_detail(exc: BaseException) -> str:
             "model-identities is unreadable; ensure the file exists and can be read "
             "by the doctor runtime."
         )
-    if "schema/contract invalid" in message or "schema invalid" in message or "contract invalid" in message:
+    if (
+        "model-identities schema_version" in message
+        or "schema_version must be" in message
+        or "model-identities invalid root" in message
+        or "schema/contract invalid" in message
+        or "schema invalid" in message
+        or "contract invalid" in message
+    ):
         return (
             "model-identities schema or contract is invalid; fix identity schema and "
             "capability settings."
