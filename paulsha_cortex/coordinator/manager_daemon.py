@@ -4,6 +4,7 @@ import json
 import argparse
 import fcntl
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -29,6 +30,23 @@ DEFAULT_EXECUTOR = "copilot"
 DEFAULT_MAX_LOAD = 1.0
 RECENT_DONE_LIMIT = 10
 MANAGER_CMD_MARKER = "paulsha_cortex.coordinator.manager_daemon"
+
+# Periodic-tick failure resilience (issue #249): a persistently failing tick
+# must never retry every poll cycle -- that turns a 5-minute schedule into a
+# hot loop. Consecutive failures back off the next attempt exponentially
+# (``tick_interval * BASE**min(failures, MAX_EXPONENT)``); once
+# TICK_CIRCUIT_BREAKER_THRESHOLD consecutive failures accrue, periodic ticks
+# pause entirely for TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS before one more
+# attempt is made. Request-queue processing (including a manual "tick"
+# request, the operator's rescue channel) is never gated by any of this.
+TICK_BACKOFF_MULTIPLIER_BASE = 2.0
+TICK_BACKOFF_MAX_EXPONENT = 4  # caps backoff at tick_interval * 2**4 = 16x
+TICK_CIRCUIT_BREAKER_THRESHOLD = 6  # consecutive failures before ticks pause
+TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0  # cool-down before one retry
+
+LOG_ERROR_SUMMARY_INTERVAL = 50  # suppressed-repeat summary cadence for _log_error
+_MULTI_SEGMENT_PATH_PATTERN = re.compile(r"\S*/\S*/\S+")
+TICK_ERROR_REASON_MAX_LENGTH = 200  # bounds status.json against a runaway message
 
 
 @dataclass
@@ -122,6 +140,35 @@ def default_tick_interval() -> float:
         return float(override)
     except ValueError:
         return DEFAULT_TICK_INTERVAL
+
+
+def _tick_backoff_seconds(base_interval: float, consecutive_failures: int) -> float:
+    """Exponential backoff interval for the next periodic-tick retry.
+
+    Doubles per consecutive failure, capped at ``TICK_BACKOFF_MAX_EXPONENT``
+    doublings, so a persistently failing tick backs off instead of retrying
+    on every poll cycle. ``consecutive_failures <= 0`` (no prior failure)
+    returns the unmodified ``base_interval``, preserving today's cadence.
+    """
+    if consecutive_failures <= 0:
+        return base_interval
+    exponent = min(consecutive_failures, TICK_BACKOFF_MAX_EXPONENT)
+    return base_interval * (TICK_BACKOFF_MULTIPLIER_BASE**exponent)
+
+
+def _safe_tick_error_summary(exc: Exception) -> dict[str, str]:
+    """Build a redacted, length-capped last-failure summary for ``status.json``.
+
+    Unlike the stderr log (operator-only, ephemeral), ``status.json`` is a
+    persisted, always-on-disk artifact, so multi-segment filesystem paths
+    (which could leak a machine's or user's directory layout) are replaced
+    with a placeholder and the reason is capped to a bounded length.
+    """
+    reason = " ".join(str(exc).split())
+    reason = _MULTI_SEGMENT_PATH_PATTERN.sub("<path>", reason)
+    if len(reason) > TICK_ERROR_REASON_MAX_LENGTH:
+        reason = reason[:TICK_ERROR_REASON_MAX_LENGTH].rstrip() + "…"
+    return {"type": type(exc).__name__, "reason": reason}
 
 
 def _in_flight_status(registry) -> list[dict[str, Any]]:
@@ -890,6 +937,10 @@ def run_loop(
     daemon_idle = True
     last_tick_monotonic = monotonic_fn()
     rounds = 0
+    consecutive_tick_failures = 0
+    tick_circuit_open = False
+    last_tick_error: dict[str, str] | None = None
+    _reset_log_error_dedup_state()
 
     try:
         while max_rounds is None or rounds < max_rounds:
@@ -929,6 +980,13 @@ def run_loop(
                         last_tick_at = now_fn()
                         last_tick_monotonic = monotonic_fn()
                         tick_ran_this_round = True
+                        # A successful manual tick is the operator's rescue
+                        # channel for a tripped circuit breaker: clear the
+                        # periodic path's failure bookkeeping so it gets a
+                        # fresh normal-cadence attempt next round.
+                        consecutive_tick_failures = 0
+                        tick_circuit_open = False
+                        last_tick_error = None
                 except Exception as exc:  # noqa: BLE001
                     done_payload = contract.build_done(
                         req_id=request_id,
@@ -945,10 +1003,15 @@ def run_loop(
                     request_drain_interrupted = True
                     break
 
+            if tick_circuit_open:
+                effective_tick_interval = TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS
+            else:
+                effective_tick_interval = _tick_backoff_seconds(tick_interval, consecutive_tick_failures)
+
             if (
                 not request_drain_interrupted
                 and not tick_ran_this_round
-                and monotonic_fn() - last_tick_monotonic >= tick_interval
+                and monotonic_fn() - last_tick_monotonic >= effective_tick_interval
             ):
                 try:
                     summary = periodic_runner()
@@ -957,8 +1020,22 @@ def run_loop(
                     if not skipped:
                         last_tick_at = now_fn()
                         last_tick_monotonic = monotonic_fn()
+                        consecutive_tick_failures = 0
+                        tick_circuit_open = False
+                        last_tick_error = None
                 except Exception as exc:  # noqa: BLE001
                     _log_error(exc)
+                    # Failure must still advance the clock -- this is the
+                    # core fix for #249: the pre-fix code left
+                    # last_tick_monotonic untouched on failure, so the next
+                    # poll cycle (3s later) immediately re-triggered the
+                    # same failing tick forever instead of waiting out
+                    # tick_interval (or the backed-off interval below).
+                    consecutive_tick_failures += 1
+                    last_tick_error = _safe_tick_error_summary(exc)
+                    last_tick_monotonic = monotonic_fn()
+                    if consecutive_tick_failures >= TICK_CIRCUIT_BREAKER_THRESHOLD:
+                        tick_circuit_open = True
 
             try:
                 snapshot = provider()
@@ -970,6 +1047,9 @@ def run_loop(
                         "pid": runtime_pid,
                         "last_tick_at": last_tick_at,
                         "idle": daemon_idle,
+                        "consecutive_tick_failures": consecutive_tick_failures,
+                        "tick_circuit_open": tick_circuit_open,
+                        "last_tick_error": last_tick_error,
                     },
                     updated_at=now_fn(),
                 )
@@ -1052,15 +1132,54 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _handle_termination)
 
 
+# Module-level state for _log_error's repeat suppression (issue #249: the
+# same ValueError printed 17,013 times over 22 hours because _log_error had
+# zero de-duplication). Reset once per daemon run via
+# _reset_log_error_dedup_state() -- called at the top of run_loop -- so a
+# fresh daemon process (or a fresh test invocation of run_loop) never
+# inherits suppression counters from a previous run.
+_LOG_ERROR_DEDUP_STATE: dict[str, Any] = {"signature": None, "repeat_count": 0}
+
+
+def _reset_log_error_dedup_state() -> None:
+    _LOG_ERROR_DEDUP_STATE["signature"] = None
+    _LOG_ERROR_DEDUP_STATE["repeat_count"] = 0
+
+
 def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None:
-    message = f"{contract.utcnow()} manager_daemon error: {type(exc).__name__}: {exc}"
+    """Print a manager_daemon error to stderr, with safe context and repeat suppression.
+
+    ``context`` (#246) carries only safe diagnostic scope -- action kind,
+    work_id, repo, snapshot/source revision; callers must not pass tokens,
+    absolute paths, or issue bodies.
+
+    Repeat suppression (#249): the first occurrence of a signature
+    (exception type + message + context) is always printed in full.
+    Consecutive repeats of the exact same signature are suppressed and
+    replaced by a periodic "still repeating" summary every
+    LOG_ERROR_SUMMARY_INTERVAL occurrences, so a persistently failing tick
+    can no longer flood the log the way it did in #249 -- while still
+    leaving evidence that the failure is ongoing.
+    """
+    timestamp = contract.utcnow()
+    signature = f"{type(exc).__name__}: {exc}"
     if context:
-        # 只收安全脈絡（action 種類／work_id／repo／snapshot 或 source
-        # revision）；呼叫端負責不要塞入 token、絕對路徑或 issue 內文。
         details = " ".join(f"{key}={value}" for key, value in context.items() if value is not None)
         if details:
-            message = f"{message} ({details})"
-    print(message, file=sys.stderr)
+            signature = f"{signature} ({details})"
+    state = _LOG_ERROR_DEDUP_STATE
+    if state["signature"] != signature:
+        state["signature"] = signature
+        state["repeat_count"] = 0
+        print(f"{timestamp} manager_daemon error: {signature}", file=sys.stderr)
+        return
+    state["repeat_count"] += 1
+    if state["repeat_count"] % LOG_ERROR_SUMMARY_INTERVAL == 0:
+        print(
+            f"{timestamp} manager_daemon error (repeated {state['repeat_count']}x since "
+            f"first occurrence, most recent at {timestamp}): {signature}",
+            file=sys.stderr,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
