@@ -1,3 +1,0 @@
-### Added
-
-- **Issue #218：work-item 級 repair budget 與 circuit breaker**：`delivery.py` 的 `MAX_FIX_ROUNDS` 依 sizing band 參數化——新增 `repair_budget_for_band()`（green=1、yellow=2、band 未掛時 fail-soft 回退現行值=2、red 防禦性拒絕），`ReviewLoop` 新增 `max_fix_rounds` 欄位取代寫死的模組常數，`ShipOrchestrator.merge_if_ready()` 同步改讀 loop 自帶的預算。`work_actions.py` 的 ship 迴圈 repair round 計數由 `active["ship"]["fix_rounds"]`（會在 multiple-delivery-targets-unsupported 復原路徑被整包 pop 掉）提升到 `active["repair_rounds"]`（work-item 頂層，與 `delivery_binding`／`snapshot_hash` 平級），確保計數跨 ship-state reset 仍存活；第 3 次 model_repair 觸發 needs_human 時，回傳結果一併附上剩餘 repair scope、已重複 stage、合法下一步（`maintainer-review`）與預估 invalidation 範圍。
