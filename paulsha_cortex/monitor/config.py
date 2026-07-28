@@ -19,7 +19,7 @@ _WARNED_DEPRECATIONS: set[str] = set()
 def _warn_deprecated_once(key: str, message: str) -> None:
     if key in _WARNED_DEPRECATIONS:
         return
-    warnings.warn(message, stacklevel=2)
+    warnings.warn(message, stacklevel=3)
     _WARNED_DEPRECATIONS.add(key)
 
 
