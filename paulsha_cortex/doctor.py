@@ -91,9 +91,37 @@ def _valid_repo(value: str | None) -> bool:
 def _preflight_probe(env: Mapping[str, str]) -> ProbeResult:
     try:
         _load_runtime_preflight_command(env)
-    except (ImportError, OSError, ValueError):
-        return ProbeResult("preflight", "fail", "runtime validator rejected preflight command", True)
+    except (ImportError, OSError, ValueError) as exc:
+        return ProbeResult("preflight", "fail", _preflight_failure_detail(exc), True)
     return ProbeResult("preflight", "pass", "runtime validator accepted typed executable", True)
+
+
+def _preflight_failure_detail(exc: BaseException) -> str:
+    message = str(exc).lower()
+    if "psc_preflight_cmd is required" in message:
+        return (
+            "PSC_PREFLIGHT_CMD is required; set it to typed argv, "
+            "例如: `python3 -m project_preflight`。"
+        )
+    if "psc_preflight_cmd is malformed" in message:
+        return (
+            "PSC_PREFLIGHT_CMD is malformed; use typed argv format "
+            "and avoid shell metacharacters."
+        )
+    if "psc_preflight_cmd shell wrapper is not allowed" in message:
+        return (
+            "PSC_PREFLIGHT_CMD uses a shell wrapper; replace it with typed argv "
+            "for example: `python3 -m project_preflight`."
+        )
+    if message.startswith("psc_preflight_cmd executable unavailable: "):
+        return (
+            "PSC_PREFLIGHT_CMD executable unavailable; install the configured "
+            "preflight executable and verify the command path."
+        )
+    return (
+        "Preflight command validation failed. Set `PSC_PREFLIGHT_CMD` as typed "
+        "argv and keep it consistent with your delivery preflight command."
+    )
 
 
 def _load_runtime_preflight_command(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -109,13 +137,38 @@ def _identity_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
     ).expanduser()
     try:
         schema_version = _load_runtime_model_identities(config_root)
-    except (ImportError, OSError, ValueError):
-        return ProbeResult("model-identities", "fail", "runtime validator rejected identity registry", True)
+    except (ImportError, OSError, ValueError, Exception) as exc:
+        return ProbeResult("model-identities", "fail", _identity_failure_detail(exc), True)
     return ProbeResult(
         "model-identities",
         "pass",
         f"runtime-validated schema v{schema_version} with canonical agy identity",
         True,
+    )
+
+
+def _identity_failure_detail(exc: BaseException) -> str:
+    message = str(exc).lower()
+    if "model-identities missing" in message:
+        return "model-identities is missing; create PSC_PROJECT_CONFIG_ROOT/model-identities.yaml first."
+    if "unreadable" in message:
+        return (
+            "model-identities is unreadable; ensure the file exists and can be read "
+            "by the doctor runtime."
+        )
+    if "schema/contract invalid" in message or "schema invalid" in message or "contract invalid" in message:
+        return (
+            "model-identities schema or contract is invalid; fix identity schema and "
+            "capability settings."
+        )
+    if "canonical agy planning identity missing" in message:
+        return (
+            "canonical agy planning identity missing; define planning identity "
+            "with `executor: agy` and planning capability."
+        )
+    return (
+        "model-identities validation failed. Ensure a valid identities file exists, "
+        "passes schema/contracts, and contains the canonical planning identity."
     )
 
 

@@ -474,6 +474,7 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
 
 | 介面 | 預設路徑 | 環境變數 |
 | --- | --- | --- |
+| preflight command (delivery) | 無預設（delivery 時必填） | `PSC_PREFLIGHT_CMD` |
 | control root | `~/.agents/control` | `PSC_CONTROL_ROOT` |
 | coordinator root | `~/.agents/coordinator` | `PSC_COORDINATOR_ROOT` |
 | specs root | `~/.agents/specs` | `PSC_SPECS_ROOT` |
@@ -485,6 +486,14 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
 | worktree root | `<repo>-worktrees` sibling | `PSC_WORKTREE_ROOT` |
 
 Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 branch，並始終以 run repository 作為 `ScriptWorktreeCreator` 的 git來源，以確保 builder worktree 在對應 repo 池內建立。
+
+`PSC_PREFLIGHT_CMD` 必須為 typed argv，不可使用 shell wrapper。delivery preflight 常見設定範例：
+
+```bash
+export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
+```
+
+實際值請替換為 repo 實際提供的 module / executable，且禁止用 `sh -c` 形式包裝。
 
 共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；installer在後者持久化`PSC_INSTANCE`與`PSC_AGENTS_ROOT`。Interactive CLI以同一`PSC_INSTANCE`選取bootstrap env，不掃描猜測其他instance；symlink、malformed或relative root會fail-closed。installer重跑會更新自身管理的Python/repo值，但保留既有operator roots。Monitor socket預設為`$PSC_RUN_ROOT/project-monitor.sock`，也可由`project-cortex.yaml`的`monitor.socket_path`覆寫；production `MonitorSocketClient`與service使用相同config解析。
 

@@ -173,7 +173,9 @@ def test_preflight_probe_uses_runtime_validator_and_fails_closed_when_unavailabl
     monkeypatch.setattr("paulsha_cortex.doctor._load_runtime_preflight_command", reject)
     result = _preflight_probe({"PSC_PREFLIGHT_CMD": "/usr/bin/env bash -c true"})
     assert result.status == "fail"
-    assert "runtime validator" in result.detail
+    lowered = result.detail.lower()
+    assert "shell wrapper" in lowered
+    assert "typed" in lowered
 
 
 @pytest.mark.parametrize(
@@ -221,7 +223,8 @@ def test_identity_probe_uses_runtime_schema_validator(monkeypatch, tmp_path: Pat
     monkeypatch.setattr("paulsha_cortex.doctor._load_runtime_model_identities", reject)
     result = _identity_probe({"PSC_PROJECT_CONFIG_ROOT": str(config)}, tmp_path)
     assert result.status == "fail"
-    assert "runtime validator" in result.detail
+    lowered = result.detail.lower()
+    assert "validation" in lowered
 
 
 @pytest.mark.parametrize(
@@ -230,6 +233,7 @@ def test_identity_probe_uses_runtime_schema_validator(monkeypatch, tmp_path: Pat
         ("model-identities missing", ("missing", "model-identities")),
         ("model-identities unreadable: /private/operator/config/model-identities.yaml", ("unreadable", "model-identities")),
         ("schema/contract invalid in model-identities", ("schema", "contract", "model-identities")),
+        ("canonical agy planning identity missing", ("canonical", "agy", "planning")),
     ],
 )
 def test_identity_probe_returns_actionable_categories_for_known_errors(

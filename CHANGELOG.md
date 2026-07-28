@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Issue #252：安全化 `cortex doctor` preflight 與 identity 失敗診斷**：對 `PSC_PREFLIGHT_CMD` 與 `model-identities` 失敗做 allowlist 分類，輸出可執行修復方向且不外洩敏感細節，並補齊 fresh-install 相關 preflight 契約文件。
+
 ## [0.1.1] - 2026-07-28
 
 ### Added
