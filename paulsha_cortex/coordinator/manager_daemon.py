@@ -667,14 +667,24 @@ def build_periodic_tick_runner(
 
     def execute() -> dict[str, Any]:
         registry = getattr(dispatcher, "_registry", None)
-        auto_claims = (
-            auto_claim_fn()
-            if auto_claim_fn is not None
-            else manager.run_auto_claim_scan(
-                registry=registry,
-                runtime_factory=planning_runtime.build_production_planning_runtime,
+        auto_claim_error: str | None = None
+        try:
+            auto_claims = (
+                auto_claim_fn()
+                if auto_claim_fn is not None
+                else manager.run_auto_claim_scan(
+                    registry=registry,
+                    runtime_factory=planning_runtime.build_production_planning_runtime,
+                )
             )
-        )
+        except (ValueError, RuntimeError, OSError) as exc:
+            # #216 daemon tick isolation：auto-claim 這個子系統整批失效（例如
+            # 快照載入本身壞掉）不得癱瘓本輪 tick——降級為空 auto_claims，
+            # 讓後面的 workflow resume 迴圈與 run_tick 照常執行；
+            # KeyboardInterrupt/SystemExit 不在攔截範圍，照常往外傳。
+            _log_error(exc, context={"action": "auto-claim-scan"})
+            auto_claims = []
+            auto_claim_error = f"{type(exc).__name__}: {exc}"
         if registry is not None and hasattr(registry, "list_workflow_runs"):
             state_path = getattr(registry, "_state_path", None)
             coordinator_root = (
@@ -716,7 +726,15 @@ def build_periodic_tick_runner(
                         ship_validator=active_ship_validator,
                     )
                 except Exception as exc:
-                    _log_error(exc)
+                    _log_error(
+                        exc,
+                        context={
+                            "action": "resume-workflow",
+                            "work_id": workflow.work_id,
+                            "repo": workflow.repo,
+                            "source_revision": workflow.source_revision,
+                        },
+                    )
                     registry._manager_update_workflow_run(
                         workflow.run_id,
                         facets=("needs_human",),
@@ -755,7 +773,13 @@ def build_periodic_tick_runner(
                 }
             )
         result = run_tick_fn(dispatcher, **run_tick_kwargs)
-        return {**result, "auto_claims": auto_claims}
+        summary = {**result, "auto_claims": auto_claims}
+        if auto_claim_error is not None:
+            # 讓 operator 能從 status/summary 看出 auto-claim 這輪降級了，
+            # 而不是靜默吞掉——不含絕對路徑／token，只有型別＋訊息摘要。
+            summary["auto_claim_failed"] = True
+            summary["auto_claim_error"] = auto_claim_error
+        return summary
 
     return execute
 
@@ -1027,8 +1051,15 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _handle_termination)
 
 
-def _log_error(exc: Exception) -> None:
-    print(f"{contract.utcnow()} manager_daemon error: {type(exc).__name__}: {exc}", file=sys.stderr)
+def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None:
+    message = f"{contract.utcnow()} manager_daemon error: {type(exc).__name__}: {exc}"
+    if context:
+        # 只收安全脈絡（action 種類／work_id／repo／snapshot 或 source
+        # revision）；呼叫端負責不要塞入 token、絕對路徑或 issue 內文。
+        details = " ".join(f"{key}={value}" for key, value in context.items() if value is not None)
+        if details:
+            message = f"{message} ({details})"
+    print(message, file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

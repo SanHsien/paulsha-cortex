@@ -2151,17 +2151,38 @@ def run_auto_claim_scan(
                 live_auto_label = live_auto_label or "cortex:auto-on-going" in names
             if issue_reads_failed:
                 continue
-        result = _claim_action(
-            args={"action": "auto-scan"},
-            authority=authority,
-            now_epoch=now(),
-            state_path=resolved_state,
-            automatic=True,
-            auto_label=live_auto_label,
-            workflow_registry=workflow_registry,
-            workflow_starter=workflow_starter,
-            readiness_checker=readiness_checker,
-        )
+        try:
+            result = _claim_action(
+                args={"action": "auto-scan"},
+                authority=authority,
+                now_epoch=now(),
+                state_path=resolved_state,
+                automatic=True,
+                auto_label=live_auto_label,
+                workflow_registry=workflow_registry,
+                workflow_starter=workflow_starter,
+                readiness_checker=readiness_checker,
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
+            # 單一 authority 的 claim 失敗（例如 #216 daemon tick isolation：
+            # start_canonical_workflow -> resolve_trusted_repo_root 對不在信任
+            # 清單中的 repo fail-closed raise ValueError）不得讓整批 scan 中止；
+            # KeyboardInterrupt/SystemExit 不在攔截範圍，照常往外傳。
+            reason = (
+                "repo-root-unresolved"
+                if isinstance(exc, ValueError) and "trusted repo registry" in str(exc)
+                else "claim-failed"
+            )
+            results.append(
+                {
+                    "repo": authority.repo,
+                    "work_id": authority.work_id,
+                    "action": "blocked",
+                    "reason": reason,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
         if result["action"] not in {"ignore", "done"}:
             results.append(
                 {
