@@ -20,6 +20,7 @@ from .dispatcher import Dispatcher
 from .model_identities import load_model_identities
 from .registry import JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
+from .work_actions import safe_exception_summary
 
 DEFAULT_TICK_INTERVAL = 300.0
 DEFAULT_POLL_INTERVAL = 3.0
@@ -678,13 +679,13 @@ def build_periodic_tick_runner(
                 )
             )
         except (ValueError, RuntimeError, OSError) as exc:
-            # #216 daemon tick isolation：auto-claim 這個子系統整批失效（例如
+            # #246 daemon tick isolation：auto-claim 這個子系統整批失效（例如
             # 快照載入本身壞掉）不得癱瘓本輪 tick——降級為空 auto_claims，
             # 讓後面的 workflow resume 迴圈與 run_tick 照常執行；
             # KeyboardInterrupt/SystemExit 不在攔截範圍，照常往外傳。
             _log_error(exc, context={"action": "auto-claim-scan"})
             auto_claims = []
-            auto_claim_error = f"{type(exc).__name__}: {exc}"
+            auto_claim_error = safe_exception_summary(exc)
         if registry is not None and hasattr(registry, "list_workflow_runs"):
             state_path = getattr(registry, "_state_path", None)
             coordinator_root = (

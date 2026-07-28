@@ -222,6 +222,18 @@ def _canonical_repo_root(value: object, *, repo: str) -> Path:
     return root
 
 
+# #246：例外摘要必須可安全外流——OSError 子類（FileNotFoundError／PermissionError
+# 等）的預設字串會內嵌絕對路徑，而 blocked 結果與 daemon summary 都會被寫進 durable
+# done record 與 log。這裡只保留型別名與清洗過的訊息：POSIX 絕對路徑與 ~ 展開路徑
+# 一律以 <path> 取代（R-21 tier: shareable，AI-SEC-001 禁止輸出個人絕對路徑）。
+_ABSOLUTE_PATH_RE = re.compile(r"(?:~|/)[^\s'\"]*/[^\s'\"]*")
+
+
+def safe_exception_summary(exc: BaseException) -> str:
+    """把例外轉成不含絕對路徑的簡短摘要，供 durable 記錄與日誌使用。"""
+    return f"{type(exc).__name__}: {_ABSOLUTE_PATH_RE.sub('<path>', str(exc))}"
+
+
 def _path_has_symlink(root: Path, relative: str) -> bool:
     current = root
     for part in PurePosixPath(relative).parts:
@@ -2164,7 +2176,7 @@ def run_auto_claim_scan(
                 readiness_checker=readiness_checker,
             )
         except (ValueError, RuntimeError, OSError) as exc:
-            # 單一 authority 的 claim 失敗（例如 #216 daemon tick isolation：
+            # 單一 authority 的 claim 失敗（例如 #246 daemon tick isolation：
             # start_canonical_workflow -> resolve_trusted_repo_root 對不在信任
             # 清單中的 repo fail-closed raise ValueError）不得讓整批 scan 中止；
             # KeyboardInterrupt/SystemExit 不在攔截範圍，照常往外傳。
@@ -2179,7 +2191,7 @@ def run_auto_claim_scan(
                     "work_id": authority.work_id,
                     "action": "blocked",
                     "reason": reason,
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": safe_exception_summary(exc),
                 }
             )
             continue

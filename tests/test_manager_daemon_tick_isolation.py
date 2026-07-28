@@ -1,4 +1,4 @@
-"""#216 迴歸測試：periodic tick 的 execute() 不得被 auto-claim 單點失敗癱瘓。
+"""#246 迴歸測試：periodic tick 的 execute() 不得被 auto-claim 單點失敗癱瘓。
 
 背景：``build_periodic_tick_runner`` 的 ``execute()`` 呼叫
 ``manager.run_auto_claim_scan(...)``（或注入的 ``auto_claim_fn``）以前完全

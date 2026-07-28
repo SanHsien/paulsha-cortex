@@ -1,4 +1,4 @@
-"""#216 迴歸測試：daemon tick 的 auto-claim 掃描逐 authority 隔離。
+"""#246 迴歸測試：daemon tick 的 auto-claim 掃描逐 authority 隔離。
 
 背景（見 manager.log 現場證據）：`run_auto_claim_scan` 的
 ``for authority in authorities:`` 迴圈以前完全沒有包住 ``_claim_action`` ->
@@ -147,3 +147,59 @@ def test_run_auto_claim_scan_claim_failed_reason_for_generic_starter_error(
     assert middle["reason"] == "claim-failed"
     assert "RuntimeError" in middle["error"]
     assert [row["work_id"] for row in result] == ["demo-1", "demo-2", "demo-3"]
+
+
+def test_safe_exception_summary_redacts_absolute_paths() -> None:
+    """#246（verifier finding）：OSError 子類的預設訊息內嵌絕對路徑，
+    而 blocked 結果／daemon summary／log 都會落到 durable done record；
+    摘要必須遮蔽路徑（R-21 tier: shareable）但保留可診斷的型別與語意。"""
+    summary = work_actions.safe_exception_summary(
+        FileNotFoundError(2, "No such file or directory", "/home/someone/.agents/jobs.json")
+    )
+    assert "FileNotFoundError" in summary
+    assert "/home/someone" not in summary
+    assert ".agents/jobs.json" not in summary
+    assert "<path>" in summary
+
+    home_relative = work_actions.safe_exception_summary(
+        PermissionError(13, "Permission denied", "~/.agents/coordinator/state.json")
+    )
+    assert "~/.agents" not in home_relative
+    assert "<path>" in home_relative
+
+    # 不含路徑的訊息必須原樣保留，才不會犧牲診斷力。
+    plain = work_actions.safe_exception_summary(
+        ValueError("trusted repo registry did not resolve exactly one owner/name root")
+    )
+    assert plain == (
+        "ValueError: trusted repo registry did not resolve exactly one owner/name root"
+    )
+
+
+def test_blocked_result_error_summary_is_path_free(tmp_path: Path) -> None:
+    """整條路徑驗證：starter 拋出帶絕對路徑的 OSError 時，
+    blocked 結果的 error 欄位不得洩漏該路徑。"""
+    leaked = tmp_path / "secret-state.json"
+    snapshot = _three_authority_snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    base_starter = work_actions._fallback_workflow_starter(registry, state)
+
+    def _starter(authority, claim_key, reason):
+        if authority.work_id == "demo-2":
+            raise FileNotFoundError(2, "No such file or directory", str(leaked))
+        return base_starter(authority, claim_key, reason)
+
+    results = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        runner=_labeled_runner,
+        workflow_registry=registry,
+        workflow_starter=_starter,
+    )
+    blocked = [row for row in results if row.get("action") == "blocked"]
+    assert blocked, "預期 starter 失敗會產生 blocked 結果"
+    for row in blocked:
+        assert str(tmp_path) not in row.get("error", "")
+        assert "<path>" in row.get("error", "")
