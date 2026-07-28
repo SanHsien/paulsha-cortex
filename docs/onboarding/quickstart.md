@@ -52,7 +52,24 @@ python -m pip install .
 python3 -m paulsha_cortex.cli --version
 ```
 
-## 2. 跑一次 bootstrap
+## 2. 設定 delivery preflight 命令
+
+在第一次執行 `cortex bootstrap` 前，請先設定 `PSC_PREFLIGHT_CMD`，避免第一次就撞到 delivery preflight 的 fail-closed。
+
+```bash
+export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
+```
+
+此為 typed argv 示例，`project_preflight` 請換成 repo 實際提供的 preflight module / executable。請避免使用 shell wrapper（例如 `sh -c`）。
+
+在 `bootstrap` 或 `cortex inspect doctor --json` 前後都可用下面指令驗證：
+
+```bash
+cortex bootstrap --repo-root "$(git rev-parse --show-toplevel)"
+cortex inspect doctor --json
+```
+
+## 3. 跑一次 bootstrap
 
 先進到你要治理的 repo：
 
@@ -85,24 +102,7 @@ cortex service status --instance cortex --json
 cortex inspect doctor --json
 ```
 
-## 2.1 設定 delivery preflight 命令
-
-在第一次執行 `cortex bootstrap` 前，請先設定 `PSC_PREFLIGHT_CMD`，避免第一次就撞到 delivery preflight 的 fail-closed。
-
-```bash
-export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
-```
-
-此為 typed argv 示例，`project_preflight` 請換成 repo 實際提供的 preflight module / executable。請避免使用 shell wrapper（例如 `sh -c`）。
-
-在 `bootstrap` 或 `cortex inspect doctor --json` 前後都可用下面指令驗證：
-
-```bash
-cortex bootstrap --repo-root "$(git rev-parse --show-toplevel)"
-cortex inspect doctor --json
-```
-
-## 3. 建立第一個 workflow
+## 4. 建立第一個 workflow
 
 建立一個 sample workflow：
 
@@ -124,7 +124,7 @@ cortex run tick --wait
 
 `cortex ready --specs-dir "$HOME/.agents/specs"` 會告訴你 sample spec 是否已經符合派工條件；`cortex run tick --wait` 會把 ready 的 workflow 送進 manager，並等待 request 進入 terminal 或 timeout。
 
-## 4. 觀察第一個 workflow 的結果
+## 5. 觀察第一個 workflow 的結果
 
 ```bash
 cortex request list
