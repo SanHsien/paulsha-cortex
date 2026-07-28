@@ -256,13 +256,18 @@ def test_log_error_deduplicates_repeated_signature_with_periodic_summary(capsys)
     assert "a totally different problem" in stderr_tail
 
 
-def test_safe_tick_error_summary_redacts_paths_and_caps_length():
-    exc = ValueError("failed reading /home/example-user/.agents/core/registry/db.sqlite during scan")
+def test_safe_tick_error_summary_redacts_paths_and_caps_length(tmp_path: Path):
+    """受測路徑一律由 tmp_path 動態組出——測試檔本身不得出現使用者絕對路徑的
+    結構字面值（``/home/<name>/``），否則會反過來觸發 R-21 secret scan。
+    這條規則在本輪已重複踩中三次，故於此明文記錄。"""
+    leaked = tmp_path / ".agents" / "core" / "registry" / "db.sqlite"
+    exc = ValueError(f"failed reading {leaked} during scan")
 
     summary = manager_daemon._safe_tick_error_summary(exc)
 
     assert summary["type"] == "ValueError"
-    assert "/home" not in summary["reason"]
+    assert str(tmp_path) not in summary["reason"]
+    assert "db.sqlite" not in summary["reason"]
     assert "<path>" in summary["reason"]
 
     long_exc = RuntimeError("x" * 500)

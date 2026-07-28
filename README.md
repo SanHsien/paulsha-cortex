@@ -1,3 +1,5 @@
+> **Fact:** `paulsha-cortex` 是 work / WorkflowRun / Job / Slice lifecycle 的唯一 authority，負責 vendor-neutral dispatch、retry、review、delivery 與 completion；domain tools 只回傳 artifacts，不得改寫 lifecycle truth。
+
 # paulsha-cortex
 
 `paulsha-cortex` 是由 orchestrator 主導的 harness 治理平面三件套：**persona 契約**、**coordinator 派工**、**control 檔案契約**。它把可移植的治理邏輯拆成獨立套件，讓主 repo 專注在產品行為，並把 Stage 3/4 的 guardrail、manager control plane、deck / monitor 以最小 runtime 依賴方式出貨。
