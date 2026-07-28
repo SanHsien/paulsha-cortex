@@ -15,3 +15,4 @@ work_item: fix-systemctl-install-failure
 - [x] [RED] 依序提交紅測試 `test(installer): 新增 systemctl 失敗 regression (#253)`。
 - [x] [GREEN] 更新 `CHANGELOG.md`（`[Unreleased]`）與 `changelog.d/fix-systemctl-install-failure.md`。
 - [x] [GREEN] 在 service 安裝文件補齊 `daemon-reload`/`enable` 非零時的使用者回報行為。
+- [x] [GREEN] 新增 OpenSpec delta 規格（`openspec/changes/fix-systemctl-install-failure/specs/porcelain-service-lifecycle/spec.md`）並保留在 change bundle。
