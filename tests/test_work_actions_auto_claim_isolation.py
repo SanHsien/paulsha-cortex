@@ -149,22 +149,27 @@ def test_run_auto_claim_scan_claim_failed_reason_for_generic_starter_error(
     assert [row["work_id"] for row in result] == ["demo-1", "demo-2", "demo-3"]
 
 
-def test_safe_exception_summary_redacts_absolute_paths() -> None:
+def test_safe_exception_summary_redacts_absolute_paths(tmp_path: Path) -> None:
     """#246（verifier finding）：OSError 子類的預設訊息內嵌絕對路徑，
     而 blocked 結果／daemon summary／log 都會落到 durable done record；
-    摘要必須遮蔽路徑（R-21 tier: shareable）但保留可診斷的型別與語意。"""
+    摘要必須遮蔽路徑（R-21 tier: shareable）但保留可診斷的型別與語意。
+
+    路徑一律由 tmp_path 動態組出——測試檔本身不得出現個人絕對路徑字面值，
+    否則會反過來觸發 R-21。
+    """
+    leaked = tmp_path / ".agents" / "jobs.json"
     summary = work_actions.safe_exception_summary(
-        FileNotFoundError(2, "No such file or directory", "/home/someone/.agents/jobs.json")
+        FileNotFoundError(2, "No such file or directory", str(leaked))
     )
     assert "FileNotFoundError" in summary
-    assert "/home/someone" not in summary
-    assert ".agents/jobs.json" not in summary
+    assert str(tmp_path) not in summary
+    assert "jobs.json" not in summary
     assert "<path>" in summary
 
     home_relative = work_actions.safe_exception_summary(
-        PermissionError(13, "Permission denied", "~/.agents/coordinator/state.json")
+        PermissionError(13, "Permission denied", "~" + "/.agents/coordinator/state.json")
     )
-    assert "~/.agents" not in home_relative
+    assert "/.agents" not in home_relative
     assert "<path>" in home_relative
 
     # 不含路徑的訊息必須原樣保留，才不會犧牲診斷力。
