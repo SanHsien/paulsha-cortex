@@ -2,7 +2,7 @@
 
 ### Requirement: systemctl 啟用失敗需轉為可行動、無 traceback 的 structured result
 
-`cortex install service` 與 `cortex service install` 在 systemd 可用但 `daemon-reload`／`enable` 失敗時，`install_service_result()` 必須回傳 `mode="systemd"` 且非零 `exit_code` 的 result，訊息需固定包含失敗階段、trimmed stderr、unit directory 與可直接重試的 `systemctl --user ...` 指令，並不得外洩 stdout 或 exception repr。
+`cortex install service` 與 `cortex service install` 在 systemd 可用但 `daemon-reload`／`enable` 失敗時，`install_service_result()` MUST 回傳 `mode="systemd"` 且非零 `exit_code` 的 result，訊息需固定包含失敗階段、trimmed stderr、unit directory 與可直接重試的 `systemctl --user ...` 指令，並不得外洩 stdout 或 exception repr。
 
 #### Scenario: daemon-reload 或 enable 失敗時的 structured result
 
@@ -16,4 +16,3 @@
 - **WHEN** 對同一個非零失敗 stage 執行 `cortex install service` 及 `cortex service install --json`
 - **THEN** 兩者皆以相同非零 exit code 結束
 - **THEN** plain output 與 JSON output 皆轉出一致的人類可判讀訊息要素，且 JSON message 欄位不含 traceback
-
