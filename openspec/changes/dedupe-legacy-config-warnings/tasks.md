@@ -14,3 +14,5 @@ work_item: dedupe-legacy-config-warnings-delivery
 - [x] [GREEN] Route both legacy paths through helper with distinct keys
 - [x] [GREEN] Verify focused tests pass and commit implementation
 - [x] [DOC] Update changelog and docs, then complete governance checks
+- [x] [REPAIR] Preserve legacy warning attribution by keeping `stacklevel=2`
+- [x] [REPAIR] Add regression test to lock warning caller attribution
