@@ -23,6 +23,74 @@ GITHUB_PROVIDER_ID = "github"
 PROVIDER_MAX_AGE_SECONDS = 900
 DERIVED_AUTHORITY_KINDS = frozenset({"workflow_run", "completion_record"})
 
+# #206：穩定 reason code，供 upstream（durable done record／manager log）在不
+# 重新解析訊息文字的情況下辨識是哪一種 authority 驗證失敗。canonical 與 legacy
+# schema 各自的 provider 失敗一律區分 -canonical / -legacy 後綴（AC3）。
+REASON_ROW_MALFORMED = "row-malformed"
+REASON_IDENTITY_INVALID = "identity-invalid"
+REASON_PROVIDER_MISSING_CANONICAL = "provider-authority-missing-canonical"
+REASON_PROVIDER_INVALID_CANONICAL = "provider-authority-invalid-canonical"
+REASON_PROVIDER_MISSING_LEGACY = "provider-authority-missing-legacy"
+REASON_PROVIDER_INVALID_LEGACY = "provider-authority-invalid-legacy"
+
+_UNSAFE_LABEL_PREFIXES = ("/", "~")
+
+
+def _diagnostic_label(value: object, *, max_len: int = 200) -> str | None:
+    """Best-effort, secret-free label for a snapshot row's identity field.
+
+    Only ever attached to :class:`AuthorityValidationError` for diagnostics
+    — never used for authorization decisions. Rejects values that look like
+    filesystem paths so a malformed row can never smuggle an absolute path
+    into a durable error message (tier: shareable — AI-SEC-001 契約）.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text.startswith(_UNSAFE_LABEL_PREFIXES) or "\\" in text:
+        return None
+    if len(text) > max_len:
+        text = text[:max_len] + "…"
+    return text
+
+
+class AuthorityValidationError(ValueError):
+    """Row-scoped authority validation failure with secret-free diagnostics.
+
+    Carries a stable ``reason_code`` plus ``repo``/``work_id``/
+    ``provider_id``/``field`` (#206 AC1/AC3) so upstream durable done
+    records and Manager logs can record *which* mutation failed without
+    re-parsing message text. Remains a ``ValueError`` subclass so existing
+    ``except ValueError`` call sites keep working unchanged.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str,
+        repo: str | None = None,
+        work_id: str | None = None,
+        provider_id: str | None = None,
+        field: str | None = None,
+    ) -> None:
+        self.reason_code = reason_code
+        self.repo = repo
+        self.work_id = work_id
+        self.provider_id = provider_id
+        self.field = field
+        self.base_message = message
+        details = [f"reason={reason_code}"]
+        for label, value in (
+            ("repo", repo),
+            ("work_id", work_id),
+            ("provider_id", provider_id),
+            ("field", field),
+        ):
+            if value is not None:
+                details.append(f"{label}={value}")
+        super().__init__(f"{message} ({', '.join(details)})")
+
 
 def semantic_source_revision(
     *,
@@ -56,14 +124,24 @@ def semantic_source_revision(
             else {"open", "closed", "merged"}
         )
         if state not in allowed:
-            raise ValueError(f"canonical {kind} lifecycle status invalid")
+            raise AuthorityValidationError(
+                f"canonical {kind} lifecycle status invalid",
+                reason_code=REASON_ROW_MALFORMED,
+                repo=_diagnostic_label(repo),
+                field="status",
+            )
         return source_id, f"identity:{ref};state:{state}"
     if kind in {"todo", "superpowers_spec", "superpowers_plan"}:
         return source_id, f"identity:{ref}"
     if kind == "openspec":
         state = str(status or "").lower()
         if state not in {"active", "archived"}:
-            raise ValueError("canonical openspec lifecycle status invalid")
+            raise AuthorityValidationError(
+                "canonical openspec lifecycle status invalid",
+                reason_code=REASON_ROW_MALFORMED,
+                repo=_diagnostic_label(repo),
+                field="status",
+            )
         return f"openspec:{repo}:{ref}", f"identity:{ref};state:{state}"
     return source_id, revision
 
@@ -144,7 +222,12 @@ def _load_snapshot(snapshot_path: str | Path | None = None) -> tuple[dict, str]:
         # PR A canonical schema keys GitHub providers by repo.
         return payload, verification.canonical_json_hash(payload)
     if not isinstance(github, dict) or github.get("provider_id") != GITHUB_PROVIDER_ID:
-        raise ValueError("durable GitHub provider authority missing")
+        raise AuthorityValidationError(
+            "durable GitHub provider authority missing",
+            reason_code=REASON_PROVIDER_MISSING_LEGACY,
+            provider_id=GITHUB_PROVIDER_ID,
+            field="provider_id",
+        )
     revision = github.get("revision")
     last_success = github.get("last_success_epoch")
     degraded = github.get("degraded")
@@ -157,7 +240,22 @@ def _load_snapshot(snapshot_path: str | Path | None = None) -> tuple[dict, str]:
         or not isinstance(degraded, bool)
         or degraded
     ):
-        raise ValueError("durable GitHub provider authority invalid")
+        if not isinstance(revision, str) or not revision.strip():
+            field = "revision"
+        elif (
+            not isinstance(last_success, (int, float))
+            or isinstance(last_success, bool)
+            or not math.isfinite(float(last_success))
+        ):
+            field = "last_success_epoch"
+        else:
+            field = "degraded"
+        raise AuthorityValidationError(
+            "durable GitHub provider authority invalid",
+            reason_code=REASON_PROVIDER_INVALID_LEGACY,
+            provider_id=GITHUB_PROVIDER_ID,
+            field=field,
+        )
     return payload, verification.canonical_json_hash(payload)
 
 
@@ -165,9 +263,14 @@ def _authority_from_row(
     *, row: object, providers: dict, snapshot_hash: str
 ) -> WorkAuthority | None:
     if not isinstance(row, dict):
-        raise ValueError("confirmed work authority row malformed")
+        raise AuthorityValidationError(
+            "confirmed work authority row malformed",
+            reason_code=REASON_ROW_MALFORMED,
+        )
     repo = row.get("repo")
     work_id = row.get("work_id")
+    repo_label = _diagnostic_label(repo)
+    work_id_label = _diagnostic_label(work_id)
     if "mapped_issues" not in row:
         return _authority_from_canonical_row(
             row=row,
@@ -176,7 +279,14 @@ def _authority_from_row(
         )
     github = providers.get(GITHUB_PROVIDER_ID)
     if not isinstance(github, dict):
-        raise ValueError("durable GitHub provider authority missing")
+        raise AuthorityValidationError(
+            "durable GitHub provider authority missing",
+            reason_code=REASON_PROVIDER_MISSING_LEGACY,
+            repo=repo_label,
+            work_id=work_id_label,
+            provider_id=GITHUB_PROVIDER_ID,
+            field="providers.github",
+        )
     issues = row.get("mapped_issues")
     prs = row.get("mapped_prs", [])
     changes = row.get("mapped_openspec", [])
@@ -202,24 +312,51 @@ def _authority_from_row(
         or any(not _safe_todo_path(path) for path in todo_paths)
         or len(set(todo_paths)) != len(todo_paths)
     ):
-        raise ValueError("confirmed work authority mapped issues invalid")
-    if (
-        not isinstance(repo, str)
-        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None
-        or not isinstance(work_id, str)
-        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
-    ):
-        raise ValueError("confirmed work authority identity invalid")
+        raise AuthorityValidationError(
+            "confirmed work authority mapped issues invalid",
+            reason_code=REASON_ROW_MALFORMED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="mapped_issues",
+        )
+    repo_valid = isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is not None
+    work_id_valid = isinstance(work_id, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is not None
+    if not repo_valid or not work_id_valid:
+        raise AuthorityValidationError(
+            "confirmed work authority identity invalid",
+            reason_code=REASON_IDENTITY_INVALID,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="repo" if not repo_valid else "work_id",
+        )
     if not isinstance(confirmed_todo, bool):
-        raise ValueError("confirmed work authority Todo flag invalid")
+        raise AuthorityValidationError(
+            "confirmed work authority Todo flag invalid",
+            reason_code=REASON_ROW_MALFORMED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="confirmed_todo",
+        )
     if not isinstance(auto_label, bool):
-        raise ValueError("confirmed work authority auto label invalid")
+        raise AuthorityValidationError(
+            "confirmed work authority auto label invalid",
+            reason_code=REASON_ROW_MALFORMED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="auto_label",
+        )
     if (
         not isinstance(source_revisions, list)
         or not source_revisions
         or any(not isinstance(value, str) or not value.strip() for value in source_revisions)
     ):
-        raise ValueError("confirmed work authority revisions invalid")
+        raise AuthorityValidationError(
+            "confirmed work authority revisions invalid",
+            reason_code=REASON_ROW_MALFORMED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="source_revisions",
+        )
     return WorkAuthority._verified(
         repo=repo,
         work_id=work_id,
@@ -242,22 +379,47 @@ def _authority_from_canonical_row(
     repo = row.get("repo")
     work_id = row.get("work_id")
     sources = row.get("sources")
+    repo_label = _diagnostic_label(repo)
+    work_id_label = _diagnostic_label(work_id)
     if not isinstance(repo, str) or not isinstance(work_id, str) or not isinstance(sources, list):
-        raise ValueError("canonical work authority row malformed")
+        raise AuthorityValidationError(
+            "canonical work authority row malformed",
+            reason_code=REASON_ROW_MALFORMED,
+            repo=repo_label,
+            work_id=work_id_label,
+        )
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
-        raise ValueError("canonical work authority identity invalid")
+        raise AuthorityValidationError(
+            "canonical work authority identity invalid",
+            reason_code=REASON_IDENTITY_INVALID,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="repo",
+        )
     next_actions = row.get("next_actions")
     if next_actions is not None and (
         not isinstance(next_actions, list)
         or any(not isinstance(action, str) or not action for action in next_actions)
     ):
-        raise ValueError("canonical work authority actions malformed")
+        raise AuthorityValidationError(
+            "canonical work authority actions malformed",
+            reason_code=REASON_ROW_MALFORMED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="next_actions",
+        )
     if any(
         not isinstance(source, dict)
         or source.get("confidence") not in {"confirmed", "inferred"}
         for source in sources
     ):
-        raise ValueError("canonical work authority sources malformed")
+        raise AuthorityValidationError(
+            "canonical work authority sources malformed",
+            reason_code=REASON_ROW_MALFORMED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="sources",
+        )
     if sources and all(source["confidence"] == "inferred" for source in sources):
         return None
     confirmed = [
@@ -272,11 +434,24 @@ def _authority_from_canonical_row(
     if not any(source.get("kind") in todo_kinds for source in confirmed):
         return None
     if re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
-        raise ValueError("canonical work authority identity invalid")
+        raise AuthorityValidationError(
+            "canonical work authority identity invalid",
+            reason_code=REASON_IDENTITY_INVALID,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="work_id",
+        )
     provider_id = f"github:{repo}"
     github = providers.get(provider_id)
     if not isinstance(github, dict):
-        raise ValueError("durable GitHub provider authority missing")
+        raise AuthorityValidationError(
+            "durable GitHub provider authority missing",
+            reason_code=REASON_PROVIDER_MISSING_CANONICAL,
+            repo=repo_label,
+            work_id=work_id_label,
+            provider_id=provider_id,
+            field="providers",
+        )
     revision = github.get("revision")
     last_success_at = github.get("last_success_at")
     if (
@@ -285,11 +460,31 @@ def _authority_from_canonical_row(
         or not revision
         or not isinstance(last_success_at, str)
     ):
-        raise ValueError("durable GitHub provider authority invalid")
+        if github.get("status") != "ok":
+            field = "status"
+        elif not isinstance(revision, str) or not revision:
+            field = "revision"
+        else:
+            field = "last_success_at"
+        raise AuthorityValidationError(
+            "durable GitHub provider authority invalid",
+            reason_code=REASON_PROVIDER_INVALID_CANONICAL,
+            repo=repo_label,
+            work_id=work_id_label,
+            provider_id=provider_id,
+            field=field,
+        )
     try:
         last_success = datetime.fromisoformat(last_success_at.replace("Z", "+00:00")).timestamp()
     except ValueError as exc:
-        raise ValueError("durable GitHub provider timestamp invalid") from exc
+        raise AuthorityValidationError(
+            "durable GitHub provider timestamp invalid",
+            reason_code=REASON_PROVIDER_INVALID_CANONICAL,
+            repo=repo_label,
+            work_id=work_id_label,
+            provider_id=provider_id,
+            field="last_success_at",
+        ) from exc
     issues: list[int] = []
     prs: list[int] = []
     changes: list[str] = []
@@ -300,16 +495,34 @@ def _authority_from_canonical_row(
         if kind in {"github_issue", "github_pr"}:
             match = re.fullmatch(rf"{re.escape(repo)}#([1-9][0-9]*)", str(ref or ""))
             if match is None:
-                raise ValueError("canonical GitHub work source ref invalid")
+                raise AuthorityValidationError(
+                    "canonical GitHub work source ref invalid",
+                    reason_code=REASON_ROW_MALFORMED,
+                    repo=repo_label,
+                    work_id=work_id_label,
+                    field="sources.ref",
+                )
             target = issues if kind == "github_issue" else prs
             target.append(int(match.group(1)))
         elif kind == "openspec":
             if not isinstance(ref, str) or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", ref) is None:
-                raise ValueError("canonical OpenSpec work source ref invalid")
+                raise AuthorityValidationError(
+                    "canonical OpenSpec work source ref invalid",
+                    reason_code=REASON_ROW_MALFORMED,
+                    repo=repo_label,
+                    work_id=work_id_label,
+                    field="sources.ref",
+                )
             changes.append(ref)
         elif kind == "todo":
             if not _safe_todo_path(ref):
-                raise ValueError("canonical Todo work source ref invalid")
+                raise AuthorityValidationError(
+                    "canonical Todo work source ref invalid",
+                    reason_code=REASON_ROW_MALFORMED,
+                    repo=repo_label,
+                    work_id=work_id_label,
+                    field="sources.ref",
+                )
             todo_paths.append(ref)
     confirmed_todo = any(source.get("kind") in todo_kinds for source in confirmed)
     semantic_sources: dict[str, str] = {}
@@ -333,12 +546,24 @@ def _authority_from_canonical_row(
         key, value = semantic
         previous = semantic_sources.setdefault(key, value)
         if previous != value:
-            raise ValueError("confirmed semantic work authority revisions conflict")
+            raise AuthorityValidationError(
+                "confirmed semantic work authority revisions conflict",
+                reason_code=REASON_ROW_MALFORMED,
+                repo=repo_label,
+                work_id=work_id_label,
+                field="source_revisions",
+            )
     source_revisions = tuple(
         f"{source_id}@{semantic_sources[source_id]}" for source_id in sorted(semantic_sources)
     )
     if not source_revisions:
-        raise ValueError("confirmed work authority revisions invalid")
+        raise AuthorityValidationError(
+            "confirmed work authority revisions invalid",
+            reason_code=REASON_ROW_MALFORMED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="source_revisions",
+        )
     return WorkAuthority._verified(
         repo=repo,
         work_id=work_id,
@@ -414,16 +639,33 @@ def claim_identity_digest(authority: WorkAuthority) -> str:
     return verification.canonical_json_hash(payload)
 
 
-def load_work_authorities(
+def _load_work_authorities_with_diagnostics(
     *, snapshot_path: str | Path | None = None
-) -> tuple[WorkAuthority, ...]:
+) -> tuple[tuple[WorkAuthority, ...], tuple[AuthorityValidationError, ...]]:
+    """Parse every row independently (#206 AC4): one row's validation failure
+    is recorded as ``AuthorityValidationError`` diagnostics and the row is
+    dropped from the result, but parsing continues for the remaining rows —
+    an unrelated repo's degraded/malformed provider must never blast-radius
+    a healthy repo's work-action (durable "authority invalid" recurrence).
+
+    Fail-closed is preserved: a skipped row's work item simply never appears
+    in the returned authorities, so any lookup for it still fails — just
+    with the specific skip reason (see ``load_work_authority``) instead of
+    aborting the whole snapshot load.
+    """
     payload, digest = _load_snapshot(snapshot_path)
     providers = payload["providers"]
-    parsed = (
-        _authority_from_row(row=row, providers=providers, snapshot_hash=digest)
-        for row in payload["work_items"]
-    )
-    authorities = tuple(authority for authority in parsed if authority is not None)
+    parsed: list[WorkAuthority] = []
+    skipped: list[AuthorityValidationError] = []
+    for row in payload["work_items"]:
+        try:
+            authority = _authority_from_row(row=row, providers=providers, snapshot_hash=digest)
+        except AuthorityValidationError as exc:
+            skipped.append(exc)
+            continue
+        if authority is not None:
+            parsed.append(authority)
+    authorities = tuple(parsed)
     identities = [(authority.repo, authority.work_id) for authority in authorities]
     if len(set(identities)) != len(identities):
         raise ValueError("confirmed work authority missing or ambiguous")
@@ -433,6 +675,9 @@ def load_work_authorities(
     # transfer state that must never surface — refuse rather than silently
     # picking a "winner": every claim/ship/abandon caller loads authority
     # through here, so this closes the ambiguity at the single choke point.
+    # These two integrity checks are snapshot-wide invariants, not per-row
+    # parsing failures, so they intentionally keep the pre-#206 raise
+    # behaviour rather than joining the per-row isolation above.
     owners: dict[tuple[str, int], str] = {}
     for authority in authorities:
         for issue in authority.mapped_issues:
@@ -440,6 +685,13 @@ def load_work_authorities(
             owner = owners.setdefault(key, authority.work_id)
             if owner != authority.work_id:
                 raise ValueError("confirmed work authority missing or ambiguous")
+    return authorities, tuple(skipped)
+
+
+def load_work_authorities(
+    *, snapshot_path: str | Path | None = None
+) -> tuple[WorkAuthority, ...]:
+    authorities, _skipped = _load_work_authorities_with_diagnostics(snapshot_path=snapshot_path)
     return authorities
 
 
@@ -449,14 +701,20 @@ def load_work_authority(
     work_id: str,
     snapshot_path: str | Path | None = None,
 ) -> WorkAuthority:
+    authorities, skipped = _load_work_authorities_with_diagnostics(snapshot_path=snapshot_path)
     matches = [
         authority
-        for authority in load_work_authorities(snapshot_path=snapshot_path)
+        for authority in authorities
         if authority.repo == repo and authority.work_id == work_id
     ]
-    if len(matches) != 1:
-        raise ValueError("confirmed work authority missing or ambiguous")
-    return matches[0]
+    if len(matches) == 1:
+        return matches[0]
+    # #206 AC1/C：目標本身就是被跳過的壞 row → 拋出帶該 row reason code 的錯誤，
+    # 而不是泛化的 missing/ambiguous，讓呼叫端能診斷「因為它的 authority 無效」。
+    for exc in skipped:
+        if exc.repo == repo and exc.work_id in (None, work_id):
+            raise exc
+    raise ValueError("confirmed work authority missing or ambiguous")
 
 
 @dataclass(frozen=True)
