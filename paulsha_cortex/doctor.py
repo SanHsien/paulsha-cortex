@@ -100,22 +100,24 @@ def _preflight_failure_detail(exc: BaseException) -> str:
     message = str(exc).lower()
     if "psc_preflight_cmd is required" in message:
         return (
-            "PSC_PREFLIGHT_CMD is required; set it to typed argv, "
-            "例如: `python3 -m project_preflight`。"
+            "PSC_PREFLIGHT_CMD is required (category: required); "
+            "set it to a typed argv, for example: `python3 -m project_preflight`."
         )
     if "psc_preflight_cmd is malformed" in message:
         return (
-            "PSC_PREFLIGHT_CMD is malformed; use typed argv format "
+            "PSC_PREFLIGHT_CMD is malformed (category: malformed); use typed argv format "
             "and avoid shell metacharacters."
         )
     if "psc_preflight_cmd shell wrapper is not allowed" in message:
         return (
-            "PSC_PREFLIGHT_CMD uses a shell wrapper; replace it with typed argv "
+            "PSC_PREFLIGHT_CMD uses a shell wrapper (category: shell-wrapper-not-allowed); "
+            "replace it with typed argv "
             "for example: `python3 -m project_preflight`."
         )
     if message.startswith("psc_preflight_cmd executable unavailable: "):
         return (
-            "PSC_PREFLIGHT_CMD executable unavailable; install the configured "
+            "PSC_PREFLIGHT_CMD executable unavailable (category: executable-unavailable); "
+            "install the configured "
             "preflight executable and verify the command path."
         )
     return (
@@ -137,7 +139,9 @@ def _identity_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
     ).expanduser()
     try:
         schema_version = _load_runtime_model_identities(config_root)
-    except (ImportError, OSError, ValueError, Exception) as exc:
+    except Exception as exc:
+        # Catch identity validation failures broadly to avoid leaking runtime payloads
+        # while preserving fail-closed behavior for unknown future errors.
         return ProbeResult("model-identities", "fail", _identity_failure_detail(exc), True)
     return ProbeResult(
         "model-identities",
@@ -150,10 +154,14 @@ def _identity_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
 def _identity_failure_detail(exc: BaseException) -> str:
     message = str(exc).lower()
     if "model-identities missing" in message:
-        return "model-identities is missing; create PSC_PROJECT_CONFIG_ROOT/model-identities.yaml first."
+        return (
+            "model-identities is missing (category: registry-missing); "
+            "create PSC_PROJECT_CONFIG_ROOT/model-identities.yaml first."
+        )
     if "unreadable" in message:
         return (
-            "model-identities is unreadable; ensure the file exists and can be read "
+            "model-identities is unreadable (category: registry-unreadable); "
+            "ensure the file exists and can be read "
             "by the doctor runtime."
         )
     if (
@@ -165,12 +173,14 @@ def _identity_failure_detail(exc: BaseException) -> str:
         or "contract invalid" in message
     ):
         return (
-            "model-identities schema or contract is invalid; fix identity schema and "
+            "model-identities schema or contract is invalid (category: registry-invalid); "
+            "fix identity schema and "
             "capability settings."
         )
     if "canonical agy planning identity missing" in message:
         return (
-            "canonical agy planning identity missing; define planning identity "
+            "canonical agy planning identity missing (category: registry-invalid); "
+            "define planning identity "
             "with `executor: agy` and planning capability."
         )
     return (

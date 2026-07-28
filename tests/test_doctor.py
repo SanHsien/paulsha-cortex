@@ -183,10 +183,10 @@ def test_preflight_probe_uses_runtime_validator_and_fails_closed_when_unavailabl
     [
         ("PSC_PREFLIGHT_CMD is required", ("required", "set")),
         ("PSC_PREFLIGHT_CMD is malformed", ("malformed", "typed")),
-        ("PSC_PREFLIGHT_CMD shell wrapper is not allowed", ("shell wrapper", "typed")),
+        ("PSC_PREFLIGHT_CMD shell wrapper is not allowed", ("shell-wrapper-not-allowed", "typed")),
         (
             "PSC_PREFLIGHT_CMD executable unavailable: /private/operator/bin/preflight",
-            ("executable unavailable",),
+            ("executable-unavailable",),
         ),
     ],
 )
@@ -230,13 +230,16 @@ def test_identity_probe_uses_runtime_schema_validator(monkeypatch, tmp_path: Pat
 @pytest.mark.parametrize(
     ("exc", "needles"),
     [
-        ("model-identities missing", ("missing", "model-identities")),
-        ("model-identities unreadable: /private/operator/config/model-identities.yaml", ("unreadable", "model-identities")),
+        ("model-identities missing", ("missing", "model-identities", "registry-missing")),
+        (
+            "model-identities unreadable: /private/operator/config/model-identities.yaml",
+            ("unreadable", "model-identities", "registry-unreadable"),
+        ),
         (
             "model-identities schema_version must be one of [1, 2], got 99",
-            ("schema", "contract", "model-identities"),
+            ("schema", "contract", "registry-invalid", "model-identities"),
         ),
-        ("canonical agy planning identity missing", ("canonical", "agy", "planning")),
+        ("canonical agy planning identity missing", ("canonical", "agy", "planning", "registry-invalid")),
     ],
 )
 def test_identity_probe_returns_actionable_categories_for_known_errors(

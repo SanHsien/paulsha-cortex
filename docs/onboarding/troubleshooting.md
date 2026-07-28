@@ -34,8 +34,8 @@
 | --- | --- | --- |
 | 未設定 `PSC_PREFLIGHT_CMD` | `required` | 設定環境變數為 typed argv，確認 delivery preflight 可直接執行 |
 | 命令格式不符 | `malformed` | 使用 argv 參數而非 shell 指令字串 |
-| 使用 shell wrapper | `shell wrapper` | 改用直接 module/executable，例如 `python3 -m project_preflight` |
-| executable 不可用 | `executable unavailable` | 安裝/調整 PATH，或改用可執行的絕對/相對命令，避免 shell 包裹 |
+| 使用 shell wrapper | `shell-wrapper-not-allowed` | 改用直接 module/executable，例如 `python3 -m project_preflight` |
+| executable 不可用 | `executable-unavailable` | 安裝/調整 PATH，或改用可執行的絕對/相對命令，避免 shell 包裹 |
 
 ## manager degraded
 
