@@ -263,12 +263,15 @@ def test_service_install_systemctl_failure_reports_expected_channel(
         assert payload["command"] == "install"
         assert payload["mode"] == "systemd"
         assert payload["result"]["exit_code"] == 7
-        assert "Failed to enable unit" in payload["message"]
+        assert "Failed to enable beta-monitor.service" in payload["message"]
         assert f"{service_runtime['home'] / '.config' / 'systemd' / 'user'}" in payload["message"]
+        assert "systemctl --user enable beta-monitor.service" in payload["message"]
         assert "Traceback" not in payload["message"]
     else:
         combined = captured.out + captured.err
         assert "Failed to enable beta-monitor.service" in combined
+        assert f"{service_runtime['home'] / '.config' / 'systemd' / 'user'}" in combined
+        assert "systemctl --user enable beta-monitor.service" in combined
         assert "Traceback" not in combined
 
 
