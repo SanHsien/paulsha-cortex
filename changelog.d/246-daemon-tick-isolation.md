@@ -1,3 +1,0 @@
-### Fixed
-
-- **Issue #246：auto-claim 單一 work item 失敗不再中止整個 periodic tick**：`work_actions.run_auto_claim_scan()` 的逐 authority 迴圈新增 try/except，任一 authority 的 claim 流程 raise（例如 `resolve_trusted_repo_root` 對不在信任清單的 repo fail-closed）改為 append 一筆帶 `repo-root-unresolved`／`claim-failed` reason 與不含機密的錯誤摘要的 blocked 結果並處理下一個 authority，不再讓整批掃描中止；`manager_daemon.build_periodic_tick_runner` 的 `execute()` 同步包住 auto-claim 呼叫，失敗時 `_log_error` 記錄安全脈絡（action／work_id／repo／source revision）並讓 `auto_claims` 降級為空 list，後面的 workflow resume 迴圈與 `run_tick` 照常執行，回傳 summary 新增 `auto_claim_failed`／`auto_claim_error` 供 operator 觀察降級（現場證據：17,013 次同一則 `ValueError` 每 4-5 秒重複，持續 22 小時）。
