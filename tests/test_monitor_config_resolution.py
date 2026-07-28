@@ -18,10 +18,7 @@ def _write(p: Path, text="workspaces:\n  - {name: a, path: /tmp/a}\n"):
 @pytest.fixture
 def isolate_warning_state(monkeypatch):
     original = getattr(monitor_config, "_WARNED_DEPRECATIONS", None)
-    if original is None:
-        monkeypatch.setattr(monitor_config, "_WARNED_DEPRECATIONS", set(), raising=False)
-    else:
-        monkeypatch.setattr(monitor_config, "_WARNED_DEPRECATIONS", set(original))
+    monkeypatch.setattr(monitor_config, "_WARNED_DEPRECATIONS", set(), raising=False)
     yield
     if original is None:
         monkeypatch.delattr(monitor_config, "_WARNED_DEPRECATIONS", raising=False)

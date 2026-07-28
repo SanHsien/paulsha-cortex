@@ -7,6 +7,7 @@
   - 不會合併任何 ambient 的 `project-hippo.yaml`（完全顯式）。
 - `config_path` 未傳入：
   - 依序使用 `PSC_MONITOR_CONFIG`、`PAULSHACLAW_CONFIG`、標準 `project-cortex.yaml` 或 legacy `paulshaclaw.yaml`。
+  - legacy config 的警告仍會提醒，但每個 process 每種 legacy 路徑僅會提示一次，且不影響既有訊息內容與設定解析順序。
   - 合併對應路徑下可見的 `project-hippo.yaml`，以提供 ambient projects。
 
 這個行為是為了讓「給定 explicit config」與「主機預設 ambient 設定」之間維持明確邊界：

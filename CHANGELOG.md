@@ -6,6 +6,11 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Fixed
+- **Issue #254：legacy monitor config 警告去重**：在
+  `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
+  去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy
+  file fallback 在同一 process 重複輸出警告。
 
 ## [0.1.1] - 2026-07-28
 
