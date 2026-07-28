@@ -248,3 +248,50 @@ def test_install_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
 
     assert exc.value.code == 2
     assert "interval 必須為正整數" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("failure_command",),
+    [
+        (["systemctl", "--user", "daemon-reload"],),
+        (["systemctl", "--user", "enable", "beta-monitor.service"],),
+        (["systemctl", "--user", "enable", "beta-manager.timer"],),
+    ],
+)
+def test_install_service_result_reports_systemctl_step_error(
+    tmp_path,
+    monkeypatch,
+    failure_command,
+):
+    from paulsha_cortex.deploy import installer
+
+    calls: list[list[str]] = []
+    unit_dir = tmp_path / ".config" / "systemd" / "user"
+    expected_commands = [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "beta-monitor.service"],
+        ["systemctl", "--user", "enable", "beta-manager.timer"],
+    ]
+    failure_index = expected_commands.index(failure_command)
+
+    def fake_run(argv, *args, **kwargs):
+        calls.append(list(argv))
+        returncode = 7 if argv == failure_command else 0
+        message = "Failed to enable unit" if argv == failure_command else ""
+        return subprocess.CompletedProcess(argv, returncode, stdout="DO_NOT_SURFACE", stderr=message)
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
+    fake_result = installer.install_service_result("beta", 120, tmp_path / "repo")
+
+    assert fake_result.mode == "systemd"
+    assert fake_result.exit_code == 7
+    assert fake_result.message
+    assert "Failed to enable unit" in fake_result.message
+    assert str(unit_dir) in fake_result.message
+    assert " ".join(failure_command) in fake_result.message
+    assert "DO_NOT_SURFACE" not in fake_result.message
+    assert "CompletedProcess" not in fake_result.message
+    assert "Traceback" not in fake_result.message
+    assert calls == expected_commands[: failure_index + 1]
