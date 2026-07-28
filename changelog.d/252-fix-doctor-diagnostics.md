@@ -1,0 +1,1 @@
+- 修正 `doctor.py` 對 preflight 與 identity 例外的可行動診斷訊息，改以分類化且不含敏感資訊的 detail 呈現（#252）。
