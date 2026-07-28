@@ -176,7 +176,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    ```
 
    `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
-   `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 目錄與重試 command（`systemctl --user ...`），不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
+   `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 落檔位置、重試 command（`systemctl --user ...`），並明確指出「unit 已寫入但僅 reload/enable 尚未完成」，不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
 
 10. 用 `run` 家族提交高階 mutation；不加 `--wait` 時會回傳 request ID 並以 exit 3 表示 accepted-pending：
 

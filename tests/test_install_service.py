@@ -289,6 +289,7 @@ def test_install_service_and_install_reports_systemctl_step_error(
     assert fake_result.exit_code == 7
     assert fake_result.message
     assert "Failed to enable unit" in fake_result.message
+    assert "unit 已落檔於" in fake_result.message
     assert str(unit_dir) in fake_result.message
     assert " ".join(failure_command) in fake_result.message
     assert "DO_NOT_SURFACE" not in fake_result.message

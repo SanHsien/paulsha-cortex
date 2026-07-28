@@ -73,16 +73,17 @@ def _systemctl_install_failure(
     unit_dir: Path,
     retry_argv: Sequence[str],
 ) -> InstallServiceResult:
-    message = (result.stderr or "systemctl 指令失敗").strip()
-    if not message:
-        message = "未回報錯誤訊息"
+    stderr_message = (result.stderr or "systemctl 指令失敗").strip()
+    if not stderr_message:
+        stderr_message = "未回報錯誤訊息"
     retry_command = " ".join(("systemctl", "--user", *retry_argv))
     exit_code = result.returncode if result.returncode > 0 else 1
     return InstallServiceResult(
         exit_code=exit_code,
         mode="systemd",
         message=(
-            f"{stage} 失敗：{message}\n"
+            f"systemctl {stage} 失敗：{stderr_message}\n"
+            f"unit 已落檔於 {unit_dir}，僅 systemd reload/enable 未完成。\n"
             f"unit dir: {unit_dir}\n"
             f"retry: {retry_command}"
         ),
