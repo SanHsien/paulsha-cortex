@@ -221,7 +221,7 @@ def test_service_install_json_reports_fallback_mode_when_systemd_is_unavailable(
 
 
 @pytest.mark.parametrize("use_json", [False, True], ids=["plain", "json"])
-def test_service_install_reports_systemd_failure_with_expected_channel(
+def test_service_install_systemctl_failure_reports_expected_channel(
     service_runtime: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

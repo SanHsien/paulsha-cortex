@@ -258,7 +258,7 @@ def test_install_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
         (["systemctl", "--user", "enable", "beta-manager.timer"],),
     ],
 )
-def test_install_service_result_reports_systemctl_step_error(
+def test_install_service_and_install_reports_systemctl_step_error(
     tmp_path,
     monkeypatch,
     failure_command,
