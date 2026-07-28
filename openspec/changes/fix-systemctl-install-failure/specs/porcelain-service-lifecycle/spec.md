@@ -8,7 +8,7 @@
 
 - **WHEN** `cortex install service` 在 `daemon-reload`、`enable <instance>-monitor.service` 或 `enable <instance>-manager.timer` 任一步驟回傳非零
 - **THEN** command sequence 必須於第一個非零步驟停止並回傳 `InstallServiceResult(mode="systemd", exit_code=returncode)`
-- **THEN** message 必須包含失敗步驟、`stderr`、`~/.agents/core/service-units/<instance>/`、以及該步驟對應的 `systemctl --user ...` 重試命令
+- **THEN** message 必須包含失敗步驟、`stderr`、`~/.config/systemd/user`、以及該步驟對應的 `systemctl --user ...` 重試命令
 - **THEN** message 不得包含 `CompletedProcess`、`Traceback`、`stdout`、環境變數或其他非必要路徑
 
 #### Scenario: plain 與 JSON CLI 共用同一失敗 contract
