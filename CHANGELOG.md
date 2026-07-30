@@ -6,6 +6,9 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Added
+- **批次 B planning artifacts（#261／#256／#262／#205／#135）**：為五個 issue 各新增 spec／design／plan／workstream todo 與 openspec change（`2026-07-30-<work_item>`），並登錄 `.cortex/work-items.yaml`，作為 cortex work-item lifecycle 的 confirmed authority。五組皆通過 `assess_planning_completeness`（`status: accepted`、必要章節齊備、無 blocking marker）。本 PR 只提供 planning authority，實作由後續 cortex 派工的 build phase 完成。
+
 ### Fixed
 - **Issue #270：CLAUDE.md 的 changelog 要求對齊 engine R-09**：agent 指引原先三處（改 code 時、
   claim done 前）都只要求 `CHANGELOG.md [Unreleased]`，與 R-09 實際檢查的 `changelog.d/*.md`
