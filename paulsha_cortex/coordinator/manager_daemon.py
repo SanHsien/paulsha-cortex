@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +30,11 @@ DEFAULT_PERSONA = "builder"
 DEFAULT_EXECUTOR = "copilot"
 DEFAULT_MAX_LOAD = 1.0
 RECENT_DONE_LIMIT = 10
+# issue #265：`recent_done` 需要 recency window 才不會被過期 manifest 永久佔滿名額。
+# 24 小時是「一次 tick 週期 ~5 分鐘」與「operator 至少每天巡一次面板」之間的折衷值：
+# 夠短，不會讓數天前的死屍霸占僅 10 個名額；夠長，跨夜、跨個位數 tick 失敗重試仍在窗內。
+# 可用 PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS 覆寫，見 README「觀察任務狀態」章節。
+RECENT_DONE_WINDOW_SECONDS = 86400.0
 MANAGER_CMD_MARKER = "paulsha_cortex.coordinator.manager_daemon"
 
 # Periodic-tick failure resilience (issue #249): a persistently failing tick
@@ -142,6 +148,30 @@ def default_tick_interval() -> float:
         return DEFAULT_TICK_INTERVAL
 
 
+def default_recent_done_window_seconds() -> float:
+    override = os.environ.get("PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS")
+    if not override:
+        return RECENT_DONE_WINDOW_SECONDS
+    try:
+        return float(override)
+    except ValueError:
+        return RECENT_DONE_WINDOW_SECONDS
+
+
+def _parse_iso8601(value: Any) -> datetime | None:
+    """寬容解析 ISO-8601 時間字串；解析失敗或非字串一律回傳 ``None``。
+
+    ``recent_done`` 的新鮮度判斷必須保守：解析不出時間就無法證明「新鮮」，
+    因此呼叫端會把 ``None`` 當成「排除在 window 之外」處理，而不是預設放行。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def _tick_backoff_seconds(base_interval: float, consecutive_failures: int) -> float:
     """Exponential backoff interval for the next periodic-tick retry.
 
@@ -225,6 +255,8 @@ def build_runtime_status_provider(
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     ready_units_fn: Callable[[list[dict[str, Any]], Callable[[str], bool]], list[dict[str, Any]]] = autonomy.ready_units,
     recent_done_limit: int = RECENT_DONE_LIMIT,
+    recent_done_window_seconds: float | None = RECENT_DONE_WINDOW_SECONDS,
+    now_fn: Callable[[], str] = contract.utcnow,
     git_runner=None,
 ) -> Callable[[], dict[str, Any]]:
     def recent_done_provider() -> list[dict[str, Any]]:
@@ -232,17 +264,33 @@ def build_runtime_status_provider(
         handoff_path = Path(handoff_dir)
         if not handoff_path.is_dir():
             return []
+        cutoff_ts: float | None = None
+        if recent_done_window_seconds is not None:
+            now_dt = _parse_iso8601(now_fn())
+            if now_dt is not None:
+                cutoff_ts = now_dt.timestamp() - recent_done_window_seconds
         for path in handoff_path.glob("*.json"):
             payload = contract.read_json(path)
             if not isinstance(payload, dict):
                 continue
+            completed_at = payload.get("completed_at")
+            if cutoff_ts is not None:
+                # window 內 0 筆時 recent_done 必須是空陣列，不得回退撈更舊的 manifest
+                # （issue #265 驗收條件）；完全解析不出時間的 manifest 一律視為過期排除，
+                # 不能因為「看不出新鮮度」就預設放行。
+                completed_dt = _parse_iso8601(completed_at)
+                if completed_dt is None or completed_dt.timestamp() < cutoff_ts:
+                    continue
             manifests.append(
                 (
-                    str(payload.get("completed_at") or ""),
+                    str(completed_at or ""),
                     {
                         "slice_id": payload.get("slice_id"),
                         "gate_status": payload.get("gate_status"),
-                        "at": payload.get("completed_at"),
+                        "at": completed_at,
+                        "gate_reason": payload.get("gate_reason"),
+                        "job_id": payload.get("job_id"),
+                        "branch": payload.get("branch"),
                     },
                 )
             )
@@ -856,6 +904,7 @@ def run_loop(
     default_review_executor: str | None = None,
     default_review_model: str | None = None,
     reaper: Callable[[], dict[str, Any]] | None = None,
+    recent_done_window_seconds: float | None = RECENT_DONE_WINDOW_SECONDS,
 ) -> bool:
     runtime_pid = os.getpid() if pid is None else pid
     held_lock = acquire_lock(pid=runtime_pid, pid_alive=pid_alive, now_fn=now_fn)
@@ -906,6 +955,8 @@ def run_loop(
         specs_dir=resolved_specs_dir,
         handoff_dir=handoff_dir,
         git_runner=getattr(ensure_dispatcher(), "_git_runner", None),
+        recent_done_window_seconds=recent_done_window_seconds,
+        now_fn=now_fn,
     )
     if periodic_tick_runner is not None:
         periodic_runner = periodic_tick_runner
@@ -1194,6 +1245,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--handoff-dir", default=autonomy.DEFAULT_HANDOFF_DIR)
     parser.add_argument("--max-rounds", type=int)
     parser.add_argument("--no-require-idle", action="store_true")
+    parser.add_argument(
+        "--recent-done-window-seconds",
+        type=float,
+        default=default_recent_done_window_seconds(),
+        help=(
+            "status.json 的 recent_done 只回溯這麼多秒內完成的 manifest（issue #265）；"
+            "預設 86400（24 小時），亦可用 PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS 覆寫。"
+        ),
+    )
     args = parser.parse_args(argv)
     _install_signal_handlers()
 
@@ -1208,6 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
         default_model=args.model,
         default_review_executor=args.review_executor,
         default_review_model=args.review_model,
+        recent_done_window_seconds=args.recent_done_window_seconds,
     )
     return 0 if started else 1
 

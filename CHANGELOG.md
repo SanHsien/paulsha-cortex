@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #230／#265：`recent_done` 補投影欄位並加入 recency window**：`manager_daemon.py` 的
+  `recent_done_provider()`（`build_runtime_status_provider()` 內）除既有 `slice_id`／`gate_status`／
+  `at` 外，多投影 handoff manifest 既有的 `gate_reason`／`job_id`／`branch`（manifest 缺欄位時為
+  `null`，不拋錯），讓 `needs_human` 條目在 consumer 端（paulshaclaw cockpit）不再只顯示「待裁決 ·
+  原因未知」（#230）；範圍不含 `next_actions`——它是 `manager.slice_status_entry()` 算出來的衍生欄位，
+  不在 manifest 欄位集合裡，不屬本次修法範圍。同時新增可設定的 recency window（新常數
+  `RECENT_DONE_WINDOW_SECONDS`，預設 86400 秒／24 小時，可用 CLI `--recent-done-window-seconds`
+  或環境變數 `PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS` 覆寫），過期 manifest 不再進入 `recent_done`；
+  window 內無資料時回空陣列，不回退撈更舊的紀錄（#265）。handoff manifest 檔案本身的
+  retention／prune 途徑不在本次範圍內，屬 #178 program teardown GC 負責。
 - **Issue #254：legacy monitor config 警告去重**：在
   `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
   去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy
