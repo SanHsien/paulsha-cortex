@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -163,13 +163,25 @@ def _parse_iso8601(value: Any) -> datetime | None:
 
     ``recent_done`` 的新鮮度判斷必須保守：解析不出時間就無法證明「新鮮」，
     因此呼叫端會把 ``None`` 當成「排除在 window 之外」處理，而不是預設放行。
+
+    ``recent_done`` 讀的是磁碟上任意來源的 JSON manifest（歷史檔、其他版本
+    寫入的檔、手動放的檔），不能假設一定帶時區。``datetime.fromisoformat``
+    對不帶時區的字串會回傳 naive datetime，而 naive datetime 的
+    ``.timestamp()`` 是用**本機系統時區**解讀、不是 UTC——同一份 manifest
+    在 UTC 與 UTC+8 主機上算出的 timestamp 會差到 8 小時，足以讓一份仍在
+    window 內的 manifest 被誤判過期而剔除（#265 修法後續發現的邊界缺陷）。
+    因此 naive datetime 一律視為 UTC 補上 tzinfo，避免新鮮度判定被執行主機
+    的本地時區污染。
     """
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _tick_backoff_seconds(base_interval: float, consecutive_failures: int) -> float:

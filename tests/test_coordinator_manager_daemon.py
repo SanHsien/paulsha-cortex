@@ -1268,6 +1268,70 @@ def test_recent_done_provider_window_disabled_when_none(monkeypatch, tmp_path):
     assert [entry["slice_id"] for entry in status["recent_done"]] == ["ancient"]
 
 
+def test_recent_done_provider_treats_naive_completed_at_as_utc(monkeypatch, tmp_path):
+    """naive（無時區）completed_at 必須視為 UTC，不能被執行主機的本地時區污染。
+
+    ``datetime.fromisoformat`` 對 naive 字串回傳 naive datetime，naive
+    datetime 的 ``.timestamp()`` 用本機系統時區解讀。在 UTC+8 主機上，若
+    provider 沒有把 naive 字串正規化成 UTC，一份實際只有 16.5 小時前完成、
+    理應落在 24 小時 window 內的 manifest，會被誤判成 24.5 小時前而剔除
+    ——方向正好與 #265 要修的「過期不留」相反，變成「新鮮的被丟掉」。
+
+    本測試把行程的 TZ 切到 Asia/Taipei（UTC+8）模擬這個環境差異，並比較
+    naive／aware 兩種寫法的同一時刻是否得到一致的新鮮度判定。
+    """
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    # now = 2026-07-30T02:00:00Z，window = 24h -> cutoff = 2026-07-29T02:00:00Z
+    (handoff_dir / "naive-fresh.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "naive-fresh",
+                "gate_status": "passed",
+                # 無時區字串；正確判定應視為 UTC，距 cutoff 尚有 16.5 小時，應保留
+                "completed_at": "2026-07-29T09:30:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (handoff_dir / "aware-fresh.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "aware-fresh",
+                "gate_status": "passed",
+                # 與上者代表同一個 UTC 時刻，帶明確時區
+                "completed_at": "2026-07-29T09:30:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "Asia/Taipei")
+    time.tzset()
+    try:
+        provider = manager_daemon.build_runtime_status_provider(
+            registry=FakeRegistry(),
+            specs_dir=str(tmp_path / "specs"),
+            handoff_dir=str(handoff_dir),
+            scan_specs_fn=lambda specs_dir: [],
+            recent_done_window_seconds=86400.0,
+            now_fn=lambda: "2026-07-30T02:00:00+00:00",
+        )
+
+        status = provider()
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
+
+    slice_ids = {entry["slice_id"] for entry in status["recent_done"]}
+    assert slice_ids == {"naive-fresh", "aware-fresh"}
+
+
 def test_runtime_status_provider_classifies_held_units(monkeypatch, tmp_path):
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
     handoff_dir = tmp_path / "handoff"
