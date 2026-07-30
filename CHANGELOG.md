@@ -7,6 +7,44 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #270：CLAUDE.md 的 changelog 要求對齊 engine R-09**：agent 指引原先三處（改 code 時、
+  claim done 前）都只要求 `CHANGELOG.md [Unreleased]`，與 R-09 實際檢查的 `changelog.d/*.md`
+  fragment 不一致，導致照指引交付的 PR 必然掛在 `policy / check`（#266／#267／#268／#269
+  四個 PR 同時實證）。改以 fragment 為硬性 gate、寫明檔名 slug 慣例與「fragment 須 commit
+  才進 diff」；claim-done checklist 的 policy_check 一項補上帶 `--pr-title`／`--pr-body`／
+  `--pr-labels`／`--pr-base-ref`／`--pr-head-ref` 的完整命令形式（裸跑會給出假的 `fail: 0`，
+  因為 CI 會傳這五個參數並啟用一批 PR／diff-aware 規則）；並移除指向不存在檔案的
+  `.github/pull_request_template.md` checklist 項目。`CLAUDE.md` 為 canonical 真檔，
+  `AGENTS.md`／`GEMINI.md`／`.github/copilot-instructions.md` 的 symlink 自動同步。
+
+### Fixed
+- **Issue #155：修補 install/upgrade 未遷移 Codex 全域 relay hook**：新增
+  `paulsha_cortex.deploy.hooks.reconcile_codex_hooks()`，於 `cortex install
+  service` 流程中 idempotent 改寫 `$HOME/.codex/hooks.json` 內
+  `managedBy: psc-coordinator-relay` 的 legacy entry（指向已不存在的
+  `paulshaclaw/scripts/coordinator/psc-relay-hook.sh` 絕對路徑）為 canonical
+  的 `cortex relay-hook` 指令，改寫前自動備份原檔（`hooks.json.bak-<hex>`），
+  只動 Cortex 自管的 entries，其餘 owner（例如 `paulsha-memory`、
+  `psc-bro-return`）與已是 canonical 的設定維持不變，修補 Codex Stop hook
+  exit 127 的 install migration gap。全程 fail-open：套件內建 manifest
+  本身損壞/缺失時也不拋例外中斷 `cortex install service`，改回傳
+  `changed=False` 並附可辨識原因的 detail；`daemon-reload`／`enable` 等
+  systemctl 步驟失敗時，若 hook 遷移已先行發生，回報訊息會一併帶出遷移
+  結果，避免副作用（改檔＋備份）發生卻未讓 operator 知情。
+- **Issue #255：AGY_MODEL_ID 改用 agy 實際輸出的 kebab id**：`agy models` 現在輸出
+  kebab id（如 `gemini-3.1-pro-high`），但 `model_identities.AGY_MODEL_ID` 仍寫死
+  顯示名 `Gemini 3.1 Pro (High)`，導致 `probe_agy_capability` 字面比對必然
+  miss，套件預設下唯一的 planning identity 永遠 probe 失敗、work-item workflow
+  卡死在 `define/needs_human`。`AGY_MODEL_ID` 改為 `gemini-3.1-pro-high`；
+  `probe_agy_capability` 新增正規化容錯比對（`_normalize_model_token` /
+  `_resolve_agy_cli_token`），顯示名與 kebab id 之間的格式落差不再是硬性
+  依賴，且一律用 `agy models` 實際列出的字面值呼叫 `--model`；`model-not-listed`
+  失敗時 `diagnostic` 帶出實際可用清單方便除錯；v1 schema 設定檔沿用舊顯示名
+  的既有寫法仍會被正確識別為 canonical agy planning identity（向後相容）。同步
+  更新套件內建 `data/model-identities.yaml` 與 `README.md` / active openspec
+  spec 的範例值。
+
+- **Issue #264：workflow phase job 收工不再誤走 slice lane gate**：`paulsha_cortex/coordinator/manager.py` 的 completion sweep 新增 `_is_workflow_lane_job()`（以 job 的 `workflow_run_id` 是否存在機械判定 lane 歸屬），completion sweep 對帶 `workflow_run_id` 的 job（workflow lane 的 phase job，本就不註冊進 `slices` 表）不再查 `slices` 表、不再產出 `needs_human`/`missing-slice-proof`，改寫入新的 `gate_status="workflow-tracked"`／`gate_reason="workflow-lane-job"`（job 失敗則 `gate_status="failed"`，`gate_reason` 仍為 `workflow-lane-job`，與 slice lane 的 `missing-slice-proof` 機械區分）；`missing-slice-proof` 保留給真正屬於 slice lane、但 slice 關聯缺失的情形，新增 regression test 釘死其 fail-closed 行為未被放寬。修正前受影響的 30 份誤判 manifest（`~/.agents/coordinator/handoff/*.json`，`gate_reason=missing-slice-proof` 且 `slice_id` 為 `wf-<hash>-<phase>` 形式）皆為歷史殘留、其對應 workflow 早已交付合併，建議標記為歷史誤判並保留供稽核（下次 completion sweep 對相同 job_id 為冪等 skip、不會自動覆寫；如需清理由使用者自行對 runtime state 執行 retention 操作，不在本次程式修改範圍內）。
 - **Issue #230／#265：`recent_done` 補投影欄位並加入 recency window**：`manager_daemon.py` 的
   `recent_done_provider()`（`build_runtime_status_provider()` 內）除既有 `slice_id`／`gate_status`／
   `at` 外，多投影 handoff manifest 既有的 `gate_reason`／`job_id`／`branch`（manifest 缺欄位時為

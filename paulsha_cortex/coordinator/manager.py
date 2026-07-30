@@ -55,6 +55,15 @@ from .workflow import (
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
+
+# workflow lane 的 phase job（issue #264）terminal manifest 語意：不查 slices
+# 表，gate 依據就是 job 自身的 exit 結果——phase 的實際推進/gate 判定由
+# workflow registry（_dispatch_workflow_card 重掃 list_jobs()）負責，跟這裡
+# 寫的 handoff manifest 無關（manifest 只供 operator 視野／cockpit 展示用）。
+# 用獨立的 gate_status/gate_reason，機械區分於 slice lane 的
+# needs_human/missing-slice-proof，不得誤觸 needs_human 佇列。
+WORKFLOW_LANE_GATE_STATUS = "workflow-tracked"
+WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
 SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "abandon"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
@@ -132,6 +141,17 @@ def _existing_manifest_job_id(path: Path) -> str | None:
         return None
     job_id = payload.get("job_id")
     return job_id if isinstance(job_id, str) else None
+
+
+def _is_workflow_lane_job(job: dict) -> bool:
+    """job 屬於 workflow lane 的判定（issue #264）。
+
+    registry.create_job() 只有透過 workflow 派工路徑（_job_for_workflow_card /
+    dispatch_workflow_card）才會帶 workflow_run_id；slice lane 的 job（經
+    autonomy.dispatch_ready 派工）恆為 None。以此欄位機械區分兩條 lane，
+    而不是靠查不到 slices 表就一律當成 slice lane 缺 proof。
+    """
+    return job.get("workflow_run_id") is not None
 
 
 def _slice_for_job(registry, slice_id: str, job_id: str) -> dict | None:
@@ -1457,8 +1477,12 @@ def complete_tick(
                 except Exception:
                     identity_registry = None
                 if slice_row is None:
-                    gate_status = "needs_human"
-                    gate_reason = "missing-slice-proof"
+                    if _is_workflow_lane_job(job):
+                        gate_status = "failed" if status == "failed" else WORKFLOW_LANE_GATE_STATUS
+                        gate_reason = WORKFLOW_LANE_GATE_REASON
+                    else:
+                        gate_status = "needs_human"
+                        gate_reason = "missing-slice-proof"
                 elif slice_row.get("state") in {"verified", "completed"} and slice_row.get("gate_state") == "passed":
                     review_path, review_hash, review_payload = _current_review_ref(slice_row)
                     if review_payload is not None:
@@ -1509,6 +1533,12 @@ def complete_tick(
                             registry.update_slice(slice_id, state="failed", gate_state="failed")
                         except Exception:
                             pass
+                elif slice_row is None and _is_workflow_lane_job(job):
+                    # workflow lane 的 build phase job 到這裡必為 status == "exited"
+                    # （failed 已在上面 `elif status == "failed":` 分支處理掉），不查
+                    # slices 表、不當成缺 slice proof。
+                    gate_status = WORKFLOW_LANE_GATE_STATUS
+                    gate_reason = WORKFLOW_LANE_GATE_REASON
                 elif slice_row is None:
                     evidence = _write_status_evidence(
                         slice_row=None,

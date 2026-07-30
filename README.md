@@ -407,7 +407,7 @@ verification:
 schema_version: 2
 identities:
   - executor: agy
-    model_id: Gemini 3.1 Pro (High)
+    model_id: gemini-3.1-pro-high
     independence_domain: google
     capabilities: [planning]
     live_probe: agy-plan-sandbox
