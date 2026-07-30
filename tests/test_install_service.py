@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 
@@ -105,6 +106,78 @@ def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):
     assert f"PY={sys.executable}" in env_lines
     assert sum(line.startswith("PY=") for line in env_lines) == 1
     assert f"PSC_REPO_ROOT={repo_root.resolve()}" in env_lines
+
+
+def test_install_reconciles_legacy_codex_relay_hook(tmp_path, monkeypatch):
+    """issue #155：install service 應 reconcile 既存的 legacy Codex hooks.json。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    codex_hooks = home / ".codex" / "hooks.json"
+    codex_hooks.parent.mkdir(parents=True)
+    codex_hooks.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup|clear|compact",
+                            "hooks": [
+                                {
+                                    "command": (
+                                        "PSC_RELAY_EVENT=session_start "
+                                        "$HOME/prj_pri/paulshaclaw/scripts/coordinator/"
+                                        "psc-relay-hook.sh"
+                                    ),
+                                    "type": "command",
+                                    "managedBy": "psc-coordinator-relay",
+                                }
+                            ],
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "command": "PSC_RELAY_EVENT=stop /opt/psc-bro-return.sh",
+                                    "type": "command",
+                                    "managedBy": "psc-bro-return",
+                                },
+                                {
+                                    "command": (
+                                        "PSC_RELAY_EVENT=stop "
+                                        "$HOME/prj_pri/paulshaclaw/scripts/coordinator/"
+                                        "psc-relay-hook.sh"
+                                    ),
+                                    "type": "command",
+                                    "managedBy": "psc-coordinator-relay",
+                                },
+                            ],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(repo_root)
+
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    doc = json.loads(codex_hooks.read_text(encoding="utf-8"))
+    stop_hooks = doc["hooks"]["Stop"][0]["hooks"]
+    session_hooks = doc["hooks"]["SessionStart"][0]["hooks"]
+    assert session_hooks[0]["command"] == "PSC_RELAY_EVENT=session_start cortex relay-hook"
+    managed_stop = next(h for h in stop_hooks if h["managedBy"] == "psc-coordinator-relay")
+    assert managed_stop["command"] == "PSC_RELAY_EVENT=stop cortex relay-hook"
+    other_stop = next(h for h in stop_hooks if h["managedBy"] == "psc-bro-return")
+    assert other_stop["command"] == "PSC_RELAY_EVENT=stop /opt/psc-bro-return.sh"
+    assert list(codex_hooks.parent.glob("hooks.json.bak-*"))
 
 
 def test_install_derives_runtime_defaults_from_agents_root_but_keeps_bootstrap_env_location(
@@ -296,3 +369,62 @@ def test_install_service_and_install_reports_systemctl_step_error(
     assert "CompletedProcess" not in fake_result.message
     assert "Traceback" not in fake_result.message
     assert calls == expected_commands[: failure_index + 1]
+
+
+def test_systemctl_failure_still_reports_hook_migration_that_already_happened(
+    tmp_path, monkeypatch
+):
+    """reconcile 跑在 systemctl for loop 之前；就算 systemctl 失敗，已發生的
+    hook 遷移／備份副作用也必須出現在回報訊息中，不能悄悄消失。"""
+    from paulsha_cortex.deploy import installer
+
+    home = tmp_path / "home"
+    codex_hooks = home / ".codex" / "hooks.json"
+    codex_hooks.parent.mkdir(parents=True)
+    codex_hooks.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "command": (
+                                        "PSC_RELAY_EVENT=stop "
+                                        "$HOME/prj_pri/paulshaclaw/scripts/coordinator/"
+                                        "psc-relay-hook.sh"
+                                    ),
+                                    "type": "command",
+                                    "managedBy": "psc-coordinator-relay",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(argv, *args, **kwargs):
+        if argv == ["systemctl", "--user", "daemon-reload"]:
+            return subprocess.CompletedProcess(argv, 7, stdout="", stderr="boom")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
+
+    result = installer.install_service_result("beta", 120, tmp_path / "repo")
+
+    assert result.mode == "systemd"
+    assert result.exit_code == 7
+    assert "codex hooks reconcile" in result.message
+    assert "cortex relay-hook" in result.message
+
+    # 副作用確實已發生：live 檔案被改寫、備份確實落檔。
+    doc = json.loads(codex_hooks.read_text(encoding="utf-8"))
+    managed = doc["hooks"]["Stop"][0]["hooks"][0]
+    assert managed["command"] == "PSC_RELAY_EVENT=stop cortex relay-hook"
+    assert list(codex_hooks.parent.glob("hooks.json.bak-*"))
