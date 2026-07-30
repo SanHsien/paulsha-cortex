@@ -173,7 +173,35 @@ def test_preflight_probe_uses_runtime_validator_and_fails_closed_when_unavailabl
     monkeypatch.setattr("paulsha_cortex.doctor._load_runtime_preflight_command", reject)
     result = _preflight_probe({"PSC_PREFLIGHT_CMD": "/usr/bin/env bash -c true"})
     assert result.status == "fail"
-    assert "runtime validator" in result.detail
+    lowered = result.detail.lower()
+    assert "shell wrapper" in lowered
+    assert "typed" in lowered
+
+
+@pytest.mark.parametrize(
+    ("exc", "needles"),
+    [
+        ("PSC_PREFLIGHT_CMD is required", ("required", "set")),
+        ("PSC_PREFLIGHT_CMD is malformed", ("malformed", "typed")),
+        ("PSC_PREFLIGHT_CMD shell wrapper is not allowed", ("shell-wrapper-not-allowed", "typed")),
+        (
+            "PSC_PREFLIGHT_CMD executable unavailable: /private/operator/bin/preflight",
+            ("executable-unavailable",),
+        ),
+    ],
+)
+def test_preflight_probe_returns_actionable_categories_for_known_errors(
+    monkeypatch, exc: str, needles: tuple[str, ...]
+) -> None:
+    def reject(_env):
+        raise ValueError(exc)
+
+    monkeypatch.setattr("paulsha_cortex.doctor._load_runtime_preflight_command", reject)
+    detail = _preflight_probe({"PSC_PREFLIGHT_CMD": "/usr/bin/env true"}).detail
+    lowered = detail.lower()
+    assert "PSC_PREFLIGHT_CMD" in detail
+    assert all(needle in lowered for needle in needles)
+    assert "/private/operator" not in detail
 
 
 @pytest.mark.parametrize("repo", ["../demo", "acme/..", "acme/demo/extra", "acme demo/repo"])
@@ -195,7 +223,58 @@ def test_identity_probe_uses_runtime_schema_validator(monkeypatch, tmp_path: Pat
     monkeypatch.setattr("paulsha_cortex.doctor._load_runtime_model_identities", reject)
     result = _identity_probe({"PSC_PROJECT_CONFIG_ROOT": str(config)}, tmp_path)
     assert result.status == "fail"
-    assert "runtime validator" in result.detail
+    lowered = result.detail.lower()
+    assert "validation" in lowered
+
+
+@pytest.mark.parametrize(
+    ("exc", "needles"),
+    [
+        ("model-identities missing", ("missing", "model-identities", "registry-missing")),
+        (
+            "model-identities unreadable: /private/operator/config/model-identities.yaml",
+            ("unreadable", "model-identities", "registry-unreadable"),
+        ),
+        (
+            "model-identities schema_version must be one of [1, 2], got 99",
+            ("schema", "contract", "registry-invalid", "model-identities"),
+        ),
+        ("canonical agy planning identity missing", ("canonical", "agy", "planning", "registry-invalid")),
+    ],
+)
+def test_identity_probe_returns_actionable_categories_for_known_errors(
+    monkeypatch, tmp_path: Path, exc: str, needles: tuple[str, ...]
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "model-identities.yaml").write_text("schema_version: 1\nidentities: []\n", encoding="utf-8")
+
+    def reject(_root):
+        raise ValueError(exc)
+
+    monkeypatch.setattr("paulsha_cortex.doctor._load_runtime_model_identities", reject)
+    detail = _identity_probe({"PSC_PROJECT_CONFIG_ROOT": str(config)}, tmp_path).detail
+    lowered = detail.lower()
+    assert all(needle in lowered for needle in needles)
+    assert "/private/operator" not in detail
+
+
+def test_identity_probe_unknown_error_uses_safe_boundary_message(monkeypatch, tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "model-identities.yaml").write_text("schema_version: 1\nidentities: []\n", encoding="utf-8")
+
+    def reject(_root):
+        raise RuntimeError("TOP_SECRET_MARKER runtime crash")
+
+    monkeypatch.setattr("paulsha_cortex.doctor._load_runtime_model_identities", reject)
+    detail = _identity_probe({"PSC_PROJECT_CONFIG_ROOT": str(config)}, tmp_path).detail
+    lower = detail.lower()
+    assert "runtime validator rejected" not in lower
+    assert "top_secret_marker" not in detail
+    assert "top secret marker" not in lower
+    assert "TOP_SECRET_MARKER" not in detail
+    assert "/private/operator" not in detail
 
 
 def test_review_sandbox_probe_requires_dependencies_only_for_claude_reviewer(

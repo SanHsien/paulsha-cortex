@@ -21,9 +21,21 @@
 | --- | --- | --- | --- |
 | `manager degraded` | `cortex status` | service 沒起來、runtime 漂移、權限或設定問題 | 看 [manager degraded](#manager-degraded) |
 | request timeout / F8 | `cortex request list` | CLI 等待視窗結束，但 manager 還在背景處理 | 看 [request timeout](#request-timeout-f8) |
+| delivery preflight failed | `cortex inspect doctor --json` | `PSC_PREFLIGHT_CMD` 未設定、格式錯誤、shell wrapper 或 executable 不可執行 | 看 [delivery preflight 失敗](#delivery-preflight-失敗) |
 | `systemd` 不可用 | `cortex service status --json` | 在沒有 `systemd --user` 的環境操作，或 unit 未安裝 | 看 [systemd 不可用](#systemd-不可用) |
 | executor 未登入 | `cortex doctor --probe-live --repo owner/name --json` | `copilot`、`claude`、`codex` 尚未登入 | 看 [executor 未登入](#executor-未登入) |
 | F34 / stale `venv` | `cortex inspect service --json` | unit 指向已刪的安裝位置，或 service 還在跑舊碼 | 看 [stale venv 或 exec path drift](#stale-venv-或-exec-path-drift-f34) |
+
+## delivery preflight 失敗
+
+`cortex inspect doctor --json` 若顯示 `preflight` 失敗，請先對照原因：
+
+| 原因 | 對應訊息關鍵字 | 修復方式 |
+| --- | --- | --- |
+| 未設定 `PSC_PREFLIGHT_CMD` | `required` | 設定環境變數為 typed argv，確認 delivery preflight 可直接執行 |
+| 命令格式不符 | `malformed` | 使用 argv 參數而非 shell 指令字串 |
+| 使用 shell wrapper | `shell-wrapper-not-allowed` | 改用直接 module/executable，例如 `python3 -m project_preflight` |
+| executable 不可用 | `executable-unavailable` | 安裝/調整 PATH，或改用可執行的絕對/相對命令，避免 shell 包裹 |
 
 ## manager degraded
 

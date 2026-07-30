@@ -88,6 +88,20 @@ def test_onboarding_docs_contract_is_documented() -> None:
         assert keyword in runbook, f"runbook must operationalize `{keyword}`"
 
 
+def test_quickstart_preflight_setup_precedes_bootstrap_and_doctor_commands() -> None:
+    quickstart = _read_required("docs/onboarding/quickstart.md")
+
+    preflight_index = quickstart.find("export PSC_PREFLIGHT_CMD")
+    bootstrap_index = quickstart.find("cortex bootstrap", preflight_index)
+    doctor_index = quickstart.find("cortex inspect doctor --json", preflight_index)
+
+    assert preflight_index != -1, "quickstart must include PSC_PREFLIGHT_CMD setup"
+    assert bootstrap_index != -1, "quickstart must include bootstrap command"
+    assert doctor_index != -1, "quickstart must include doctor inspect command"
+    assert preflight_index < bootstrap_index, "PSC_PREFLIGHT_CMD setup must precede bootstrap"
+    assert preflight_index < doctor_index, "PSC_PREFLIGHT_CMD setup must precede doctor inspect"
+
+
 def test_onboarding_docs_use_repo_safe_paths_only() -> None:
     readme = _read_required("README.md")
     guide = _extract_markdown_section(readme, README_GUIDE_HEADING)
