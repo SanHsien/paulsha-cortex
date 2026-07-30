@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #270：CLAUDE.md 的 changelog 要求對齊 engine R-09**：agent 指引原先三處（改 code 時、
+  claim done 前）都只要求 `CHANGELOG.md [Unreleased]`，與 R-09 實際檢查的 `changelog.d/*.md`
+  fragment 不一致，導致照指引交付的 PR 必然掛在 `policy / check`（#266／#267／#268／#269
+  四個 PR 同時實證）。改以 fragment 為硬性 gate、寫明檔名 slug 慣例與「fragment 須 commit
+  才進 diff」；claim-done checklist 的 policy_check 一項補上帶 `--pr-title`／`--pr-body`／
+  `--pr-labels`／`--pr-base-ref`／`--pr-head-ref` 的完整命令形式（裸跑會給出假的 `fail: 0`，
+  因為 CI 會傳這五個參數並啟用一批 PR／diff-aware 規則）；並移除指向不存在檔案的
+  `.github/pull_request_template.md` checklist 項目。`CLAUDE.md` 為 canonical 真檔，
+  `AGENTS.md`／`GEMINI.md`／`.github/copilot-instructions.md` 的 symlink 自動同步。
+
+### Fixed
 - **Issue #254：legacy monitor config 警告去重**：在
   `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
   去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy
