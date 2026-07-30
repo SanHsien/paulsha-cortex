@@ -1297,6 +1297,7 @@ def _claim_action(
             if run.repo == authority.repo
             and run.work_id == authority.work_id
             and run.claim_key == expected_key
+            and run.status == "ongoing"
         ]
         if len(matching) > 1:
             raise RuntimeError("canonical workflow claim is ambiguous")
@@ -1910,6 +1911,120 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
     return {"ref": str(target), "hash": digest}
 
 
+def _read_planning_failure_record(
+    *,
+    run,
+    run_id: str,
+) -> dict[str, Any]:
+    """讀取 run 指定的 planning 失敗 evidence（僅供 recover-planning 決策）。"""
+
+    def load_record(path: Path) -> dict[str, Any] | None:
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or not path.is_file()
+            or not path.parent.name == "planning-recovery"
+        ):
+            return None
+        try:
+            payload = path.read_text(encoding="utf-8")
+            body = json.loads(payload)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(body, dict):
+            return None
+        return body
+
+    matches = []
+    for path_value in run.evidence_refs:
+        if not isinstance(path_value, str):
+            continue
+        record = load_record(Path(path_value))
+        if (
+            record is None
+            or record.get("schema") != "cortex-planning-failure/v1"
+            or record.get("run_id") != run_id
+        ):
+            continue
+        classification = record.get("classification")
+        reason = record.get("reason")
+        if (
+            classification not in {"environment", "content"}
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            continue
+        matches.append(
+            {
+                "classification": classification,
+                "reason": reason,
+                "evidence_ref": path_value,
+            }
+        )
+    if not matches:
+        raise RuntimeError("recover-planning requires planning failure evidence")
+    if len(matches) > 1:
+        raise RuntimeError("recover-planning planning failure evidence ambiguous")
+    return matches[0]
+
+
+def _recover_planning_record(
+    run,
+    *,
+    state_path: Path,
+    actor: str,
+    failure_classification: str,
+    failure_reason: str,
+    evidence_ref: str,
+) -> dict[str, str]:
+    body = {
+        "schema": "cortex-work-planning-recovery/v1",
+        "run_id": run.run_id,
+        "source_revision": run.source_revision,
+        "actor": actor,
+        "failure_classification": failure_classification,
+        "failure_reason": failure_reason,
+        "failure_evidence_ref": evidence_ref,
+        "recovery_basis": "planning-runtime-retry",
+    }
+    digest = verification.canonical_json_hash(body)
+    root = state_path.resolve().parent / "evidence" / "planning-recovery"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{run.run_id}-{digest}.json"
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content:
+            raise RuntimeError("workflow planning recovery evidence conflict")
+    else:
+        temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as error:
+            raise RuntimeError("workflow planning recovery evidence collision") from error
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fchmod(handle.fileno(), 0o444)
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                if target.is_symlink() or target.read_bytes() != content:
+                    raise RuntimeError("workflow planning recovery evidence conflict")
+            else:
+                directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {"ref": str(target), "hash": digest}
+
+
 def _superseded_abandon_body(
     run,
     *,
@@ -2085,6 +2200,149 @@ def _abandon_action(
         "reason": reason,
         "actor": actor,
         "expected_run_id": expected_run_id,
+        "evidence": record,
+        "run": updated.to_dict(),
+    }
+
+
+def _recover_planning_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    requested_by: str,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """重跑 define 階段 planning，避免環境類失敗造成永久 blocked。"""
+
+    extras = set(args) - {
+        "action",
+        "repo",
+        "work_id",
+        "issue",
+        "actor",
+        "expected_run_id",
+        "failure_classification",
+        "failure_reason",
+    }
+    if extras:
+        raise ValueError(
+            f"recover-planning rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    expected_run_id = args.get("expected_run_id")
+    failure_classification = args.get("failure_classification")
+    failure_reason = args.get("failure_reason")
+    actor = args.get("actor")
+    if (
+        not isinstance(expected_run_id, str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+    ):
+        raise ValueError("recover-planning requires exact expected_run_id")
+    if (
+        not isinstance(failure_classification, str)
+        or failure_classification not in {"environment", "content"}
+    ):
+        raise ValueError("recover-planning requires failure_classification")
+    if (
+        not isinstance(failure_reason, str)
+        or not failure_reason.strip()
+        or "\n" in failure_reason
+    ):
+        raise ValueError("recover-planning requires failure_reason")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("recover-planning issue is not authorized by WorkAuthority")
+    related = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo and run.work_id == authority.work_id
+    ]
+    exact = [run for run in related if run.run_id == expected_run_id]
+    if len(exact) != 1:
+        raise RuntimeError("recover-planning expected WorkflowRun CAS mismatch")
+    run = exact[0]
+    run_status = workflow_status(run)
+    if run_status == "blocked":
+        raise RuntimeError("recover-planning workflow is blocked (persisted-block)")
+    if run_status == "done":
+        raise RuntimeError("recover-planning requires needs_human workflow")
+    if run.current_phase != "define":
+        evidence_refs = tuple(
+            ref for ref in run.evidence_refs if Path(ref).parent.name == "planning-recovery"
+        )
+        recovery = None
+        for path_value in evidence_refs:
+            try:
+                body = json.loads(Path(path_value).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(body, dict)
+                and body.get("schema") == "cortex-work-planning-recovery/v1"
+                and str(body.get("run_id")) == expected_run_id
+            ):
+                recovery = {"ref": path_value}
+                break
+        if recovery is None:
+            return {
+                "action": "recovered",
+                "reason": "already-recovered",
+                "expected_run_id": expected_run_id,
+                "run": run.to_dict(),
+                "failure_classification": failure_classification,
+                "failure_reason": failure_reason,
+            }
+        return {
+            "action": "recovered",
+            "reason": "already-recovered",
+            "expected_run_id": expected_run_id,
+            "run": run.to_dict(),
+            "evidence": recovery,
+            "failure_classification": failure_classification,
+                "failure_reason": failure_reason,
+            }
+    if "needs_human" not in run.facets:
+        raise RuntimeError("recover-planning requires needs_human workflow in define")
+    failure = _read_planning_failure_record(
+        run=run, run_id=expected_run_id
+    )
+    if failure["classification"] != failure_classification:
+        raise RuntimeError("recover-planning classification mismatch")
+    if failure["classification"] != "environment":
+        raise RuntimeError("recover-planning is not allowed for content failures")
+    if failure["reason"] != failure_reason:
+        raise RuntimeError("recover-planning requires matching failure_reason")
+    actor_value = actor if isinstance(actor, str) and actor.strip() else requested_by
+    if not isinstance(actor_value, str) or not actor_value.strip():
+        actor_value = "operator"
+    record = _recover_planning_record(
+        run,
+        state_path=state_path,
+        actor=actor_value,
+        failure_classification=failure_classification,
+        failure_reason=failure_reason,
+        evidence_ref=failure["evidence_ref"],
+    )
+    current_facets = tuple(
+        facet for facet in run.facets if facet not in {"needs_human", "blocked"}
+    )
+    evidence_refs = run.evidence_refs
+    if record["ref"] not in evidence_refs:
+        evidence_refs = (*evidence_refs, record["ref"])
+    updated = workflow_registry._manager_update_workflow_run(
+        run.run_id,
+        current_phase="plan",
+        facets=current_facets,
+        gate_status="running",
+        evidence_refs=evidence_refs,
+    )
+    return {
+        "action": "recovered",
+        "reason": "planning-recovery-dispatched",
+        "expected_run_id": expected_run_id,
+        "failure_classification": failure_classification,
+        "failure_reason": failure_reason,
+        "failure_basis": failure,
         "evidence": record,
         "run": updated.to_dict(),
     }
@@ -2849,7 +3107,8 @@ def execute_work_action(
     work_id = args.get("work_id")
     if action not in {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-        "retry-review", "abandon", "auto", "ship", "review-attest",
+        "retry-review", "recover-planning", "abandon", "auto", "ship",
+        "review-attest",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -2903,6 +3162,14 @@ def execute_work_action(
         result = _retry_review_action(
             args=args,
             authority=authority,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "recover-planning":
+        result = _recover_planning_action(
+            args=args,
+            authority=authority,
+            requested_by=requested_by,
+            state_path=resolved_state_path,
             workflow_registry=workflow_registry,
         )
     elif action == "abandon":

@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #256：planning claim 前向恢復與放行語意修正**：`recover-planning` 新增環境/內容分類判定與 CAS 重入保護，`abandon` 加入 `planning_released` 釋放標記讓 `needs_human` 的同識別 work item 可重 claim，並在 `resume` 狀態回傳合法 `next_actions`；`work_actions`、`control/contract`、`coordinator/cli`、`porcelain/run`、`work bridge/registry` 均同步放行與解讀新動作。
+
 - **Issue #273（實例修正）：openspec change 內 frontmatter `work_item` 不一致**：`openspec/changes/fix-systemctl-install-failure/tasks.md` 的 `work_item` 與同目錄 `proposal.md`／`design.md` 不同，使同一 openspec source 被兩個 work item 宣告擁有，觸發 confirmed source collision，導致 `hamanpaul/paulsha-cortex` 的 monitor work item projection 由 43 個降為 0、任何 work item 皆無法 claim。本次對齊 frontmatter 使 projection 恢復；靜默吞例外與 collision 影響範圍過大的根本問題見 #273。
 
 ### Added

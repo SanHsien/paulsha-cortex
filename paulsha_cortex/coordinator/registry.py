@@ -1221,14 +1221,31 @@ class JobRegistry:
         plan_review_passed: bool = False,
         frozen_readiness: dict[str, Any] | None = None,
     ) -> WorkflowRun:
-        for existing in self._workflows:
-            if existing.claim_key != claim_key:
+        matches = [
+            existing
+            for existing in self._workflows
+            if existing.claim_key == claim_key
+            and existing.work_id == work_id
+            and existing.repo == repo
+        ]
+        if any(existing.status == "ongoing" for existing in matches):
+            return self._copy_workflow_run(
+                next(existing for existing in matches if existing.status == "ongoing")
+            )
+        if any(existing.work_id != work_id or existing.repo != repo for existing in matches):
+            raise ValueError(f"claim_key 已屬於其他 work item: {claim_key}")
+        if len(matches) != len(set(run.run_id for run in matches)):
+            raise ValueError(f"workflow run id duplicated for claim_key: {claim_key}")
+        attempt = len(matches) + 1
+        while True:
+            seed = f"{claim_key}:{attempt}"
+            run_id = f"workflow-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:20]}"
+            if any(run.run_id == run_id for run in self._workflows):
+                attempt += 1
+                if attempt > 10_000:
+                    raise ValueError(f"workflow run id collision: {run_id}")
                 continue
-            if existing.work_id != work_id or existing.repo != repo:
-                raise ValueError(f"claim_key 已屬於其他 work item: {claim_key}")
-            return self._copy_workflow_run(existing)
-
-        run_id = f"workflow-{hashlib.sha256(claim_key.encode('utf-8')).hexdigest()[:20]}"
+            break
         if any(run.run_id == run_id for run in self._workflows):
             raise ValueError(f"workflow run id collision: {run_id}")
         now = _now_iso()
@@ -1809,7 +1826,7 @@ class JobRegistry:
         updated = replace(
             current,
             status="superseded",
-            facets=tuple(sorted(set(current.facets) | {"blocked"})),
+            facets=tuple(sorted(set(current.facets) | {"blocked", "planning_released"})),
             evidence_refs=(*current.evidence_refs, evidence_ref),
             updated_at=_now_iso(),
         )

@@ -743,6 +743,7 @@ class ClaimDecision:
     reason: str | None = None
     claim_key: str | None = None
     run_id: str | None = None
+    next_actions: tuple[str, ...] = ()
 
 
 def _validate_candidate(candidate: ClaimCandidate) -> None:
@@ -882,6 +883,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             reason="already-completed",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
+            next_actions=(),
         )
     if candidate.active_status == "needs_human":
         return ClaimDecision(
@@ -889,6 +891,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             reason="human-intervention-required",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
+            next_actions=("abandon",),
         )
     if candidate.active_status == "blocked":
         return ClaimDecision(
@@ -896,6 +899,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             reason="persisted-block",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
+            next_actions=("abandon",),
         )
     if candidate.active_status == "needs_decomposition":
         # #223（design #208 H.3）：run 已因 Red band 轉入拆分路由（見
@@ -907,12 +911,14 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             reason="decomposition-required",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
+            next_actions=(),
         )
     return ClaimDecision(
         action="resume",
         reason="active-workflow",
         claim_key=candidate.active_claim_key,
         run_id=candidate.active_run_id,
+        next_actions=(),
     )
 
 

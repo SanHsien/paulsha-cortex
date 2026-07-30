@@ -367,6 +367,8 @@ def workflow_status(run) -> str:
     if getattr(run, "status", "ongoing") == "done":
         return "done"
     if getattr(run, "status", "ongoing") == "superseded":
+        if "planning_released" in run.facets:
+            return "ongoing"
         return "blocked"
     if "needs_human" in run.facets:
         return "needs_human"

@@ -48,6 +48,8 @@ def _add_work_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kind", choices=sorted(WORK_SOURCE_KINDS))
     parser.add_argument("--ref")
     parser.add_argument("--actor")
+    parser.add_argument("--failure-classification")
+    parser.add_argument("--failure-reason")
     parser.add_argument("--expected-candidate")
     parser.add_argument("--expected-run-id")
     parser.add_argument("--reason")
@@ -118,6 +120,8 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
                 "kind",
                 "ref",
                 "actor",
+                "failure_classification",
+                "failure_reason",
                 "expected_candidate",
                 "expected_run_id",
                 "reason",
