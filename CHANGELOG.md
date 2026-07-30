@@ -7,6 +7,30 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #270：CLAUDE.md 的 changelog 要求對齊 engine R-09**：agent 指引原先三處（改 code 時、
+  claim done 前）都只要求 `CHANGELOG.md [Unreleased]`，與 R-09 實際檢查的 `changelog.d/*.md`
+  fragment 不一致，導致照指引交付的 PR 必然掛在 `policy / check`（#266／#267／#268／#269
+  四個 PR 同時實證）。改以 fragment 為硬性 gate、寫明檔名 slug 慣例與「fragment 須 commit
+  才進 diff」；claim-done checklist 的 policy_check 一項補上帶 `--pr-title`／`--pr-body`／
+  `--pr-labels`／`--pr-base-ref`／`--pr-head-ref` 的完整命令形式（裸跑會給出假的 `fail: 0`，
+  因為 CI 會傳這五個參數並啟用一批 PR／diff-aware 規則）；並移除指向不存在檔案的
+  `.github/pull_request_template.md` checklist 項目。`CLAUDE.md` 為 canonical 真檔，
+  `AGENTS.md`／`GEMINI.md`／`.github/copilot-instructions.md` 的 symlink 自動同步。
+
+### Fixed
+- **Issue #155：修補 install/upgrade 未遷移 Codex 全域 relay hook**：新增
+  `paulsha_cortex.deploy.hooks.reconcile_codex_hooks()`，於 `cortex install
+  service` 流程中 idempotent 改寫 `$HOME/.codex/hooks.json` 內
+  `managedBy: psc-coordinator-relay` 的 legacy entry（指向已不存在的
+  `paulshaclaw/scripts/coordinator/psc-relay-hook.sh` 絕對路徑）為 canonical
+  的 `cortex relay-hook` 指令，改寫前自動備份原檔（`hooks.json.bak-<hex>`），
+  只動 Cortex 自管的 entries，其餘 owner（例如 `paulsha-memory`、
+  `psc-bro-return`）與已是 canonical 的設定維持不變，修補 Codex Stop hook
+  exit 127 的 install migration gap。全程 fail-open：套件內建 manifest
+  本身損壞/缺失時也不拋例外中斷 `cortex install service`，改回傳
+  `changed=False` 並附可辨識原因的 detail；`daemon-reload`／`enable` 等
+  systemctl 步驟失敗時，若 hook 遷移已先行發生，回報訊息會一併帶出遷移
+  結果，避免副作用（改檔＋備份）發生卻未讓 operator 知情。
 - **Issue #255：AGY_MODEL_ID 改用 agy 實際輸出的 kebab id**：`agy models` 現在輸出
   kebab id（如 `gemini-3.1-pro-high`），但 `model_identities.AGY_MODEL_ID` 仍寫死
   顯示名 `Gemini 3.1 Pro (High)`，導致 `probe_agy_capability` 字面比對必然
