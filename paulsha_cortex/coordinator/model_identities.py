@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,12 @@ from .launcher import build_agy_argv
 
 MODEL_IDENTITY_SCHEMA_VERSION = 2
 SUPPORTED_MODEL_IDENTITY_SCHEMAS = frozenset({1, 2})
-AGY_MODEL_ID = "Gemini 3.1 Pro (High)"
+# `agy models` 現在輸出 kebab id（例如 `gemini-3.1-pro-high`），不是顯示名。
+# 這裡的常數就是 registry 用來比對／查找的 canonical model_id，必須跟 CLI
+# 實際輸出一致，否則 probe_agy_capability 會字面比對失敗（issue #255）。
+AGY_MODEL_ID = "gemini-3.1-pro-high"
+# 舊版顯示名，僅為相容 v1 schema 的既有設定檔（見 `_is_canonical_agy_model_id`）。
+_AGY_MODEL_ID_LEGACY_DISPLAY_NAME = "Gemini 3.1 Pro (High)"
 AGY_DOMAIN = "google"
 AGY_LIVE_PROBE = "agy-plan-sandbox"
 PLANNER_PRIORITY = (
@@ -55,6 +61,11 @@ def _assert_no_duplicate_yaml_keys(text: str) -> None:
         if key in contexts[-1][1]:
             raise ValueError(f"duplicate key '{key}' at line {lineno}")
         contexts[-1][1].add(key)
+
+
+def _is_canonical_agy_model_id(model_id: str) -> bool:
+    """v1 設定檔可能仍寫著舊顯示名；兩種拼法都視為 canonical agy 身分。"""
+    return model_id in (AGY_MODEL_ID, _AGY_MODEL_ID_LEGACY_DISPLAY_NAME)
 
 
 def _nonempty(value: object, field: str) -> str:
@@ -213,9 +224,13 @@ def _load_model_identity_file(path: Path) -> IdentityRegistry:
             # v1 had no capability field. Preserve its identities as planning
             # fallback candidates; selection still requires a matching live
             # probe and a foreign independence domain.
-            if executor != "agy" or model_id == AGY_MODEL_ID:
+            if executor != "agy" or (
+                isinstance(model_id, str) and _is_canonical_agy_model_id(model_id)
+            ):
                 normalized["capabilities"] = ["planning"]
-            if executor == "agy" and model_id == AGY_MODEL_ID:
+            if executor == "agy" and isinstance(model_id, str) and _is_canonical_agy_model_id(
+                model_id
+            ):
                 normalized["live_probe"] = AGY_LIVE_PROBE
             normalized_rows.append(normalized)
         rows = normalized_rows
@@ -290,6 +305,29 @@ def _failed_agy(reason: str, diagnostic: str | None = None) -> CapabilityProbe:
     return CapabilityProbe(False, "agy", AGY_MODEL_ID, AGY_DOMAIN, reason, diagnostic)
 
 
+def _normalize_model_token(value: str) -> str:
+    """正規化 model id／顯示名，容忍 `agy models` 輸出格式（顯示名 vs kebab id、
+    大小寫、空白/括號等標點差異）未來再次改版。"""
+    return re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+
+
+def _resolve_agy_cli_token(expected: str, listed: Iterable[str]) -> str | None:
+    """在 `agy models` 的輸出行中找出與 expected 語意相符的實際 CLI token。
+
+    優先字面完全比對；找不到時退而用正規化比對，讓顯示名／kebab id 之間的
+    命名落差不必等到常數再次寫死才修（issue #255）。回傳的是 `agy models`
+    實際印出的那一行，因為 `--model` 必須用 CLI 認得的字面值呼叫。
+    """
+    listed_set = {line for line in listed if line}
+    if expected in listed_set:
+        return expected
+    target = _normalize_model_token(expected)
+    for line in listed_set:
+        if _normalize_model_token(line) == target:
+            return line
+    return None
+
+
 def probe_agy_capability(
     *,
     runner: ProcessRunner | None = None,
@@ -310,8 +348,14 @@ def probe_agy_capability(
         return _failed_agy("models-probe-failed", type(exc).__name__)
     if listed_rc != 0:
         return _failed_agy("models-probe-failed", f"exit-code:{listed_rc}")
-    if AGY_MODEL_ID not in {line.strip() for line in listed_stdout.splitlines()}:
-        return _failed_agy("model-not-listed")
+    listed_lines = {line.strip() for line in listed_stdout.splitlines() if line.strip()}
+    cli_model_token = _resolve_agy_cli_token(AGY_MODEL_ID, listed_lines)
+    if cli_model_token is None:
+        available = ", ".join(sorted(listed_lines)[:20])
+        return _failed_agy(
+            "model-not-listed",
+            f"expected={AGY_MODEL_ID!r} available=[{available}]",
+        )
 
     expected = {"capability": "cortex-plan-sandbox", "model": AGY_MODEL_ID}
     prompt = (
@@ -322,7 +366,7 @@ def probe_agy_capability(
         prompt=prompt,
         slice_id="cortex-capability-probe",
         log_dir=".",
-        model=AGY_MODEL_ID,
+        model=cli_model_token,
     )
     try:
         smoke_raw = process_runner(argv, **common)

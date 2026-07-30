@@ -119,7 +119,7 @@ Verify/review identity MUST以schema v2明示`review` capability且其independen
 - **AND**forged、stale或unknown evidence state MUST保留`needs_human`且不得dispatch
 
 ### Requirement: Agy launcher必須使用safe plan sandbox
-`agy` launcher MUST使用headless print、plan mode與sandbox，MUST NOT加入unsafe permission bypass。Model identity registry MUST登錄`agy + Gemini 3.1 Pro (High)`為`google`並由`doctor --probe-live`驗capability；版本字串 alone MUST NOT視為可用。
+`agy` launcher MUST使用headless print、plan mode與sandbox，MUST NOT加入unsafe permission bypass。Model identity registry MUST登錄`agy + gemini-3.1-pro-high`（`agy models`實際輸出的kebab id，非顯示名）為`google`並由`doctor --probe-live`驗capability；版本字串 alone MUST NOT視為可用。
 
 #### Scenario: CLI介面漂移
 - **WHEN**agy存在但plan/sandbox smoke失敗或model identity不符
