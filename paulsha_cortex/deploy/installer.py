@@ -57,6 +57,39 @@ def _systemctl_available() -> bool:
     return probe.returncode == 0
 
 
+def _run_systemctl_install_step(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _systemctl_install_failure(
+    *,
+    stage: str,
+    result: subprocess.CompletedProcess[str],
+    unit_dir: Path,
+    retry_argv: Sequence[str],
+) -> InstallServiceResult:
+    stderr_message = (result.stderr or "systemctl 指令失敗").strip()
+    if not stderr_message:
+        stderr_message = "未回報錯誤訊息"
+    retry_command = " ".join(("systemctl", "--user", *retry_argv))
+    exit_code = result.returncode if result.returncode > 0 else 1
+    return InstallServiceResult(
+        exit_code=exit_code,
+        mode="systemd",
+        message=(
+            f"systemctl {stage} 失敗：{stderr_message}\n"
+            f"unit 已落檔於 {unit_dir}，僅 systemd reload/enable 未完成。\n"
+            f"unit dir: {unit_dir}\n"
+            f"retry: {retry_command}"
+        ),
+    )
+
+
 def _resolve_git_repo_root(repo_root: Path) -> Path:
     candidate = repo_root.expanduser().resolve()
     probe = subprocess.run(
@@ -235,9 +268,19 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
                 "fallback 缺少 `cortex service logs --follow` 即時串流。"
             ),
         )
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", f"{instance}-monitor.service"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", f"{instance}-manager.timer"], check=True)
+    for stage, args in (
+        ("daemon-reload", ("daemon-reload",)),
+        ("enable monitor service", ("enable", f"{instance}-monitor.service")),
+        ("enable manager timer", ("enable", f"{instance}-manager.timer")),
+    ):
+        result = _run_systemctl_install_step(*args)
+        if result.returncode != 0:
+            return _systemctl_install_failure(
+                stage=stage,
+                result=result,
+                unit_dir=unit_dir,
+                retry_argv=list(args),
+            )
     return InstallServiceResult(
         exit_code=0,
         mode="systemd",

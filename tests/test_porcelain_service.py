@@ -220,6 +220,61 @@ def test_service_install_json_reports_fallback_mode_when_systemd_is_unavailable(
     assert "--follow" in payload["message"]
 
 
+@pytest.mark.parametrize("use_json", [False, True], ids=["plain", "json"])
+def test_service_install_systemctl_failure_reports_expected_channel(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    use_json: bool,
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    repo_root = service_runtime["repo_root"]
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    monkeypatch.setattr(
+        installer,
+        "install_service_result",
+        lambda *_, **__: installer.InstallServiceResult(
+            exit_code=7,
+            mode="systemd",
+            message="Failed to enable beta-monitor.service; unit dir: "
+            f"{service_runtime['home'] / '.config' / 'systemd' / 'user'}; retry: systemctl --user enable beta-monitor.service",
+        ),
+    )
+
+    argv = [
+        "service",
+        "install",
+        "--instance",
+        "beta",
+        "--repo-root",
+        str(repo_root),
+        "--interval",
+        "60",
+    ]
+    if use_json:
+        argv.append("--json")
+    assert _run_cli(argv) == 7
+
+    captured = capsys.readouterr()
+    if use_json:
+        payload = json.loads(captured.out)
+        assert payload["schema"] == SERVICE_SCHEMA
+        assert payload["command"] == "install"
+        assert payload["mode"] == "systemd"
+        assert payload["result"]["exit_code"] == 7
+        assert "Failed to enable beta-monitor.service" in payload["message"]
+        assert f"{service_runtime['home'] / '.config' / 'systemd' / 'user'}" in payload["message"]
+        assert "systemctl --user enable beta-monitor.service" in payload["message"]
+        assert "Traceback" not in payload["message"]
+    else:
+        combined = captured.out + captured.err
+        assert "Failed to enable beta-monitor.service" in combined
+        assert f"{service_runtime['home'] / '.config' / 'systemd' / 'user'}" in combined
+        assert "systemctl --user enable beta-monitor.service" in combined
+        assert "Traceback" not in combined
+
+
 @pytest.mark.parametrize(("command", "verb"), [("start", "start"), ("stop", "stop"), ("restart", "restart")])
 def test_service_lifecycle_commands_operate_manager_service_and_timer_together(
     service_runtime: dict[str, Path],

@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Issue #253：系統 Service 安裝失敗改為可結構化回報**：`cortex install service` 在 `daemon-reload`、`enable monitor service` 或 `enable manager timer` 失敗時，不再拋出 traceback；改由回傳 `mode=systemd` 的非零 result，訊息固定帶出 systemd stderr、unit directory 與重試指令，並在第一個失敗步驟即停止後續流程。
+
 ## [0.1.1] - 2026-07-28
 
 ### Added
