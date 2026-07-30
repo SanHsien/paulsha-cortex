@@ -726,6 +726,114 @@ class CompleteTickReconcileTests(unittest.TestCase):
             self.assertEqual(summary["errors"], [])
 
 
+def _make_workflow_job(
+    reg: JobRegistry,
+    slice_id: str,
+    *,
+    kind: str = "build",
+    run_id: str = "wf-abc123",
+    phase: str = "build",
+    card: str = "card-1",
+) -> dict:
+    """workflow lane 的 phase job：帶 workflow_run_id，不註冊進 slices 表（issue #264）。"""
+    return reg.create_job(
+        task=slice_id, persona="builder", branch=f"feature/{slice_id}",
+        pane="", worktree=f"/wt/{slice_id}",
+        executor="copilot", session_name=slice_id, pid=4242,
+        log_path=f"/logs/{slice_id}.jsonl",
+        kind=kind,
+        workflow_run_id=run_id,
+        workflow_claim_key="claim-1",
+        workflow_repo="owner/repo",
+        workflow_card=card,
+        workflow_phase=phase,
+    )
+
+
+class CompleteTickWorkflowLaneGateTests(unittest.TestCase):
+    """issue #264：workflow phase job 收工不得誤走 slice lane 的 missing-slice-proof gate。"""
+
+    def test_workflow_build_phase_job_terminal_is_not_missing_slice_proof(self) -> None:
+        # slices 表無對應列（workflow lane 本就不註冊進 slices）；job 帶 workflow_run_id。
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_workflow_job(reg, "wf-c81b4d82a7-build-1", kind="build")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+
+            summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads((hdir / "wf-c81b4d82a7-build-1.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(manifest["gate_status"], "needs_human")
+            self.assertNotEqual(manifest["gate_reason"], "missing-slice-proof")
+            self.assertEqual(manifest["gate_status"], manager.WORKFLOW_LANE_GATE_STATUS)
+            self.assertEqual(manifest["gate_reason"], manager.WORKFLOW_LANE_GATE_REASON)
+            self.assertEqual(
+                summary["completed"],
+                [{"slice_id": "wf-c81b4d82a7-build-1", "gate_status": manager.WORKFLOW_LANE_GATE_STATUS}],
+            )
+            self.assertEqual(summary["errors"], [])
+
+    def test_workflow_review_phase_job_terminal_is_not_missing_slice_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_workflow_job(
+                reg, "wf-c81b4d82a7-adversarial-review-1", kind="review", phase="adversarial-review",
+            )
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+
+            manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads(
+                (hdir / "wf-c81b4d82a7-adversarial-review-1.json").read_text(encoding="utf-8")
+            )
+            self.assertNotEqual(manifest["gate_status"], "needs_human")
+            self.assertNotEqual(manifest["gate_reason"], "missing-slice-proof")
+            self.assertEqual(manifest["gate_status"], manager.WORKFLOW_LANE_GATE_STATUS)
+            self.assertEqual(manifest["gate_reason"], manager.WORKFLOW_LANE_GATE_REASON)
+
+    def test_workflow_review_phase_job_failed_is_failed_not_missing_slice_proof(self) -> None:
+        # workflow lane 的 review kind job 失敗時：fail closed 為 failed，不是 needs_human/
+        # missing-slice-proof（那是 slice lane 的語意，這裡是模型錯配就不該套用）。
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_workflow_job(
+                reg, "wf-c81b4d82a7-adversarial-review-2", kind="review", phase="adversarial-review",
+            )
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "failed"})
+            hdir = Path(d) / "handoff"
+
+            manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads(
+                (hdir / "wf-c81b4d82a7-adversarial-review-2.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["gate_status"], "failed")
+            self.assertNotEqual(manifest["gate_reason"], "missing-slice-proof")
+            self.assertEqual(manifest["gate_reason"], manager.WORKFLOW_LANE_GATE_REASON)
+
+    def test_slice_lane_job_missing_pinned_verification_contract_still_fails_closed(self) -> None:
+        # regression pin：不得因本次修改而放寬 slice lane 的 fail-closed 行為——
+        # 沒有 workflow_run_id、也沒有註冊進 slices 表的 job，仍必須是
+        # needs_human/missing-slice-proof（issue #264 驗收條件：不可放寬既有語意）。
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_job(reg, "slice-missing-proof")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+
+            summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads((hdir / "slice-missing-proof.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "missing-slice-proof")
+            self.assertEqual(
+                summary["completed"],
+                [{"slice_id": "slice-missing-proof", "gate_status": "needs_human"}],
+            )
+
+
 class CompleteTickVerificationTests(unittest.TestCase):
     def test_verification_runner_exception_marks_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:
