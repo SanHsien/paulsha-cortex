@@ -6,6 +6,11 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Fixed
+- **Issue #254：legacy monitor config 警告去重**：在
+  `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
+  去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy
+  file fallback 在同一 process 重複輸出警告。
 
 ### Fixed
 - **Issue #253：系統 Service 安裝失敗改為可結構化回報**：`cortex install service` 在 `daemon-reload`、`enable monitor service` 或 `enable manager timer` 失敗時，不再拋出 traceback；改由回傳 `mode=systemd` 的非零 result，訊息固定帶出 systemd stderr、unit directory 與重試指令，並在第一個失敗步驟即停止後續流程。

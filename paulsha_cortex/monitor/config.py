@@ -13,6 +13,13 @@ from paulsha_cortex.monitor.registry import ProjectEntry, load_hippo_projects
 ENV_CONFIG_VAR = "PAULSHACLAW_CONFIG"
 NEW_ENV_CONFIG_VAR = "PSC_MONITOR_CONFIG"
 ALLOWED_LEGACY_POLICIES = ("list-only", "hide")
+_WARNED_DEPRECATIONS: set[str] = set()
+
+
+def _warn_deprecated_once(key: str, _message: str) -> bool:
+    if key in _WARNED_DEPRECATIONS:
+        return False
+    return True
 
 
 def default_config_path() -> Path:
@@ -61,20 +68,30 @@ def _resolve_config_source(config_path: Path | None) -> Path | None:
         if not raw:
             continue
         if env == ENV_CONFIG_VAR:
-            warnings.warn(
+            if _warn_deprecated_once(
+                "legacy-monitor-env",
                 "PAULSHACLAW_CONFIG 已 deprecated，改用 project-cortex.yaml",
-                stacklevel=2,
-            )
+            ):
+                warnings.warn(
+                    "PAULSHACLAW_CONFIG 已 deprecated，改用 project-cortex.yaml",
+                    stacklevel=2,
+                )
+                _WARNED_DEPRECATIONS.add("legacy-monitor-env")
         return Path(raw).expanduser()
     new = _new_manual_path()
     if new.exists():
         return new
     legacy = _legacy_manual_path()
     if legacy.exists():
-        warnings.warn(
+        if _warn_deprecated_once(
+            "legacy-monitor-file",
             f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {new}",
-            stacklevel=2,
-        )
+        ):
+            warnings.warn(
+                f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {new}",
+                stacklevel=2,
+            )
+            _WARNED_DEPRECATIONS.add("legacy-monitor-file")
         return legacy
     return None
 

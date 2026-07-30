@@ -1,8 +1,10 @@
 from pathlib import Path
+import warnings
 
 import pytest
 
 from paulsha_cortex.monitor.config import _resolve_config_source, load_config
+import paulsha_cortex.monitor.config as monitor_config
 from paulsha_cortex.monitor.work_api import MonitorSocketClient
 from paulsha_cortex.config import paths
 
@@ -11,6 +13,17 @@ def _write(p: Path, text="workspaces:\n  - {name: a, path: /tmp/a}\n"):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
     return p
+
+
+@pytest.fixture
+def isolate_warning_state(monkeypatch):
+    original = getattr(monitor_config, "_WARNED_DEPRECATIONS", None)
+    monkeypatch.setattr(monitor_config, "_WARNED_DEPRECATIONS", set(), raising=False)
+    yield
+    if original is None:
+        monkeypatch.delattr(monitor_config, "_WARNED_DEPRECATIONS", raising=False)
+    else:
+        monkeypatch.setattr(monitor_config, "_WARNED_DEPRECATIONS", original)
 
 
 def test_prefers_new_project_cortex_over_legacy(monkeypatch, tmp_path):
@@ -31,6 +44,75 @@ def test_legacy_only_transition(monkeypatch, tmp_path, recwarn):
     legacy = _write(tmp_path / "legacy" / "paulshaclaw.yaml")
     assert _resolve_config_source(None) == legacy
     assert any("deprecated" in str(w.message).lower() for w in recwarn.list)
+
+
+def test_legacy_file_warning_once_per_process(monkeypatch, tmp_path, isolate_warning_state):
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+    legacy = _write(tmp_path / "legacy" / "paulshaclaw.yaml")
+    expected_message = (
+        f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {tmp_path / 'agents' / 'project-cortex.yaml'}"
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resolved = [_resolve_config_source(None) for _ in range(3)]
+
+    assert resolved == [legacy, legacy, legacy]
+    assert len(caught) == 1
+    assert str(caught[0].message) == expected_message
+
+
+def test_legacy_env_warning_once_per_process(monkeypatch, tmp_path, isolate_warning_state):
+    legacy_env = tmp_path / "legacy-env-config.yaml"
+    legacy = _write(legacy_env)
+    monkeypatch.setenv("PAULSHACLAW_CONFIG", str(legacy))
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resolved = [_resolve_config_source(None) for _ in range(3)]
+
+    assert resolved == [legacy, legacy, legacy]
+    assert len(caught) == 1
+    assert str(caught[0].message) == "PAULSHACLAW_CONFIG 已 deprecated，改用 project-cortex.yaml"
+
+
+def test_legacy_env_warning_stacklevel_points_to_caller(monkeypatch, tmp_path, isolate_warning_state):
+    legacy = _write(tmp_path / "legacy-env-config.yaml")
+    monkeypatch.setenv("PAULSHACLAW_CONFIG", str(legacy))
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+
+    def resolve_once():
+        return _resolve_config_source(None)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resolve_once()
+
+    assert len(caught) == 1
+    assert Path(caught[0].filename).name == Path(__file__).name
+
+
+def test_new_config_has_no_deprecation_warning(monkeypatch, tmp_path, isolate_warning_state):
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+    new = _write(tmp_path / "agents" / "project-cortex.yaml")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resolved = [_resolve_config_source(None) for _ in range(3)]
+
+    assert resolved == [new, new, new]
+    assert caught == []
 
 
 def test_none_when_no_manual(monkeypatch, tmp_path):
