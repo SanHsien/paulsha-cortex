@@ -332,3 +332,58 @@ work_items:
         ref: hamanpaul/paulsha-cortex#100
       - kind: github_issue
         ref: hamanpaul/paulsha-cortex#152
+  terminal-result-contract:
+    title: terminal/result contract 誠實表達 gate failure (#261)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#261
+      - kind: openspec
+        ref: 2026-07-30-terminal-result-contract
+      - kind: path
+        ref: docs/superpowers/workstreams/terminal-result-contract/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/terminal-result-contract-spec.md
+  planning-claim-recovery:
+    title: planning claim 前向恢復與 abandon 釋放語意 (#256)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#256
+      - kind: openspec
+        ref: 2026-07-30-planning-claim-recovery
+      - kind: path
+        ref: docs/superpowers/workstreams/planning-claim-recovery/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/planning-claim-recovery-spec.md
+  dispatch-runtime-preflight:
+    title: dispatch 前 runtime capability 與 provider 新鮮度驗證 (#262)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#262
+      - kind: openspec
+        ref: 2026-07-30-dispatch-runtime-preflight
+      - kind: path
+        ref: docs/superpowers/workstreams/dispatch-runtime-preflight/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/dispatch-runtime-preflight-spec.md
+  per-work-model-chain:
+    title: per-work 模型鏈覆寫 (#205)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#205
+      - kind: openspec
+        ref: 2026-07-30-per-work-model-chain
+      - kind: path
+        ref: docs/superpowers/workstreams/per-work-model-chain/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/per-work-model-chain-spec.md
+  persona-enforce-required-check:
+    title: persona enforcement 切 enforce 並設 required check (#135)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#135
+      - kind: openspec
+        ref: 2026-07-30-persona-enforce-required-check
+      - kind: path
+        ref: docs/superpowers/workstreams/persona-enforce-required-check/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/persona-enforce-required-check-spec.md
