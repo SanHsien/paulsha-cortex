@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Sequence
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.deploy import hooks as hook_reconcile
 
 _INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 _SUPPORTED_EXECUTORS = frozenset({"copilot", "claude", "codex"})
@@ -259,13 +260,18 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
             }
         ),
     )
+    hook_reconcile_result = hook_reconcile.reconcile_codex_hooks(
+        hook_reconcile.default_codex_hooks_path(home)
+    )
+    hook_note = f"codex hooks reconcile: {hook_reconcile_result.detail}"
     if not _systemctl_available():
         return InstallServiceResult(
             exit_code=0,
             mode="fallback",
             message=(
                 f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式；"
-                "fallback 缺少 `cortex service logs --follow` 即時串流。"
+                "fallback 缺少 `cortex service logs --follow` 即時串流。\n"
+                f"{hook_note}"
             ),
         )
     for stage, args in (
@@ -284,7 +290,10 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
     return InstallServiceResult(
         exit_code=0,
         mode="systemd",
-        message=f"installed: {instance}-manager.{{service,timer}} + {instance}-monitor.service",
+        message=(
+            f"installed: {instance}-manager.{{service,timer}} + {instance}-monitor.service\n"
+            f"{hook_note}"
+        ),
     )
 
 

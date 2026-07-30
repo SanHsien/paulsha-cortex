@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #155：修補 install/upgrade 未遷移 Codex 全域 relay hook**：新增
+  `paulsha_cortex.deploy.hooks.reconcile_codex_hooks()`，於 `cortex install
+  service` 流程中 idempotent 改寫 `$HOME/.codex/hooks.json` 內
+  `managedBy: psc-coordinator-relay` 的 legacy entry（指向已不存在的
+  `paulshaclaw/scripts/coordinator/psc-relay-hook.sh` 絕對路徑）為 canonical
+  的 `cortex relay-hook` 指令，改寫前自動備份原檔（`hooks.json.bak-<hex>`），
+  只動 Cortex 自管的 entries，其餘 owner（例如 `paulsha-memory`、
+  `psc-bro-return`）與已是 canonical 的設定維持不變，修補 Codex Stop hook
+  exit 127 的 install migration gap。
 - **Issue #254：legacy monitor config 警告去重**：在
   `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
   去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy
