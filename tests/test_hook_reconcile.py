@@ -142,6 +142,37 @@ class HookReconcileTests(unittest.TestCase):
         home = Path("/tmp/fake-home")
         self.assertEqual(hooks_mod.default_codex_hooks_path(home), home / ".codex" / "hooks.json")
 
+    def test_missing_packaged_manifest_is_fail_open_noop(self) -> None:
+        """套件內建 manifest 損壞/缺失，不得讓 reconcile 拋例外炸穿 install。"""
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "hooks.json"
+            target.write_text(json.dumps(_legacy_doc()), encoding="utf-8")
+            missing_manifest = Path(d) / "does-not-exist.json"
+
+            result = hooks_mod.reconcile_codex_hooks(target, manifest_path=missing_manifest)
+
+            self.assertFalse(result.changed)
+            self.assertIn("manifest", result.detail)
+            # live hooks.json 完全未被觸碰
+            doc = json.loads(target.read_text(encoding="utf-8"))
+            managed_stop = next(
+                h for h in doc["hooks"]["Stop"][0]["hooks"]
+                if h["managedBy"] == "psc-coordinator-relay"
+            )
+            self.assertEqual(managed_stop["command"], LEGACY_STOP_COMMAND)
+
+    def test_corrupt_packaged_manifest_is_fail_open_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "hooks.json"
+            target.write_text(json.dumps(_legacy_doc()), encoding="utf-8")
+            corrupt_manifest = Path(d) / "codex.json"
+            corrupt_manifest.write_text("{not valid json", encoding="utf-8")
+
+            result = hooks_mod.reconcile_codex_hooks(target, manifest_path=corrupt_manifest)
+
+            self.assertFalse(result.changed)
+            self.assertIn("manifest", result.detail)
+
 
 if __name__ == "__main__":
     unittest.main()

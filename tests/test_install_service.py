@@ -369,3 +369,62 @@ def test_install_service_and_install_reports_systemctl_step_error(
     assert "CompletedProcess" not in fake_result.message
     assert "Traceback" not in fake_result.message
     assert calls == expected_commands[: failure_index + 1]
+
+
+def test_systemctl_failure_still_reports_hook_migration_that_already_happened(
+    tmp_path, monkeypatch
+):
+    """reconcile 跑在 systemctl for loop 之前；就算 systemctl 失敗，已發生的
+    hook 遷移／備份副作用也必須出現在回報訊息中，不能悄悄消失。"""
+    from paulsha_cortex.deploy import installer
+
+    home = tmp_path / "home"
+    codex_hooks = home / ".codex" / "hooks.json"
+    codex_hooks.parent.mkdir(parents=True)
+    codex_hooks.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "command": (
+                                        "PSC_RELAY_EVENT=stop "
+                                        "$HOME/prj_pri/paulshaclaw/scripts/coordinator/"
+                                        "psc-relay-hook.sh"
+                                    ),
+                                    "type": "command",
+                                    "managedBy": "psc-coordinator-relay",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(argv, *args, **kwargs):
+        if argv == ["systemctl", "--user", "daemon-reload"]:
+            return subprocess.CompletedProcess(argv, 7, stdout="", stderr="boom")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
+
+    result = installer.install_service_result("beta", 120, tmp_path / "repo")
+
+    assert result.mode == "systemd"
+    assert result.exit_code == 7
+    assert "codex hooks reconcile" in result.message
+    assert "cortex relay-hook" in result.message
+
+    # 副作用確實已發生：live 檔案被改寫、備份確實落檔。
+    doc = json.loads(codex_hooks.read_text(encoding="utf-8"))
+    managed = doc["hooks"]["Stop"][0]["hooks"][0]
+    assert managed["command"] == "PSC_RELAY_EVENT=stop cortex relay-hook"
+    assert list(codex_hooks.parent.glob("hooks.json.bak-*"))

@@ -15,7 +15,11 @@
   的 `cortex relay-hook` 指令，改寫前自動備份原檔（`hooks.json.bak-<hex>`），
   只動 Cortex 自管的 entries，其餘 owner（例如 `paulsha-memory`、
   `psc-bro-return`）與已是 canonical 的設定維持不變，修補 Codex Stop hook
-  exit 127 的 install migration gap。
+  exit 127 的 install migration gap。全程 fail-open：套件內建 manifest
+  本身損壞/缺失時也不拋例外中斷 `cortex install service`，改回傳
+  `changed=False` 並附可辨識原因的 detail；`daemon-reload`／`enable` 等
+  systemctl 步驟失敗時，若 hook 遷移已先行發生，回報訊息會一併帶出遷移
+  結果，避免副作用（改檔＋備份）發生卻未讓 operator 知情。
 - **Issue #254：legacy monitor config 警告去重**：在
   `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
   去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy

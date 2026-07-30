@@ -71,6 +71,10 @@ def reconcile_codex_hooks(
     - 非 managedBy=psc-coordinator-relay 的 entries：不動。
     - 已是 canonical command 的 entries：不動（idempotent，changed=False）。
     - 寫回前先備份原檔到 `<path>.bak-<hex>`，並以 atomic replace 落檔。
+    - 全程 fail-open：live hooks.json 無法解析/結構不符，或套件內建 manifest
+      本身損壞讀不出來，一律回傳 `changed=False` 並附上可辨識原因的 detail，
+      不拋例外——這是 `cortex install service` 的附帶步驟，不該讓主要安裝
+      流程整體失敗。
     """
     target = hooks_path if hooks_path is not None else default_codex_hooks_path()
     manifest = manifest_path if manifest_path is not None else _codex_hooks_manifest_path()
@@ -91,7 +95,17 @@ def reconcile_codex_hooks(
             path=target, changed=False, detail="hooks 設定結構不符預期，略過"
         )
 
-    canonical_commands = _load_canonical_commands(manifest)
+    try:
+        canonical_commands = _load_canonical_commands(manifest)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+        return HookReconcileResult(
+            path=target,
+            changed=False,
+            detail=(
+                f"套件內建 hooks manifest（{manifest}）無法讀取或解析，略過遷移；"
+                f"這通常代表套件安裝損壞而非 hooks 設定本身的問題：{exc}"
+            ),
+        )
 
     migrated_events: list[str] = []
     for event, canonical_command in canonical_commands.items():

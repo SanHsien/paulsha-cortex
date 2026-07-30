@@ -73,21 +73,27 @@ def _systemctl_install_failure(
     result: subprocess.CompletedProcess[str],
     unit_dir: Path,
     retry_argv: Sequence[str],
+    hook_note: str | None = None,
 ) -> InstallServiceResult:
     stderr_message = (result.stderr or "systemctl 指令失敗").strip()
     if not stderr_message:
         stderr_message = "未回報錯誤訊息"
     retry_command = " ".join(("systemctl", "--user", *retry_argv))
     exit_code = result.returncode if result.returncode > 0 else 1
+    message = (
+        f"systemctl {stage} 失敗：{stderr_message}\n"
+        f"unit 已落檔於 {unit_dir}，僅 systemd reload/enable 未完成。\n"
+        f"unit dir: {unit_dir}\n"
+        f"retry: {retry_command}"
+    )
+    if hook_note:
+        # reconcile 發生在本 for loop 之前；即使 systemctl 這一步失敗，
+        # hook 檔案／備份的副作用已經產生，必須一併回報給 operator。
+        message = f"{message}\n{hook_note}"
     return InstallServiceResult(
         exit_code=exit_code,
         mode="systemd",
-        message=(
-            f"systemctl {stage} 失敗：{stderr_message}\n"
-            f"unit 已落檔於 {unit_dir}，僅 systemd reload/enable 未完成。\n"
-            f"unit dir: {unit_dir}\n"
-            f"retry: {retry_command}"
-        ),
+        message=message,
     )
 
 
@@ -286,6 +292,7 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
                 result=result,
                 unit_dir=unit_dir,
                 retry_argv=list(args),
+                hook_note=hook_note,
             )
     return InstallServiceResult(
         exit_code=0,
