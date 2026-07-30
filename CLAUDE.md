@@ -23,9 +23,16 @@ policy_version: 1.0.15
 - [ ] 若本任務跨多個子項，先建議用 `git worktree` 拆開
 
 ## 改 code 時
-- [ ] 同一 PR 必須同步更新 `CHANGELOG.md [Unreleased]`
-- [ ] 除非可明確標示為 docs-only / test-only / chore，否則不得省略 CHANGELOG
+- [ ] **同一 PR 必須新增 `changelog.d/<slug>.md` fragment**（R-09 實際檢查的就是這個；
+      只寫 `CHANGELOG.md [Unreleased]` 會 FAIL）
+  - 檔名 slug＝分支名去掉 issue number，例：`feature/155-migrate-codex-relay-hook`
+    → `changelog.d/migrate-codex-relay-hook.md`
+  - fragment 必須 **commit** 才算（只 `git add` 不進 diff，R-09 仍 FAIL）
+  - 發版時由 fragment 收攏進 `CHANGELOG.md`，因此並行 PR 不會在同一段互相衝突
+- [ ] 另同步補 `CHANGELOG.md [Unreleased]` entry（repo 慣例，與 fragment 併存）
+- [ ] 除非可明確標示為 docs-only / test-only / chore，否則不得省略 changelog
 - [ ] code_paths 涵蓋的檔案變動皆視為 code change
+      （本 repo 的 code_paths 含 `**/*.md`，故連改 `CLAUDE.md`／docs 也算）
 
 ## 改版號時（release 觸發時）
 - [ ] 嚴格遵循 `<MAJOR>.<MINOR>.<PATCH>[-fix.N]`
@@ -36,10 +43,20 @@ policy_version: 1.0.15
 - [ ] MAJOR bump 需使用者明確核可
 
 ## 完成任務（claim done）前
-- [ ] `CHANGELOG.md [Unreleased]` 有對應 entry（或 PR 標 `skip-changelog` + 理由）
+- [ ] `changelog.d/<slug>.md` fragment 已新增且已 commit（或 PR 標 `skip-changelog` + 理由）
+- [ ] `CHANGELOG.md [Unreleased]` 有對應 entry
 - [ ] `VERSION` 內容與意圖一致（release label PR 才可偏離 latest tag）
-- [ ] `.github/pull_request_template.md` checklist 全勾
-- [ ] `python3 -m policy_check --repo .` 無任何 failure
+- [ ] PR body checklist 全勾（R-11；本 repo 目前無 PR template 檔案，
+      checklist 由 PR body 自行帶出）
+- [ ] **policy_check 必須帶 PR 上下文跑**，裸跑會給出假的 `fail: 0`：
+      ```bash
+      python3 -m policy_check --repo . \
+        --pr-title "<PR 標題>" --pr-body "<PR body>" --pr-labels "<labels>" \
+        --pr-base-ref main --pr-head-ref "feature/<slug>"
+      ```
+      CI 走 `.github/workflows/policy-check.yml` → conventions 的
+      `reusable-policy-check.yml`，會傳這五個參數並啟用一批 PR／diff-aware 規則
+      （含 R-09 的 diff 判定）；少了它們本機看不到那些 rule 的真實結果
 - [ ] 若本 repo 有額外測試 / lint / build 指令，需一併通過
 - [ ] 若跳過任何檢查，PR 必須帶對應豁免 label + 理由
 

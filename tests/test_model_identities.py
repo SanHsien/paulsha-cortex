@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from paulsha_cortex.coordinator.model_identities import (
+    AGY_LIVE_PROBE,
     AGY_MODEL_ID,
     CapabilityProbe,
     IdentityRegistry,
@@ -150,11 +151,11 @@ def test_foreign_review_uses_v2_registry_without_leaking_planner_metadata(tmp_pa
     from paulsha_cortex.coordinator import review
 
     (tmp_path / "model-identities.yaml").write_text(
-        """\
+        f"""\
 schema_version: 2
 identities:
   - executor: agy
-    model_id: Gemini 3.1 Pro (High)
+    model_id: {AGY_MODEL_ID}
     independence_domain: google
     capabilities: [planning]
     live_probe: agy-plan-sandbox
@@ -177,9 +178,9 @@ def test_agy_probe_requires_model_listing_and_safe_headless_smoke() -> None:
     def runner(argv, **kwargs):
         calls.append({"argv": argv, **kwargs})
         if argv == ["agy", "models"]:
-            return _completed(stdout=f"Gemini 3.1 Pro (Low)\n{AGY_MODEL_ID}\n")
+            return _completed(stdout=f"gemini-3.1-pro-low\n{AGY_MODEL_ID}\n")
         return _completed(
-            stdout='{"capability":"cortex-plan-sandbox","model":"Gemini 3.1 Pro (High)"}\n'
+            stdout=f'{{"capability":"cortex-plan-sandbox","model":"{AGY_MODEL_ID}"}}\n'
         )
 
     probe = probe_agy_capability(runner=runner, timeout_seconds=11)
@@ -315,6 +316,86 @@ def test_secondary_selection_fails_closed_for_unknown_or_same_domain_only() -> N
         probes=probes,
     )
     assert (same.state, same.reason) == ("needs_human", "no-heterogeneous-planner")
+
+
+def test_agy_model_id_matches_agy_cli_kebab_id() -> None:
+    """`agy models` 現在輸出 kebab id，而不是顯示名（issue #255 根因）。
+
+    這條測試釘住 canonical 值本身，避免未來又悄悄退回顯示名或其他跟
+    `agy models` 實際輸出脫節的拼法。
+    """
+    assert AGY_MODEL_ID == "gemini-3.1-pro-high"
+    assert AGY_MODEL_ID.islower()
+    assert " " not in AGY_MODEL_ID
+
+
+def test_agy_probe_tolerates_display_name_vs_kebab_id_drift(monkeypatch) -> None:
+    """即使 `agy models` 的輸出格式再跟 canonical 常數脫節一次，probe 也不該
+    一字不差比對失敗——這條測試刻意跟目前的 AGY_MODEL_ID 拼法無關，用
+    monkeypatch 固定一個 canonical 值，驗證「正規化後語意相同即可」這條規則
+    本身，而不是巧合碰上兩者剛好相等。
+
+    容錯比對用正規化（大小寫／標點）判斷語意相同的那一行，並且用
+    `agy models` 實際印出的字面值去呼叫 `--model`，而不是硬塞 canonical
+    id（CLI 不一定認得 canonical 拼法）。
+    """
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.model_identities.AGY_MODEL_ID", "sample-model-x"
+    )
+    calls: list[dict] = []
+    drifted_line = "Sample Model X"  # 與 canonical 值語意相同、格式不同
+
+    def runner(argv, **kwargs):
+        calls.append({"argv": argv, **kwargs})
+        if argv == ["agy", "models"]:
+            return _completed(stdout=f"other-model\n{drifted_line}\n")
+        return _completed(
+            stdout='{"capability":"cortex-plan-sandbox","model":"sample-model-x"}\n'
+        )
+
+    probe = probe_agy_capability(runner=runner)
+
+    assert probe.ready is True
+    assert probe.identity == ("agy", "sample-model-x", "google")
+    model_index = calls[1]["argv"].index("--model") + 1
+    assert calls[1]["argv"][model_index] == drifted_line
+
+
+def test_agy_probe_model_not_listed_diagnostic_surfaces_available_models() -> None:
+    """失敗時 diagnostic 要帶出實際清單，不能只留下一個空的 reason 讓人猜。"""
+    probe = probe_agy_capability(
+        runner=lambda *a, **k: _completed(
+            stdout="gemini-3.6-flash-high\ngemini-3.6-flash-medium\n"
+        )
+    )
+
+    assert probe.ready is False
+    assert probe.reason == "model-not-listed"
+    assert probe.diagnostic is not None
+    assert AGY_MODEL_ID in probe.diagnostic
+    assert "gemini-3.6-flash-high" in probe.diagnostic
+
+
+def test_v1_legacy_display_name_still_promotes_to_canonical_agy_planning_identity(
+    tmp_path: Path,
+) -> None:
+    """既有 v1 設定檔若還寫著舊顯示名，也要繼續被視為 canonical agy 身分。"""
+    (tmp_path / "model-identities.yaml").write_text(
+        """\
+schema_version: 1
+identities:
+  - executor: agy
+    model_id: Gemini 3.1 Pro (High)
+    independence_domain: google
+""",
+        encoding="utf-8",
+    )
+
+    registry = load_model_identities(tmp_path, use_packaged_default=False)
+
+    legacy = registry.require("agy", "Gemini 3.1 Pro (High)")
+    assert legacy.capabilities == ("planning",)
+    assert legacy.live_probe == AGY_LIVE_PROBE
 
 
 def test_v1_identity_is_a_probe_bound_planning_fallback(tmp_path: Path) -> None:
