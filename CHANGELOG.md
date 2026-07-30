@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #255：AGY_MODEL_ID 改用 agy 實際輸出的 kebab id**：`agy models` 現在輸出
+  kebab id（如 `gemini-3.1-pro-high`），但 `model_identities.AGY_MODEL_ID` 仍寫死
+  顯示名 `Gemini 3.1 Pro (High)`，導致 `probe_agy_capability` 字面比對必然
+  miss，套件預設下唯一的 planning identity 永遠 probe 失敗、work-item workflow
+  卡死在 `define/needs_human`。`AGY_MODEL_ID` 改為 `gemini-3.1-pro-high`；
+  `probe_agy_capability` 新增正規化容錯比對（`_normalize_model_token` /
+  `_resolve_agy_cli_token`），顯示名與 kebab id 之間的格式落差不再是硬性
+  依賴，且一律用 `agy models` 實際列出的字面值呼叫 `--model`；`model-not-listed`
+  失敗時 `diagnostic` 帶出實際可用清單方便除錯；v1 schema 設定檔沿用舊顯示名
+  的既有寫法仍會被正確識別為 canonical agy planning identity（向後相容）。同步
+  更新套件內建 `data/model-identities.yaml` 與 `README.md` / active openspec
+  spec 的範例值。
+
 - **Issue #254：legacy monitor config 警告去重**：在
   `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
   去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy
