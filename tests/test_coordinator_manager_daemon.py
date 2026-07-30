@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import signal
 import subprocess
@@ -1112,6 +1113,7 @@ def test_runtime_status_provider_lists_recent_done_by_completion_time(monkeypatc
         handoff_dir=str(handoff_dir),
         scan_specs_fn=lambda specs_dir: [{"slice_id": "slice-ready", "dispatch": "auto", "plan": "p.md", "depends_on": []}],
         ready_units_fn=lambda metas, predicate: metas,
+        now_fn=lambda: "2026-07-03T09:10:00+00:00",
     )
 
     status = provider()
@@ -1119,6 +1121,215 @@ def test_runtime_status_provider_lists_recent_done_by_completion_time(monkeypatc
     assert status["ready"] == ["slice-ready"]
     assert status["in_flight"] == [{"job_id": "job-1", "slice_id": "slice-x", "state": "running"}]
     assert [entry["slice_id"] for entry in status["recent_done"]] == ["slice-b", "slice-a"]
+
+
+def test_recent_done_provider_projects_gate_reason_job_id_branch(monkeypatch, tmp_path):
+    """#230：provider 需多投影 gate_reason／job_id／branch，manifest 缺欄位時為 null 不拋錯。"""
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    (handoff_dir / "slice-full.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "slice-full",
+                "gate_status": "needs_human",
+                "completed_at": "2026-07-03T09:03:00+00:00",
+                "gate_reason": "missing-slice-proof",
+                "job_id": "wf-abc-code-review-1",
+                "branch": "feature/xyz",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (handoff_dir / "slice-sparse.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "slice-sparse",
+                "gate_status": "passed",
+                "completed_at": "2026-07-03T09:01:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=FakeRegistry(),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        scan_specs_fn=lambda specs_dir: [],
+        now_fn=lambda: "2026-07-03T09:10:00+00:00",
+    )
+
+    status = provider()
+    entries = {entry["slice_id"]: entry for entry in status["recent_done"]}
+
+    assert entries["slice-full"]["gate_reason"] == "missing-slice-proof"
+    assert entries["slice-full"]["job_id"] == "wf-abc-code-review-1"
+    assert entries["slice-full"]["branch"] == "feature/xyz"
+    assert entries["slice-sparse"]["gate_reason"] is None
+    assert entries["slice-sparse"]["job_id"] is None
+    assert entries["slice-sparse"]["branch"] is None
+
+
+def test_recent_done_provider_applies_recency_window(monkeypatch, tmp_path):
+    """#265：超出 window 的 manifest 不進 recent_done，window 內無資料時回空陣列。"""
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    (handoff_dir / "stale.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "stale",
+                "gate_status": "needs_human",
+                "completed_at": "2026-07-22T03:46:54+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=FakeRegistry(),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        scan_specs_fn=lambda specs_dir: [],
+        recent_done_window_seconds=86400.0,
+        now_fn=lambda: "2026-07-30T02:05:31+00:00",
+    )
+
+    status = provider()
+
+    assert status["recent_done"] == []
+
+
+def test_recent_done_provider_window_boundary_included_and_excluded(monkeypatch, tmp_path):
+    """window 邊界：剛好在窗內（含 cutoff 當下）納入，剛好過期（早於 cutoff 一秒）排除。"""
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    # now = 2026-07-04T00:00:00+00:00, window = 86400s -> cutoff = 2026-07-03T00:00:00+00:00
+    (handoff_dir / "in-window.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "in-window",
+                "gate_status": "passed",
+                "completed_at": "2026-07-03T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (handoff_dir / "expired.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "expired",
+                "gate_status": "passed",
+                "completed_at": "2026-07-02T23:59:59+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=FakeRegistry(),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        scan_specs_fn=lambda specs_dir: [],
+        recent_done_window_seconds=86400.0,
+        now_fn=lambda: "2026-07-04T00:00:00+00:00",
+    )
+
+    status = provider()
+
+    assert [entry["slice_id"] for entry in status["recent_done"]] == ["in-window"]
+
+
+def test_recent_done_provider_window_disabled_when_none(monkeypatch, tmp_path):
+    """recent_done_window_seconds=None 明確關閉 window（保留舊行為的逃生艙口，供未來調校用）。"""
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    (handoff_dir / "ancient.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "ancient",
+                "gate_status": "passed",
+                "completed_at": "2020-01-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=FakeRegistry(),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        scan_specs_fn=lambda specs_dir: [],
+        recent_done_window_seconds=None,
+        now_fn=lambda: "2026-07-30T00:00:00+00:00",
+    )
+
+    status = provider()
+
+    assert [entry["slice_id"] for entry in status["recent_done"]] == ["ancient"]
+
+
+def test_recent_done_provider_treats_naive_completed_at_as_utc(monkeypatch, tmp_path):
+    """naive（無時區）completed_at 必須視為 UTC，不能被執行主機的本地時區污染。
+
+    ``datetime.fromisoformat`` 對 naive 字串回傳 naive datetime，naive
+    datetime 的 ``.timestamp()`` 用本機系統時區解讀。在 UTC+8 主機上，若
+    provider 沒有把 naive 字串正規化成 UTC，一份實際只有 16.5 小時前完成、
+    理應落在 24 小時 window 內的 manifest，會被誤判成 24.5 小時前而剔除
+    ——方向正好與 #265 要修的「過期不留」相反，變成「新鮮的被丟掉」。
+
+    本測試把行程的 TZ 切到 Asia/Taipei（UTC+8）模擬這個環境差異，並比較
+    naive／aware 兩種寫法的同一時刻是否得到一致的新鮮度判定。
+    """
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    # now = 2026-07-30T02:00:00Z，window = 24h -> cutoff = 2026-07-29T02:00:00Z
+    (handoff_dir / "naive-fresh.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "naive-fresh",
+                "gate_status": "passed",
+                # 無時區字串；正確判定應視為 UTC，距 cutoff 尚有 16.5 小時，應保留
+                "completed_at": "2026-07-29T09:30:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (handoff_dir / "aware-fresh.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "aware-fresh",
+                "gate_status": "passed",
+                # 與上者代表同一個 UTC 時刻，帶明確時區
+                "completed_at": "2026-07-29T09:30:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "Asia/Taipei")
+    time.tzset()
+    try:
+        provider = manager_daemon.build_runtime_status_provider(
+            registry=FakeRegistry(),
+            specs_dir=str(tmp_path / "specs"),
+            handoff_dir=str(handoff_dir),
+            scan_specs_fn=lambda specs_dir: [],
+            recent_done_window_seconds=86400.0,
+            now_fn=lambda: "2026-07-30T02:00:00+00:00",
+        )
+
+        status = provider()
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
+
+    slice_ids = {entry["slice_id"] for entry in status["recent_done"]}
+    assert slice_ids == {"naive-fresh", "aware-fresh"}
 
 
 def test_runtime_status_provider_classifies_held_units(monkeypatch, tmp_path):
@@ -1988,11 +2199,15 @@ def test_run_loop_default_builders_receive_injected_dispatcher_and_registry(monk
         seen["workflow_runtime_factory"] = workflow_runtime_factory
         return lambda req: {"dispatched": [req["req_id"]], "completed": [], "errors": [], "reaped": None}
 
-    def fake_build_runtime_status_provider(*, registry, specs_dir, handoff_dir, git_runner=None):
+    def fake_build_runtime_status_provider(
+        *, registry, specs_dir, handoff_dir, git_runner=None, recent_done_window_seconds=None, now_fn=None
+    ):
         seen["status_registry"] = registry
         seen["status_specs_dir"] = specs_dir
         seen["status_handoff_dir"] = handoff_dir
         seen["status_git_runner"] = git_runner
+        seen["status_recent_done_window_seconds"] = recent_done_window_seconds
+        seen["status_now_fn"] = now_fn
         return lambda: {"ready": [], "in_flight": [], "recent_done": []}
 
     def fake_build_periodic_tick_runner(*, dispatcher, specs_dir, handoff_dir, launcher, require_idle, default_executor, reaper):

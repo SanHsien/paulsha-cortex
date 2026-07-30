@@ -87,6 +87,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    ```dotenv
    PSC_MANAGER_EXECUTOR=codex
    PSC_MANAGER_INTERVAL_SECONDS=300
+   PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS=86400
    ```
 
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
@@ -310,7 +311,7 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 - `in_flight`：正在執行的 Job。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
 - `attention`：全部 `needs_human` 項目，包含 reason 與當下合法的 `next_actions`。
-- `recent_done`：最近完成或進入 terminal gate 的 slice 摘要。
+- `recent_done`：最近完成或進入 terminal gate 的 slice 摘要，含 `slice_id`、`gate_status`、`at`、`gate_reason`、`job_id`、`branch`（manifest 缺該欄時為 `null`）。只回溯 `--recent-done-window-seconds`（預設 86400 秒／24 小時，可用 `PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS` 覆寫）內完成的 handoff manifest；window 內沒有資料時回空陣列，不會回退撈更舊的紀錄，過期 manifest 檔案本身的清理屬於 #178 program teardown GC 的範圍，不在 `recent_done` provider 職責內。
 
 Job `exited` 只代表 Agent process 以 exit code 0 結束，**不代表任務交付完成**。只有 Slice 通過 deterministic verification、必要的 foreign review，且 Candidate 已進入 target branch 後，才會變成 `completed` 並釋放下游 dependency。
 

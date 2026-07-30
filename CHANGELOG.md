@@ -45,6 +45,16 @@
   spec 的範例值。
 
 - **Issue #264：workflow phase job 收工不再誤走 slice lane gate**：`paulsha_cortex/coordinator/manager.py` 的 completion sweep 新增 `_is_workflow_lane_job()`（以 job 的 `workflow_run_id` 是否存在機械判定 lane 歸屬），completion sweep 對帶 `workflow_run_id` 的 job（workflow lane 的 phase job，本就不註冊進 `slices` 表）不再查 `slices` 表、不再產出 `needs_human`/`missing-slice-proof`，改寫入新的 `gate_status="workflow-tracked"`／`gate_reason="workflow-lane-job"`（job 失敗則 `gate_status="failed"`，`gate_reason` 仍為 `workflow-lane-job`，與 slice lane 的 `missing-slice-proof` 機械區分）；`missing-slice-proof` 保留給真正屬於 slice lane、但 slice 關聯缺失的情形，新增 regression test 釘死其 fail-closed 行為未被放寬。修正前受影響的 30 份誤判 manifest（`~/.agents/coordinator/handoff/*.json`，`gate_reason=missing-slice-proof` 且 `slice_id` 為 `wf-<hash>-<phase>` 形式）皆為歷史殘留、其對應 workflow 早已交付合併，建議標記為歷史誤判並保留供稽核（下次 completion sweep 對相同 job_id 為冪等 skip、不會自動覆寫；如需清理由使用者自行對 runtime state 執行 retention 操作，不在本次程式修改範圍內）。
+- **Issue #230／#265：`recent_done` 補投影欄位並加入 recency window**：`manager_daemon.py` 的
+  `recent_done_provider()`（`build_runtime_status_provider()` 內）除既有 `slice_id`／`gate_status`／
+  `at` 外，多投影 handoff manifest 既有的 `gate_reason`／`job_id`／`branch`（manifest 缺欄位時為
+  `null`，不拋錯），讓 `needs_human` 條目在 consumer 端（paulshaclaw cockpit）不再只顯示「待裁決 ·
+  原因未知」（#230）；範圍不含 `next_actions`——它是 `manager.slice_status_entry()` 算出來的衍生欄位，
+  不在 manifest 欄位集合裡，不屬本次修法範圍。同時新增可設定的 recency window（新常數
+  `RECENT_DONE_WINDOW_SECONDS`，預設 86400 秒／24 小時，可用 CLI `--recent-done-window-seconds`
+  或環境變數 `PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS` 覆寫），過期 manifest 不再進入 `recent_done`；
+  window 內無資料時回空陣列，不回退撈更舊的紀錄（#265）。handoff manifest 檔案本身的
+  retention／prune 途徑不在本次範圍內，屬 #178 program teardown GC 負責。
 - **Issue #254：legacy monitor config 警告去重**：在
   `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
   去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy
