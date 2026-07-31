@@ -1369,3 +1369,89 @@ def test_pr_body_work_item_is_not_confirmed_authority():
         "github_pr:example/acme#9": "github_issue:example/acme#7"
     }
     assert "evil" not in json.dumps(result.observations["closing_links"])
+
+
+def test_schema_retry_counts_surface_without_degrading_projection(tmp_path):
+    """#261 D5：schema mismatch 計數要能被投影出來，且不得讓任何 row 變 unsupported。
+
+    #205 曾經因為新增 WorkflowRun 欄位而讓每一個 row 落入 optional-key 白名單之外、
+    整份 workflow projection 變 degraded。本測試同時鎖住兩件事：計數確實出現，
+    以及 provider 仍為 ok、run 仍被投影出來。
+    """
+
+    state = tmp_path / "registry.json"
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 3,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-1",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "build",
+                        "attempts": {
+                            "build": 2,
+                            "schema-mismatch:tdd-red": 2,
+                            "schema-mismatch:impl": 1,
+                        },
+                    },
+                    {
+                        "run_id": "run-2",
+                        "repo": "example/acme",
+                        "work_id": "other",
+                        "status": "build",
+                        "attempts": {"build": 1},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    # 沒有任何 row 被判為 unsupported → provider 仍 ok，兩個 run 都在。
+    assert result.status == "ok"
+    assert result.diagnostics == ()
+    assert sorted(source.ref for source in result.sources) == ["run-1", "run-2"]
+
+    # 只有 schema-mismatch:* 會被萃取出來，一般的 phase attempts 不混入。
+    assert result.observations["schema_retry"] == {
+        "work": {"tdd-red": 2, "impl": 1}
+    }
+
+
+def test_schema_retry_extraction_ignores_non_integer_counts(tmp_path):
+    """壞資料不得讓 provider 掛掉或產出非數值計數。"""
+
+    state = tmp_path / "registry.json"
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 1,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-1",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "build",
+                        "attempts": {
+                            "schema-mismatch:ok": 1,
+                            "schema-mismatch:bool": True,
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    assert result.observations["schema_retry"] == {"work": {"ok": 1}}

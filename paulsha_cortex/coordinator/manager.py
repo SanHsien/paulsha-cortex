@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import dataclasses
 import fnmatch
 import hashlib
 import json
@@ -2403,34 +2402,42 @@ def _terminal_parse_diagnostics(
     )
 
 
+# #261 R2：會實際跑確定性 gate 的 phase。這些 phase 的 `passed` 必須有 manager 獨立
+# 產生的 gate ledger 背書；plan card 不改動 candidate、不跑 gate，故不在此列。
+GATE_LEDGER_REQUIRED_PHASES = frozenset({"build", "verify"})
+
+
 def _assert_terminal_gate_consistency(
     raw: Mapping[str, object],
     *,
-    run_id: object,
-    card_id: object,
-    coordinator_root: str | Path,
+    job: Mapping[str, object],
 ) -> None:
     """#261 R2／D3：矛盾偵測優先於狀態採信。
 
-    manager 端重讀自己 evidence 目錄下的 gate ledger；只要有任何確定性 gate
-    的實際結果不是 passed，terminal 自稱的 ``passed`` 一律 fail closed，並把
-    「哪一個 gate、期望值、實際值」保留在錯誤訊息裡供 operator 判讀。
-    模型文字、exit code 為 0、無明確錯誤，三者皆不構成成功授權。
+    manager 讀的是 :mod:`paulsha_cortex.coordinator.gate_ledger` 在模型行程結束
+    **之後**、於 manager 掌控的 wrapper script 內產生的 ledger——不是模型講的話。
+    只要有任何確定性 gate 的實際結果不是 passed，terminal 自稱的 ``passed`` 一律
+    fail closed，並把「哪一個 gate、期望值、實際值」保留在錯誤訊息裡。
+
+    會跑 gate 的 phase（build／verify）若連 ledger 都不存在，代表 wrapper 的 gate
+    階段沒跑完，同樣 fail closed：模型文字、exit code 為 0、無明確錯誤三者皆不構成
+    成功授權。
     """
 
-    if not isinstance(run_id, str) or not isinstance(card_id, str):
-        return
     try:
         envelope = terminal_contract.validate_envelope(raw)
     except terminal_contract.TerminalContractError:
         # 形狀問題交給既有的 per-phase schema 驗證發聲，這裡只負責矛盾偵測，
         # 不改寫既有錯誤訊息。
         return
-    if envelope.run_id is None or envelope.card_id is None:
-        # legacy verification／review payload 不帶 run_id／card_id，改用 job 綁定值
-        # 重建 locator，確保這條 cross-check 對三類 card 一致生效。
-        envelope = dataclasses.replace(envelope, run_id=run_id, card_id=card_id)
-    terminal_contract.authorize_terminal(envelope, coordinator_root=coordinator_root)
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return
+    terminal_contract.authorize_terminal(
+        envelope,
+        ledger_path=terminal_contract.gate_ledger_path(log_path),
+        require_ledger=job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES,
+    )
 
 
 def _extract_terminal_json(log_path: object) -> dict[str, object]:
@@ -4028,12 +4035,7 @@ def terminalize_workflow_job(
     raw = _extract_terminal_json(job.get("log_path"))
     # #261 R2／D3：矛盾偵測排在任何狀態採信之前。放在 per-phase schema 驗證之前，
     # 是為了避免「先按 passed 走一段流程、後面才發現不對」造成的部分副作用。
-    _assert_terminal_gate_consistency(
-        raw,
-        run_id=job.get("workflow_run_id"),
-        card_id=job.get("workflow_card"),
-        coordinator_root=coordinator_root,
-    )
+    _assert_terminal_gate_consistency(raw, job=job)
     declared_outputs = job.get("workflow_outputs")
     if not isinstance(declared_outputs, list):
         raise ValueError("workflow job declared outputs missing")
@@ -5267,7 +5269,7 @@ def _workflow_job_prompt(
             }
     else:
         fixed_terminal_fields: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": terminal_contract.TERMINAL_SCHEMA_VERSION,
             "kind": "workflow-card",
             "run_id": run.run_id,
             "card_id": step.card,
@@ -5276,8 +5278,13 @@ def _workflow_job_prompt(
             fixed_terminal_fields["outputs"] = []
         terminal_schema = {
             "kind": "workflow-card",
-            "schema_version": 1,
-            "required": ["schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"],
+            # #261 D1：canonical envelope。舊的 schema_version 1 形狀仍可被 harvest
+            # 讀取（相容路徑＋legacy 標記），但新派工一律要求 canonical 版本。
+            "schema_version": terminal_contract.TERMINAL_SCHEMA_VERSION,
+            "required": [
+                "schema_version", "kind", "status", "run_id", "card_id", "candidate",
+                "outputs", "diagnostics", "gate_evidence",
+            ],
             "fixed": fixed_terminal_fields,
             "status": ["passed", "failed", "needs_human"],
             # #261 R2：成功必須由 gate evidence 證明。模型自述、exit code 為 0、
@@ -5295,6 +5302,27 @@ def _workflow_job_prompt(
                 "items": "repo-relative artifact path string matching declared_outputs",
                 "must_match_every_declared_output": True,
                 "descriptive_objects_forbidden": True,
+            },
+            # #261 R1：結構化 diagnostics，讓失敗與需人工介入有對等的表達位置。
+            "diagnostics": {
+                "type": "object",
+                "description": (
+                    "Structured, machine-readable context for this terminal. Required for "
+                    "every status; put the concrete failure detail here when reporting "
+                    "failed or needs_human instead of burying it in prose."
+                ),
+            },
+            # #261 R2：模型自述跑了哪些 gate。Manager 會用它自己在你結束之後獨立
+            # 產生的 gate ledger 對照這份宣告，任何不一致都會 fail closed。
+            "gate_evidence": {
+                "type": "array",
+                "items": {"name": "gate name", "status": "passed | failed"},
+                "description": (
+                    "Declare every deterministic gate you actually ran and its real result. "
+                    "The Manager independently re-runs the declared gate commands after your "
+                    "process exits and compares; claiming a gate you did not run, or claiming "
+                    "passed for a gate that failed, fails the card closed."
+                ),
             },
         }
     contract: dict[str, object] = {

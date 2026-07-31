@@ -116,7 +116,7 @@ def _print_ready(ready_rows: list[dict[str, Any]]) -> None:
         )
 
 
-def _print_work(item: dict[str, Any]) -> None:
+def _print_work(item: dict[str, Any], *, schema_retry: dict[str, Any] | None = None) -> None:
     sys.stdout.write(f"repo: {item.get('repo')}\n")
     sys.stdout.write(f"work_id: {item.get('work_id')}\n")
     sys.stdout.write(f"title: {item.get('title')}\n")
@@ -125,6 +125,13 @@ def _print_work(item: dict[str, Any]) -> None:
     sys.stdout.write(
         "facets: " + json.dumps(item.get("facets", []), ensure_ascii=False, sort_keys=True) + "\n"
     )
+    # #261 D5：只在真的發生過 schema mismatch retry 時才列出，避免在正常情況下
+    # 為每個 work item 多印一行雜訊。
+    if schema_retry:
+        limit = schema_retry.get("limit")
+        for card, count in sorted(schema_retry.get("by_card", {}).items()):
+            exhausted = " (exhausted)" if isinstance(limit, int) and count >= limit else ""
+            sys.stdout.write(f"schema_retry[{card}]: {count}/{limit}{exhausted}\n")
 
 
 def _print_doctor(report: dict[str, Any]) -> None:
@@ -187,7 +194,7 @@ def _monitor_socket_path() -> str:
         return str(default_socket_path())
 
 
-def _load_work_item(work_id: str, *, repo: str | None) -> dict[str, Any]:
+def _load_work_item(work_id: str, *, repo: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
     request = {"kind": "get_work_item", "work_id": work_id}
     if repo is not None:
         request["repo"] = repo
@@ -200,15 +207,21 @@ def _load_work_item(work_id: str, *, repo: str | None) -> dict[str, Any]:
     item = data.get("item")
     if not isinstance(item, dict):
         raise ValueError(f"work item not found: {work_id}")
-    return item
+    # #261：schema retry 摘要與 item 平行放在 envelope 上（非 item 欄位），
+    # 沿用 Monitor 既有的 work item 讀模型，不需要新增 WorkItem 欄位。
+    schema_retry = data.get("schema_retry")
+    return item, schema_retry if isinstance(schema_retry, dict) else {}
 
 
 def _run_work(work_id: str, *, repo: str | None, json_output: bool) -> int:
-    item = _load_work_item(work_id, repo=repo)
+    item, schema_retry = _load_work_item(work_id, repo=repo)
     if json_output:
-        _json_dump(_inspect_envelope("work", item=item))
+        payload: dict[str, Any] = {"item": item}
+        if schema_retry:
+            payload["schema_retry"] = schema_retry
+        _json_dump(_inspect_envelope("work", **payload))
         return 0
-    _print_work(item)
+    _print_work(item, schema_retry=schema_retry)
     return 0
 
 

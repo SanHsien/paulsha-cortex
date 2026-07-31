@@ -33,118 +33,76 @@ def _card(**overrides: object) -> dict[str, object]:
 
 
 def _write_ledger(
-    coordinator_root: Path,
+    log_path: Path,
     *,
-    run_id: str = "run-1",
-    card_id: str = "tdd-red",
     gates: list[dict[str, object]],
 ) -> str:
-    """寫入 manager 側可重驗的 gate ledger，回傳其 canonical digest。"""
+    """寫入 manager 側的 gate ledger（模擬 wrapper 在模型結束後產生的那份）。"""
 
-    path = tc.gate_ledger_path(coordinator_root, run_id=run_id, card_id=card_id)
+    path = tc.gate_ledger_path(log_path)
     payload = {
         "schema_version": tc.GATE_LEDGER_SCHEMA_VERSION,
         "kind": "workflow-gate-ledger",
-        "run_id": run_id,
-        "card_id": card_id,
+        "slice_id": "slice",
         "gates": gates,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     return tc.gate_ledger_digest(payload)
-
-
-# --------------------------------------------------------------------------
-# R1 canonical result envelope
-# --------------------------------------------------------------------------
-
-
-def test_envelope_supports_all_terminal_states() -> None:
-    """R1：三種終局狀態在三類 card 上皆為合法且語意保真，不得只有成功形狀合法。"""
-
-    for kind, extra in (
-        ("workflow-card", {"run_id": "run-1", "card_id": "tdd-red", "candidate": None, "outputs": []}),
-        ("workflow-verification-result", {"summary": "s", "details": {}, "reports": []}),
-        ("workflow-review-result", {"reason": "r", "findings": [], "reports": []}),
-    ):
-        for status in ("passed", "failed", "needs_human"):
-            payload = {
-                "schema_version": tc.TERMINAL_SCHEMA_VERSION,
-                "kind": kind,
-                "status": status,
-                "diagnostics": {"note": f"{kind}/{status}"},
-                "gate_evidence": [],
-                **extra,
-            }
-            envelope = tc.validate_envelope(payload)
-            # 語意保真：狀態與 diagnostics 不得在正規化過程被改寫或吞掉。
-            assert envelope.status == status
-            assert envelope.kind == kind
-            assert envelope.schema_version == tc.TERMINAL_SCHEMA_VERSION
-            assert envelope.diagnostics == {"note": f"{kind}/{status}"}
-            assert envelope.legacy is False
-
-    # 完整狀態集合以外的值不得被接受（避免「未知狀態被當成功」）。
-    with pytest.raises(tc.TerminalContractError) as excinfo:
-        tc.validate_envelope(_card(status="verified"))
-    assert excinfo.value.reason == "status-not-terminal"
-    assert "verified" in str(excinfo.value)
-
-    # 舊形狀（無 schema_version 2）走相容路徑並帶可觀測 legacy 標記，而非被拒收。
-    legacy = tc.validate_envelope(
-        {
-            "schema_version": 1,
-            "kind": "workflow-card",
-            "status": "passed",
-            "run_id": "run-1",
-            "card_id": "tdd-red",
-            "candidate": "a" * 40,
-            "outputs": [],
-        }
-    )
-    assert legacy.legacy is True
-    assert legacy.status == "passed"
-
-
 # --------------------------------------------------------------------------
 # R2 passed 必須有 gate evidence 背書
 # --------------------------------------------------------------------------
 
 
 def test_passed_without_gate_evidence_is_rejected(tmp_path: Path) -> None:
-    """R2：canonical envelope 宣稱 passed 但沒有可重驗 evidence 時必須 fail closed。"""
+    """R2：會跑 gate 的 phase 宣稱 passed 但沒有 manager 產生的 ledger → fail closed。"""
 
+    log = tmp_path / "job.jsonl"
     envelope = tc.validate_envelope(_card(status="passed", gate_evidence=[]))
+
     with pytest.raises(tc.TerminalContractError) as excinfo:
-        tc.authorize_terminal(envelope, coordinator_root=tmp_path)
+        tc.authorize_terminal(
+            envelope, ledger_path=tc.gate_ledger_path(log), require_ledger=True
+        )
     assert excinfo.value.reason == "gate-evidence-missing"
-    # 保留可操作原因：operator 要能看出是哪個 run/card 缺 evidence。
-    assert "run-1" in str(excinfo.value) and "tdd-red" in str(excinfo.value)
+    # 保留可操作原因：operator 要看得出是哪一份 ledger 沒生出來。
+    assert "job.gates.json" in str(excinfo.value)
 
     # 對稱性：failed／needs_human 不需要 gate evidence，才不會逼模型只能回成功形狀。
     for status in ("failed", "needs_human"):
         stopped = tc.authorize_terminal(
             tc.validate_envelope(_card(status=status, gate_evidence=[])),
-            coordinator_root=tmp_path,
+            ledger_path=tc.gate_ledger_path(log),
+            require_ledger=True,
         )
         assert stopped.authorized is False
         assert stopped.status == status
 
-    # 有 ledger 但 envelope 未引用 → 仍是「沒有背書」，不得因為檔案存在就放行。
-    _write_ledger(tmp_path, gates=[{"name": "pytest", "status": "passed", "exit_code": 0}])
-    with pytest.raises(tc.TerminalContractError) as excinfo2:
+    # 模型自己在 worktree 裡偽造一份「ledger 長相」的檔案也沒用：manager 讀的是
+    # 由 log_path 推導、模型拿不到的路徑，偽造檔不在那個位置。
+    (tmp_path / "gates.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "workflow-gate-ledger",
+                "gates": [{"name": "pytest", "status": "passed", "exit_code": 0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(tc.TerminalContractError) as forged:
         tc.authorize_terminal(
-            tc.validate_envelope(_card(status="passed", gate_evidence=[])),
-            coordinator_root=tmp_path,
+            envelope, ledger_path=tc.gate_ledger_path(log), require_ledger=True
         )
-    assert excinfo2.value.reason == "gate-evidence-missing"
+    assert forged.value.reason == "gate-evidence-missing"
 
 
 def test_passed_contradicting_failed_gate_is_rejected(tmp_path: Path) -> None:
     """R2：確定性 gate 已失敗而 terminal 自稱 passed 時 fail closed，並保留矛盾原因。"""
 
-    digest = _write_ledger(
-        tmp_path,
+    log = tmp_path / "job.jsonl"
+    _write_ledger(
+        log,
         gates=[
             {"name": "openspec", "status": "passed", "exit_code": 0},
             {"name": "pytest", "status": "failed", "exit_code": 1, "detail": "3 failed"},
@@ -154,14 +112,16 @@ def test_passed_contradicting_failed_gate_is_rejected(tmp_path: Path) -> None:
         _card(
             status="passed",
             gate_evidence=[
-                {"name": "openspec", "status": "passed", "sha256": digest},
-                # 模型自述 pytest 通過——但 manager 重讀 ledger 得到 failed。
-                {"name": "pytest", "status": "passed", "sha256": digest},
+                {"name": "openspec", "status": "passed"},
+                # 模型自述 pytest 通過——但 manager 獨立產生的 ledger 記的是 failed。
+                {"name": "pytest", "status": "passed"},
             ],
         )
     )
     with pytest.raises(tc.GateContradictionError) as excinfo:
-        tc.authorize_terminal(envelope, coordinator_root=tmp_path)
+        tc.authorize_terminal(
+            envelope, ledger_path=tc.gate_ledger_path(log), require_ledger=True
+        )
     err = excinfo.value
     assert err.gate == "pytest"
     assert err.expected == "passed"
@@ -171,11 +131,21 @@ def test_passed_contradicting_failed_gate_is_rejected(tmp_path: Path) -> None:
     # 矛盾原因必須是 machine-readable，才能進 status surface。
     assert err.errors[0]["gate"] == "pytest"
     assert err.errors[0]["actual"] == "failed"
+    assert "3 failed" in err.errors[0]["detail"]
+
+    # 「沒提到」不能當作「沒失敗」：terminal 完全不引用失敗的 gate 也一樣被否決。
+    with pytest.raises(tc.GateContradictionError) as silent:
+        tc.authorize_terminal(
+            tc.validate_envelope(_card(status="passed", gate_evidence=[])),
+            ledger_path=tc.gate_ledger_path(log),
+            require_ledger=True,
+        )
+    assert silent.value.gate == "pytest"
 
     # ledger 自身矛盾（exit_code 非 0 卻標 passed）同樣不得被採信。
-    inconsistent = _write_ledger(
-        tmp_path,
-        card_id="tdd-red",
+    inconsistent_log = tmp_path / "inconsistent.jsonl"
+    _write_ledger(
+        inconsistent_log,
         gates=[{"name": "policy", "status": "passed", "exit_code": 2}],
     )
     with pytest.raises(tc.GateContradictionError) as excinfo2:
@@ -183,51 +153,57 @@ def test_passed_contradicting_failed_gate_is_rejected(tmp_path: Path) -> None:
             tc.validate_envelope(
                 _card(
                     status="passed",
-                    gate_evidence=[{"name": "policy", "status": "passed", "sha256": inconsistent}],
+                    gate_evidence=[{"name": "policy", "status": "passed"}],
                 )
             ),
-            coordinator_root=tmp_path,
+            ledger_path=tc.gate_ledger_path(inconsistent_log),
+            require_ledger=True,
         )
     assert excinfo2.value.gate == "policy"
     assert excinfo2.value.actual == "failed"
 
-    # hash 不符 → 不是「重驗過」，同樣 fail closed（模型不得改寫 ledger 後仍宣稱通過）。
-    good = _write_ledger(
-        tmp_path,
-        card_id="green",
+    # 模型宣稱跑了 ledger 中根本沒有的 gate → 自述不可信，fail closed。
+    green_log = tmp_path / "green.jsonl"
+    digest = _write_ledger(
+        green_log,
         gates=[{"name": "pytest", "status": "passed", "exit_code": 0}],
     )
-    with pytest.raises(tc.TerminalContractError) as excinfo3:
+    with pytest.raises(tc.TerminalContractError) as unknown:
         tc.authorize_terminal(
             tc.validate_envelope(
                 _card(
                     status="passed",
-                    card_id="green",
-                    gate_evidence=[{"name": "pytest", "status": "passed", "sha256": "0" * 64}],
+                    gate_evidence=[
+                        {"name": "pytest", "status": "passed"},
+                        {"name": "openspec", "status": "passed"},
+                    ],
                 )
             ),
-            coordinator_root=tmp_path,
+            ledger_path=tc.gate_ledger_path(green_log),
+            require_ledger=True,
         )
-    assert excinfo3.value.reason == "gate-evidence-hash-mismatch"
+    assert unknown.value.reason == "gate-evidence-unknown-gate"
 
-    # 正向對照：全數 passed 且 hash 相符才授權。
+    # 正向對照：ledger 全綠且自述一致才授權，且回報 manager 重算的 digest。
     granted = tc.authorize_terminal(
         tc.validate_envelope(
             _card(
                 status="passed",
-                card_id="green",
-                gate_evidence=[{"name": "pytest", "status": "passed", "sha256": good}],
+                gate_evidence=[{"name": "pytest", "status": "passed"}],
             )
         ),
-        coordinator_root=tmp_path,
+        ledger_path=tc.gate_ledger_path(green_log),
+        require_ledger=True,
     )
     assert granted.authorized is True
     assert granted.verified_gates == ("pytest",)
+    assert granted.ledger_digest == digest
 
 
 def test_natural_language_and_exit_zero_do_not_authorize_success(tmp_path: Path) -> None:
     """R2：模型文字、exit code 0、無明確錯誤，三者皆不得單獨構成成功授權。"""
 
+    log = tmp_path / "job.jsonl"
     envelope = tc.validate_envelope(
         _card(
             status="passed",
@@ -240,7 +216,9 @@ def test_natural_language_and_exit_zero_do_not_authorize_success(tmp_path: Path)
         )
     )
     with pytest.raises(tc.TerminalContractError) as excinfo:
-        tc.authorize_terminal(envelope, coordinator_root=tmp_path)
+        tc.authorize_terminal(
+            envelope, ledger_path=tc.gate_ledger_path(log), require_ledger=True
+        )
     assert excinfo.value.reason == "gate-evidence-missing"
 
 
@@ -408,9 +386,7 @@ def test_manager_harvest_fails_closed_on_passed_contradicting_gate_ledger(tmp_pa
     )
     job = _build_card_job(registry, tmp_path, log=log)
     _write_ledger(
-        tmp_path,
-        run_id="run",
-        card_id="card",
+        log,
         gates=[{"name": "pytest", "status": "failed", "exit_code": 1, "detail": "3 failed"}],
     )
 
@@ -431,12 +407,9 @@ def test_manager_harvest_accepts_passed_backed_by_verified_gate_ledger(tmp_path:
 
     from paulsha_cortex.coordinator import manager
 
-    _write_ledger(
-        tmp_path,
-        run_id="run",
-        card_id="card",
-        gates=[{"name": "pytest", "status": "passed", "exit_code": 0}],
-    )
+    log = tmp_path / "build.jsonl"
+    log.write_text("", encoding="utf-8")
+    _write_ledger(log, gates=[{"name": "pytest", "status": "passed", "exit_code": 0}])
     raw = {
         "schema_version": 1,
         "kind": "workflow-card",
@@ -448,7 +421,35 @@ def test_manager_harvest_accepts_passed_backed_by_verified_gate_ledger(tmp_path:
     }
     # 不應拋出任何例外。
     manager._assert_terminal_gate_consistency(
-        raw, run_id="run", card_id="card", coordinator_root=tmp_path
+        raw, job={"log_path": str(log), "workflow_phase": "build"}
+    )
+
+
+def test_manager_harvest_fails_closed_when_gate_ledger_absent(tmp_path: Path) -> None:
+    """R2：build phase 沒有 ledger（wrapper 的 gate 階段沒跑完）→ passed 不得放行。"""
+
+    from paulsha_cortex.coordinator import manager
+
+    log = tmp_path / "build.jsonl"
+    log.write_text("", encoding="utf-8")
+    raw = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+    with pytest.raises(tc.TerminalContractError) as excinfo:
+        manager._assert_terminal_gate_consistency(
+            raw, job={"log_path": str(log), "workflow_phase": "build"}
+        )
+    assert excinfo.value.reason == "gate-evidence-missing"
+
+    # plan card 不跑 gate，不受此要求約束（否則會誤殺純規劃的 card）。
+    manager._assert_terminal_gate_consistency(
+        raw, job={"log_path": str(log), "workflow_phase": "plan"}
     )
 
 
@@ -707,3 +708,89 @@ def test_verify_card_can_report_non_passing_without_being_called_malformed(
     # fail closed：不綁 evidence、不授權。
     assert registry.get_job(job["job_id"])["workflow_evidence"] is None
     assert not (tmp_path / "evidence" / "workflow").exists()
+
+
+def test_prompt_contract_matches_what_manager_enforces(tmp_path: Path) -> None:
+    """#261：派給模型的 terminal_schema 必須就是 manager 實際驗的那份契約。
+
+    契約文件與實作漂移是這張票的原始成因之一（模型被教成只能回成功形狀）。
+    這裡直接拿 prompt 宣告的 schema 造一份 terminal，斷言它能通過 harvest。
+    """
+
+    from dataclasses import replace as _replace
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.coordinator.registry import JobRegistry
+    from paulsha_cortex.deck.compile import compile_combo
+    from paulsha_cortex.deck.schema import (
+        DEFAULT_CARDS_PATH,
+        DEFAULT_COMBOS_DIR,
+        load_cards,
+        load_combo,
+    )
+
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "feature-oneshot.yaml", cards)
+    manifest = compile_combo(combo, cards, "contract sync", change="contract-sync").workflow_manifest
+    assert manifest is not None
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="contract-sync",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=tuple(
+            _replace(step, executor="codex", model="gpt-primary", domain="openai")
+            for step in manifest.steps
+        ),
+        issue_refs=(),
+        openspec_refs=(),
+        pr_refs=(),
+        attempts={},
+        facets=(),
+        gate_status="running",
+    )
+    step = next(item for item in run.steps if item.phase == "build" and not item.outputs)
+    prompt = manager._workflow_job_prompt(
+        run, step, builder_job_id=None, coordinator_root=tmp_path
+    )
+    schema = json.loads(prompt[prompt.index("{") : prompt.rindex("}") + 1])["terminal_schema"]
+
+    # prompt 宣告的就是 canonical envelope，且三種終局狀態俱在。
+    assert schema["schema_version"] == tc.TERMINAL_SCHEMA_VERSION
+    assert set(schema["status"]) == set(tc.TERMINAL_STATUSES)
+    assert {"diagnostics", "gate_evidence"} <= set(schema["required"])
+
+    # 依 prompt 宣告的 required 欄位造一份 terminal，harvest 必須認得。
+    terminal = {
+        "schema_version": schema["schema_version"],
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": run.run_id,
+        "card_id": step.card,
+        "candidate": "a" * 40,
+        "outputs": [],
+        "diagnostics": {"gates": "all green"},
+        "gate_evidence": [{"name": "pytest", "status": "passed"}],
+    }
+    assert set(terminal) == set(schema["required"])
+
+    log = tmp_path / "build.jsonl"
+    log.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+    _write_ledger(log, gates=[{"name": "pytest", "status": "passed", "exit_code": 0}])
+    job = _build_card_job(registry, tmp_path, log=log, run_id=run.run_id, card_id=step.card)
+
+    # cross-check 放行（不得因為 v2 多兩個欄位就被判 malformed）。
+    manager._assert_terminal_gate_consistency(raw=terminal, job=registry.get_job(job["job_id"]))
+    assert manager._malformed_workflow_card_terminal(registry.get_job(job["job_id"])) is False
+
+    # 同一份 v2 terminal 若 ledger 說 pytest 失敗，則 fail closed。
+    _write_ledger(log, gates=[{"name": "pytest", "status": "failed", "exit_code": 1}])
+    with pytest.raises(tc.GateContradictionError) as excinfo:
+        manager._assert_terminal_gate_consistency(
+            raw=terminal, job=registry.get_job(job["job_id"])
+        )
+    assert excinfo.value.gate == "pytest"

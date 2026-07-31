@@ -275,6 +275,7 @@ class WorkflowRegistryProvider:
                 rows = payload["workflow_runs"]
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
+            schema_retry: dict[str, dict[str, int]] = {}
             diagnostics: list[str] = []
             validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
@@ -306,6 +307,12 @@ class WorkflowRegistryProvider:
                     )
                 )
                 _add_workflow_link(links, source_id, work_id)
+                # #261 D5：schema mismatch retry 計數存在既有的 attempts 欄位裡
+                # （刻意不新增 WorkflowRun 欄位——新欄位會讓每一個 row 落入
+                # _WORKFLOW_V2_OPTIONAL_ROW_KEYS 之外而使整份 projection degraded）。
+                retry_rows = _schema_retry_rows(row.get("attempts"))
+                if retry_rows:
+                    schema_retry.setdefault(work_id, {}).update(retry_rows)
                 if status != "superseded":
                     for ref in row.get("issue_refs", []):
                         _add_workflow_link(links, f"github_issue:{ref}", work_id)
@@ -342,8 +349,28 @@ class WorkflowRegistryProvider:
             observations={
                 "workflow_links": links,
                 "validated_completions": validated_completions,
+                "schema_retry": schema_retry,
             },
         )
+
+
+
+SCHEMA_RETRY_ATTEMPT_PREFIX = "schema-mismatch:"
+
+
+def _schema_retry_rows(attempts: object) -> dict[str, int]:
+    """#261：從 run.attempts 取出 `schema-mismatch:<card>` 的計數。"""
+
+    if not isinstance(attempts, Mapping):
+        return {}
+    rows: dict[str, int] = {}
+    for key, value in attempts.items():
+        if not isinstance(key, str) or not key.startswith(SCHEMA_RETRY_ATTEMPT_PREFIX):
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        rows[key[len(SCHEMA_RETRY_ATTEMPT_PREFIX):]] = value
+    return rows
 
 
 def _nonempty(value: object, field: str) -> str:

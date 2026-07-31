@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -56,9 +55,6 @@ MAX_SCHEMA_RETRIES = 2
 
 GATE_LEDGER_SCHEMA_VERSION = 1
 GATE_LEDGER_KIND = "workflow-gate-ledger"
-
-_SAFE_LEDGER_KEY = re.compile(r"[A-Za-z0-9._-]+")
-
 
 class TerminalContractError(ValueError):
     """確定性的 terminal contract 違規；一律 fail closed，且錯誤可被機器讀取。"""
@@ -386,9 +382,11 @@ def validate_envelope(payload: object) -> TerminalEnvelope:
                 reason="gate-evidence-invalid",
                 validation_path=f"$.gate_evidence[{index}].name",
             )
-        if not isinstance(sha256, str) or len(sha256) != 64:
+        # sha256 為選填的 provenance 欄位：ledger 是在模型結束之後才由 manager 產生的，
+        # 模型不可能知道它的 digest，因此不得把 digest 設為模型的義務。
+        if sha256 is not None and (not isinstance(sha256, str) or len(sha256) != 64):
             raise TerminalContractError(
-                f"gate_evidence {name!r} 缺少可重驗的 sha256",
+                f"gate_evidence {name!r} 的 sha256 格式非法",
                 reason="gate-evidence-invalid",
                 validation_path=f"$.gate_evidence[{index}].sha256",
             )
@@ -413,18 +411,16 @@ def validate_envelope(payload: object) -> TerminalEnvelope:
     )
 
 
-def gate_ledger_path(coordinator_root: str | Path, *, run_id: str, card_id: str) -> Path:
-    """manager 側 gate ledger 的確定性路徑（confined 於 coordinator evidence 目錄）。"""
+def gate_ledger_path(log_path: str | Path) -> Path:
+    """由 job 的 ``log_path`` 推導 gate ledger 路徑（``<...>.jsonl`` → ``<...>.gates.json``）。
 
-    for label, value in (("run_id", run_id), ("card_id", card_id)):
-        if not isinstance(value, str) or _SAFE_LEDGER_KEY.fullmatch(value) is None:
-            raise TerminalContractError(
-                f"gate ledger {label} 非法：{value!r}",
-                reason="gate-ledger-key-invalid",
-                validation_path=f"$.{label}",
-            )
-    root = Path(coordinator_root) / "evidence" / "gates"
-    return root / f"{run_id}-{card_id}.json"
+    刻意與 :func:`paulsha_cortex.coordinator.dispatcher.exit_sentinel_path` 同一套
+    推導方式：ledger 由 manager 掌控的 wrapper script 寫在 manager 自己的 log_dir，
+    模型的 cwd 是 worktree、也拿不到這個路徑，因此 ledger 不是模型能產生或改寫的。
+    """
+
+    path = Path(log_path)
+    return path.with_name(path.stem + ".gates.json")
 
 
 def gate_ledger_digest(payload: Mapping[str, Any]) -> str:
@@ -436,12 +432,10 @@ def gate_ledger_digest(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def read_gate_ledger(
-    coordinator_root: str | Path, *, run_id: str, card_id: str
-) -> tuple[dict[str, Any], str] | None:
+def read_gate_ledger(ledger_path: str | Path) -> tuple[dict[str, Any], str] | None:
     """讀回 manager 側 gate ledger 與其 digest；不存在回 ``None``。"""
 
-    path = gate_ledger_path(coordinator_root, run_id=run_id, card_id=card_id)
+    path = Path(ledger_path)
     if path.is_symlink():
         raise TerminalContractError(
             "gate ledger 不得為 symlink",
@@ -509,9 +503,14 @@ def _ledger_outcomes(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
 def authorize_terminal(
     envelope: TerminalEnvelope,
     *,
-    coordinator_root: str | Path,
+    ledger_path: str | Path,
+    require_ledger: bool = False,
 ) -> TerminalAuthorization:
-    """採信 terminal 狀態；``passed`` 必須由可重驗的 gate evidence 授權（R2）。
+    """採信 terminal 狀態；``passed`` 必須由 manager 獨立產生的 gate ledger 授權（R2）。
+
+    ledger 由 :mod:`paulsha_cortex.coordinator.gate_ledger` 在模型行程結束**之後**、
+    於 manager 掌控的 wrapper script 內產生，因此它不是模型講的話。envelope 內的
+    ``gate_evidence`` 只是模型的自述宣告，這裡用 ledger 去對照那份宣告。
 
     D3：矛盾偵測優先於狀態採信——先做確定性 cross-check，矛盾即 fail closed，
     才進入正常的狀態處理，避免「先按 passed 走一段流程」造成部分副作用。
@@ -527,98 +526,69 @@ def authorize_terminal(
             legacy=envelope.legacy,
         )
 
-    run_id = envelope.run_id
-    card_id = envelope.card_id
-    ledger: dict[str, Any] | None = None
-    digest: str | None = None
-    if run_id and card_id:
-        found = read_gate_ledger(coordinator_root, run_id=run_id, card_id=card_id)
-        if found is not None:
-            ledger, digest = found
+    found = read_gate_ledger(ledger_path)
+    ledger = found[0] if found is not None else None
+    digest = found[1] if found is not None else None
 
-    if ledger is not None:
-        outcomes = _ledger_outcomes(ledger)
-        # D3：先做矛盾偵測。即使 terminal 沒有引用該 gate，manager 讀到的失敗結果
-        # 也直接否決 passed——「沒提到」不能當作「沒失敗」。
-        for name in sorted(outcomes):
-            actual = outcomes[name]
-            if actual["status"] != "passed":
-                raise GateContradictionError(
-                    gate=name,
-                    expected="passed",
-                    actual=actual["status"],
-                    detail=str(actual.get("detail") or ""),
-                )
-
-    if envelope.legacy:
-        # 舊形狀不帶 gate_evidence 欄位；相容路徑僅保留矛盾偵測，不即刻失效（D1）。
+    if ledger is None:
+        if require_ledger:
+            # ledger 不存在 = manager 掌控的 wrapper 沒跑完 gate 階段。此時沒有任何
+            # 獨立證據可以背書 passed；模型文字、exit code 為 0、無明確錯誤三者
+            # 皆不構成成功授權，故 fail closed。
+            raise TerminalContractError(
+                "terminal 宣稱 passed 但 manager 端沒有可重驗的 gate ledger"
+                f"（{Path(ledger_path).name}）；模型文字、exit code 為 0、"
+                "無明確錯誤皆不構成成功授權",
+                reason="gate-evidence-missing",
+                validation_path="$.gate_evidence",
+                errors=({"ledger_path": str(ledger_path)},),
+            )
+        # 未要求 ledger 的 phase（例如不跑 gate 的 plan card）維持既有行為。
         return TerminalAuthorization(
             status="passed",
             authorized=True,
-            verified_gates=tuple(sorted(_ledger_outcomes(ledger))) if ledger else (),
-            ledger_digest=digest,
-            legacy=True,
-        )
-
-    if not envelope.gate_evidence:
-        raise TerminalContractError(
-            "terminal 宣稱 passed 但未引用任何可重驗的 gate evidence"
-            f"（run_id={run_id!r}, card_id={card_id!r}）；"
-            "模型文字、exit code 為 0、無明確錯誤皆不構成成功授權",
-            reason="gate-evidence-missing",
-            validation_path="$.gate_evidence",
-            errors=(
-                {
-                    "run_id": run_id,
-                    "card_id": card_id,
-                    "expected": "至少一筆可重驗的 gate evidence",
-                },
-            ),
-        )
-    if ledger is None or digest is None:
-        raise TerminalContractError(
-            "terminal 引用了 gate evidence 但 manager 端讀不到對應 gate ledger"
-            f"（run_id={run_id!r}, card_id={card_id!r}）",
-            reason="gate-evidence-missing",
-            validation_path="$.gate_evidence",
-            errors=({"run_id": run_id, "card_id": card_id},),
+            verified_gates=(),
+            ledger_digest=None,
+            legacy=envelope.legacy,
         )
 
     outcomes = _ledger_outcomes(ledger)
-    verified: list[str] = []
+    # D3：先做矛盾偵測。即使 terminal 沒有引用該 gate，manager 讀到的失敗結果
+    # 也直接否決 passed——「沒提到」不能當作「沒失敗」。
+    for name in sorted(outcomes):
+        actual = outcomes[name]
+        if actual["status"] != "passed":
+            raise GateContradictionError(
+                gate=name,
+                expected="passed",
+                actual=actual["status"],
+                detail=str(actual.get("detail") or ""),
+            )
+
+    # 模型自述的 gate 宣告必須與 ledger 一致：宣稱跑了 ledger 沒有的 gate，或宣稱
+    # 的結果與 ledger 不符，都是 R2 定義的矛盾（前者代表自述不可信，後者已被上面
+    # 的迴圈攔下，這裡補上「宣稱 failed 卻整體 passed」這類不一致）。
     for item in envelope.gate_evidence:
         name = item["name"]
-        if item["sha256"] != digest:
-            raise TerminalContractError(
-                f"gate evidence {name!r} 的 sha256 與 manager 重算的 ledger digest 不符",
-                reason="gate-evidence-hash-mismatch",
-                validation_path="$.gate_evidence",
-                errors=(
-                    {"gate": name, "expected": digest, "actual": item["sha256"]},
-                ),
-            )
         if name not in outcomes:
             raise TerminalContractError(
-                f"gate evidence 引用了 ledger 中不存在的 gate：{name!r}",
+                f"terminal 宣稱跑了 gate {name!r}，但 manager 的 ledger 沒有這一項",
                 reason="gate-evidence-unknown-gate",
                 validation_path="$.gate_evidence",
                 errors=({"gate": name, "known": sorted(outcomes)},),
             )
-        verified.append(name)
-
-    missing = sorted(set(outcomes) - set(verified))
-    if missing:
-        raise TerminalContractError(
-            f"gate ledger 記錄的 gate 未被 terminal 全數引用：{missing}",
-            reason="gate-evidence-incomplete",
-            validation_path="$.gate_evidence",
-            errors=({"missing": missing},),
-        )
+        if item["status"] != outcomes[name]["status"]:
+            raise GateContradictionError(
+                gate=name,
+                expected=str(item["status"]),
+                actual=str(outcomes[name]["status"]),
+                detail=str(outcomes[name].get("detail") or ""),
+            )
 
     return TerminalAuthorization(
         status="passed",
         authorized=True,
-        verified_gates=tuple(sorted(verified)),
+        verified_gates=tuple(sorted(outcomes)),
         ledger_digest=digest,
-        legacy=False,
+        legacy=envelope.legacy,
     )

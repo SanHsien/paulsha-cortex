@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #261（收口）：gate ledger 由 manager 掌控的 wrapper 產生，canonical envelope 實際生效**：
+  新增 `paulsha_cortex/coordinator/gate_ledger.py`，由 `launcher.build_wrapper_script` 產生的
+  headless wrapper 在模型行程結束**之後**執行——`<模型 argv>; printf %s "$?" > <sentinel>;
+  python3 -m ...gate_ledger --out <ledger> --worktree <wt> >/dev/null 2>&1`。三段以 `;` 串接，
+  模型失敗時 sentinel 與 ledger 仍會產生；sentinel 早於 gate 階段寫入，模型 exit code 不被
+  gate 耗時污染；gate 輸出導向 `/dev/null`，不污染 terminal evidence 解析。gate 清單由 operator
+  以 `PSC_GATE_CMD_<NAME>` 宣告（沿用 `PSC_PREFLIGHT_CMD` 的 typed-argv 規範、拒絕 shell wrapper），
+  exit code 來自真實 subprocess，模型既不能選 gate、不能定 exit code，也拿不到 ledger 路徑
+  （由 job `log_path` 推導、位於 manager 的 log_dir），因此 R2 的重驗不再是「拿模型的話驗模型的話」。
+  跑不起來或逾時的 gate 一律記為 `failed`。`_workflow_job_prompt` 改發 `schema_version: 2` 的
+  canonical envelope（含 `diagnostics` 與 `gate_evidence`），舊形狀維持相容讀取；build／verify
+  的 `passed` 在缺少 ledger 時 fail closed。schema retry 計數經 workflow provider observations
+  投影到 Monitor work item envelope，`cortex inspect work` 會列出 `schema_retry[<card>]:
+  <count>/<limit>`；計數沿用既有 `attempts` 欄位而非新增 `WorkflowRun` 欄位，避免 #205 那類
+  「新欄位讓每個 run row 變 unsupported、整份 projection degraded」的 regression。
 - **Issue #261：terminal/result contract 誠實表達 gate failure，消除 fail-open 破口**：
   新增 `paulsha_cortex/coordinator/terminal_contract.py` 作為 terminal/result 契約的單一
   真相源——帶 `schema_version` 的 canonical envelope 讓 `passed`／`failed`／`needs_human`
