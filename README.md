@@ -503,7 +503,7 @@ export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
 
 | 面向 | 現況 |
 | --- | --- |
-| persona enforcement | standalone PR workflow 為 `shadow`；coordinator verification 的 `persona-scope` 為 fail-closed gate |
+| persona enforcement | standalone PR workflow（`persona-scope.yml`）由 `personas.yaml` 的 `enforcement` 驅動，現為 `enforce`（#135；切換前以 `python -m paulsha_cortex.persona.replay` 回放近期已合併 PR 驗證零誤殺，見 `docs/persona-scope-enforcement.md`）；coordinator verification 的 `persona-scope` 為 fail-closed gate |
 | manager service install | `cortex install service` 會 render / copy / enable，但不會 start；systemd 不可用時只落檔 |
 | coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` / `work` 走 control queue；舊低階 `dispatch` 已停用 |
 | deck 驗證 | compile 只產生 `dispatch: hold` 骨架；verify 只檢查 `produces` glob 存在性，不驗內容 |
