@@ -125,7 +125,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_slice_action = sub.add_parser("slice-action", help="對 needs_human slice 送出本機 recovery action")
     p_slice_action.add_argument("slice_id")
-    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "abandon"])
+    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"])
     p_slice_action.add_argument("--actor", required=True)
 
     p_work = sub.add_parser("work", help="透過 manager daemon 執行 work lifecycle mutation")
@@ -133,8 +133,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "action",
         choices=[
             "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-            "retry-review", "recover-planning", "abandon", "auto", "ship",
-            "review-attest",
+            "retry-review", "recover-planning", "recover-pre-candidate", "abandon",
+            "auto", "ship", "review-attest",
         ],
     )
     p_work.add_argument("work_id")
