@@ -2402,6 +2402,107 @@ def _recover_planning_action(
     }
 
 
+def _recover_pre_candidate_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    requested_by: str,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """恢復 candidate 產生前失敗的 builder slice / workflow。"""
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "expected_candidate",
+    }
+    if extras:
+        raise ValueError(f"recover-pre-candidate rejects caller evidence/input: {sorted(extras)[0]}")
+    expected_candidate = args.get("expected_candidate")
+    if expected_candidate is not None and expected_candidate.lower() not in {"null", "none", ""}:
+        raise ValueError("recover-pre-candidate requires null expected_candidate")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("recover-pre-candidate issue is not authorized by WorkAuthority")
+
+    matching_slices = [
+        s for s in workflow_registry.list_slices()
+        if s.get("slice_id") == authority.work_id or s.get("spec", {}).get("path", "").endswith(f"{authority.work_id}.md")
+    ]
+    if not matching_slices:
+        matching_slices = workflow_registry.list_slices()
+
+    target_slice = None
+    for s in matching_slices:
+        cand = s.get("candidate")
+        if not (isinstance(cand, str) and verification.SAFE_SHA_RE.fullmatch(cand) is not None):
+            target_slice = s
+            break
+
+    if target_slice is None:
+        raise RuntimeError("recover-pre-candidate requires a slice with null candidate")
+
+    slice_id = target_slice["slice_id"]
+    if target_slice.get("state") not in {"needs_human", "failed", "pending"}:
+        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
+
+    if target_slice.get("state") == "pending" and target_slice.get("builder_job_id") is None:
+        return {
+            "action": "recover-pre-candidate",
+            "reason": "already-recovered",
+            "slice_id": slice_id,
+            "slice_state": "pending",
+        }
+
+    builder_job_id = target_slice.get("builder_job_id")
+    wt_path = None
+    if isinstance(builder_job_id, str):
+        try:
+            b_job = workflow_registry.get_job(builder_job_id)
+            wt_path = b_job.get("worktree")
+        except Exception:
+            pass
+    if not wt_path:
+        wt_path = target_slice.get("worktree")
+    if not wt_path and isinstance(target_slice.get("branch"), str):
+        slug = target_slice["branch"].replace("/", "-")
+        wt_path = str(Path(paths.worktree_root()) / slug)
+
+    if wt_path and isinstance(wt_path, (str, Path)):
+        target_wt = Path(wt_path)
+        if target_wt.exists() or target_wt.is_symlink():
+            try:
+                subprocess.run(["git", "worktree", "remove", "--force", str(target_wt)], check=False)
+            except Exception:
+                pass
+            if target_wt.exists() or target_wt.is_symlink():
+                import shutil
+                shutil.rmtree(target_wt, ignore_errors=True)
+
+    actor = args.get("actor") or requested_by
+    workflow_registry.record_action(
+        slice_id,
+        action="operator-recover-pre-candidate",
+        actor=actor,
+        state="pending",
+        gate_state="pending",
+        result="ok",
+    )
+    workflow_registry.update_slice(
+        slice_id,
+        state="pending",
+        gate_state="pending",
+        builder_job_id=None,
+        candidate=None,
+    )
+    updated = workflow_registry.get_slice(slice_id)
+    return {
+        "action": "recover-pre-candidate",
+        "reason": "pre-candidate-slice-reset",
+        "slice_id": slice_id,
+        "slice_state": updated.get("state"),
+        "gate_state": updated.get("gate_state"),
+    }
+
+
 def run_auto_claim_scan(
     *,
     snapshot_path: str | Path | None = None,
@@ -3161,8 +3262,8 @@ def execute_work_action(
     work_id = args.get("work_id")
     if action not in {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-        "retry-review", "recover-planning", "abandon", "auto", "ship",
-        "review-attest",
+        "retry-review", "recover-planning", "recover-pre-candidate", "abandon",
+        "auto", "ship", "review-attest",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -3220,6 +3321,14 @@ def execute_work_action(
         )
     elif action == "recover-planning":
         result = _recover_planning_action(
+            args=args,
+            authority=authority,
+            requested_by=requested_by,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "recover-pre-candidate":
+        result = _recover_pre_candidate_action(
             args=args,
             authority=authority,
             requested_by=requested_by,

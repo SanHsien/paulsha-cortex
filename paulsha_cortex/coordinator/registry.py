@@ -56,8 +56,8 @@ SLICE_STATE_TRANSITIONS = {
     "reviewing": frozenset({"reviewing", "needs_human", "verified", "failed"}),
     "verified": frozenset({"verified", "completed", "needs_human"}),
     "completed": frozenset({"completed"}),
-    "needs_human": frozenset({"needs_human", "building", "reviewing", "verified", "failed", "completed"}),
-    "failed": frozenset({"failed", "needs_human"}),
+    "needs_human": frozenset({"needs_human", "pending", "building", "reviewing", "verified", "failed", "completed"}),
+    "failed": frozenset({"failed", "pending", "needs_human"}),
 }
 GATE_STATE_TRANSITIONS = {
     "pending": frozenset({"pending", "passed", "failed", "needs_human"}),

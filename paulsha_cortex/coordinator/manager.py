@@ -66,7 +66,7 @@ TERMINAL_STATUSES = frozenset({"exited", "failed"})
 WORKFLOW_LANE_GATE_STATUS = "workflow-tracked"
 WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
-SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "abandon"})
+SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
 
 
@@ -332,6 +332,12 @@ def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
         evidence_refs=refs,
         candidate=payload["candidate"],
     )
+    registry.update_slice(
+        slice_id,
+        verification_hash=evidence["hash"],
+        current_evidence_refs=refs,
+        candidate=payload["candidate"],
+    )
 
 
 def _identity_registry() -> dict[tuple[str, str], dict[str, str]]:
@@ -431,17 +437,19 @@ def _current_verification_payload(slice_row: dict | None) -> dict | None:
 def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
     if not isinstance(slice_row, dict):
         return []
-    if slice_row.get("state") == "failed":
-        return ["retry-build", "abandon"]
-    if slice_row.get("state") != "needs_human":
-        return []
-    actions = ["retry-build", "abandon"]
     candidate = slice_row.get("candidate")
-    if not (
+    valid_candidate = (
         isinstance(candidate, str)
         and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
-    ):
-        return actions
+    )
+    state = slice_row.get("state")
+    if state == "failed":
+        return ["retry-build", "recover-pre-candidate", "abandon"] if not valid_candidate else ["retry-build", "abandon"]
+    if state != "needs_human":
+        return []
+    if not valid_candidate:
+        return ["recover-pre-candidate", "abandon"]
+    actions = ["retry-build", "abandon"]
     builder_job_id = slice_row.get("builder_job_id")
     if not isinstance(builder_job_id, str):
         return actions
@@ -1184,6 +1192,79 @@ def apply_slice_action(
             "consumed_at": consumed_at,
         }
 
+    if action == "recover-pre-candidate":
+        cand = slice_row.get("candidate")
+        if isinstance(cand, str) and verification.SAFE_SHA_RE.fullmatch(cand) is not None:
+            raise ValueError("action-not-allowed:recover-pre-candidate")
+
+        if slice_row.get("state") == "pending" and slice_row.get("builder_job_id") is None:
+            consumed_at = clock()
+            return {
+                "slice_id": slice_id,
+                "action": action,
+                "slice_state": "pending",
+                "gate_state": "pending",
+                "result": "ok",
+                "reason": "already-recovered",
+                "requested_at": requested_at,
+                "consumed_at": consumed_at,
+            }
+
+        builder_job_id = slice_row.get("builder_job_id")
+        wt_path = None
+        if isinstance(builder_job_id, str):
+            try:
+                b_job = registry.get_job(builder_job_id)
+                wt_path = b_job.get("worktree")
+            except Exception:
+                pass
+        if not wt_path:
+            wt_path = slice_row.get("worktree")
+        if not wt_path and isinstance(slice_row.get("branch"), str):
+            slug = slice_row["branch"].replace("/", "-")
+            wt_path = str(Path(paths.worktree_root()) / slug)
+
+        if wt_path and isinstance(wt_path, (str, Path)):
+            target_wt = Path(wt_path)
+            if target_wt.exists() or target_wt.is_symlink():
+                if runner is not None:
+                    try:
+                        runner(["git", "worktree", "remove", "--force", str(target_wt)])
+                    except Exception:
+                        pass
+                if target_wt.exists() or target_wt.is_symlink():
+                    import shutil
+                    shutil.rmtree(target_wt, ignore_errors=True)
+
+        consumed_at = clock()
+        registry.record_action(
+            slice_id,
+            action="operator-recover-pre-candidate",
+            actor=actor,
+            state="pending",
+            gate_state="pending",
+            requested_at=requested_at,
+            consumed_at=consumed_at,
+            result="ok",
+        )
+        registry.update_slice(
+            slice_id,
+            state="pending",
+            gate_state="pending",
+            builder_job_id=None,
+            candidate=None,
+        )
+        latest = registry.get_slice(slice_id)
+        return {
+            "slice_id": slice_id,
+            "action": action,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+            "result": "ok",
+            "requested_at": requested_at,
+            "consumed_at": consumed_at,
+        }
+
     if action == "retry-build":
         metas = scan_specs_fn(specs_dir)
         target = next((meta for meta in metas if meta.get("slice_id") == slice_id), None)
@@ -1424,6 +1505,48 @@ def complete_tick(
             before_ready = _ready_ids()
         except ValueError:
             released_ok = False  # metas 有環/重複 → released 觀測停用，不擋完成側
+
+    list_slices_fn = getattr(registry, "list_slices", None)
+    slices = list_slices_fn() if callable(list_slices_fn) else []
+    for slice_item in slices:
+        if slice_item.get("state") == "needs_human":
+            ev_data = _current_verification_payload(slice_item)
+            if ev_data and ev_data.get("payload", {}).get("summary") in {
+                "candidate-worktree-dirty",
+                "candidate-worktree-dirty-after-verification",
+            }:
+                builder_job_id = slice_item.get("builder_job_id")
+                if isinstance(builder_job_id, str):
+                    try:
+                        b_job = registry.get_job(builder_job_id)
+                        if b_job.get("status") in TERMINAL_STATUSES:
+                            try:
+                                r_root = (
+                                    autonomy._infer_repo_root(Path(slice_item["spec"]["path"]))
+                                    if isinstance(slice_item.get("spec"), dict) and slice_item["spec"].get("path")
+                                    else Path.cwd().resolve()
+                                )
+                            except Exception:
+                                r_root = Path.cwd().resolve()
+                            st_path = getattr(registry, "_state_path", None)
+                            coord_root = Path(st_path).parent if st_path is not None else None
+                            re_ev = verification_runner(
+                                slice_row=slice_item,
+                                job=b_job,
+                                repo_root=r_root,
+                                coordinator_root=coord_root,
+                                git_runner=git_runner,
+                                subprocess_runner=subprocess_runner,
+                            )
+                            if re_ev and isinstance(re_ev, dict):
+                                validated_ev = _validate_result_evidence(
+                                    evidence=re_ev,
+                                    slice_id=slice_item["slice_id"],
+                                    coordinator_root=coord_root,
+                                )
+                                _apply_verification_result(registry, slice_item["slice_id"], validated_ev)
+                    except Exception:
+                        pass
 
     for snapshot in registry.list_jobs():
         job_id = snapshot["job_id"]
