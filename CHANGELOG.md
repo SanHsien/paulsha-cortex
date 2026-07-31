@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #286：fanout plan pinning 以 spec 檔自身所在 repo 解析**：修復 `coordinator/autonomy.py` 中 `_infer_repo_root(spec_path)` 於 `PSC_REPO_ROOT` 環境變數存在時盲目回傳 manager host repo 的問題。調整為優先以 `spec_path` 所在目錄向上推導專案 Git repository root；當 spec 位於 manager host 外部的其他 repository（如 `serialwrap` 或 worktree）時，能正確將 relative plan glob 解析至該專案目錄，解決跨 repo ad-hoc 派工觸發 `DispatchReadyError: plan file unreadable` 的問題，並使 `ready` 與 `fanout` 階段對專案 repo_root 的判定維持一致。
+- **Issue #273：修復 Monitor refresh 靜默失敗、同 Repo 多 Checkout 衝突與 Source Collision 歸零缺陷**：
+  - 缺陷一：`ProjectMonitorService._refresh_work_model` 不再靜默吞掉 `ValueError` / `OSError` 例外，加入 log 紀錄並於 store / status / snapshot 記錄 `last_refresh_error` 與連續失敗計數；`cortex work show` / `work start` 在 snapshot 停更或 refresh 失敗時直接回報真正原因。
+  - 缺陷二：`WorkModelRefresher` 掃描專案時依 git 身分去重同 repo 的多個 checkout，優先選擇 canonical checkout 避免 duplicate work item ID 錯誤，並在 status diagnostics 中明確標示碰撞目錄。
+  - 缺陷三：`correlate_work_sources` 與 `project_work_items` 發生 source collision 時，將影響限縮於相關 Work Item 並標記 `degraded` 診斷，不再導致整個 repo 的 Work Item projection 歸零。
 - **Issue #277：repo rebind 後 monitor 投影與 work authority 跟隨 `PSC_REPO_ROOT`**：
   - monitor 設定解析遇到 deprecated legacy 設定（`PAULSHACLAW_CONFIG` 或 `paulshaclaw.yaml`）時改為 fail-loudly 拋出 `ValueError`，不再靜默降級至舊 repo 設定。
   - monitor config 載入時自動將 `PSC_REPO_ROOT` 納入監控專案集，確保 instance 換綁 repo 後 monitor 投影能正確解析當前 repo 的 work items。

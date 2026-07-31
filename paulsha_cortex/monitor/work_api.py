@@ -86,6 +86,8 @@ class WorkReadModelStore:
             identity: dict(explanation)
             for identity, explanation in (explanations or {}).items()
         }
+        self._last_refresh_error: str | None = snapshot.last_refresh_error
+        self._consecutive_refresh_failures: int = snapshot.consecutive_refresh_failures
 
     @classmethod
     def empty(cls) -> "WorkReadModelStore":
@@ -104,6 +106,36 @@ class WorkReadModelStore:
     def sequence(self) -> int:
         with self._lock:
             return self._snapshot.sequence
+
+    @property
+    def last_refresh_error(self) -> str | None:
+        with self._lock:
+            return self._last_refresh_error or self._snapshot.last_refresh_error
+
+    @property
+    def consecutive_refresh_failures(self) -> int:
+        with self._lock:
+            return self._consecutive_refresh_failures or self._snapshot.consecutive_refresh_failures
+
+    def record_refresh_failure(self, exc: Exception | str) -> None:
+        with self._lock:
+            self._last_refresh_error = str(exc)
+            self._consecutive_refresh_failures += 1
+            self._snapshot = replace(
+                self._snapshot,
+                last_refresh_error=self._last_refresh_error,
+                consecutive_refresh_failures=self._consecutive_refresh_failures,
+            )
+
+    def record_refresh_success(self) -> None:
+        with self._lock:
+            self._last_refresh_error = None
+            self._consecutive_refresh_failures = 0
+            self._snapshot = replace(
+                self._snapshot,
+                last_refresh_error=None,
+                consecutive_refresh_failures=0,
+            )
 
     def current_items(self) -> tuple[WorkItem, ...]:
         with self._lock:
@@ -202,7 +234,10 @@ class WorkReadModelStore:
                 if item_id == work_id and (repo is None or item_repo == repo)
             ]
             if not matches:
-                raise KeyError(work_id)
+                err_msg = work_id
+                if self.last_refresh_error is not None:
+                    err_msg = f"{work_id} (monitor refresh failing: {self.last_refresh_error})"
+                raise KeyError(err_msg)
             if len(matches) > 1:
                 raise AmbiguousWorkItemError(work_id)
             item = matches[0]
@@ -401,12 +436,37 @@ class WorkModelRefresher:
             if current_time.tzinfo is None:
                 raise ValueError("now must include timezone")
             attempted_at = current_time.isoformat().replace("+00:00", "Z")
-            for project in sorted(projects, key=lambda item: item.path):
-                if project.legacy:
-                    continue
+            active_projects = [p for p in sorted(projects, key=lambda item: item.path) if not p.legacy]
+            repo_groups: dict[str, list[tuple[ProjectState, Path, bool]]] = {}
+            for project in active_projects:
                 root = Path(project.path)
                 repo, is_github = _repo_identity(root, project.project_id)
+                repo_groups.setdefault(repo, []).append((project, root, is_github))
+
+            for repo, group in sorted(repo_groups.items(), key=lambda row: row[0]):
+                # Sort so main git repo (.git is dir) comes first, then shortest path
+                def _is_canonical(root: Path) -> int:
+                    git_dir = root / ".git"
+                    return 0 if git_dir.is_dir() else 1
+
+                sorted_group = sorted(
+                    group, key=lambda row: (_is_canonical(row[1]), len(row[1].parts), str(row[1]))
+                )
+                project, root, is_github = sorted_group[0]
+                duplicate_roots = [row[1] for row in sorted_group[1:]]
+
                 local_result = RepoWorkProvider(root, repo=repo).scan()
+                if duplicate_roots:
+                    dup_paths = ", ".join(str(r) for r in duplicate_roots)
+                    local_result = replace(
+                        local_result,
+                        diagnostics=tuple(
+                            (
+                                *local_result.diagnostics,
+                                f"duplicate checkout of repo {repo} at {dup_paths}; ignoring non-canonical checkouts",
+                            )
+                        ),
+                    )
                 previous_local = providers.get(local_result.provider_id)
                 local = _retain_last_good(previous_local, local_result)
                 providers[local.provider_id] = local
@@ -541,22 +601,22 @@ class WorkModelRefresher:
                     (work_key(repo, work_id), explanation)
                     for work_id, explanation in projection.explanations.items()
                 )
+                source_owners.update(
+                    (source_id, work_key(repo, owner))
+                    for source_id, owner in correlation.source_owners.items()
+                )
+                exclusions.extend(correlation.exclusions)
                 if correlation.degraded:
                     projected_ids = {
                         work_key(item.repo, item.work_id) for item in projection.items
                     }
-                    source_owners.update(
-                        (source_id, owner)
-                        for source_id, owner in previous.source_owners.items()
-                        if owner in projected_ids
-                    )
+                    current_source_ids = {
+                        source.source_id for item in projection.items for source in item.sources
+                    }
+                    for source_id, owner in previous.source_owners.items():
+                        if owner in projected_ids and source_id not in current_source_ids and source_id not in source_owners:
+                            source_owners[source_id] = owner
                     exclusions.extend(previous.exclusions)
-                else:
-                    source_owners.update(
-                        (source_id, work_key(repo, owner))
-                        for source_id, owner in correlation.source_owners.items()
-                    )
-                    exclusions.extend(correlation.exclusions)
             providers = {
                 provider_id: provider
                 for provider_id, provider in providers.items()

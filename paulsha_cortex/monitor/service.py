@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import stat
 import threading
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from .config import MonitorConfig
 from .fs import checked_resolve, checked_stat_mode
@@ -347,9 +350,15 @@ class ProjectMonitorService:
             events = self._work_refresher.refresh(
                 self._store.current_snapshot(), include_github=include_github
             )
-        except (OSError, ValueError):
-            # Durable last-good remains available; the next scheduled refresh retries.
+        except Exception as exc:
+            self._work_store.record_refresh_failure(exc)
+            if isinstance(exc, ValueError):
+                logger.error("deterministic work model refresh failure: %s", exc, exc_info=True)
+            else:
+                logger.warning("transient work model refresh failure: %s", exc, exc_info=True)
             return
+        else:
+            self._work_store.record_refresh_success()
         if events:
             self._server.publish_work_events(events)
 
