@@ -58,6 +58,16 @@ def _add_work_options(parser: argparse.ArgumentParser) -> None:
     toggle.add_argument("--disable", action="store_const", dest="enabled", const=False)
     parser.set_defaults(enabled=None)
     parser.add_argument("--payload", help="額外 manager-side evidence refs JSON 檔案路徑")
+    # #205：run-scoped planner/builder/reviewer 模型鏈覆寫（只作用於本次
+    # claim 的 run，不改共享 model-identities.yaml）；executor/model 必須成對
+    # 提供，是否合法（capability／independence domain）由 dispatch 時 fail
+    # closed 判定，這裡只是語法層傳遞。
+    parser.add_argument("--planner-executor", default=None, help="覆寫本 run 的 planner executor（run-scoped，不動共享 registry）")
+    parser.add_argument("--planner-model", default=None, help="覆寫本 run 的 planner model ID（run-scoped，不動共享 registry）")
+    parser.add_argument("--builder-executor", default=None, help="覆寫本 run 的 builder executor（run-scoped，不動共享 registry）")
+    parser.add_argument("--builder-model", default=None, help="覆寫本 run 的 builder model ID（run-scoped，不動共享 registry）")
+    parser.add_argument("--reviewer-executor", default=None, help="覆寫本 run 的 reviewer executor（run-scoped，不動共享 registry）")
+    parser.add_argument("--reviewer-model", default=None, help="覆寫本 run 的 reviewer model ID（run-scoped，不動共享 registry）")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -126,6 +136,12 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
                 "expected_run_id",
                 "reason",
                 "enabled",
+                "planner_executor",
+                "planner_model",
+                "builder_executor",
+                "builder_model",
+                "reviewer_executor",
+                "reviewer_model",
             ),
         ),
     }

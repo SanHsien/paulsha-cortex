@@ -1220,6 +1220,7 @@ class JobRegistry:
         decomposition_depth: int = 0,
         plan_review_passed: bool = False,
         frozen_readiness: dict[str, Any] | None = None,
+        model_chain_override: dict[str, dict[str, str]] | None = None,
     ) -> WorkflowRun:
         matches = [
             existing
@@ -1280,6 +1281,7 @@ class JobRegistry:
             decomposition_depth=decomposition_depth,
             plan_review_passed=plan_review_passed,
             frozen_readiness=frozen_readiness,
+            model_chain_override=model_chain_override,
         )
         superseded_at = _now_iso()
         next_workflows = [
@@ -1333,6 +1335,8 @@ class JobRegistry:
         decomposition_depth: int | None = None,
         plan_review_passed: bool | None = None,
         frozen_readiness: dict[str, Any] | None = None,
+        model_chain_override: dict[str, dict[str, str]] | None = None,
+        resolved_model_chain: dict[str, dict[str, str]] | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -1415,6 +1419,16 @@ class JobRegistry:
                 current.plan_review_passed
                 if plan_review_passed is None
                 else plan_review_passed
+            ),
+            model_chain_override=(
+                current.model_chain_override
+                if model_chain_override is None
+                else model_chain_override
+            ),
+            resolved_model_chain=(
+                current.resolved_model_chain
+                if resolved_model_chain is None
+                else resolved_model_chain
             ),
             frozen_readiness=(
                 current.frozen_readiness if frozen_readiness is None else frozen_readiness

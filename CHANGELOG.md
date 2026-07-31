@@ -32,6 +32,8 @@
   失敗時優先在既有 identity 順序與 independence domain 規則內 re-route，無合法替代才進入帶具體
   reason 的 `needs_human`，全程 model invocation 維持 0；`cortex inspect status` 顯示缺少的
   capability、使用中的 executor environment 與 snapshot 新鮮度。
+### Added
+- **Issue #205：per-work planner/builder/reviewer 模型鏈覆寫**：`WorkflowRun` 新增 `model_chain_override`（run-scoped 覆寫，claim/首次 dispatch 時凍結，只作用於本 run，不動共享 `model-identities.yaml`）與 `resolved_model_chain`（三段實際解析結果與來源 override/registry，供事後稽核）兩個 provenance-only 欄位；`_select_workflow_identity` 逐段優先讀凍結覆寫、未指定段落回退共享 registry，覆寫仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 fail closed 並列出可用 identity；`cortex run work start/resume/retry-build/retry-verify/retry-review/...` 新增 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model` 六個 run-scoped 覆寫參數。詳見 `changelog.d/per-work-model-chain.md`。
 
 ### Fixed
 - **Issue #256：planning claim 前向恢復與放行語意修正**：`recover-planning` 新增環境/內容分類判定與 CAS 重入保護，`abandon` 加入 `planning_released` 釋放標記讓 `needs_human` 的同識別 work item 可重 claim，並讓 `resume` 對 `needs_human` 回傳合法 `next_actions`（停在 `define` 的環境類 planning 失敗才含 `recover-planning`，內容類仍只給 `abandon`）與具體 `blocking_reason`，恢復稽核紀錄亦保存前後 run 狀態；`work_actions`、`control/contract`、`coordinator/cli`、`porcelain/run`、`work bridge/registry` 均同步放行與解讀新動作。
