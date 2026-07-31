@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #277：repo rebind 後 monitor 投影與 work authority 跟隨 `PSC_REPO_ROOT`**：
+  - monitor 設定解析遇到 deprecated legacy 設定（`PAULSHACLAW_CONFIG` 或 `paulshaclaw.yaml`）時改為 fail-loudly 拋出 `ValueError`，不再靜默降級至舊 repo 設定。
+  - monitor config 載入時自動將 `PSC_REPO_ROOT` 納入監控專案集，確保 instance 換綁 repo 後 monitor 投影能正確解析當前 repo 的 work items。
+  - `work link` / `unlink` 重寫 `.cortex/work-items.yaml` 時保留原始鍵（key）排序，避免無謂重排導致 git status 變 dirty，並於寫入後新增 readback 讀回驗證。
 - **Issue #284：persona 歷史回放測試改釘固定錨點**：原以浮動的 `main` ref 回放，merge／rebase 進行中 `prs_scanned` 可能落到 0 而讓斷言失敗（「掃不到」被誤判為「有誤殺」，實測 merge 期間出現過一次隨機紅）；且 `actions/checkout` 預設 shallow（實測 depth 1 的 clone `git log --merges -n 30` 回 0 個），CI 實際回放範圍遠少於宣稱的 30 個 PR 卻仍以「歷史回放零誤殺」通過。改釘固定 commit 錨點（`6813058`，即 #135 切換 enforce 當下的 main），使結果不隨 HEAD 移動而改變，並新增「錨點不可解析時明確 skip」的分支，避免在淺 clone 環境靜默宣稱零誤殺。偵測新 PR 誤殺仍由 CI `persona-scope` workflow 對 PR diff 負責，`replay.py` CLI 的動態回放能力不受影響。
 
 ### Changed

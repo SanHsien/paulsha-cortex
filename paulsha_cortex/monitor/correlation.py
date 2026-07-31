@@ -478,7 +478,7 @@ def _atomic_write_overrides(root: Path, overrides: WorkItemOverrides) -> None:
                 "links": [{"kind": link.kind, "ref": link.ref} for link in item.links],
                 "excludes": [{"kind": link.kind, "ref": link.ref} for link in item.excludes],
             }
-            for work_id, item in sorted(overrides.work_items.items())
+            for work_id, item in overrides.work_items.items()
         },
     }
     body = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).encode("utf-8")

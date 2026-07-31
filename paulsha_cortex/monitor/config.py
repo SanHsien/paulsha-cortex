@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 from paulsha_cortex.config import paths
-from paulsha_cortex.monitor.registry import ProjectEntry, load_hippo_projects
+from paulsha_cortex.monitor.registry import ProjectEntry, load_hippo_projects, merge_projects
 
 ENV_CONFIG_VAR = "PAULSHACLAW_CONFIG"
 NEW_ENV_CONFIG_VAR = "PSC_MONITOR_CONFIG"
@@ -63,37 +63,26 @@ class MonitorConfig:
 def _resolve_config_source(config_path: Path | None) -> Path | None:
     if config_path is not None:
         return Path(config_path)
-    for env in (NEW_ENV_CONFIG_VAR, ENV_CONFIG_VAR):
-        raw = os.environ.get(env, "").strip()
-        if not raw:
-            continue
-        if env == ENV_CONFIG_VAR:
-            if _warn_deprecated_once(
-                "legacy-monitor-env",
-                "PAULSHACLAW_CONFIG 已 deprecated，改用 project-cortex.yaml",
-            ):
-                warnings.warn(
-                    "PAULSHACLAW_CONFIG 已 deprecated，改用 project-cortex.yaml",
-                    stacklevel=2,
-                )
-                _WARNED_DEPRECATIONS.add("legacy-monitor-env")
-        return Path(raw).expanduser()
+    raw_new_env = os.environ.get(NEW_ENV_CONFIG_VAR, "").strip()
+    if raw_new_env:
+        return Path(raw_new_env).expanduser()
+
+    raw_legacy_env = os.environ.get(ENV_CONFIG_VAR, "").strip()
+    if raw_legacy_env:
+        raise ValueError("PAULSHACLAW_CONFIG 已 deprecated，改用 project-cortex.yaml")
+
     new = _new_manual_path()
     if new.exists():
         return new
+
     legacy = _legacy_manual_path()
     if legacy.exists():
-        if _warn_deprecated_once(
-            "legacy-monitor-file",
-            f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {new}",
-        ):
-            warnings.warn(
-                f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {new}",
-                stacklevel=2,
-            )
-            _WARNED_DEPRECATIONS.add("legacy-monitor-file")
-        return legacy
+        raise ValueError(
+            f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {new}"
+        )
+
     return None
+
 
 
 def _parse_workspaces(raw: Any) -> tuple[WorkspaceConfig, ...]:
@@ -190,24 +179,43 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
     )
 
 
+def _get_active_repo_projects() -> list[ProjectEntry]:
+    raw = os.environ.get("PSC_REPO_ROOT", "").strip()
+    if not raw:
+        return []
+    repo_path = Path(raw).expanduser()
+    if not repo_path.exists():
+        return []
+    from paulsha_cortex.monitor.fs import stable_path
+    return [ProjectEntry(path=stable_path(repo_path), name=repo_path.name, source="repo_root")]
+
+
 def load_config(*, config_path: Path | None = None) -> MonitorConfig:
     """Load the global paulshaclaw config.
 
     Resolution order: explicit `config_path` → `PSC_MONITOR_CONFIG` env →
-    `PAULSHACLAW_CONFIG` env → `project-cortex.yaml` → legacy `paulshaclaw.yaml`.
+    `project-cortex.yaml`.
     """
     resolved = _resolve_config_source(config_path)
+    active_repo_projects = _get_active_repo_projects() if config_path is None else []
+
     if resolved is None:
-        hippo = tuple(load_hippo_projects())
+        hippo = merge_projects(load_hippo_projects(), active_repo_projects)
         if not hippo:
             raise FileNotFoundError(
                 "無 project 設定：manual（project-cortex.yaml / legacy）與 "
                 "project-hippo.yaml 皆不存在"
             )
-        return MonitorConfig(workspaces=(), hippo_projects=hippo)
+        return MonitorConfig(workspaces=(), hippo_projects=tuple(hippo))
     if config_path is not None:
         return replace(_load_manual_config(resolved), hippo_projects=())
+    
+    hippo_list = merge_projects(
+        load_hippo_projects(resolved.parent / "project-hippo.yaml"),
+        active_repo_projects,
+    )
     return replace(
         _load_manual_config(resolved),
-        hippo_projects=tuple(load_hippo_projects(resolved.parent / "project-hippo.yaml")),
+        hippo_projects=tuple(hippo_list),
     )
+

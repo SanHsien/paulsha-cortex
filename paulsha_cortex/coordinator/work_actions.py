@@ -286,7 +286,7 @@ def _canonical_source(*, args: dict[str, Any], repo: str) -> dict[str, str]:
 
 def _write_override(path: Path, payload: dict[str, Any]) -> None:
     lines = ["version: 1", "work_items:"]
-    for work_id, row in sorted(payload["work_items"].items()):
+    for work_id, row in payload["work_items"].items():
         lines.extend([f"  {work_id}:", f"    title: {row['title']!r}"])
         for field in ("links", "excludes"):
             lines.append(f"    {field}:")
@@ -386,6 +386,13 @@ def _mutate_override(*, args: dict[str, Any], repo: str, work_id: str) -> dict[s
             row["excludes"].append(ref)
     _validate_override_payload(payload, repo=repo)
     _write_override(path, payload)
+    from paulsha_cortex.monitor.correlation import load_work_item_overrides
+    try:
+        loaded = load_work_item_overrides(path.parent.parent)
+        if work_id not in loaded.work_items:
+            raise ValueError(f"work override readback failed: {work_id} missing after write")
+    except Exception as exc:
+        raise ValueError(f"work override readback failed: {exc}") from exc
     return {"action": args["action"], "override_path": str(path), "source": ref}
 
 

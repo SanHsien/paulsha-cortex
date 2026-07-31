@@ -36,17 +36,17 @@ def test_prefers_new_project_cortex_over_legacy(monkeypatch, tmp_path):
     assert _resolve_config_source(None) == new
 
 
-def test_legacy_only_transition(monkeypatch, tmp_path, recwarn):
+def test_legacy_only_transition(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
     monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
     monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
     legacy = _write(tmp_path / "legacy" / "paulshaclaw.yaml")
-    assert _resolve_config_source(None) == legacy
-    assert any("deprecated" in str(w.message).lower() for w in recwarn.list)
+    with pytest.raises(ValueError, match="deprecated legacy monitor"):
+        _resolve_config_source(None)
 
 
-def test_legacy_file_warning_once_per_process(monkeypatch, tmp_path, isolate_warning_state):
+def test_legacy_file_fails_loudly(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
     monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
     monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
@@ -55,17 +55,12 @@ def test_legacy_file_warning_once_per_process(monkeypatch, tmp_path, isolate_war
     expected_message = (
         f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {tmp_path / 'agents' / 'project-cortex.yaml'}"
     )
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        resolved = [_resolve_config_source(None) for _ in range(3)]
-
-    assert resolved == [legacy, legacy, legacy]
-    assert len(caught) == 1
-    assert str(caught[0].message) == expected_message
+    with pytest.raises(ValueError) as exc_info:
+        _resolve_config_source(None)
+    assert str(exc_info.value) == expected_message
 
 
-def test_legacy_env_warning_once_per_process(monkeypatch, tmp_path, isolate_warning_state):
+def test_legacy_env_fails_loudly(monkeypatch, tmp_path):
     legacy_env = tmp_path / "legacy-env-config.yaml"
     legacy = _write(legacy_env)
     monkeypatch.setenv("PAULSHACLAW_CONFIG", str(legacy))
@@ -73,31 +68,9 @@ def test_legacy_env_warning_once_per_process(monkeypatch, tmp_path, isolate_warn
     monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        resolved = [_resolve_config_source(None) for _ in range(3)]
+    with pytest.raises(ValueError, match="PAULSHACLAW_CONFIG"):
+        _resolve_config_source(None)
 
-    assert resolved == [legacy, legacy, legacy]
-    assert len(caught) == 1
-    assert str(caught[0].message) == "PAULSHACLAW_CONFIG 已 deprecated，改用 project-cortex.yaml"
-
-
-def test_legacy_env_warning_stacklevel_points_to_caller(monkeypatch, tmp_path, isolate_warning_state):
-    legacy = _write(tmp_path / "legacy-env-config.yaml")
-    monkeypatch.setenv("PAULSHACLAW_CONFIG", str(legacy))
-    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
-    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
-    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
-
-    def resolve_once():
-        return _resolve_config_source(None)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        resolve_once()
-
-    assert len(caught) == 1
-    assert Path(caught[0].filename).name == Path(__file__).name
 
 
 def test_new_config_has_no_deprecation_warning(monkeypatch, tmp_path, isolate_warning_state):
