@@ -44,7 +44,7 @@ python -m paulsha_cortex.persona.replay --limit 30 --ref main
 2. 對每個 merge，用 `parent1...parent2` 三點差異取得該次合併實際的檔案清單
    （等同該 PR 的 diff）。
 3. 以 `builder` 角色（見下方「角色假設」）逐檔套用
-   `PersonaGuardrail.evaluate_filesystem`——與 `scope_ci.py` enforce 模式下
+   `PersonaGuardrail.evaluate_filesystem`——與 `paulsha_cortex/persona/scope_ci.py` enforce 模式下
    實際使用的判定邏輯完全相同，只是離線對歷史 diff 重放一次。
 4. 印出結構化 JSON（`prs_scanned` / `files_scanned` / `false_positives` /
    逐 PR 明細），`false_positives == 0` 時 `exit 0`。
@@ -114,7 +114,7 @@ python -m paulsha_cortex.persona.replay --limit 30 --ref main
 
 Label 傳遞機制：`.github/workflows/persona-scope.yml` 以
 `PERSONA_SCOPE_PR_LABELS`（逗號分隔）環境變數，將
-`github.event.pull_request.labels.*.name` 傳給 `scope_ci.py`；本機重放/除錯
+`github.event.pull_request.labels.*.name` 傳給 `paulsha_cortex/persona/scope_ci.py`；本機重放/除錯
 時可自行設定同名環境變數模擬。
 
 ## 設為 main 的 required status check（R3，GitHub repo 設定）
