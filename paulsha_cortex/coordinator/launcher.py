@@ -66,7 +66,13 @@ def _claude_review_json_schema(kind: str) -> str:
             "properties": {
                 "schema_version": {"type": "integer", "enum": [1]},
                 "kind": {"type": "string", "enum": [kind]},
-                "status": {"type": "string", "enum": ["verified"]},
+                # #261 R1：三種終局狀態在契約上對等可達。只允許成功形狀會逼模型
+                # 在 gate 已失敗時仍輸出成功 card（fail-open）；非通過狀態由
+                # manager.terminalize_workflow_job fail closed 為可操作錯誤。
+                "status": {
+                    "type": "string",
+                    "enum": ["verified", "failed", "needs_human"],
+                },
                 "summary": {"type": "string", "minLength": 1},
                 "details": {"type": "object"},
                 "reports": {"type": "array", "minItems": 1, "items": report},
@@ -112,6 +118,12 @@ def _claude_review_json_schema(kind: str) -> str:
             "properties": {
                 "schema_version": {"type": "integer", "enum": [1]},
                 "kind": {"type": "string", "enum": [kind]},
+                # #261 R1：選填的終局狀態欄位。review verdict 本身仍由 findings
+                # 決定；status 讓 reviewer 能誠實表達「這張 card 自己沒跑完」。
+                "status": {
+                    "type": "string",
+                    "enum": ["passed", "failed", "needs_human"],
+                },
                 "reason": {"type": "string", "minLength": 1},
                 "findings": {"type": "array", "items": finding},
                 "reports": {"type": "array", "minItems": 1, "items": report},

@@ -117,3 +117,15 @@ V1 terminal delivery 僅支援 GitHub。其他 forge 仍可顯示 read model，�
 候選變更必須通過 OpenSpec validation、policy、full preflight、ForeignReview，以及 exact current-HEAD 的 adversarial maintainer review。任一 typed output 或 gate 缺失、失敗或無法對準同一 HEAD 時，workflow 必須 fail-closed 保持 `needs_human`，不得宣稱 terminal completion。
 
 PR #54 僅識別目前仍為 open 的 delivery target；此編號本身不是 merge、issue closure 或 `done` evidence。Manager 先以 official archive 流程封存 OpenSpec change，後續只有在其餘 strict gates 通過後，才可透過該 PR 以帶 closing reference 的 merge commit 交付並關閉 issue #31。重新讀取 default branch 與 remote authority 後，只有 PR、archive、merge ancestry、issue closure、Todo 與 CompletionRecord 全部成立，Monitor 才能投影為 `done`。
+
+## Terminal/result contract（#261）
+
+`paulsha_cortex/coordinator/terminal_contract.py` 是 terminal/result 契約的單一真相源，供 build、verify、review 三類 card 共用。
+
+**Canonical envelope。** envelope 帶 `schema_version`，並完整支援 `passed`、`failed`、`needs_human` 三種終局狀態與結構化 `diagnostics`；三類 card 都不存在「只有成功形狀才合法」的路徑。不帶 canonical 版本的舊 payload 走相容讀取路徑並記 legacy 標記，既有 run 不因版本差異被拒收。
+
+**成功必須被證明。** `manager.terminalize_workflow_job` 在任何狀態採信之前，先以 `_assert_terminal_gate_consistency` 做確定性 cross-check：manager 重讀自己 evidence 目錄下的 gate ledger（`<coordinator_root>/evidence/gates/<run_id>-<card_id>.json`），只要有任何 gate 的實際結果不是 passed，terminal 自稱的 `passed` 一律 fail closed，錯誤訊息保留哪一個 gate、期望值與實際值。ledger 自身矛盾（記了非 0 exit code 卻標 passed）視同失敗。canonical envelope 另要求 `passed` 引用可重驗的 `gate_evidence`（比對 manager 重算的 ledger digest），缺 evidence、hash 不符、引用未知 gate 或漏引用皆 fail closed。模型輸出的自然語言、exit code 為 0、以及「沒有明確錯誤」三者皆不構成成功授權。
+
+**schema mismatch 是有上限的確定性失敗。** StructuredOutput 的 wrapper 正規化只認明確白名單外層鍵（`input`／`params`／`parameters`／`arguments`／`payload`／`response`），且同一個確定性 mismatch 只嘗試一次修復；未知形狀終止為帶 machine-readable validation errors 的可操作錯誤，不以寬鬆解析吞掉未知欄位。`resume_workflow_run` 的 malformed-terminal 重派帶上限與計數器：計數持久化於 `WorkflowRun.attempts["schema-mismatch:<card>"]`，逾限即停止重派、轉 `needs_human`，並在回傳結果上曝光 `schema_retry_count`、`schema_retry_limit`、`last_validation_path` 與 `last_validation_reason`。
+
+**診斷與授權分離。** terminal parse 失敗時，`_terminal_parse_diagnostics` 保留 observed HEAD、job id 與失敗原因的唯讀診斷（`terminal_diagnostics`），但該 payload 明確標示 `authority_granted: false`，且不含任何 candidate authority 欄位——可觀測不等於可授權。

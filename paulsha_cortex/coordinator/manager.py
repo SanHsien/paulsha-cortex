@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import fnmatch
 import hashlib
 import json
@@ -24,6 +25,7 @@ from . import completion
 from . import planning_runtime
 from . import seams
 from . import review as foreign_review
+from . import terminal_contract
 from . import verification
 from ..config.paths import worktree_root_for
 from .claim import decomposition_route
@@ -2324,6 +2326,113 @@ def _review_builder_job(
     return builder, identity
 
 
+def _unwrap_structured_output(value: object) -> dict[str, object] | None:
+    """#261 R3／D4：只剝一層白名單 wrapper，未知形狀一律回 ``None``。
+
+    刻意不在這裡拋錯：``_extract_terminal_json`` 還會繼續掃描其他行，
+    真正的「找不到 terminal evidence」由該函式統一終止。寬鬆解析（遞迴找出
+    看起來像 canonical 的 dict）會把契約破口變成安靜的錯誤資料，故不採用。
+    """
+
+    if not isinstance(value, Mapping) or len(value) != 1:
+        return None
+    only_key = next(iter(value))
+    if only_key not in terminal_contract.WRAPPER_KEYS:
+        return None
+    try:
+        normalized = terminal_contract.normalize_structured_output(value)
+    except terminal_contract.TerminalContractError:
+        return None
+    payload = normalized.payload
+    return payload if _is_workflow_terminal_payload(payload) else None
+
+
+def _schema_retry_attempt_key(card_id: str) -> str:
+    """#261 D5：schema mismatch retry 計數在 run.attempts 上的鍵。
+
+    刻意與 phase attempts 分開命名，避免和既有的 phase 重試次數混淆。
+    """
+
+    return f"schema-mismatch:{card_id}"
+
+
+def _canonicalize_card_terminal(raw: Mapping[str, object]) -> dict[str, object]:
+    """#261 D1：把 canonical envelope 投影成既有 card 驗證路徑吃得下的形狀。
+
+    canonical envelope 多帶 ``diagnostics``／``gate_evidence`` 兩個欄位，兩者的
+    語意（診斷與 gate 背書）都已經在 :func:`_assert_terminal_gate_consistency`
+    消費完畢；此處只保留 lifecycle 需要的欄位，避免新舊兩種讀法在下游並存。
+    """
+
+    projected = {
+        key: value
+        for key, value in raw.items()
+        if key not in {"diagnostics", "gate_evidence"}
+    }
+    projected["schema_version"] = 1
+    return projected
+
+
+def _terminal_parse_diagnostics(
+    job: Mapping[str, object],
+    *,
+    error: BaseException | None = None,
+) -> terminal_contract.TerminalDiagnostics:
+    """#261 R4／D6：parse 失敗時保留唯讀診斷，但不授予 candidate authority。
+
+    ``observed_head`` 取自 job 上「觀察到的」 subject/dispatch HEAD，與
+    ``WorkflowRun.candidate_head``（已授權）分離；呼叫端不得用它去 bind。
+    """
+
+    reason = str(error) if error is not None else ""
+    if not reason:
+        try:
+            _extract_terminal_json(job.get("log_path"))
+        except ValueError as exc:
+            reason = str(exc)
+        else:
+            reason = "workflow terminal payload did not satisfy the result contract"
+    observed = job.get("subject_head")
+    if not isinstance(observed, str) or not observed:
+        observed = job.get("dispatch_head")
+    return terminal_contract.TerminalDiagnostics(
+        job_id=str(job.get("job_id")),
+        observed_head=observed if isinstance(observed, str) and observed else None,
+        reason=reason,
+        validation_path=getattr(error, "validation_path", "$"),
+    )
+
+
+def _assert_terminal_gate_consistency(
+    raw: Mapping[str, object],
+    *,
+    run_id: object,
+    card_id: object,
+    coordinator_root: str | Path,
+) -> None:
+    """#261 R2／D3：矛盾偵測優先於狀態採信。
+
+    manager 端重讀自己 evidence 目錄下的 gate ledger；只要有任何確定性 gate
+    的實際結果不是 passed，terminal 自稱的 ``passed`` 一律 fail closed，並把
+    「哪一個 gate、期望值、實際值」保留在錯誤訊息裡供 operator 判讀。
+    模型文字、exit code 為 0、無明確錯誤，三者皆不構成成功授權。
+    """
+
+    if not isinstance(run_id, str) or not isinstance(card_id, str):
+        return
+    try:
+        envelope = terminal_contract.validate_envelope(raw)
+    except terminal_contract.TerminalContractError:
+        # 形狀問題交給既有的 per-phase schema 驗證發聲，這裡只負責矛盾偵測，
+        # 不改寫既有錯誤訊息。
+        return
+    if envelope.run_id is None or envelope.card_id is None:
+        # legacy verification／review payload 不帶 run_id／card_id，改用 job 綁定值
+        # 重建 locator，確保這條 cross-check 對三類 card 一致生效。
+        envelope = dataclasses.replace(envelope, run_id=run_id, card_id=card_id)
+    terminal_contract.authorize_terminal(envelope, coordinator_root=coordinator_root)
+
+
 def _extract_terminal_json(log_path: object) -> dict[str, object]:
     if not isinstance(log_path, str) or not log_path:
         raise ValueError("workflow terminal log missing")
@@ -2364,6 +2473,11 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
                 return parsed
         if _is_workflow_terminal_payload(value):
             return value
+        # #261 R3：StructuredOutput 有時把 canonical payload 包在白名單外層鍵裡；
+        # 只剝一層，未知形狀不處理（留給下方統一終止）。
+        unwrapped = _unwrap_structured_output(value)
+        if unwrapped is not None:
+            return unwrapped
     fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```\r?\n?", content)
     if fenced is not None:
         parsed = _parse_terminal_json_text(fenced.group("body"))
@@ -2416,6 +2530,8 @@ def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
         raw = _extract_terminal_json(job.get("log_path"))
     except ValueError:
         return False
+    if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
+        raw = _canonicalize_card_terminal(raw)
     required = {
         "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
     }
@@ -2460,6 +2576,8 @@ def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
         raw = _extract_terminal_json(job.get("log_path"))
     except ValueError:
         return True
+    if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
+        raw = _canonicalize_card_terminal(raw)
     required = {
         "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
     }
@@ -2601,6 +2719,8 @@ def _is_exact_legacy_agy_recovery(
         raw = _extract_terminal_json(job.get("log_path"))
     except ValueError:
         return False
+    if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
+        raw = _canonicalize_card_terminal(raw)
     required = {
         "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
     }
@@ -3906,12 +4026,24 @@ def terminalize_workflow_job(
     if phase not in {"plan", "build", "verify", "review"}:
         raise ValueError("workflow job phase is not terminalizable")
     raw = _extract_terminal_json(job.get("log_path"))
+    # #261 R2／D3：矛盾偵測排在任何狀態採信之前。放在 per-phase schema 驗證之前，
+    # 是為了避免「先按 passed 走一段流程、後面才發現不對」造成的部分副作用。
+    _assert_terminal_gate_consistency(
+        raw,
+        run_id=job.get("workflow_run_id"),
+        card_id=job.get("workflow_card"),
+        coordinator_root=coordinator_root,
+    )
     declared_outputs = job.get("workflow_outputs")
     if not isinstance(declared_outputs, list):
         raise ValueError("workflow job declared outputs missing")
     candidate: str | None = None
     inline_reports: tuple[tuple[str, str], ...] = ()
     if phase in {"plan", "build"}:
+        if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
+            # canonical envelope（#261 D1）：多帶 diagnostics 與 gate_evidence 兩個
+            # 欄位；其餘欄位語意與 legacy 一致，往下沿用同一條驗證路徑。
+            raw = _canonicalize_card_terminal(raw)
         required = {"schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"}
         if set(raw) != required or raw.get("schema_version") != 1 or raw.get("kind") != "workflow-card":
             raise ValueError("workflow card terminal evidence schema invalid")
@@ -3927,11 +4059,17 @@ def terminalize_workflow_job(
         normalized_payload: dict[str, object] = dict(raw)
     elif phase == "verify":
         required = {"schema_version", "kind", "status", "summary", "details", "reports"}
+        # #261 R1：verifier 也必須能誠實回報 failed／needs_human，不得只有成功形狀
+        # 合法。非通過狀態在此 fail closed 為可操作錯誤，而不是被誤判成 schema 壞掉。
+        if raw.get("status") in terminal_contract.NON_PASSING_STATUSES:
+            raise ValueError(
+                f"workflow verification terminal reported non-passing status: {raw.get('status')}"
+            )
         if (
             set(raw) != required
             or raw.get("schema_version") != 1
             or raw.get("kind") != "workflow-verification-result"
-            or raw.get("status") != "verified"
+            or raw.get("status") not in {"verified", "passed"}
             or not isinstance(raw.get("summary"), str)
             or not str(raw["summary"]).strip()
             or not isinstance(raw.get("details"), dict)
@@ -3963,6 +4101,18 @@ def terminalize_workflow_job(
         required = {"schema_version", "kind", "reason", "findings", "reports"}
         if expected_authority_hashes:
             required = required | {"authority_hashes"}
+        # #261 R1：review card 同樣必須能誠實回報 failed／needs_human。status 是
+        # canonical envelope 的選填欄位（review verdict 本身由 findings 決定），
+        # 在此先取出並攔截非通過狀態，再做既有的 exact key-set 驗證。
+        if "status" in raw:
+            declared_review_status = raw.get("status")
+            if declared_review_status in terminal_contract.NON_PASSING_STATUSES:
+                raise ValueError(
+                    f"workflow review terminal reported non-passing status: {declared_review_status}"
+                )
+            if declared_review_status != "passed":
+                raise ValueError("workflow review terminal schema invalid")
+            raw = {key: value for key, value in raw.items() if key != "status"}
         if (
             set(raw) != required
             or raw.get("schema_version") != 1
@@ -5061,7 +5211,15 @@ def _workflow_job_prompt(
             "kind": "workflow-verification-result",
             "schema_version": 1,
             "required": ["schema_version", "kind", "status", "summary", "details", "reports"],
-            "fixed": {"schema_version": 1, "kind": "workflow-verification-result", "status": "verified"},
+            "fixed": {"schema_version": 1, "kind": "workflow-verification-result"},
+            # #261 R1：成功、失敗與需人工介入三者對等可達。gate 失敗時必須誠實回
+            # failed／needs_human，不得為了讓 card 收斂而輸出 verified。
+            "status": ["verified", "failed", "needs_human"],
+            "status_policy": (
+                "Report verified only when every deterministic gate you ran actually passed. "
+                "If any gate failed, report failed; if the decision needs a human, report "
+                "needs_human. A non-passing terminal is a valid, expected outcome."
+            ),
             "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
         }
     elif step.phase == "review":
@@ -5078,6 +5236,10 @@ def _workflow_job_prompt(
                 *(["authority_hashes"] if authority_hashes_expected else []),
             ],
             "fixed": {"schema_version": 1, "kind": "workflow-review-result"},
+            # #261 R1：選填欄位；review verdict 仍由 findings 決定，status 只用來
+            # 誠實表達「這張 review card 自己沒能完成」。
+            "optional": ["status"],
+            "status": ["passed", "failed", "needs_human"],
             "finding_keys": ["category", "severity", "summary", "evidence", "recommendation"],
             "finding_evidence_keys": ["path", "line", "detail"],
             "finding_categories": sorted(foreign_review.VALID_FINDING_CATEGORIES),
@@ -5118,6 +5280,16 @@ def _workflow_job_prompt(
             "required": ["schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"],
             "fixed": fixed_terminal_fields,
             "status": ["passed", "failed", "needs_human"],
+            # #261 R2：成功必須由 gate evidence 證明。模型自述、exit code 為 0、
+            # 「沒看到錯誤」三者皆不構成成功授權；manager 會重讀 gate ledger 做
+            # 確定性 cross-check，矛盾即 fail closed。
+            "status_policy": (
+                "Report passed only when every deterministic gate you ran (OpenSpec / pytest / "
+                "policy) actually passed. Natural-language confidence, an exit code of 0, and "
+                "the absence of an explicit error do NOT authorize passed. If any gate failed, "
+                "report failed; the Manager re-reads the gate ledger and fails closed on any "
+                "contradiction, so a dishonest passed only costs you a retry."
+            ),
             "outputs": {
                 "type": "array",
                 "items": "repo-relative artifact path string matching declared_outputs",
@@ -6051,6 +6223,35 @@ def resume_workflow_run(
             "reason": failure_reason,
         }
     if _malformed_workflow_card_terminal(job):
+        # #261 R3／D5：同一個確定性 schema mismatch 不得無限回派模型。計數持久化在
+        # run.attempts（既有的可觀測欄位），逾限即停止並讓 operator 接手。
+        diagnostics = _terminal_parse_diagnostics(job)
+        retry_key = _schema_retry_attempt_key(step.card)
+        attempts = dict(run.attempts)
+        seen = attempts.get(retry_key, 0)
+        status_fields = {
+            "schema_retry_count": seen,
+            "schema_retry_limit": terminal_contract.MAX_SCHEMA_RETRIES,
+            "last_validation_path": diagnostics.validation_path,
+            "last_validation_reason": diagnostics.reason,
+        }
+        if seen >= terminal_contract.MAX_SCHEMA_RETRIES:
+            current = registry.get_workflow_run(run.run_id)
+            registry._manager_update_workflow_run(
+                run.run_id,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                gate_status="running",
+            )
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "job_id": job["job_id"],
+                "reason": "card-terminal-schema-retry-exhausted",
+                **status_fields,
+                # #261 R4／D6：唯讀診斷與授權欄位分離；operator 看得到 observed
+                # HEAD／job id／失敗原因，但 candidate 並未因此取得 authority。
+                "terminal_diagnostics": diagnostics.as_dict(),
+            }
         replacement = dispatch_workflow_card(
             dispatcher,
             run=run,
@@ -6061,11 +6262,17 @@ def resume_workflow_run(
         )
         if replacement is None:
             return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
+        current = registry.get_workflow_run(run.run_id)
+        attempts = dict(current.attempts)
+        attempts[retry_key] = seen + 1
+        registry._manager_update_workflow_run(run.run_id, attempts=attempts)
         return {
             "run_id": run.run_id,
             "current_phase": run.current_phase,
             "job_id": replacement["job_id"],
             "reason": "card-terminal-malformed-retry",
+            **{**status_fields, "schema_retry_count": seen + 1},
+            "terminal_diagnostics": diagnostics.as_dict(),
         }
     try:
         job = terminalize_workflow_job(
