@@ -6,6 +6,23 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Added
+- **Issue #262：dispatch 前驗證 runtime capability 與 provider snapshot 新鮮度**：新增
+  `coordinator/runtime_preflight.py`，在建立 worktree／sandbox／job row／model session 之前，
+  於「即將實際被使用的 executor 環境」執行低成本 preflight。card 契約新增 `runtime_capabilities`
+  資料宣告（`module:` / `executable:` / `bridge:` / `provider:`），preflight 為通用執行器，新增
+  card 不需修改實作；非法宣告在 deck 載入時 fail-closed。module 檢查透過 executor 的 interpreter
+  以子行程 import、executable 只查 executor PATH，皆不使用 manager 這側的 import 或 host PATH；
+  `SubprocessLauncher.executor_environment()` 沿用與 `launch()` 相同的 `_git_scope_env()`／
+  `_review_scope_env()`，確保 preflight 與正式 job 的 interpreter／PATH／HOME／sandbox policy 一致。
+  provider 健康改採「快照 + TTL + 有界 probe」三層，snapshot 帶 `observed_at`／TTL／source／reason，
+  超過 TTL 的 degraded 判斷不再被當成當前事實；`capability missing`／`provider unavailable`／
+  `stale snapshot`／`probe inconclusive` 四種結果各自獨立表達，只有前兩者是 hard block。live probe
+  以 provider identity 為鍵共用 TTL 快取與 rate-limit 額度，同批次同 provider 不重複探測。preflight
+  失敗時優先在既有 identity 順序與 independence domain 規則內 re-route，無合法替代才進入帶具體
+  reason 的 `needs_human`，全程 model invocation 維持 0；`cortex inspect status` 顯示缺少的
+  capability、使用中的 executor environment 與 snapshot 新鮮度。
+
 ### Fixed
 - **Issue #256：planning claim 前向恢復與放行語意修正**：`recover-planning` 新增環境/內容分類判定與 CAS 重入保護，`abandon` 加入 `planning_released` 釋放標記讓 `needs_human` 的同識別 work item 可重 claim，並讓 `resume` 對 `needs_human` 回傳合法 `next_actions`（停在 `define` 的環境類 planning 失敗才含 `recover-planning`，內容類仍只給 `abandon`）與具體 `blocking_reason`，恢復稽核紀錄亦保存前後 run 狀態；`work_actions`、`control/contract`、`coordinator/cli`、`porcelain/run`、`work bridge/registry` 均同步放行與解讀新動作。
 

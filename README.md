@@ -399,6 +399,57 @@ verification:
 - v1 只支援 `tier: shareable`；非 shareable 會 fail-closed 到 `needs_human`。
 - verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
 
+### Runtime preflight（dispatch 前的 capability 與 provider 新鮮度，#262）
+
+Manager 在建立 worktree／sandbox／job row／model session **之前**，會依 card 宣告在
+「即將實際被使用的 executor 環境」執行低成本 preflight。card 未宣告任何 capability
+時 preflight 是 no-op，行為與先前相同。
+
+`paulsha_cortex/deck/data/cards.yaml` 的 card 可宣告 `runtime_capabilities`，形式為
+`<kind>:<name>`，kind 為 `module`／`executable`／`bridge`／`provider`：
+
+```yaml
+  - id: tdd-red
+    # ...
+    runtime_capabilities: ["module:pytest"]
+```
+
+宣告是資料而非程式碼分支——新增 card 只要寫這份宣告，不需修改 preflight 實作；
+非法 kind 或空 name 會在 deck 載入時 fail-closed（`DeckSchemaError`），避免無聲漏檢。
+
+檢查一律走 executor 環境，不看 host：
+
+- `module:` 以 executor 的 interpreter 開子行程 import；
+- `executable:` 只解析 executor 的 `PATH`；
+- `bridge:` 依內建對照表落到 module 或 executable 探測；
+- `provider:` 讀 provider snapshot 的新鮮度。
+
+`SubprocessLauncher.executor_environment()` 用與 `launch()` 相同的
+`_git_scope_env()`／`_review_scope_env()` 產生 env，因此 preflight 與正式 job 的
+interpreter、`PATH`、`HOME`／sandbox policy 一致（reviewer 會走最小 env）。
+
+Provider 健康採「快照 + TTL + 有界 probe」三層。snapshot 帶 `observed_at`、TTL、
+source 與 reason；TTL 內直接採信，逾期的 degraded **不會**被當成當前事實，而是對
+必要 provider 執行有界 live probe。四種結果各自獨立，不折疊成布林：
+
+| 結果 | 意義 | 是否 hard block |
+| --- | --- | --- |
+| `capability_missing` | executor 環境缺 module／executable／bridge | 是 |
+| `provider_unavailable` | 新鮮快照或 live probe 判定 provider 不可用 | 是 |
+| `stale_snapshot` | 快照逾期且無法探測，需刷新 | 否 |
+| `probe_inconclusive` | 探測 timeout／額度耗盡／無定論 | 否 |
+
+live probe 以 provider identity 為鍵共用 TTL 快取與 rate-limit 額度（沿用
+`claim_readiness` 的 `LiveProbeCache` 模式），同批次多張 card 對同一 provider 只探測
+一次。preflight 失敗時，Manager 會在既有 identity 順序與 independence domain 規則內
+自動 re-route 至下一個合法 identity；沒有合法替代才進入帶具體 reason 的
+`needs_human`（`reason` 形如 `runtime-preflight-capability_missing`）。整個 gate 位於
+model session 建立之前，被擋下時 model invocation 維持 0。
+
+`cortex inspect status` 會顯示缺少的 capability、使用中的 executor environment
+（名稱／interpreter／`PATH`／`HOME`）與每個 provider 的 snapshot 新鮮度
+（status、source、age、TTL、是否 fresh）。
+
 ### Foreign reviewer identity（不同 independence domain）
 
 `PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`：
