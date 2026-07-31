@@ -188,24 +188,23 @@ def _normalize_depends_on(value: object) -> list[str]:
 
 def _infer_repo_root(spec_path: Path) -> Path:
     configured = paths.repo_root().resolve()
-    if os.getenv("PSC_REPO_ROOT"):
-        try:
-            spec_path.resolve().relative_to(configured)
-        except ValueError:
-            return configured
-        else:
-            return configured
+    resolved_spec = spec_path.resolve()
     try:
-        spec_path.resolve().relative_to(configured)
+        resolved_spec.relative_to(configured)
         return configured
     except ValueError:
         pass
-    for parent in [spec_path.resolve(), *spec_path.resolve().parents]:
-        if parent == configured.parent:
-            break
+
+    agents_dir = Path.home() / ".agents"
+    for parent in [resolved_spec, *resolved_spec.parents]:
         if (parent / ".git").exists():
+            if parent == agents_dir or parent.name in {".agents", "agents"}:
+                continue
             return parent
-    return spec_path.resolve().parent
+
+    if os.getenv("PSC_REPO_ROOT"):
+        return configured
+    return resolved_spec.parent
 
 
 def _resolve_contract_path(path_value: str | None, repo_root: Path) -> Path | None:
