@@ -39,9 +39,22 @@ def _write_manifest(repo_root: Path, **overrides: object) -> Path:
     return path
 
 
-def _run(repo_root: Path, env: dict[str, str]) -> tuple[int, dict[str, object]]:
-    """跑 scope_ci.main 並擷取 stdout JSON。"""
+def _run(
+    repo_root: Path, env: dict[str, str], case: unittest.TestCase | None = None
+) -> tuple[int, dict[str, object]]:
+    """跑 scope_ci.main 並擷取 stdout JSON。
+
+    本檔案的測試意圖是驗證 shadow 模式行為本身（#135 前的既有覆蓋），與
+    production `personas.yaml` 目前實際的 enforcement 值（現為 enforce）無關；
+    傳入 `case` 時強制 `load_enforcement` 回傳 `shadow`，讓測試意圖獨立於
+    production 設定值。
+    """
     from paulsha_cortex.persona import scope_ci
+
+    if case is not None:
+        original = scope_ci.load_enforcement
+        scope_ci.load_enforcement = lambda *a, **k: "shadow"
+        case.addCleanup(setattr, scope_ci, "load_enforcement", original)
 
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -82,7 +95,9 @@ class InScopeShadowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d)
             _write_manifest(repo)  # from_role=builder
-            code, payload = _run(repo, {"GITHUB_BASE_REF": "main", "GITHUB_SHA": "deadbeef"})
+            code, payload = _run(
+                repo, {"GITHUB_BASE_REF": "main", "GITHUB_SHA": "deadbeef"}, case=self
+            )
             self.assertEqual(code, 0)
             self.assertEqual(payload["role"], "builder")
             self.assertEqual(payload["violations"], [])
@@ -106,7 +121,7 @@ class OutOfScopeShadowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d)
             _write_manifest(repo)  # from_role=builder
-            code, payload = _run(repo, {"GITHUB_BASE_REF": "main"})
+            code, payload = _run(repo, {"GITHUB_BASE_REF": "main"}, case=self)
             self.assertEqual(code, 0)  # shadow 恆 0，即使越界
             self.assertFalse(payload["ok"])
             offending = [v["path"] for v in payload["violations"]]
@@ -127,7 +142,7 @@ class OutOfScopeShadowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d)
             _write_manifest(repo)
-            code, payload = _run(repo, {"GITHUB_BASE_REF": "main"})
+            code, payload = _run(repo, {"GITHUB_BASE_REF": "main"}, case=self)
             self.assertEqual(code, 0)  # shadow 仍放行
             self.assertIn("diff_error", payload)
             self.assertFalse(payload["ok"])
@@ -153,7 +168,7 @@ class CatalogErrorShadowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d)
             _write_manifest(repo)  # manifest 存在，但 catalog 壞掉
-            code, payload = _run(repo, {"GITHUB_BASE_REF": "main"})
+            code, payload = _run(repo, {"GITHUB_BASE_REF": "main"}, case=self)
             self.assertEqual(code, 0)  # shadow 恆 0，即使 catalog 壞掉
             self.assertIn("catalog_error", payload)
             self.assertTrue(payload["catalog_error"])

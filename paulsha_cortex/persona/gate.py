@@ -31,13 +31,19 @@ def evaluate_diff(
     changed_paths: Sequence[str],
     catalog: Mapping[str, object] | None = None,
 ) -> list[dict[str, str]]:
-    """逐檔 evaluate_filesystem，回傳越界清單 [{path, reason}]。"""
+    """逐檔 evaluate_filesystem，回傳越界清單 [{path, rule_id, reason}]。
+
+    `rule_id` 為違反的 scope 規則識別（見 `guardrail.GuardrailDecision`），
+    供 required check 阻擋訊息定位「違反哪條規則」（D3）。
+    """
     rail = PersonaGuardrail(catalog) if catalog is not None else PersonaGuardrail()
     violations: list[dict[str, str]] = []
     for path in changed_paths:
         decision = rail.evaluate_filesystem(role=role, path=path)
         if not decision.allowed:
-            violations.append({"path": path, "reason": decision.reason})
+            violations.append(
+                {"path": path, "rule_id": decision.rule_id, "reason": decision.reason}
+            )
     return violations
 
 

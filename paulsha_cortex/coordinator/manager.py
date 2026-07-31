@@ -4955,9 +4955,14 @@ _MODEL_CHAIN_CAPABILITY_BY_PERSONA = {
 }
 
 
-def _workflow_identity_candidates(persona: str, identities: IdentityRegistry, builder_domains: set):
-    """依 persona 過濾出合法 candidate 清單（既有共享 registry 選擇邏輯與
-    #205 run-scoped 覆寫的約束檢查共用同一份過濾條件，避免兩處判準漂移）。"""
+def _identity_candidates_for_persona(persona: str, identities: IdentityRegistry, builder_domains: set):
+    """依 persona 過濾出合法 candidate 清單（capability + independence domain）。
+
+    #205 的 run-scoped 覆寫用它做約束檢查，與共享 registry 選擇共用同一份過濾
+    條件，避免兩處判準漂移。**刻意不含 `primary_domain` 偏好**——那是「同 domain
+    優先」的排序偏好，不是合法性限制；拿它驗證覆寫會把偏好升級成硬約束，讓
+    operator 明確指定的 identity 被誤判為違規。
+    """
     # 非 planner／reviewer 一律視為 builder（比照 #205 之前既有的 else 分支
     # catch-all 行為，deck 目前只會派出 planner/build/reviewer 三種 persona）。
     capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona, "build")
@@ -4967,7 +4972,18 @@ def _workflow_identity_candidates(persona: str, identities: IdentityRegistry, bu
     return candidates
 
 
-def _select_workflow_identity(run, step, identities: IdentityRegistry):
+def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> list:
+    """依既有規則產生合格 identity 清單，順序即優先序。
+
+    #262：re-route 需要「次佳但合法」的候選，因此把原本只回傳 candidates[0]
+    的邏輯抽成清單。過濾條件（persona capability、independence domain）完全
+    不變——spec 明列「不改 identity 選擇順序與 independence domain 規則」。
+
+    #205：run-scoped 覆寫先於共享 registry 選擇被檢查；命中時回傳**單元素**
+    清單，使 #262 的 preflight re-route 不會把 operator 明確指定的 identity
+    換成別的——覆寫的意義就是「用這一個」，被 re-route 掉等同靜默失效。
+    """
+
     builder_domains = {
         item.domain
         for item in run.steps
@@ -4980,7 +4996,7 @@ def _select_workflow_identity(run, step, identities: IdentityRegistry):
     override = getattr(run, "model_chain_override", None)
     persona_override = override.get(step.persona) if isinstance(override, dict) else None
     if persona_override is not None:
-        eligible = _workflow_identity_candidates(step.persona, identities, builder_domains)
+        eligible = _identity_candidates_for_persona(step.persona, identities, builder_domains)
         executor = persona_override.get("executor")
         model_id = persona_override.get("model_id")
         identity = identities.get(executor, model_id)
@@ -5000,15 +5016,106 @@ def _select_workflow_identity(run, step, identities: IdentityRegistry):
                 "model chain override 指定的 identity 不符既有約束: "
                 f"{step.persona}={executor}/{model_id}（{reason}；可用 candidates: {available}）"
             )
-        return identity
-    candidates = _workflow_identity_candidates(step.persona, identities, builder_domains)
+        return [identity]
+    candidates = _identity_candidates_for_persona(step.persona, identities, builder_domains)
     if step.persona == "builder" and run.primary_domain is not None:
         preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
         if preferred:
             candidates = preferred
     if not candidates:
         raise ValueError(f"no configured identity for workflow persona: {step.persona}")
-    return candidates[0]
+    return candidates
+
+
+def _select_workflow_identity(run, step, identities: IdentityRegistry):
+    return _workflow_identity_candidates(run, step, identities)[0]
+
+
+def _specialize_workflow_launcher(launcher, step):
+    """依 persona／commit policy 套用 launcher 的執行契約。
+
+    抽成函式是為了讓 #262 的 preflight 能取得「與正式 job 完全相同」的
+    launcher（進而是相同的 PATH／HOME／sandbox policy）。若 preflight 用未
+    specialize 的 launcher，reviewer 的最小 env 就不會被檢查到——那正是
+    design D2 說的安慰劑。
+    """
+
+    if step.persona == "planner":
+        read_only_factory = getattr(launcher, "as_read_only", None)
+        if not callable(read_only_factory):
+            raise ValueError("planner launcher lacks enforced read-only contract")
+        launcher = read_only_factory()
+    elif step.persona == "reviewer":
+        review_only_factory = getattr(launcher, "as_review_only", None)
+        if not callable(review_only_factory):
+            raise ValueError("reviewer launcher lacks enforced read-only contract")
+        terminal_kind = (
+            "workflow-verification-result"
+            if step.phase == "verify"
+            else "workflow-review-result"
+        )
+        launcher = review_only_factory(terminal_kind=terminal_kind)
+    effective_commit_policy = step.commit_policy or _LEGACY_CARD_EXECUTION.get(
+        step.card, (None, None, None, None)
+    )[2]
+    if effective_commit_policy == "required":
+        if step.persona != "builder":
+            raise ValueError("commit-required workflow card must use builder persona")
+        commit_required_factory = getattr(launcher, "as_commit_required", None)
+        if not callable(commit_required_factory):
+            raise ValueError("builder launcher lacks explicit commit-required capability")
+        launcher = commit_required_factory()
+    return launcher
+
+
+def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher_factory):
+    """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
+
+    回傳 None 代表這張 card 未宣告任何 capability，呼叫端照原路徑走；否則回傳
+    `DispatchGateDecision`，其中 `launcher` 只在通過 preflight 的 identity 上建立
+    ——被擋下的 identity 不會產生任何 model session。
+    """
+
+    from .runtime_preflight import card_runtime_requirements, evaluate_dispatch_gate
+
+    try:
+        requirements = card_runtime_requirements(step.card)
+    except Exception:  # noqa: BLE001 - deck 載入問題不得把 dispatch 一起拖垮
+        return None
+    if not requirements:
+        return None
+
+    candidates = _workflow_identity_candidates(run, step, identities)
+
+    # 每個 identity 只 specialize 一次並記憶：preflight 與最終 dispatch 共用同一
+    # 個 launcher 實例，因此（a）檢查的環境就是 job 的環境，（b）通過的 identity
+    # 不會被重複套用 as_commit_required／as_review_only 等契約工廠。
+    specialized: dict[int, object] = {}
+
+    def _launcher_for(identity):
+        key = id(identity)
+        if key not in specialized:
+            specialized[key] = _specialize_workflow_launcher(launcher_factory(identity), step)
+        return specialized[key]
+
+    def _environment_for(identity):
+        launcher = _launcher_for(identity)
+        describe = getattr(launcher, "executor_environment", None)
+        if callable(describe):
+            return describe()
+        # launcher 未描述自身環境時退回 host 描述：仍會檢查，只是無法保證與正式
+        # job 完全一致；這是 fail-soft，不比 #262 之前更差。
+        from .runtime_preflight import host_environment
+
+        return host_environment()
+
+    return evaluate_dispatch_gate(
+        card=step.card,
+        requirements=requirements,
+        candidates=candidates,
+        environment_for=_environment_for,
+        launcher_factory=_launcher_for,
+    )
 
 
 def _record_resolved_model_chain(registry, run, step, identity) -> None:
@@ -5479,36 +5586,41 @@ def _dispatch_workflow_card(
                 **({"plan_review_passed": True} if plan_review_passed_now else {}),
             )
             return None
-    identity = _select_workflow_identity(run, step, identities)
-    _record_resolved_model_chain(registry, run, step, identity)
-    launcher = launcher_factory(identity)
-    if launcher is None:
-        raise ValueError("workflow launcher unavailable")
-    if step.persona == "planner":
-        read_only_factory = getattr(launcher, "as_read_only", None)
-        if not callable(read_only_factory):
-            raise ValueError("planner launcher lacks enforced read-only contract")
-        launcher = read_only_factory()
-    elif step.persona == "reviewer":
-        review_only_factory = getattr(launcher, "as_review_only", None)
-        if not callable(review_only_factory):
-            raise ValueError("reviewer launcher lacks enforced read-only contract")
-        terminal_kind = (
-            "workflow-verification-result"
-            if step.phase == "verify"
-            else "workflow-review-result"
+    # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
+    # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
+    # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
+    gate = _runtime_preflight_gate(
+        run,
+        step,
+        identities=identities,
+        launcher_factory=launcher_factory,
+    )
+    if gate is not None and gate.action == "needs_human":
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
         )
-        launcher = review_only_factory(terminal_kind=terminal_kind)
-    effective_commit_policy = step.commit_policy or _LEGACY_CARD_EXECUTION.get(
-        step.card, (None, None, None, None)
-    )[2]
-    if effective_commit_policy == "required":
-        if step.persona != "builder":
-            raise ValueError("commit-required workflow card must use builder persona")
-        commit_required_factory = getattr(launcher, "as_commit_required", None)
-        if not callable(commit_required_factory):
-            raise ValueError("builder launcher lacks explicit commit-required capability")
-        launcher = commit_required_factory()
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": f"runtime-preflight-{gate.result.outcome.value}",
+            "runtime_preflight": gate.to_dict(),
+        }
+    if gate is not None:
+        # gate.launcher 已由 _runtime_preflight_gate 套過執行契約，不再 specialize。
+        identity = gate.identity
+        launcher = gate.launcher
+        if launcher is None:
+            raise ValueError("workflow launcher unavailable")
+    else:
+        identity = _select_workflow_identity(run, step, identities)
+        launcher = launcher_factory(identity)
+        if launcher is None:
+            raise ValueError("workflow launcher unavailable")
+        launcher = _specialize_workflow_launcher(launcher, step)
+    # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
+    # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
+    _record_resolved_model_chain(registry, run, step, identity)
     builder_jobs = [
         job
         for job in registry.list_jobs()

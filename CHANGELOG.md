@@ -6,6 +6,32 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Changed
+- **Issue #135：persona enforcement shadow → enforce**：切換前先以
+  `python -m paulsha_cortex.persona.replay`（新增，可重跑）回放最近已合併 PR 的
+  實際檔案清單，證明對現行 `builder` 派工慣例零誤殺，才把
+  `paulsha_cortex/persona/personas.yaml` 的 `enforcement` 由 `shadow` 切為
+  `enforce`。`persona-scope.yml`（`scope_ci.py`）現依 `enforcement` 動態決定放
+  行：違規時輸出含 persona／觸及路徑／違反規則的可定位 verdict 並 `exit 1`；
+  套用 `policy-exempt:persona-scope` label 時不阻擋，但違規內容仍完整輸出（不
+  靜音）。`persona-scope` 設為 main required status check 屬 GitHub repo 設定，
+  設定步驟見 `docs/persona-scope-enforcement.md`。
+### Added
+- **Issue #262：dispatch 前驗證 runtime capability 與 provider snapshot 新鮮度**：新增
+  `coordinator/runtime_preflight.py`，在建立 worktree／sandbox／job row／model session 之前，
+  於「即將實際被使用的 executor 環境」執行低成本 preflight。card 契約新增 `runtime_capabilities`
+  資料宣告（`module:` / `executable:` / `bridge:` / `provider:`），preflight 為通用執行器，新增
+  card 不需修改實作；非法宣告在 deck 載入時 fail-closed。module 檢查透過 executor 的 interpreter
+  以子行程 import、executable 只查 executor PATH，皆不使用 manager 這側的 import 或 host PATH；
+  `SubprocessLauncher.executor_environment()` 沿用與 `launch()` 相同的 `_git_scope_env()`／
+  `_review_scope_env()`，確保 preflight 與正式 job 的 interpreter／PATH／HOME／sandbox policy 一致。
+  provider 健康改採「快照 + TTL + 有界 probe」三層，snapshot 帶 `observed_at`／TTL／source／reason，
+  超過 TTL 的 degraded 判斷不再被當成當前事實；`capability missing`／`provider unavailable`／
+  `stale snapshot`／`probe inconclusive` 四種結果各自獨立表達，只有前兩者是 hard block。live probe
+  以 provider identity 為鍵共用 TTL 快取與 rate-limit 額度，同批次同 provider 不重複探測。preflight
+  失敗時優先在既有 identity 順序與 independence domain 規則內 re-route，無合法替代才進入帶具體
+  reason 的 `needs_human`，全程 model invocation 維持 0；`cortex inspect status` 顯示缺少的
+  capability、使用中的 executor environment 與 snapshot 新鮮度。
 ### Added
 - **Issue #205：per-work planner/builder/reviewer 模型鏈覆寫**：`WorkflowRun` 新增 `model_chain_override`（run-scoped 覆寫，claim/首次 dispatch 時凍結，只作用於本 run，不動共享 `model-identities.yaml`）與 `resolved_model_chain`（三段實際解析結果與來源 override/registry，供事後稽核）兩個 provenance-only 欄位；`_select_workflow_identity` 逐段優先讀凍結覆寫、未指定段落回退共享 registry，覆寫仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 fail closed 並列出可用 identity；`cortex run work start/resume/retry-build/retry-verify/retry-review/...` 新增 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model` 六個 run-scoped 覆寫參數。詳見 `changelog.d/per-work-model-chain.md`。
 
