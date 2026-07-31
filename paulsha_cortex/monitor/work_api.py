@@ -21,6 +21,7 @@ from .providers import (
     RepoWorkProvider,
     WorkflowRegistryProvider,
 )
+from ..coordinator.terminal_contract import MAX_SCHEMA_RETRIES as SCHEMA_RETRY_LIMIT
 from .work_models import ProviderSnapshot
 from .work_models import WorkItem
 from .work_snapshot import WorkSnapshot, WorkSnapshotStore, work_key
@@ -207,7 +208,36 @@ class WorkReadModelStore:
             item = matches[0]
             envelope = self._envelope(repo=item.repo, work_id=item.work_id)
             envelope["item"] = item.to_dict()
+            # #261 D5：schema mismatch retry 計數／上限，讓 retry storm 在面板上就是
+            # 可見的數字，operator 不必翻 job jsonl。資料源是 workflow provider 的
+            # observations（已隨 snapshot 一起 round-trip），因此不需要為此在
+            # WorkflowRun 或 WorkSnapshot 上新增欄位。
+            retries = self._schema_retry(item.repo, item.work_id)
+            if retries:
+                envelope["schema_retry"] = retries
             return envelope
+
+    def _schema_retry(self, repo: str, work_id: str) -> dict:
+        for provider_id, provider in self._snapshot.providers.items():
+            if not provider_id.startswith("workflow:"):
+                continue
+            observations = provider.observations
+            if not isinstance(observations, Mapping):
+                continue
+            rows = observations.get("schema_retry", {})
+            if not isinstance(rows, Mapping):
+                continue
+            found = rows.get(work_id)
+            if isinstance(found, Mapping) and found:
+                return {
+                    "limit": SCHEMA_RETRY_LIMIT,
+                    "by_card": {
+                        str(card): int(count)
+                        for card, count in sorted(found.items())
+                        if isinstance(count, int) and not isinstance(count, bool)
+                    },
+                }
+        return {}
 
     def explain_work_item(self, work_id: str, *, repo: str | None = None) -> dict:
         envelope = self.get_work_item(work_id, repo=repo)
@@ -551,6 +581,7 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
         "workflow_links": {},
         "closure_by_work": {},
         "validated_completions": {},
+        "schema_retry": {},
         "inferred_signals": [],
         "remote_openspec": {"active": [], "archived": []},
         "remote_openspec_observed": False,
@@ -568,6 +599,11 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
             value = observations.get("workflow_links", {})
             if isinstance(value, Mapping):
                 merged["workflow_links"].update(value)
+            retries = observations.get("schema_retry", {})
+            if isinstance(retries, Mapping):
+                for work_id, rows in retries.items():
+                    if isinstance(work_id, str) and isinstance(rows, Mapping):
+                        merged["schema_retry"].setdefault(work_id, {}).update(rows)
             completions = observations.get("validated_completions", {})
             if isinstance(completions, Mapping):
                 for work_id, rows in completions.items():

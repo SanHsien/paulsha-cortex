@@ -117,3 +117,27 @@ V1 terminal delivery 僅支援 GitHub。其他 forge 仍可顯示 read model，�
 候選變更必須通過 OpenSpec validation、policy、full preflight、ForeignReview，以及 exact current-HEAD 的 adversarial maintainer review。任一 typed output 或 gate 缺失、失敗或無法對準同一 HEAD 時，workflow 必須 fail-closed 保持 `needs_human`，不得宣稱 terminal completion。
 
 PR #54 僅識別目前仍為 open 的 delivery target；此編號本身不是 merge、issue closure 或 `done` evidence。Manager 先以 official archive 流程封存 OpenSpec change，後續只有在其餘 strict gates 通過後，才可透過該 PR 以帶 closing reference 的 merge commit 交付並關閉 issue #31。重新讀取 default branch 與 remote authority 後，只有 PR、archive、merge ancestry、issue closure、Todo 與 CompletionRecord 全部成立，Monitor 才能投影為 `done`。
+
+## Terminal/result contract（#261）
+
+`paulsha_cortex/coordinator/terminal_contract.py` 是 terminal/result 契約的單一真相源，供 build、verify、review 三類 card 共用。
+
+**Canonical envelope。** envelope 帶 `schema_version`，並完整支援 `passed`、`failed`、`needs_human` 三種終局狀態與結構化 `diagnostics`；三類 card 都不存在「只有成功形狀才合法」的路徑。不帶 canonical 版本的舊 payload 走相容讀取路徑並記 legacy 標記，既有 run 不因版本差異被拒收。
+
+**gate ledger 由 manager 產生，不是模型自述。** 重驗只有在「被驗的東西不是模型講的話」時才有意義。`launcher.build_wrapper_script` 產生的 headless wrapper 是 manager 擁有的，形狀為：
+
+```text
+<模型 argv>; printf %s "$?" > <sentinel>; python3 -m paulsha_cortex.coordinator.gate_ledger --out <ledger> --worktree <wt> >/dev/null 2>&1
+```
+
+三段以 `;` 串接，因此模型失敗時 sentinel 與 ledger 仍會產生；sentinel 早於 gate 階段寫入，模型的 exit code 不會被 gate 耗時污染；gate 階段輸出導向 `/dev/null`，不污染 JSONL 的 terminal evidence。gate 清單由 operator 以 `PSC_GATE_CMD_<NAME>` 環境變數宣告（沿用 `PSC_PREFLIGHT_CMD` 的 typed-argv 規範，拒絕 shell wrapper），exit code 由真實 subprocess 產生。模型既不能選擇跑哪些 gate、不能決定 exit code，也拿不到 ledger 路徑（`<log_dir>/<slice_id>.gates.json` 由 job 的 `log_path` 推導，模型的 cwd 是 worktree）。跑不起來或逾時的 gate 一律記為 `failed`，避免 operator 設定壞掉靜默變成 fail-open。
+
+**成功必須被證明。** `manager.terminalize_workflow_job` 在任何狀態採信之前，先以 `_assert_terminal_gate_consistency` 做確定性 cross-check：只要 ledger 中有任何 gate 的實際結果不是 passed，terminal 自稱的 `passed` 一律 fail closed，錯誤訊息保留哪一個 gate、期望值與實際值。「沒提到」不能當作「沒失敗」——terminal 完全不引用某個失敗的 gate 也一樣被否決。ledger 自身矛盾（記了非 0 exit code 卻標 passed）視同失敗。envelope 內的 `gate_evidence` 是模型「自述跑了哪些 gate」的宣告，manager 以 ledger 對照：宣稱跑了 ledger 中不存在的 gate，或宣稱的結果與 ledger 不符，皆 fail closed。會實際跑 gate 的 phase（`build`／`verify`，見 `GATE_LEDGER_REQUIRED_PHASES`）若連 ledger 都不存在，代表 wrapper 的 gate 階段沒跑完，同樣 fail closed。模型輸出的自然語言、exit code 為 0、以及「沒有明確錯誤」三者皆不構成成功授權。
+
+**operator 未宣告任何 gate 時的語意。** 沒有 `PSC_GATE_CMD_*` 時 wrapper 仍會寫出 `gates: []` 的 ledger：ledger 的**存在**證明 wrapper 跑完了，內容為空則代表 operator 明確選擇不設 gate。此時 `passed` 會被放行——這是 operator 的顯式設定，不是靜默旁路，但也表示此設定下沒有 R2 保護。要讓保護生效，至少宣告一個確定性 gate。
+
+**升級與運維。** 派工 prompt 現在發的是 canonical envelope（`schema_version: 2`，多帶 `diagnostics` 與 `gate_evidence`）。不帶該版本的舊 payload 仍走相容讀取路徑，不會因版本差異被拒收。切換當下已在飛行、且沒有 gate ledger 的 build／verify run，其 `passed` terminal 會 fail closed 並轉 `needs_human`——這是預期行為（沒有獨立證據就不放行），不是資料損毀：candidate 與 worktree 都還在，只是未被授權。處理方式是對該 run 重新派工該張 card（resume 會以新的 wrapper 重跑並產生 ledger），不需要 abandon 整個 work item；只有在 candidate 本身已被判定不可用時才需要 abandon 重跑。
+
+**schema mismatch 是有上限的確定性失敗。** StructuredOutput 的 wrapper 正規化只認明確白名單外層鍵（`input`／`params`／`parameters`／`arguments`／`payload`／`response`），且同一個確定性 mismatch 只嘗試一次修復；未知形狀終止為帶 machine-readable validation errors 的可操作錯誤，不以寬鬆解析吞掉未知欄位。`resume_workflow_run` 的 malformed-terminal 重派帶上限與計數器：計數持久化於 `WorkflowRun.attempts["schema-mismatch:<card>"]`，逾限即停止重派、轉 `needs_human`，並在回傳結果上曝光 `schema_retry_count`、`schema_retry_limit`、`last_validation_path` 與 `last_validation_reason`。計數同時經 workflow provider 的 observations 投影到 Monitor work item envelope，`cortex inspect work <id>` 會在發生過 mismatch 時列出 `schema_retry[<card>]: <count>/<limit>`（逾限標 `(exhausted)`）。計數刻意存放在既有的 `attempts` 欄位而非新增 `WorkflowRun` 欄位——新欄位會落在 `providers._WORKFLOW_V2_OPTIONAL_ROW_KEYS` 白名單之外，使每一個 run row 被判為 unsupported、整份 workflow projection 變 `degraded`（#205 曾實際踩到）。
+
+**診斷與授權分離。** terminal parse 失敗時，`_terminal_parse_diagnostics` 保留 observed HEAD、job id 與失敗原因的唯讀診斷（`terminal_diagnostics`），但該 payload 明確標示 `authority_granted: false`，且不含任何 candidate authority 欄位——可觀測不等於可授權。

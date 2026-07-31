@@ -385,3 +385,88 @@ def test_inspect_missing_targets_exit_one(
     assert _run_cli(argv) == 1
     captured = capsys.readouterr()
     assert needle in (captured.out + captured.err)
+
+
+def test_inspect_work_surfaces_schema_retry_counter_and_limit(
+    inspect_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#261 D5：retry storm 必須在 status surface 上是可見的數字。"""
+
+    from paulsha_cortex.coordinator import terminal_contract
+    from paulsha_cortex.monitor import work_api
+
+    limit = terminal_contract.MAX_SCHEMA_RETRIES
+
+    def fake_request(self, payload):
+        return {
+            "ok": True,
+            "data": {
+                "schema": "cortex-work/v1",
+                "sequence": 7,
+                "item": {
+                    "repo": "example/acme",
+                    "work_id": "retry-storm",
+                    "title": "retry storm",
+                    "state": "on-going",
+                    "phase": "build",
+                    "facets": ["needs_human"],
+                },
+                "schema_retry": {
+                    "limit": limit,
+                    "by_card": {"tdd-red": limit, "impl": 1},
+                },
+            },
+        }
+
+    monkeypatch.setattr(work_api.MonitorSocketClient, "request", fake_request)
+
+    assert _run_cli(["inspect", "work", "retry-storm", "--repo", "example/acme"]) == 0
+    human = capsys.readouterr().out
+    # 逾限的 card 要明確標示，未逾限的只顯示計數，兩者都帶上限。
+    assert f"schema_retry[tdd-red]: {limit}/{limit} (exhausted)" in human
+    assert f"schema_retry[impl]: 1/{limit}" in human
+    impl_line = next(
+        line for line in human.splitlines() if line.startswith("schema_retry[impl]")
+    )
+    assert "(exhausted)" not in impl_line
+
+    assert _run_cli(
+        ["inspect", "work", "retry-storm", "--repo", "example/acme", "--json"]
+    ) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["schema_retry"]["limit"] == limit
+    assert rendered["schema_retry"]["by_card"]["tdd-red"] == limit
+
+
+def test_inspect_work_omits_schema_retry_when_never_mismatched(
+    inspect_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """正常情況不得為每個 work item 多印一行雜訊。"""
+
+    from paulsha_cortex.monitor import work_api
+
+    def fake_request(self, payload):
+        return {
+            "ok": True,
+            "data": {
+                "schema": "cortex-work/v1",
+                "sequence": 7,
+                "item": {
+                    "repo": "example/acme",
+                    "work_id": "clean",
+                    "title": "clean",
+                    "state": "todo",
+                    "phase": "plan",
+                    "facets": [],
+                },
+            },
+        }
+
+    monkeypatch.setattr(work_api.MonitorSocketClient, "request", fake_request)
+
+    assert _run_cli(["inspect", "work", "clean", "--repo", "example/acme"]) == 0
+    assert "schema_retry" not in capsys.readouterr().out

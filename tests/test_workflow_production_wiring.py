@@ -12,8 +12,8 @@ import pytest
 from paulsha_cortex.control import constants, contract
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
-    manager, manager_daemon, planning_runtime, registry as registry_module, review, verification,
-    work_bridge,
+    manager, manager_daemon, planning_runtime, registry as registry_module, review,
+    terminal_contract, verification, work_bridge,
 )
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -33,6 +33,29 @@ from paulsha_cortex.coordinator.workflow import (
 )
 from paulsha_cortex.deck.compile import compile_combo, emit
 from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
+
+
+def _gate_ledger_passed(log_path) -> None:
+    """#261：模擬 manager wrapper 在模型行程結束後寫下的 gate ledger。
+
+    真實流程中這份檔案由 `launcher` 產生的 wrapper script 呼叫
+    `paulsha_cortex.coordinator.gate_ledger` 寫出，模型碰不到；沒有它的話
+    build／verify 的 `passed` 會（正確地）因為缺乏獨立 gate 證據而 fail closed。
+    """
+
+    path = terminal_contract.gate_ledger_path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": terminal_contract.GATE_LEDGER_SCHEMA_VERSION,
+                "kind": "workflow-gate-ledger",
+                "slice_id": Path(log_path).stem,
+                "gates": [],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _manifest() -> WorkflowManifest:
@@ -1128,6 +1151,7 @@ def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_ol
         source_revision=run.source_revision,
     )
     registry.attach_launch_handle(old_job["job_id"], log_path=str(log))
+    _gate_ledger_passed(log)
     registry.update_headless_result(old_job["job_id"], status="exited", exit_code=0)
 
     class Launcher:
@@ -1725,6 +1749,7 @@ def test_build_card_advances_candidate_only_to_exact_descendant_head(tmp_path: P
         session_name="wf-tdd-red",
         log_path=str(log),
     )
+    _gate_ledger_passed(log)
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
     terminal = manager.terminalize_workflow_job(
         registry,
@@ -2442,6 +2467,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
             log_path.with_suffix(".exit").write_text("0", encoding="utf-8")
+            _gate_ledger_passed(log_path)
             return LaunchHandle(
                 executor=str(job["executor"]), model_id=str(job["model_id"]),
                 session_name=slice_id, pid=100, log_path=str(log_path),
@@ -3235,6 +3261,7 @@ def test_verify_terminal_evidence_cannot_substitute_for_declared_report(tmp_path
         workflow_outputs=("reports/verify/work.md",), source_revision="rev",
     )
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    _gate_ledger_passed(log)
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
 
     with pytest.raises(ValueError, match="non-empty list"):
@@ -3272,6 +3299,7 @@ def test_planner_terminalization_rejects_disposable_sandbox_pollution(tmp_path: 
         source_revision="rev", workflow_sandbox_hash=sandbox_hash,
     )
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    _gate_ledger_passed(log)
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
     (sandbox / "empty-pollution").mkdir()
 
@@ -3767,6 +3795,7 @@ def test_existing_report_requires_baseline_change_and_embedded_workflow_binding(
         workflow_output_baseline=({"path": report_ref, "sha256": baseline},),
     )
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    _gate_ledger_passed(log)
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
 
     report.write_text(stale.replace("Passed.", "Operator drift."), encoding="utf-8")
@@ -3909,6 +3938,7 @@ def test_terminal_report_manifest_cannot_authorize_arbitrary_markdown_overwrite(
         source_revision="rev",
     )
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    _gate_ledger_passed(log)
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
 
     with pytest.raises(ValueError, match="manifest root invalid"):
@@ -3943,6 +3973,7 @@ def test_report_publication_rolls_back_when_registry_bind_fails(
         workflow_repo_root=str(tmp_path), workflow_outputs=(report_ref,), source_revision="rev",
     )
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    _gate_ledger_passed(log)
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
     monkeypatch.setattr(
         registry,
@@ -3988,6 +4019,7 @@ def test_multi_report_partial_write_is_rolled_back(
         source_revision="rev",
     )
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    _gate_ledger_passed(log)
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
     original = manager._PlanningPublicationTransaction._write_atomic
     failed = False
@@ -4408,6 +4440,7 @@ def test_review_terminal_rejects_non_builder_job_binding_before_publication(
         workflow_builder_job_id=invalid_builder["job_id"], source_revision=run.source_revision,
     )
     registry.attach_launch_handle(review_job["job_id"], log_path=str(log))
+    _gate_ledger_passed(log)
     registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
 
     with pytest.raises(ValueError, match="builder binding mismatch: persona"):

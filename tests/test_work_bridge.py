@@ -14,6 +14,7 @@ from paulsha_cortex.coordinator import (
     completion,
     manager_daemon,
     review,
+    terminal_contract,
     verification,
     work_actions,
     work_bridge,
@@ -984,6 +985,20 @@ identities:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
             log_path.with_suffix(".exit").write_text("0", encoding="utf-8")
+            # #261：真實 wrapper 在模型結束後除了 exit sentinel 還會寫下 gate
+            # ledger；fake launcher 一併模擬，否則 build／verify 的 passed 會
+            # 因為「沒有獨立 gate 證據」而正確地 fail closed。
+            terminal_contract.gate_ledger_path(log_path).write_text(
+                json.dumps(
+                    {
+                        "schema_version": terminal_contract.GATE_LEDGER_SCHEMA_VERSION,
+                        "kind": "workflow-gate-ledger",
+                        "slice_id": slice_id,
+                        "gates": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
             return LaunchHandle(
                 executor=str(job["executor"]),
                 model_id=str(job["model_id"]),

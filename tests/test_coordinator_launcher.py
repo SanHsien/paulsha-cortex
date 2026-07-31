@@ -243,7 +243,11 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(
             schema["properties"]["kind"]["enum"], ["workflow-verification-result"]
         )
-        self.assertEqual(schema["properties"]["status"]["enum"], ["verified"])
+        # #261 R1：三種終局狀態對等可達；只允許成功形狀會逼 verifier fail-open。
+        self.assertEqual(
+            schema["properties"]["status"]["enum"],
+            ["verified", "failed", "needs_human"],
+        )
         review = build_claude_argv(
             prompt="P",
             slice_id="review", log_dir="/lg", worktree="/wt/reviewer", review_only=True,

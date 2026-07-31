@@ -9,7 +9,9 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Mapping, Protocol, Sequence, runtime_checkable
+
+from . import gate_ledger, terminal_contract
 
 
 _GIT_REPOSITORY_ENV_KEYS = frozenset(
@@ -67,7 +69,13 @@ def _claude_review_json_schema(kind: str) -> str:
             "properties": {
                 "schema_version": {"type": "integer", "enum": [1]},
                 "kind": {"type": "string", "enum": [kind]},
-                "status": {"type": "string", "enum": ["verified"]},
+                # #261 R1：三種終局狀態在契約上對等可達。只允許成功形狀會逼模型
+                # 在 gate 已失敗時仍輸出成功 card（fail-open）；非通過狀態由
+                # manager.terminalize_workflow_job fail closed 為可操作錯誤。
+                "status": {
+                    "type": "string",
+                    "enum": ["verified", "failed", "needs_human"],
+                },
                 "summary": {"type": "string", "minLength": 1},
                 "details": {"type": "object"},
                 "reports": {"type": "array", "minItems": 1, "items": report},
@@ -113,6 +121,12 @@ def _claude_review_json_schema(kind: str) -> str:
             "properties": {
                 "schema_version": {"type": "integer", "enum": [1]},
                 "kind": {"type": "string", "enum": [kind]},
+                # #261 R1：選填的終局狀態欄位。review verdict 本身仍由 findings
+                # 決定；status 讓 reviewer 能誠實表達「這張 card 自己沒跑完」。
+                "status": {
+                    "type": "string",
+                    "enum": ["passed", "failed", "needs_human"],
+                },
                 "reason": {"type": "string", "minLength": 1},
                 "findings": {"type": "array", "items": finding},
                 "reports": {"type": "array", "minItems": 1, "items": report},
@@ -121,6 +135,47 @@ def _claude_review_json_schema(kind: str) -> str:
     else:
         raise ValueError("Claude reviewer terminal contract kind invalid")
     return json.dumps(schema, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def build_wrapper_script(
+    *,
+    inner_argv: Sequence[str],
+    sentinel: str,
+    ledger: str,
+    worktree: str,
+    repo_root: str | None,
+    run_gates: bool,
+) -> str:
+    """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
+
+    三段皆以 ``;`` 串接，因此模型失敗時 sentinel 與 ledger 仍會產生：
+
+    1. 模型 argv；
+    2. 把 ``$?`` 寫入 exit sentinel（跨進程 durable 完成判定，早於 gate 階段，
+       確保 gate 執行時間不會被算進模型的 exit code）；
+    3. 由 manager 掌控的 gate ledger writer。
+
+    gate 階段的 stdout/stderr 一律導向 /dev/null：JSONL log 是 terminal evidence 的
+    來源，混入 gate 輸出會讓 ``_extract_terminal_json`` 讀到非 terminal 的內容。
+    """
+
+    script = f'{shlex.join(inner_argv)}; printf %s "$?" > {shlex.quote(sentinel)}'
+    if not run_gates or not repo_root:
+        return script
+    gate_argv = [
+        "python3",
+        "-m",
+        "paulsha_cortex.coordinator.gate_ledger",
+        "--out",
+        ledger,
+        "--worktree",
+        worktree,
+    ]
+    # PYTHONPATH 指向 repo root，讓 wrapper 在 worktree cwd 下仍能 import 套件。
+    return (
+        f"{script}; PYTHONPATH={shlex.quote(repo_root)} "
+        f"{shlex.join(gate_argv)} >/dev/null 2>&1"
+    )
 
 
 def _srt_runtime_root() -> Path | None:
@@ -664,6 +719,19 @@ class SubprocessLauncher:
             commit_required=True,
         )
 
+    def _should_run_gates(self, env: Mapping[str, str]) -> bool:
+        """#261：只有會改動 candidate 的可寫入 card 才在 wrapper 內跑確定性 gate。
+
+        read-only／review-only 的 reviewer 不改 candidate，也刻意在最小 env 下執行，
+        不應在它的 sandbox 內跑 gate；operator 未宣告任何 ``PSC_GATE_CMD_*`` 時仍會
+        寫出一份 ``gates: []`` 的 ledger，讓 harvest 能區分「沒宣告 gate」與
+        「wrapper 根本沒跑完」。
+        """
+
+        if self._review_only or self._read_only:
+            return False
+        return env.get("PSC_REPO_ROOT") is not None
+
     def executor_environment(self, *, slice_id: str = "preflight"):
         """#262 D2：回報正式 job 會實際看到的 executor 環境。
 
@@ -753,7 +821,17 @@ class SubprocessLauncher:
         # 否則 poll_headless_done 會讀到上一輪的 sentinel / 末筆 JSONL，
         # 誤判「還沒開始就已完成」（fail-closed：每輪從乾淨狀態起跑）。
         Path(sentinel).unlink(missing_ok=True)
-        script = f'{shlex.join(inner_argv)}; printf %s "$?" > {shlex.quote(sentinel)}'
+        # #261：同理清掉上一輪的 gate ledger，避免 harvest 讀到前一次的 gate 結果。
+        ledger = terminal_contract.gate_ledger_path(log_path)
+        Path(ledger).unlink(missing_ok=True)
+        script = build_wrapper_script(
+            inner_argv=inner_argv,
+            sentinel=sentinel,
+            ledger=str(ledger),
+            worktree=worktree,
+            repo_root=env.get("PSC_REPO_ROOT"),
+            run_gates=self._should_run_gates(env),
+        )
         # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
         argv = ["bash", "-c" if self._review_only else "-lc", script]
         with open(log_path, "wb") as logf:
