@@ -8,8 +8,9 @@ from paulsha_cortex.persona.loader import load_enforcement
 
 
 class LoadEnforcementTests(unittest.TestCase):
-    def test_default_yaml_is_shadow(self) -> None:
-        self.assertEqual(load_enforcement(), "shadow")
+    def test_repo_default_yaml_is_enforce(self) -> None:
+        """#135：production personas.yaml 已由 shadow 切為 enforce。"""
+        self.assertEqual(load_enforcement(), "enforce")
 
     def test_explicit_enforce_is_read(self) -> None:
         with tempfile.TemporaryDirectory() as d:

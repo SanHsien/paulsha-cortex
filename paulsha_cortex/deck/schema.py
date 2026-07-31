@@ -37,8 +37,14 @@ _CARD_KEYS = frozenset(
         "provider_binding",
         "slice_group",
         "execution",
+        "runtime_capabilities",
     }
 )
+# #262 R1：card 以資料宣告執行所需 runtime capability，形式為 `<kind>:<name>`
+# （例：`module:pytest`、`executable:socat`）。新增 card 只需寫這份宣告，
+# 不必修改 preflight 實作。kind 白名單與
+# coordinator.runtime_preflight.CAPABILITY_KINDS 為同一組值。
+RUNTIME_CAPABILITY_KINDS = ("module", "executable", "bridge", "provider")
 _EXECUTION_KEYS = frozenset({"action", "commit_policy", "test_policy"})
 _COMBO_FILE_KEYS = frozenset({"combo"})
 _COMBO_KEYS = frozenset({"id", "task_type", "cards", "gate_spine", "band_triggered"})
@@ -74,6 +80,8 @@ class Card:
     action: str | None = None
     commit_policy: str | None = None
     test_policy: str | None = None
+    # #262 R1：dispatch 前 preflight 依這份宣告逐項檢查。
+    runtime_capabilities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -227,6 +235,20 @@ def load_cards(path: str | Path) -> dict[str, Card]:
         slice_group = rec.get("slice_group")
         if slice_group is not None and (not isinstance(slice_group, str) or not slice_group):
             rec_errors.append(f"{cid}: slice_group 必須為非空字串")
+        runtime_capabilities = _str_tuple(
+            rec.get("runtime_capabilities"), cid, "runtime_capabilities", rec_errors
+        )
+        # fail-closed：宣告格式錯誤（未知 kind／空 name）在載入時就擋下，
+        # 避免無聲漏檢——漏掉一項宣告等於退回 #262 的現狀。
+        for token in runtime_capabilities:
+            kind_part, sep, name_part = token.partition(":")
+            if not sep or kind_part not in RUNTIME_CAPABILITY_KINDS or not name_part.strip():
+                rec_errors.append(
+                    f"{cid}: runtime_capabilities 非法值 {token!r}"
+                    f"（須為 <kind>:<name>，kind ∈ {'/'.join(RUNTIME_CAPABILITY_KINDS)}）"
+                )
+        if len(set(runtime_capabilities)) != len(runtime_capabilities):
+            rec_errors.append(f"{cid}: runtime_capabilities 有重複宣告")
         if rec_errors:
             errors.extend(rec_errors)
             continue
@@ -245,6 +267,7 @@ def load_cards(path: str | Path) -> dict[str, Card]:
             action=action,
             commit_policy=commit_policy,
             test_policy=test_policy,
+            runtime_capabilities=runtime_capabilities,
         )
     if errors:
         raise DeckSchemaError(f"cards 驗證失敗: {source}: " + "; ".join(errors))

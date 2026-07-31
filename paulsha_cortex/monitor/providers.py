@@ -406,6 +406,10 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         # #208 收口 wiring：#213 freeze 接線持久化欄位／#211 pre-claim readiness
         # 凍結集，供 builder worktree 建立消費。
         "plan_review_passed", "frozen_readiness",
+        # #205：run-scoped planner/builder/reviewer 模型鏈覆寫（claim 時凍結）
+        # 與其解析結果稽核紀錄（executor/model/domain/來源），provenance-only，
+        # 比照 retry_classification／sizing_score 的可選欄位模式。
+        "model_chain_override", "resolved_model_chain",
     }
 )
 

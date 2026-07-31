@@ -6,6 +6,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
@@ -730,6 +731,45 @@ class SubprocessLauncher:
         if self._review_only or self._read_only:
             return False
         return env.get("PSC_REPO_ROOT") is not None
+
+    def executor_environment(self, *, slice_id: str = "preflight"):
+        """#262 D2：回報正式 job 會實際看到的 executor 環境。
+
+        env 由與 `launch()` 相同的 `_review_scope_env()`／`_git_scope_env()` 產生，
+        因此 preflight 檢查的 PATH／HOME／sandbox policy 與正式 job 一致；
+        若在此另建一份 env，preflight 就只是安慰劑（見 design D2）。
+        """
+
+        from .runtime_preflight import ExecutorEnvironment
+
+        if self._review_only:
+            env = _review_scope_env()
+        else:
+            env = {
+                **_git_scope_env(),
+                "PSC_SLICE_ID": slice_id,
+                "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
+            }
+            if self._relay_target is not None:
+                env["PSC_RELAY_TARGET"] = self._relay_target
+        # interpreter：job 以 `bash -lc` 啟動，其 python 由 env 的 PATH 決定，
+        # 因此以同一份 env 解析，而非用 manager 自己的 sys.executable。
+        interpreter = shutil.which("python3", path=env.get("PATH", "")) or shutil.which(
+            "python", path=env.get("PATH", "")
+        )
+        if self._review_only:
+            mode = "review-only"
+        elif self._read_only:
+            mode = "read-only"
+        else:
+            mode = "workspace-write"
+        return ExecutorEnvironment(
+            name=f"{self._executor}:{mode}",
+            interpreter=(interpreter,) if interpreter else (sys.executable,),
+            path=env.get("PATH", ""),
+            home=env.get("HOME", ""),
+            provider_identity=f"{self._executor}/{self._model}" if self._model else self._executor,
+        )
 
     def launch(self, *, slice_id: str, prompt: str, worktree: str, log_dir: str) -> LaunchHandle:
         resolved_worktree = Path(worktree).resolve(strict=True)

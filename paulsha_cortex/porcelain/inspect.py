@@ -90,6 +90,13 @@ def _print_status(status: dict[str, Any]) -> None:
     sys.stdout.write(
         "recent_done: " + json.dumps(status.get("recent_done", []), ensure_ascii=False, sort_keys=True) + "\n"
     )
+    # #262 R5：顯示缺少的 capability、使用中的 executor environment 與 snapshot 新鮮度。
+    preflight = status.get("runtime_preflight")
+    if preflight:
+        from paulsha_cortex.coordinator.runtime_preflight import render_preflight_status
+
+        for line in render_preflight_status(preflight):
+            sys.stdout.write(line + "\n")
 
 
 def _print_job(job: dict[str, Any]) -> None:

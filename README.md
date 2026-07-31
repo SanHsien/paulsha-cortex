@@ -186,9 +186,12 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    cortex run fanout --executor codex --model "<builder-model-id>"
    cortex run complete --review-executor claude --review-model "<reviewer-model-id>" --wait
    cortex run work resume porcelain-run-recover --repo hamanpaul/paulsha-cortex --actor operator
+   cortex run work start per-work-model-chain --repo hamanpaul/paulsha-cortex \
+     --builder-executor codex --builder-model "gpt-5.3-codex-spark"
    ```
 
    `--executor`／`--model` 省略時由 daemon 採用部署設定；帶 `--wait [--timeout N]` 時成功為 exit 0、terminal failure 為 exit 1、逾時仍為 exit 3。所有 queue mutation 都可加 `--json` 取得 `cortex-porcelain/run/v1` 輸出。
+   `cortex run work start/resume/...` 額外支援 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model`：run-scoped 覆寫該 work item 這次 claim 的 planner/builder/reviewer 模型鏈，三段各自獨立、未指定的段落回退共享 `model-identities.yaml`。覆寫只影響這個 run，不改共享設定檔、不影響其他 active run 尚未派出的 card；於 claim（或首次 dispatch）時凍結，之後 resume／retry 沿用凍結值。指定的 identity 仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 CLI 直接回報錯誤原因並列出可用 identity，不會靜默退回共享預設。
 
 11. 用 `recover` 家族執行受限復原；slice/work mutation 的 `--actor` 為必要審計欄位：
 
@@ -399,6 +402,57 @@ verification:
 - v1 只支援 `tier: shareable`；非 shareable 會 fail-closed 到 `needs_human`。
 - verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
 
+### Runtime preflight（dispatch 前的 capability 與 provider 新鮮度，#262）
+
+Manager 在建立 worktree／sandbox／job row／model session **之前**，會依 card 宣告在
+「即將實際被使用的 executor 環境」執行低成本 preflight。card 未宣告任何 capability
+時 preflight 是 no-op，行為與先前相同。
+
+`paulsha_cortex/deck/data/cards.yaml` 的 card 可宣告 `runtime_capabilities`，形式為
+`<kind>:<name>`，kind 為 `module`／`executable`／`bridge`／`provider`：
+
+```yaml
+  - id: tdd-red
+    # ...
+    runtime_capabilities: ["module:pytest"]
+```
+
+宣告是資料而非程式碼分支——新增 card 只要寫這份宣告，不需修改 preflight 實作；
+非法 kind 或空 name 會在 deck 載入時 fail-closed（`DeckSchemaError`），避免無聲漏檢。
+
+檢查一律走 executor 環境，不看 host：
+
+- `module:` 以 executor 的 interpreter 開子行程 import；
+- `executable:` 只解析 executor 的 `PATH`；
+- `bridge:` 依內建對照表落到 module 或 executable 探測；
+- `provider:` 讀 provider snapshot 的新鮮度。
+
+`SubprocessLauncher.executor_environment()` 用與 `launch()` 相同的
+`_git_scope_env()`／`_review_scope_env()` 產生 env，因此 preflight 與正式 job 的
+interpreter、`PATH`、`HOME`／sandbox policy 一致（reviewer 會走最小 env）。
+
+Provider 健康採「快照 + TTL + 有界 probe」三層。snapshot 帶 `observed_at`、TTL、
+source 與 reason；TTL 內直接採信，逾期的 degraded **不會**被當成當前事實，而是對
+必要 provider 執行有界 live probe。四種結果各自獨立，不折疊成布林：
+
+| 結果 | 意義 | 是否 hard block |
+| --- | --- | --- |
+| `capability_missing` | executor 環境缺 module／executable／bridge | 是 |
+| `provider_unavailable` | 新鮮快照或 live probe 判定 provider 不可用 | 是 |
+| `stale_snapshot` | 快照逾期且無法探測，需刷新 | 否 |
+| `probe_inconclusive` | 探測 timeout／額度耗盡／無定論 | 否 |
+
+live probe 以 provider identity 為鍵共用 TTL 快取與 rate-limit 額度（沿用
+`claim_readiness` 的 `LiveProbeCache` 模式），同批次多張 card 對同一 provider 只探測
+一次。preflight 失敗時，Manager 會在既有 identity 順序與 independence domain 規則內
+自動 re-route 至下一個合法 identity；沒有合法替代才進入帶具體 reason 的
+`needs_human`（`reason` 形如 `runtime-preflight-capability_missing`）。整個 gate 位於
+model session 建立之前，被擋下時 model invocation 維持 0。
+
+`cortex inspect status` 會顯示缺少的 capability、使用中的 executor environment
+（名稱／interpreter／`PATH`／`HOME`）與每個 provider 的 snapshot 新鮮度
+（status、source、age、TTL、是否 fresh）。
+
 ### Foreign reviewer identity（不同 independence domain）
 
 `PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`：
@@ -503,7 +557,7 @@ export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
 
 | 面向 | 現況 |
 | --- | --- |
-| persona enforcement | standalone PR workflow 為 `shadow`；coordinator verification 的 `persona-scope` 為 fail-closed gate |
+| persona enforcement | standalone PR workflow（`persona-scope.yml`）由 `personas.yaml` 的 `enforcement` 驅動，現為 `enforce`（#135；切換前以 `python -m paulsha_cortex.persona.replay` 回放近期已合併 PR 驗證零誤殺，見 `docs/persona-scope-enforcement.md`）；coordinator verification 的 `persona-scope` 為 fail-closed gate |
 | manager service install | `cortex install service` 會 render / copy / enable，但不會 start；systemd 不可用時只落檔 |
 | coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` / `work` 走 control queue；舊低階 `dispatch` 已停用 |
 | deck 驗證 | compile 只產生 `dispatch: hold` 骨架；verify 只檢查 `produces` glob 存在性，不驗內容 |
