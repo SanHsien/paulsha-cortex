@@ -1,5 +1,5 @@
 version: 1
-enforcement: shadow
+enforcement: enforce
 roles:
   manager:
     role: manager

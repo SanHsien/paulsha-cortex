@@ -6,6 +6,16 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Changed
+- **Issue #135：persona enforcement shadow → enforce**：切換前先以
+  `python -m paulsha_cortex.persona.replay`（新增，可重跑）回放最近已合併 PR 的
+  實際檔案清單，證明對現行 `builder` 派工慣例零誤殺，才把
+  `paulsha_cortex/persona/personas.yaml` 的 `enforcement` 由 `shadow` 切為
+  `enforce`。`persona-scope.yml`（`scope_ci.py`）現依 `enforcement` 動態決定放
+  行：違規時輸出含 persona／觸及路徑／違反規則的可定位 verdict 並 `exit 1`；
+  套用 `policy-exempt:persona-scope` label 時不阻擋，但違規內容仍完整輸出（不
+  靜音）。`persona-scope` 設為 main required status check 屬 GitHub repo 設定，
+  設定步驟見 `docs/persona-scope-enforcement.md`。
 ### Added
 - **Issue #262：dispatch 前驗證 runtime capability 與 provider snapshot 新鮮度**：新增
   `coordinator/runtime_preflight.py`，在建立 worktree／sandbox／job row／model session 之前，

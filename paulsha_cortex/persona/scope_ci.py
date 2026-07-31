@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from . import gate, handoff
-from .loader import load_catalog
+from .loader import load_catalog, load_enforcement
 
 HANDOFF_GLOB = "runtime/handoff/*.json"
+EXEMPTION_LABEL = "policy-exempt:persona-scope"
 
 
 def resolve_base(env: Mapping[str, str]) -> str:
@@ -39,13 +40,35 @@ def find_latest_manifest(repo_root: str | Path | None = None) -> Path | None:
     return max(files, key=lambda p: p.stat().st_mtime)
 
 
+def _pr_labels(env: Mapping[str, str]) -> list[str]:
+    """自 env 讀 PR labels（workflow 以 `PERSONA_SCOPE_PR_LABELS` 逗號分隔傳入）。"""
+    raw = env.get("PERSONA_SCOPE_PR_LABELS", "")
+    return [label.strip() for label in raw.split(",") if label.strip()]
+
+
+def _is_exempted(env: Mapping[str, str]) -> bool:
+    return EXEMPTION_LABEL in _pr_labels(env)
+
+
+def _finalize(mode: str, exempted: bool, ok: bool) -> int:
+    """依 enforcement mode 決定 exit code；shadow／豁免恆放行，enforce 違規則擋。"""
+    if mode != "enforce":
+        return 0  # shadow：恆放行，僅觀測/annotate
+    if exempted:
+        return 0  # R4/D4：豁免不擋合併，但呼叫端已印出完整違規內容（不靜音）
+    return 0 if ok else 1
+
+
 def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
-    """Shadow persona-scope CI runner：恆 return 0（observe/annotate-only）。
+    """persona-scope CI runner：依 `personas.yaml` 的 enforcement 決定是否阻擋。
 
     無 manifest（常態）→ 印 skipped 通知並放行。
-    有 manifest → reuse gate verdict 邏輯、印 JSON，shadow 仍恆放行。
+    有 manifest → reuse gate verdict 邏輯、印 JSON；
+    shadow 恆放行，enforce 違規且未豁免時回非零（R2）。
     """
     env = os.environ if env is None else env
+    mode = load_enforcement()
+    exempted = _is_exempted(env)
 
     parser = argparse.ArgumentParser(prog="python -m paulsha_cortex.persona.scope_ci")
     parser.add_argument("--repo", default=None, help="repo root（預設 cwd；測試可注入 temp dir）")
@@ -56,8 +79,8 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     if manifest is None:
         print(
             json.dumps(
-                {"mode": "shadow", "skipped": True,
-                 "notice": "no manifest, skipped (shadow)"},
+                {"mode": mode, "skipped": True,
+                 "notice": f"no manifest, skipped ({mode})"},
                 ensure_ascii=False,
             )
         )
@@ -67,24 +90,25 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     head = resolve_head(env)
 
     # catalog 壞掉（缺 personas.yaml / YAML 壞 / schema 不過）→ 視為「不可驗證」：
-    # 印 verdict（ok=false + catalog_error）、shadow 仍恆放行。
+    # 印 verdict（ok=false + catalog_error）；shadow 仍放行，enforce 且未豁免則 fail-closed 擋下。
     # 註：import 期 contract.PERSONA_CATALOG 已 fail-closed 退空（見 contract._load_catalog_import_safe），
     # 故 import 不會逃逸；此處再 guard 直接 load_catalog() 的 fail-closed 例外。
     try:
         catalog = load_catalog()
     except (FileNotFoundError, ValueError) as exc:
         verdict = {
-            "mode": "shadow",
+            "mode": mode,
             "manifest": str(manifest),
             "base": base,
             "head": head,
             "catalog_error": str(exc),
             "ok": False,
+            "exempted": exempted,
         }
         print(json.dumps(verdict, ensure_ascii=False))
-        return 0  # shadow：catalog 壞掉仍乾淨放行，僅觀測/annotate
+        return _finalize(mode, exempted, ok=False)
 
-    # manifest 存在但壞掉 → 視為「存在但不可信」：印 verdict（ok=false）、shadow 放行。
+    # manifest 存在但壞掉 → 視為「存在但不可信」：印 verdict（ok=false）。
     try:
         payload = handoff.read_manifest(manifest, catalog)
         from_role = str(payload.get("from_role", ""))
@@ -96,7 +120,7 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     try:
         changed_paths = gate.compute_changed_paths(base, head, repo=repo_root)
         diff_error: str | None = None
-    except RuntimeError as exc:  # fail-closed：取 diff 失敗 → 標記但 shadow 不擋
+    except RuntimeError as exc:  # fail-closed：取 diff 失敗 → 標記
         changed_paths = []
         diff_error = str(exc)
 
@@ -107,10 +131,11 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         manifest_ok=manifest_ok,
         catalog=catalog,
     )
-    verdict["mode"] = "shadow"
+    verdict["mode"] = mode
     verdict["manifest"] = str(manifest)
     verdict["base"] = base
     verdict["head"] = head
+    verdict["exempted"] = exempted
     if manifest_error is not None:
         verdict["manifest_error"] = manifest_error
         verdict["ok"] = False
@@ -118,8 +143,9 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         verdict["diff_error"] = diff_error
         verdict["ok"] = False
 
+    # R4/D4：豁免不靜音——即使套用豁免、即使 shadow，違規內容一律先印出再決定是否放行。
     print(json.dumps(verdict, ensure_ascii=False))
-    return 0  # shadow：恆放行，僅觀測/annotate
+    return _finalize(mode, exempted, ok=bool(verdict["ok"]))
 
 
 if __name__ == "__main__":  # pragma: no cover
