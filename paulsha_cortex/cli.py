@@ -46,7 +46,7 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|link|unlink|start|resume|retry-build|retry-verify|retry-review|abandon|auto|review-attest|ship> ...
+usage: cortex work <show|link|unlink|start|resume|retry-build|retry-verify|retry-review|recover-planning|abandon|auto|review-attest|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
@@ -58,6 +58,7 @@ work item commands:
   retry-verify  以 exact Candidate CAS 只重跑 verification，不重建 candidate
   retry-review  以 exact Candidate CAS 只重跑 foreign review，不重跑 builder
   abandon   以 exact WorkflowRun CAS 將 pre-delivery run 標成 superseded
+  recover-planning  對 define/needs_human 的 planning 失敗作可恢復重跑
   auto      管理 cortex:auto-on-going issue label
   review-attest  建立 exact-HEAD maintainer review evidence
   ship      執行 fail-closed delivery state machine

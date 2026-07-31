@@ -16,7 +16,8 @@ REQUEST_TYPES = frozenset(
 WORK_ACTIONS = frozenset(
     {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-        "retry-review", "abandon", "auto", "ship", "review-attest",
+        "retry-review", "recover-planning", "abandon", "auto", "ship",
+        "review-attest",
     }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
@@ -105,6 +106,26 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
         ):
             raise ValueError(f"work-action {action} requires exact expected_candidate")
+        if action == "recover-planning":
+            expected_run_id = args.get("expected_run_id")
+            failure_classification = args.get("failure_classification")
+            failure_reason = args.get("failure_reason")
+            if (
+                not isinstance(expected_run_id, str)
+                or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+            ):
+                raise ValueError("work-action recover-planning requires exact expected_run_id")
+            if (
+                not isinstance(failure_classification, str)
+                or failure_classification not in {"environment", "content"}
+            ):
+                raise ValueError("work-action recover-planning requires failure_classification")
+            if (
+                not isinstance(failure_reason, str)
+                or not failure_reason.strip()
+                or "\n" in failure_reason
+            ):
+                raise ValueError("work-action recover-planning requires failure_reason")
         if action == "abandon":
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")

@@ -735,6 +735,12 @@ class ClaimCandidate:
     active_authority_digest: str | None = None
     active_plan_review_passed: bool = True
     active_claim_identity_digest: str | None = None
+    # #256 R2：resume 對 needs_human 必須說得出「為什麼卡住、現在能做什麼」。
+    # 以下三個欄位是那個判斷的唯一輸入，全部取自系統寫入的 run 狀態／evidence
+    # （current_phase 與 planning failure record），呼叫端自述不得寫入。
+    active_phase: str | None = None
+    active_planning_failure_classification: str | None = None
+    active_planning_failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -743,6 +749,11 @@ class ClaimDecision:
     reason: str | None = None
     claim_key: str | None = None
     run_id: str | None = None
+    next_actions: tuple[str, ...] = ()
+    # #256 R2：`reason` 是動作語意（呼叫端據以分支，維持穩定）；`blocking_reason`
+    # 才是「這個 run 到底為什麼停住」的具體原因，取自 run 自己的 evidence，
+    # 拿不到時為 None（不編造）。
+    blocking_reason: str | None = None
 
 
 def _validate_candidate(candidate: ClaimCandidate) -> None:
@@ -786,6 +797,20 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
         raise ValueError("confirmed_issue is not authorized by WorkAuthority")
     if candidate.active_run_id is None and candidate.active_claim_key is not None:
         raise ValueError("active_claim_key requires active_run_id")
+    if candidate.active_planning_failure_classification is not None and (
+        candidate.active_planning_failure_classification not in {"environment", "content"}
+    ):
+        raise ValueError("active planning failure classification invalid")
+    if candidate.active_planning_failure_reason is not None and (
+        not isinstance(candidate.active_planning_failure_reason, str)
+        or not candidate.active_planning_failure_reason.strip()
+    ):
+        raise ValueError("active planning failure reason must be a non-empty string")
+    if (
+        candidate.active_planning_failure_classification is None
+        and candidate.active_planning_failure_reason is not None
+    ):
+        raise ValueError("planning failure reason requires its classification")
     if candidate.active_run_id is not None:
         if not isinstance(candidate.active_run_id, str) or not candidate.active_run_id.strip():
             raise ValueError("active_run_id must be a non-empty string")
@@ -882,13 +907,28 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             reason="already-completed",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
+            next_actions=(),
         )
     if candidate.active_status == "needs_human":
+        # #256 R2：不得只原樣回報狀態。`abandon` 永遠合法（釋放後可重 claim，R3）；
+        # `recover-planning` 只有在該 run 自己的 evidence 顯示「停在 define 的
+        # 環境類 planning 失敗」時才是合法出口——內容類失敗不得由本路徑繞過
+        # （R1 fail-closed），拿不到 evidence 時也不宣稱它可用。
+        classification = candidate.active_planning_failure_classification
+        recoverable = classification == "environment" and candidate.active_phase == "define"
+        next_actions = ("recover-planning", "abandon") if recoverable else ("abandon",)
+        blocking_reason = (
+            f"planning-failure:{classification}:{candidate.active_planning_failure_reason}"
+            if classification is not None and candidate.active_planning_failure_reason
+            else None
+        )
         return ClaimDecision(
             action="needs_human",
             reason="human-intervention-required",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
+            next_actions=next_actions,
+            blocking_reason=blocking_reason,
         )
     if candidate.active_status == "blocked":
         return ClaimDecision(
@@ -896,6 +936,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             reason="persisted-block",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
+            next_actions=("abandon",),
         )
     if candidate.active_status == "needs_decomposition":
         # #223（design #208 H.3）：run 已因 Red band 轉入拆分路由（見
@@ -907,12 +948,14 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             reason="decomposition-required",
             claim_key=candidate.active_claim_key,
             run_id=candidate.active_run_id,
+            next_actions=(),
         )
     return ClaimDecision(
         action="resume",
         reason="active-workflow",
         claim_key=candidate.active_claim_key,
         run_id=candidate.active_run_id,
+        next_actions=(),
     )
 
 

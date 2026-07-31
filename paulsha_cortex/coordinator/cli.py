@@ -133,7 +133,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "action",
         choices=[
             "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-            "retry-review", "abandon", "auto", "ship", "review-attest",
+            "retry-review", "recover-planning", "abandon", "auto", "ship",
+            "review-attest",
         ],
     )
     p_work.add_argument("work_id")
@@ -142,6 +143,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--kind", choices=["github_issue", "github_pr", "openspec", "path"])
     p_work.add_argument("--ref")
     p_work.add_argument("--actor")
+    p_work.add_argument("--failure-classification")
+    p_work.add_argument("--failure-reason")
     p_work.add_argument("--expected-run-id", help="abandon 使用的 exact WorkflowRun CAS")
     p_work.add_argument("--reason", help="abandon 的單行審計理由（最多 500 字）")
     toggle = p_work.add_mutually_exclusive_group()
@@ -282,6 +285,10 @@ def main(
             request_args["ref"] = args.ref
         if args.actor is not None:
             request_args["actor"] = args.actor
+        if args.failure_classification is not None:
+            request_args["failure_classification"] = args.failure_classification
+        if args.failure_reason is not None:
+            request_args["failure_reason"] = args.failure_reason
         if args.expected_run_id is not None:
             request_args["expected_run_id"] = args.expected_run_id
         if args.reason is not None:

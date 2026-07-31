@@ -13,7 +13,9 @@ DEFAULT_WORKFLOW_COMBO = "feature-oneshot"
 WORKFLOW_MANIFEST_VERSION = 1
 WORKFLOW_PHASES = ("claim", "define", "plan", "build", "verify", "review", "ship")
 WORKFLOW_GATE_STATUSES = frozenset({"pending", "running", "passed", "failed"})
-WORKFLOW_FACETS = frozenset({"needs_human", "blocked", "degraded", "needs_decomposition"})
+WORKFLOW_FACETS = frozenset(
+    {"needs_human", "blocked", "degraded", "needs_decomposition", "planning_released"}
+)
 STEP_GATE_RESULTS = frozenset({"pending", "running", "passed", "failed", "needs_human", "blocked", "skipped"})
 
 
