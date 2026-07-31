@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -70,12 +71,48 @@ def _patch_enforcement(case: unittest.TestCase, mode: str) -> None:
     case.addCleanup(setattr, scope_ci, "load_enforcement", original)
 
 
+# #284：回放錨點釘在固定 commit，而非浮動的 `main`。
+#
+# 原本以 `ref="main"` 回放有兩個問題：
+#   1. **flaky**：merge／rebase 進行中 `main` ref 正在變動，`prs_scanned` 可能落到 0
+#      而讓斷言失敗——「掃不到」不等於「有誤殺」，兩者被混為一談。
+#   2. **CI 上驗證力未知**：`actions/checkout` 預設 shallow（實測 depth 1 的 clone
+#      `git log --merges -n 30` 回 0 個），CI 實際回放範圍遠少於宣稱的 30 個 PR，
+#      卻仍以「歷史回放零誤殺」通過。
+#
+# 釘住錨點後語意變誠實：這是「#135 切換 enforce 當下、對該段真實歷史證明零誤殺」
+# 的固化證據，不隨 HEAD 移動而改變。偵測新 PR 是否引入誤殺是 CI `persona-scope`
+# workflow 對 PR diff 的職責；要對當前歷史手動回放請用
+# `python -m paulsha_cortex.persona.replay --ref main`。
+REPLAY_ANCHOR_SHA = "6813058f8fa748c7d89a07d0cab5bd825fd37f2e"
+REPLAY_ANCHOR_LIMIT = 30
+
+
+def _anchor_available(repo_root: Path, sha: str) -> bool:
+    """錨點 commit 在本地是否可解析（shallow clone 環境不會有）。"""
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{sha}^{{commit}}"],
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
 class HistoricalReplayTests(unittest.TestCase):
     def test_historical_replay_has_zero_false_positives(self) -> None:
-        """R1 / D1：以近期已合併 PR 檔案清單回放 persona scope 判定，零誤殺、可重跑。"""
+        """R1 / D1：以固定歷史區段回放 persona scope 判定，零誤殺、可重跑。"""
         from paulsha_cortex.persona import replay
 
-        summary = replay.replay(repo_root=REPO_ROOT, limit=30, ref="main")
+        if not _anchor_available(REPO_ROOT, REPLAY_ANCHOR_SHA):
+            # 明確 skip 而非靜默通過：淺 clone 沒有足夠歷史可回放，
+            # 在這種環境下宣稱「零誤殺」沒有根據。
+            self.skipTest(
+                f"回放錨點 {REPLAY_ANCHOR_SHA[:12]} 不在本地（淺 clone？）；"
+                "歷史回放需完整 clone"
+            )
+
+        summary = replay.replay(
+            repo_root=REPO_ROOT, limit=REPLAY_ANCHOR_LIMIT, ref=REPLAY_ANCHOR_SHA
+        )
 
         # 回放必須實際掃到東西，避免空回放偽造零誤殺。
         self.assertGreater(summary["prs_scanned"], 0, msg="回放未掃到任何已合併 PR")
@@ -89,10 +126,16 @@ class HistoricalReplayTests(unittest.TestCase):
             ),
         )
 
+        # 錨點固定 ⇒ 掃描範圍必為滿額，不因 HEAD 位置而縮水。
+        self.assertEqual(summary["prs_scanned"], REPLAY_ANCHOR_LIMIT)
+
         # 可重跑：同樣輸入應得到同樣結論（結構化、非一次性手算）。
-        rerun = replay.replay(repo_root=REPO_ROOT, limit=30, ref="main")
+        rerun = replay.replay(
+            repo_root=REPO_ROOT, limit=REPLAY_ANCHOR_LIMIT, ref=REPLAY_ANCHOR_SHA
+        )
         self.assertEqual(rerun["false_positives"], summary["false_positives"])
         self.assertEqual(rerun["prs_scanned"], summary["prs_scanned"])
+        self.assertEqual(rerun["files_scanned"], summary["files_scanned"])
 
 
 class ViolationExitCodeTests(unittest.TestCase):
