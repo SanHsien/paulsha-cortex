@@ -714,6 +714,11 @@ def load_work_authority(
     for exc in skipped:
         if exc.repo == repo and exc.work_id in (None, work_id):
             raise exc
+    payload, _ = _load_snapshot(snapshot_path)
+    if isinstance(payload, dict) and payload.get("last_refresh_error"):
+        raise ValueError(
+            f"confirmed work authority missing or ambiguous (monitor refresh failed: {payload['last_refresh_error']})"
+        )
     raise ValueError("confirmed work authority missing or ambiguous")
 
 

@@ -287,15 +287,6 @@ def correlate_work_sources(
             )
         elif len(work_ids) == 1:
             owners[source_id] = next(iter(work_ids))
-    if diagnostics:
-        return CorrelationResult(
-            groups=(),
-            source_owners={},
-            exclusions=tuple(all_exclusions),
-            explanations={},
-            degraded=True,
-            diagnostics=tuple(diagnostics),
-        )
 
     groups: dict[str, list[WorkSource]] = {}
     for source in sources:
@@ -404,6 +395,8 @@ def correlate_work_sources(
         source_owners=owners,
         exclusions=tuple(all_exclusions),
         explanations=explanations,
+        degraded=bool(diagnostics),
+        diagnostics=tuple(diagnostics),
     )
 
 
