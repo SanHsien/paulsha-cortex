@@ -1344,6 +1344,9 @@ def _claim_action(
                 "run": None,
                 "readiness_failed_check": readiness.failed_check,
             }
+    planning_failure_hint = (
+        _planning_failure_hint(canonical_run) if canonical_run is not None else None
+    )
     candidate = ClaimCandidate(
         authority=authority,
         repo=authority.repo,
@@ -1376,6 +1379,17 @@ def _claim_action(
         ),
         active_claim_identity_digest=(
             claim_identity_digest(authority) if canonical_run is not None else None
+        ),
+        # #256 R2：needs_human 的可執行下一步由 run 自身狀態決定——phase 與
+        # 系統寫入的 planning 失敗 evidence，呼叫端自述不參與。
+        active_phase=(
+            getattr(canonical_run, "current_phase", None) if canonical_run is not None else None
+        ),
+        active_planning_failure_classification=(
+            planning_failure_hint["classification"] if planning_failure_hint else None
+        ),
+        active_planning_failure_reason=(
+            planning_failure_hint["reason"] if planning_failure_hint else None
         ),
     )
     if (
@@ -1536,7 +1550,18 @@ def _claim_action(
                     run_id_to_persist, frozen_readiness=frozen_dict
                 )
                 active["frozen_readiness"] = persisted.frozen_readiness
-    return {"action": decision.action, "reason": decision.reason, "run": active}
+    response: dict[str, Any] = {
+        "action": decision.action,
+        "reason": decision.reason,
+        "run": active,
+    }
+    # #256 R2：operator／agent 不必翻 registry 就知道下一步——狀態帶得出合法
+    # 動作集合與具體 blocking reason 時一併回報。
+    if decision.next_actions:
+        response["next_actions"] = list(decision.next_actions)
+    if decision.blocking_reason is not None:
+        response["blocking_reason"] = decision.blocking_reason
+    return response
 
 
 class RetryClassification(str, Enum):
@@ -1968,6 +1993,22 @@ def _read_planning_failure_record(
     return matches[0]
 
 
+def _planning_failure_hint(run) -> dict[str, Any] | None:
+    """#256 R2：resume 用的唯讀 planning 失敗判讀，讀不到／有歧義一律回 None。
+
+    與 `_read_planning_failure_record` 共用同一份 evidence 判準，差別只在這裡
+    是提示用途（決定 resume 要浮現哪些 next_actions），不得因此放寬任何
+    fail-closed 行為——`recover-planning` 本身仍會重新做完整驗證。
+    """
+
+    if run is None:
+        return None
+    try:
+        return _read_planning_failure_record(run=run, run_id=run.run_id)
+    except (RuntimeError, OSError, AttributeError):
+        return None
+
+
 def _recover_planning_record(
     run,
     *,
@@ -1976,12 +2017,17 @@ def _recover_planning_record(
     failure_classification: str,
     failure_reason: str,
     evidence_ref: str,
+    recovered_phase: str,
 ) -> dict[str, str]:
     body = {
         "schema": "cortex-work-planning-recovery/v1",
         "run_id": run.run_id,
         "source_revision": run.source_revision,
         "actor": actor,
+        # #256 R4：稽核必須含恢復前後的 run 狀態，不能只留觸發者與判定依據。
+        "previous_phase": run.current_phase,
+        "previous_facets": sorted(run.facets),
+        "recovered_phase": recovered_phase,
         "failure_classification": failure_classification,
         "failure_reason": failure_reason,
         "failure_evidence_ref": evidence_ref,
@@ -2322,6 +2368,7 @@ def _recover_planning_action(
         failure_classification=failure_classification,
         failure_reason=failure_reason,
         evidence_ref=failure["evidence_ref"],
+        recovered_phase="plan",
     )
     current_facets = tuple(
         facet for facet in run.facets if facet not in {"needs_human", "blocked"}
