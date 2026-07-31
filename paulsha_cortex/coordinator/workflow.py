@@ -17,6 +17,50 @@ WORKFLOW_FACETS = frozenset(
     {"needs_human", "blocked", "degraded", "needs_decomposition", "planning_released"}
 )
 STEP_GATE_RESULTS = frozenset({"pending", "running", "passed", "failed", "needs_human", "blocked", "skipped"})
+# #205：run-scoped 模型鏈覆寫／解析結果三段固定為 planner／builder／reviewer，
+# 與 WorkflowStep.persona 的合法值對齊（見 deck.schema 對 persona 的定義）。
+MODEL_CHAIN_PERSONAS = frozenset({"planner", "builder", "reviewer"})
+MODEL_CHAIN_RESOLUTION_SOURCES = frozenset({"override", "registry"})
+
+
+def _validate_model_chain_override(value: object, *, field_name: str) -> None:
+    """#205 D1：run-scoped 覆寫格式——{persona: {"executor":.., "model_id":..}}。"""
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"workflow run {field_name} 必須為null或dict")
+    for persona, row in value.items():
+        if persona not in MODEL_CHAIN_PERSONAS:
+            raise ValueError(f"workflow run {field_name} persona 非法: {persona!r}")
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"executor", "model_id"}
+            or not isinstance(row.get("executor"), str)
+            or not row["executor"]
+            or not isinstance(row.get("model_id"), str)
+            or not row["model_id"]
+        ):
+            raise ValueError(f"workflow run {field_name}[{persona!r}] 格式錯誤")
+
+
+def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
+    """#205 D5：解析結果稽核紀錄——{persona: {executor, model_id,
+    independence_domain, source}}，source 只能是 override 或 registry。"""
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"workflow run {field_name} 必須為null或dict")
+    required_keys = {"executor", "model_id", "independence_domain", "source"}
+    for persona, row in value.items():
+        if persona not in MODEL_CHAIN_PERSONAS:
+            raise ValueError(f"workflow run {field_name} persona 非法: {persona!r}")
+        if not isinstance(row, dict) or set(row) != required_keys:
+            raise ValueError(f"workflow run {field_name}[{persona!r}] 格式錯誤")
+        for key in ("executor", "model_id", "independence_domain"):
+            if not isinstance(row.get(key), str) or not row[key]:
+                raise ValueError(f"workflow run {field_name}[{persona!r}].{key} 必須為非空字串")
+        if row.get("source") not in MODEL_CHAIN_RESOLUTION_SOURCES:
+            raise ValueError(f"workflow run {field_name}[{persona!r}].source 非法: {row.get('source')!r}")
 
 
 @dataclass(frozen=True)
@@ -337,6 +381,16 @@ class WorkflowRun:
     # dispatch 自行重新推導一個可能更新鮮（或更陳舊）的 base。``None`` 表示尚未
     # 凍結或呼叫端未接上 readiness transaction，維持既有行為。
     frozen_readiness: dict[str, Any] | None = None
+    # #205 R1/D1：run-scoped planner/builder/reviewer 模型鏈覆寫，claim（或首次
+    # dispatch）時凍結；只作用於本 run，完全不觸碰共享 model-identities.yaml。
+    # 比照 retry_classification／pr_candidate 的 provenance-only 加法模式——
+    # 未指定的段落維持 None，_select_workflow_identity 逐段回退共享 registry。
+    model_chain_override: dict[str, dict[str, str]] | None = None
+    # #205 R4/D5：三段各自實際解析到的 executor／model／independence_domain
+    # 與來源標記（run-scoped override vs 共享 registry），供事後稽核「這次到底
+    # 用了什麼模型、為什麼」。每次 dispatch 選定 identity 時逐段覆寫更新，純
+    # provenance，不影響既有 workflow 語意。
+    resolved_model_chain: dict[str, dict[str, str]] | None = None
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -506,6 +560,8 @@ class WorkflowRun:
                 datetime.fromisoformat(value.replace("Z", "+00:00"))
             except (AttributeError, ValueError) as exc:
                 raise ValueError(f"workflow run {field} 必須為ISO8601") from exc
+        _validate_model_chain_override(self.model_chain_override, field_name="model_chain_override")
+        _validate_model_chain_resolution(self.resolved_model_chain, field_name="resolved_model_chain")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -548,6 +604,16 @@ class WorkflowRun:
             "plan_review_passed": self.plan_review_passed,
             "frozen_readiness": (
                 dict(self.frozen_readiness) if self.frozen_readiness is not None else None
+            ),
+            "model_chain_override": (
+                {persona: dict(row) for persona, row in self.model_chain_override.items()}
+                if self.model_chain_override is not None
+                else None
+            ),
+            "resolved_model_chain": (
+                {persona: dict(row) for persona, row in self.resolved_model_chain.items()}
+                if self.resolved_model_chain is not None
+                else None
             ),
         }
 
@@ -627,6 +693,8 @@ class WorkflowRun:
             decomposition_depth=payload.get("decomposition_depth", 0),
             plan_review_passed=payload.get("plan_review_passed", False),
             frozen_readiness=payload.get("frozen_readiness"),
+            model_chain_override=payload.get("model_chain_override"),
+            resolved_model_chain=payload.get("resolved_model_chain"),
         )
 
 

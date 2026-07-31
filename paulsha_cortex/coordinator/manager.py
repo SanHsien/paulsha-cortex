@@ -4948,31 +4948,83 @@ def _current_workflow_step(run):
     return pending[0] if pending else None
 
 
+_MODEL_CHAIN_CAPABILITY_BY_PERSONA = {
+    "planner": "planning",
+    "reviewer": "review",
+    "builder": "build",
+}
+
+
+def _workflow_identity_candidates(persona: str, identities: IdentityRegistry, builder_domains: set):
+    """依 persona 過濾出合法 candidate 清單（既有共享 registry 選擇邏輯與
+    #205 run-scoped 覆寫的約束檢查共用同一份過濾條件，避免兩處判準漂移）。"""
+    # 非 planner／reviewer 一律視為 builder（比照 #205 之前既有的 else 分支
+    # catch-all 行為，deck 目前只會派出 planner/build/reviewer 三種 persona）。
+    capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona, "build")
+    candidates = [item for item in identities.identities if capability in item.capabilities]
+    if persona == "reviewer":
+        candidates = [item for item in candidates if item.independence_domain not in builder_domains]
+    return candidates
+
+
 def _select_workflow_identity(run, step, identities: IdentityRegistry):
     builder_domains = {
         item.domain
         for item in run.steps
         if item.phase == "build" and item.gate_result == "passed" and item.domain is not None
     }
-    candidates = list(identities.identities)
-    if step.persona == "planner":
-        candidates = [item for item in candidates if "planning" in item.capabilities]
-    elif step.persona == "reviewer":
-        candidates = [
-            item
-            for item in candidates
-            if "review" in item.capabilities
-            and item.independence_domain not in builder_domains
-        ]
-    else:
-        candidates = [item for item in candidates if "build" in item.capabilities]
-        if run.primary_domain is not None:
-            preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
-            if preferred:
-                candidates = preferred
+    # #205 R1/D1/D3/D4：run-scoped 覆寫先於共享 registry 選擇；三段各自獨立，
+    # 未覆寫的段落回退既有共享 registry 選擇邏輯（下方 fallback 完全不動）。
+    # 覆寫仍須通過與共享路徑相同的 capability／independence domain 約束，違反
+    # 時 fail closed 並列出可用 candidates，MUST NOT 靜默退回共享預設。
+    override = getattr(run, "model_chain_override", None)
+    persona_override = override.get(step.persona) if isinstance(override, dict) else None
+    if persona_override is not None:
+        eligible = _workflow_identity_candidates(step.persona, identities, builder_domains)
+        executor = persona_override.get("executor")
+        model_id = persona_override.get("model_id")
+        identity = identities.get(executor, model_id)
+        available = ", ".join(f"{item.executor}/{item.model_id}" for item in eligible) or "(none)"
+        if identity is None:
+            raise ValueError(
+                "model chain override 指定的 identity 不存在於 registry: "
+                f"{step.persona}={executor}/{model_id}（可用 candidates: {available}）"
+            )
+        if identity not in eligible:
+            if step.persona == "reviewer" and identity.independence_domain in builder_domains:
+                reason = "independence_domain 與 builder 相同"
+            else:
+                capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(step.persona, "build")
+                reason = f"不具備 {capability} capability"
+            raise ValueError(
+                "model chain override 指定的 identity 不符既有約束: "
+                f"{step.persona}={executor}/{model_id}（{reason}；可用 candidates: {available}）"
+            )
+        return identity
+    candidates = _workflow_identity_candidates(step.persona, identities, builder_domains)
+    if step.persona == "builder" and run.primary_domain is not None:
+        preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
+        if preferred:
+            candidates = preferred
     if not candidates:
         raise ValueError(f"no configured identity for workflow persona: {step.persona}")
     return candidates[0]
+
+
+def _record_resolved_model_chain(registry, run, step, identity) -> None:
+    """#205 R4/D5：把本次 dispatch 實際解析到的 executor/model/domain 與來源
+    （run-scoped override vs 共享 registry）寫入 run，供事後稽核。純 provenance
+    寫入，逐段覆蓋合併既有紀錄，不影響既有 workflow 語意或推進邏輯。"""
+    override = getattr(run, "model_chain_override", None)
+    source = "override" if isinstance(override, dict) and step.persona in override else "registry"
+    resolved = dict(getattr(run, "resolved_model_chain", None) or {})
+    resolved[step.persona] = {
+        "executor": identity.executor,
+        "model_id": identity.model_id,
+        "independence_domain": identity.independence_domain,
+        "source": source,
+    }
+    registry._manager_update_workflow_run(run.run_id, resolved_model_chain=resolved)
 
 
 _LEGACY_CARD_EXECUTION = {
@@ -5428,6 +5480,7 @@ def _dispatch_workflow_card(
             )
             return None
     identity = _select_workflow_identity(run, step, identities)
+    _record_resolved_model_chain(registry, run, step, identity)
     launcher = launcher_factory(identity)
     if launcher is None:
         raise ValueError("workflow launcher unavailable")
@@ -6654,6 +6707,10 @@ def apply_workflow_action(
     # 只負責原樣轉交給 _manager_create_workflow_run；不在 manager.py 重算。
     start_sizing_score = args.get("sizing_score")
     start_sizing_band = args.get("sizing_band")
+    # #205 R1/R2：run-scoped 模型鏈覆寫在 claim 當下（本次 `_manager_create_
+    # workflow_run` 呼叫，若同 claim_key 已存在 ongoing run 則此呼叫是
+    # no-op，覆寫沿用既有 run，見 registry.py 的 idempotent 短路）一併凍結。
+    start_model_chain_override = args.get("model_chain_override")
     run = registry._manager_create_workflow_run(
         work_id=_required_workflow_string(args, "work_id"),
         repo=_required_workflow_string(args, "repo"),
@@ -6677,6 +6734,7 @@ def apply_workflow_action(
         gate_status="running",
         sizing_score=start_sizing_score,
         sizing_band=start_sizing_band,
+        model_chain_override=start_model_chain_override,
     )
     artifact_root = Path(_required_workflow_string(args, "artifact_root")).resolve()
     transaction_root = (
@@ -6876,13 +6934,16 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
     """唯一 production mutation seam；daemon control request 之外不直接呼叫。"""
     from .work_actions import execute_work_action
     from .registry import JobRegistry
-    from .work_bridge import start_canonical_workflow
+    from .work_bridge import extract_model_chain_override, start_canonical_workflow
 
     active_registry = registry or JobRegistry()
     state_path = getattr(active_registry, "_state_path", None)
     coordinator_root = (
         Path(state_path).resolve().parent if state_path is not None else paths.coordinator_root().resolve()
     )
+    # #205 R1：operator 在 `cortex run work start/resume/...` 帶入的 run-scoped
+    # 模型鏈覆寫語法層抽取；是否合法留給 dispatch 時 fail closed（D4）。
+    work_action_model_chain_override = extract_model_chain_override(args)
 
     def starter(authority, claim_key, reason):
         return start_canonical_workflow(
@@ -6893,6 +6954,7 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
             explicit_repo_root=args.get("repo_root"),
             runtime_factory=runtime_factory or planning_runtime.build_production_planning_runtime,
             needs_human_reason=reason,
+            model_chain_override=work_action_model_chain_override,
         )
 
     return execute_work_action(

@@ -39,6 +39,34 @@ from .planning import (
     compute_sizing_score,
 )
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
+from .workflow import MODEL_CHAIN_PERSONAS
+
+
+def extract_model_chain_override(args: Mapping[str, object]) -> dict[str, dict[str, str]] | None:
+    """#205 R1：從 work-action args 抽出 run-scoped planner/builder/reviewer
+    模型鏈覆寫（``<persona>_executor``／``<persona>_model`` 成對出現）。
+
+    只做「有沒有指定」的語法層抽取；executor/model 是否真的合法（capability、
+    independence domain）留給 dispatch 時的 ``manager._select_workflow_identity``
+    做 fail-closed 檢查（D4），這裡不重複判準也不預先做語意驗證。
+    """
+    override: dict[str, dict[str, str]] = {}
+    for persona in sorted(MODEL_CHAIN_PERSONAS):
+        executor = args.get(f"{persona}_executor")
+        model_id = args.get(f"{persona}_model")
+        if executor is None and model_id is None:
+            continue
+        if (
+            not isinstance(executor, str)
+            or not executor.strip()
+            or not isinstance(model_id, str)
+            or not model_id.strip()
+        ):
+            raise ValueError(
+                f"model chain override for {persona} requires both executor and model"
+            )
+        override[persona] = {"executor": executor.strip(), "model_id": model_id.strip()}
+    return override or None
 
 
 def _remote_repo(root: Path) -> str | None:
@@ -272,6 +300,7 @@ def start_canonical_workflow(
     identity_registry: IdentityRegistry | None = None,
     runtime_factory=None,
     needs_human_reason: str | None = None,
+    model_chain_override: dict[str, dict[str, str]] | None = None,
 ):
     """Create/resume the real WorkflowRun for a WorkAuthority claim."""
 
@@ -285,6 +314,14 @@ def start_canonical_workflow(
             return existing_run
         if existing_run.current_phase != "define":
             return existing_run
+    # #205 R2：覆寫於 claim（或首次 dispatch）時凍結——operator 這次沒有明確
+    # 再次覆寫時，沿用既有 run（仍在 define phase 的重試路徑）已凍結的覆寫，
+    # 不得因為這次呼叫沒帶覆寫參數就悄悄清空既有意圖。
+    effective_model_chain_override = (
+        model_chain_override
+        if model_chain_override is not None
+        else (existing_run.model_chain_override if existing_run is not None else None)
+    )
     stale_owners = _other_owner_ongoing_runs(registry, authority)
     if stale_owners:
         blocking = ", ".join(sorted({run.work_id for run in stale_owners}))
@@ -322,6 +359,7 @@ def start_canonical_workflow(
             gate_status="running",
             sizing_score=claim_sizing_score,
             sizing_band=claim_sizing_band,
+            model_chain_override=effective_model_chain_override,
         )
         return run
     manifest_path = _write_manifest(Path(coordinator_root), claim_key, manifest)
@@ -355,6 +393,7 @@ def start_canonical_workflow(
             "issue_refs": [f"{authority.repo}#{number}" for number in authority.mapped_issues],
             "openspec_refs": list(authority.mapped_openspec),
             "pr_refs": [],
+            "model_chain_override": effective_model_chain_override,
         },
         identity_registry=identities,
         runtime_factory=runtime_factory,
