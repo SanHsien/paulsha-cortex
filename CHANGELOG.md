@@ -6,6 +6,17 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Changed
+- **Issue #135：persona enforcement shadow → enforce**：切換前先以
+  `python -m paulsha_cortex.persona.replay`（新增，可重跑）回放最近已合併 PR 的
+  實際檔案清單，證明對現行 `builder` 派工慣例零誤殺，才把
+  `paulsha_cortex/persona/personas.yaml` 的 `enforcement` 由 `shadow` 切為
+  `enforce`。`persona-scope.yml`（`scope_ci.py`）現依 `enforcement` 動態決定放
+  行：違規時輸出含 persona／觸及路徑／違反規則的可定位 verdict 並 `exit 1`；
+  套用 `policy-exempt:persona-scope` label 時不阻擋，但違規內容仍完整輸出（不
+  靜音）。`persona-scope` 設為 main required status check 屬 GitHub repo 設定，
+  設定步驟見 `docs/persona-scope-enforcement.md`。
+
 ### Fixed
 - **Issue #256：planning claim 前向恢復與放行語意修正**：`recover-planning` 新增環境/內容分類判定與 CAS 重入保護，`abandon` 加入 `planning_released` 釋放標記讓 `needs_human` 的同識別 work item 可重 claim，並讓 `resume` 對 `needs_human` 回傳合法 `next_actions`（停在 `define` 的環境類 planning 失敗才含 `recover-planning`，內容類仍只給 `abandon`）與具體 `blocking_reason`，恢復稽核紀錄亦保存前後 run 狀態；`work_actions`、`control/contract`、`coordinator/cli`、`porcelain/run`、`work bridge/registry` 均同步放行與解讀新動作。
 
