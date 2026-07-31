@@ -19,6 +19,8 @@ SNAPSHOT_SCHEMA = "work-items-snapshot/v1"
 
 def work_key(repo: str, work_id: str) -> str:
     """Stable external identity for a repo-scoped Work Item."""
+    if work_id.startswith(f"{repo}::"):
+        return work_id
     return f"{repo}::{work_id}"
 
 
@@ -38,6 +40,8 @@ class WorkSnapshot:
     work_items: tuple[WorkItem, ...]
     source_owners: Mapping[str, str]
     exclusions: tuple[Mapping[str, str], ...]
+    last_refresh_error: str | None = None
+    consecutive_refresh_failures: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) or self.sequence < 0:
@@ -66,7 +70,12 @@ class WorkSnapshot:
                 raise ValueError("provider map key does not match provider snapshot")
         work_ids = {work_key(item.repo, item.work_id) for item in self.work_items}
         if len(work_ids) != len(self.work_items):
-            raise ValueError("duplicate work item ID")
+            counts: dict[str, int] = {}
+            for item in self.work_items:
+                k = work_key(item.repo, item.work_id)
+                counts[k] = counts.get(k, 0) + 1
+            dups = sorted(k for k, v in counts.items() if v > 1)
+            raise ValueError(f"duplicate work item ID: {', '.join(dups)}")
         for source_id, owner in self.source_owners.items():
             if not isinstance(source_id, str) or not source_id:
                 raise ValueError("ownership source ID must be non-empty")
@@ -91,7 +100,7 @@ class WorkSnapshot:
                 raise ValueError("exclusion keys and values must be strings")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema": SNAPSHOT_SCHEMA,
             "sequence": self.sequence,
             "written_at": self.written_at,
@@ -109,6 +118,11 @@ class WorkSnapshot:
             },
             "exclusions": [dict(item) for item in self.exclusions],
         }
+        if self.last_refresh_error is not None:
+            payload["last_refresh_error"] = self.last_refresh_error
+        if self.consecutive_refresh_failures:
+            payload["consecutive_refresh_failures"] = self.consecutive_refresh_failures
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "WorkSnapshot":
@@ -124,6 +138,8 @@ class WorkSnapshot:
         work_items = payload.get("work_items")
         source_owners = payload.get("source_owners")
         exclusions = payload.get("exclusions")
+        last_refresh_error = payload.get("last_refresh_error")
+        consecutive_refresh_failures = payload.get("consecutive_refresh_failures", 0)
         if isinstance(sequence, bool) or not isinstance(sequence, int):
             raise ValueError("snapshot sequence must be an integer")
         if not isinstance(written_at, str):
@@ -146,6 +162,8 @@ class WorkSnapshot:
             work_items=tuple(WorkItem.from_dict(item) for item in work_items),
             source_owners=dict(source_owners),
             exclusions=tuple(exclusions),
+            last_refresh_error=str(last_refresh_error) if last_refresh_error is not None else None,
+            consecutive_refresh_failures=int(consecutive_refresh_failures) if isinstance(consecutive_refresh_failures, (int, float)) and not isinstance(consecutive_refresh_failures, bool) else 0,
         )
 
     def provider_is_fresh(

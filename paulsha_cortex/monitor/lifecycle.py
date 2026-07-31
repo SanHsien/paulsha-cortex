@@ -112,38 +112,6 @@ def project_work_items(
         work_id: dict(explanation)
         for work_id, explanation in correlation.explanations.items()
     }
-    if correlation.degraded:
-        frozen_items: list[WorkItem] = []
-        for item in previous.values():
-            decision = reduce_lifecycle(
-                LifecycleFacts(
-                    previous_state=item.state,
-                    provider_degraded=True,
-                    facets=tuple(facet for facet in item.facets if facet != "degraded"),
-                )
-            )
-            frozen_items.append(
-                WorkItem(
-                    work_id=item.work_id,
-                    repo=item.repo,
-                    title=item.title,
-                    state=decision.state,
-                    phase=item.phase,
-                    facets=decision.facets,
-                    sources=item.sources,
-                    next_actions=item.next_actions,
-                    workflow_run_id=item.workflow_run_id,
-                    updated_at=updated_at,
-                )
-            )
-            explanation = dict(explanations.get(item.work_id, _empty_explanation(item.work_id)))
-            explanation["reducer_trace"] = list(decision.trace)
-            explanations[item.work_id] = explanation
-        return LifecycleProjection(
-            items=tuple(sorted(frozen_items, key=lambda item: (item.repo, item.work_id))),
-            explanations=explanations,
-        )
-
     projected: list[WorkItem] = []
     todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
     for group in correlation.groups:
@@ -166,6 +134,7 @@ def project_work_items(
                 for source in group.sources
             ),
             closure=closure_by_work.get(group.work_id),
+            provider_degraded=correlation.degraded,
             facets=tuple(
                 facet for facet in (prior.facets if prior is not None else ())
                 if facet != "degraded"
@@ -194,6 +163,37 @@ def project_work_items(
         )
         explanation["reducer_trace"] = list(decision.trace)
         explanations[group.work_id] = explanation
+
+    if correlation.degraded:
+        projected_ids = {group.work_id for group in correlation.groups}
+        for item in previous.values():
+            if item.work_id in projected_ids:
+                continue
+            decision = reduce_lifecycle(
+                LifecycleFacts(
+                    previous_state=item.state,
+                    provider_degraded=True,
+                    facets=tuple(facet for facet in item.facets if facet != "degraded"),
+                )
+            )
+            projected.append(
+                WorkItem(
+                    work_id=item.work_id,
+                    repo=item.repo,
+                    title=item.title,
+                    state=decision.state,
+                    phase=item.phase,
+                    facets=decision.facets,
+                    sources=item.sources,
+                    next_actions=item.next_actions,
+                    workflow_run_id=item.workflow_run_id,
+                    updated_at=updated_at,
+                )
+            )
+            explanation = dict(explanations.get(item.work_id, _empty_explanation(item.work_id)))
+            explanation["reducer_trace"] = list(decision.trace)
+            explanations[item.work_id] = explanation
+
     return LifecycleProjection(
         items=tuple(sorted(projected, key=lambda item: (item.repo, item.work_id))),
         explanations=explanations,
