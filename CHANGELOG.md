@@ -30,6 +30,7 @@
   靜音）。`persona-scope` 設為 main required status check 屬 GitHub repo 設定，
   設定步驟見 `docs/persona-scope-enforcement.md`。
 ### Added
+- **Refs #292：實作 subagent / agent 派工收尾的六項確定性機械驗收檢查**：提供零 model session 的確定性收尾檢查 (`paulsha_cortex.mechanical_acceptance` 與 `cortex mechanical-acceptance`)，包含 1. 自我宣稱 vs 產出比對、2. 輸出內部一致性、3. 摘要 vs 內文一致性、4. 事實新鮮度 (涵蓋 PR body 與 commit message 的 closing keyword 雙重檢查)、5. 語言規範、6. 禁止無依據量化。提供 `--pr <N>`/`--unresolved-issues`/`--repo-root` 自動 context 蒐集、缺 context 標為 `SKIPPED`（exit code 2）而非 `PASS`、`policy-exempt:*` 白名單豁免與全套正負向測試。
 - **Issue #262：dispatch 前驗證 runtime capability 與 provider snapshot 新鮮度**：新增
   `coordinator/runtime_preflight.py`，在建立 worktree／sandbox／job row／model session 之前，
   於「即將實際被使用的 executor 環境」執行低成本 preflight。card 契約新增 `runtime_capabilities`
