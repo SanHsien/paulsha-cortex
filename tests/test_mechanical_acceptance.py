@@ -255,28 +255,94 @@ class TestItem6UnsubstantiatedQuantification:
 
 
 class TestMechanicalAcceptanceRunnerAndCLI:
-    def test_run_acceptance_checks_runner(self) -> None:
+    def test_run_acceptance_checks_runner_complete_context(self) -> None:
+        """當 6 項檢查所需的 context 齊備時，run_acceptance_checks 回報全 PASS。"""
         context = {
             "text_content": "本專案預設使用繁體中文，測試驗證資料完整，已採納修正。",
             "pr_body": "Refs #292",
             "commit_messages": ["feat: implementation Refs #292"],
+            "unresolved_issues": [292],
+            "claim_vs_output": {"claimed_count": 0, "residual_findings": []},
+            "internal_consistency": {"rule_bands": {"A": (0, 5)}, "classified_items": [{"name": "i1", "score": 2, "band": "A"}]},
+            "summary_vs_body": {"summary_claims": {"Fix": 1}, "body_counts": {"Fix": 1}},
         }
         report = run_acceptance_checks(context)
         assert isinstance(report, AcceptanceReport)
         assert report.passed is True
+        assert report.has_skipped is False
+        assert report.status_summary == "PASS"
         assert len(report.results) == 6
 
-    def test_porcelain_cli_mechanical_acceptance(self, capsys, tmp_path: Path) -> None:
-        input_data = {
+    def test_run_acceptance_checks_runner_partial_context_returns_skipped(self) -> None:
+        """當缺少必要 context 時，run_acceptance_checks 不得回報 PASS，而是 report.passed = False 且 has_skipped = True。"""
+        context = {
             "text_content": "本專案預設使用繁體中文，測試驗證資料完整，已採納修正。",
             "pr_body": "Refs #292",
         }
-        input_file = tmp_path / "input.json"
-        input_file.write_text(json.dumps(input_data), encoding="utf-8")
+        report = run_acceptance_checks(context)
+        assert report.passed is False
+        assert report.has_skipped is True
+        assert report.status_summary == "INCOMPLETE (SKIPPED)"
 
-        exit_code = umbrella_cli.main(["mechanical-acceptance", "--input-file", str(input_file), "--json"])
-        assert exit_code == 0
+    def test_cli_e2e_real_sample_277_reports_fail(self, capsys, tmp_path: Path) -> None:
+        """端到端測試 1：給定真實失敗樣本 #277 與完整 context，CLI 確實回報 FAIL 並指出具體 finding。"""
+        sample_file = tmp_path / "sample_277.txt"
+        sample_file.write_text(
+            "fix(work): repo rebind 後 monitor 投影與 work authority 跟著走\n\nFixes #277",
+            encoding="utf-8",
+        )
+
+        exit_code = umbrella_cli.main([
+            "mechanical-acceptance",
+            "--text-file", str(sample_file),
+            "--unresolved-issues", "277",
+        ])
+
+        assert exit_code == 1
         output = capsys.readouterr().out
-        report_dict = json.loads(output)
-        assert report_dict["passed"] is True
-        assert len(report_dict["results"]) == 6
+        assert "Mechanical Acceptance Status: FAIL" in output
+        assert "- [FAIL] 事實新鮮度 (fact_freshness)" in output
+        assert "PR body 使用 closing keyword 'Fixes #277'，但 Issue #277 未完全解決" in output
+
+    def test_cli_e2e_missing_context_reports_skipped(self, capsys, tmp_path: Path) -> None:
+        """端到端測試 2：當缺少必要 context (例如只傳 --text-file 含 Fixes #277 但無 unresolved_issues)，CLI 回報 SKIPPED (exit code 2) 而非 PASS。"""
+        sample_file = tmp_path / "sample_277.txt"
+        sample_file.write_text(
+            "fix(work): repo rebind 後 monitor 投影與 work authority 跟著走\n\nFixes #277",
+            encoding="utf-8",
+        )
+
+        exit_code = umbrella_cli.main([
+            "mechanical-acceptance",
+            "--text-file", str(sample_file),
+        ])
+
+        assert exit_code == 2
+        output = capsys.readouterr().out
+        assert "Mechanical Acceptance Status: INCOMPLETE (SKIPPED)" in output
+        assert "- [SKIPPED] 事實新鮮度 (fact_freshness)" in output
+        assert "缺少必要 context: 檢出 closing keyword 'Fixes #277'" in output
+
+    def test_cli_e2e_pr_option_with_fake_gh_runner(self, capsys) -> None:
+        """端到端測試 3：使用 --pr <N> 參數與 fake gh 執行器，驗證 CLI 能從 PR 自動取得資料並比對。"""
+        from paulsha_cortex.porcelain.mechanical_acceptance import main as porcelain_main
+
+        def fake_gh_runner(args: list[str]) -> str:
+            if args[:3] == ["pr", "view", "277"]:
+                return json.dumps({
+                    "title": "fix(work): repo rebind 後 monitor 投影與 work authority 跟著走",
+                    "body": "修正 monitor 投影。 Fixes #277",
+                    "labels": [],
+                    "commits": [{"message": "fix(work): rebind monitor Fixes #277"}],
+                })
+            elif args[:3] == ["issue", "view", "277"]:
+                return json.dumps({"number": 277, "state": "OPEN"})
+            raise ValueError(f"Unexpected gh args: {args}")
+
+        exit_code = porcelain_main(["--pr", "277"], gh_runner=fake_gh_runner)
+
+        assert exit_code == 1
+        output = capsys.readouterr().out
+        assert "Mechanical Acceptance Status: FAIL" in output
+        assert "- [FAIL] 事實新鮮度 (fact_freshness)" in output
+        assert "Issue #277 未完全解決" in output

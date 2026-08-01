@@ -21,6 +21,20 @@ def check_internal_consistency(
 
     findings: list[str] = []
     details: dict[str, Any] = {}
+    has_input = bool((rule_bands and classified_items) or test_assertion_audits)
+
+    if not has_input:
+        return CheckResult(
+            check_id=check_id,
+            check_name=check_name,
+            passed=exempt,
+            exempted=exempt,
+            exemption_reason=reason if exempt else "",
+            skipped=not exempt,
+            skipped_reason="缺少內部一致性規則 context (rule_bands/classified_items 或 test_assertion_audits)",
+            findings=findings,
+            details=details,
+        )
 
     # 1. 規則 vs 套用結果自洽性
     if rule_bands and classified_items:

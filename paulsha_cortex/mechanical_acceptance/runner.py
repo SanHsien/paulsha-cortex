@@ -53,6 +53,8 @@ def run_acceptance_checks(context: Mapping[str, Any]) -> AcceptanceReport:
 
     # 4. fact_freshness
     c4 = context.get("fact_freshness") or {}
+    unresolved_val = c4.get("unresolved_issues") if "unresolved_issues" in c4 else context.get("unresolved_issues")
+    unresolved_provided = unresolved_val is not None
     results.append(
         check_fact_freshness(
             text_content=c4.get("text_content") or context.get("text_content") or "",
@@ -60,7 +62,8 @@ def run_acceptance_checks(context: Mapping[str, Any]) -> AcceptanceReport:
             commit_messages=c4.get("commit_messages") or context.get("commit_messages") or (),
             referenced_files=c4.get("referenced_files") or (),
             repo_root=c4.get("repo_root") or context.get("repo_root"),
-            unresolved_issues=c4.get("unresolved_issues") or (),
+            unresolved_issues=unresolved_val,
+            unresolved_issues_provided=unresolved_provided,
             pr_labels=pr_labels,
         )
     )
@@ -68,42 +71,24 @@ def run_acceptance_checks(context: Mapping[str, Any]) -> AcceptanceReport:
     # 5. language_conventions
     c5 = context.get("language_conventions") or {}
     text_for_lang = c5.get("text_content") or context.get("text_content") or ""
-    if text_for_lang:
-        results.append(
-            check_language_conventions(
-                text_content=text_for_lang,
-                title=c5.get("title") or context.get("title") or "",
-                repo_name=c5.get("repo_name") or context.get("repo_name") or "hamanpaul/paulsha-cortex",
-                pr_labels=pr_labels,
-            )
+    results.append(
+        check_language_conventions(
+            text_content=text_for_lang,
+            title=c5.get("title") or context.get("title") or "",
+            repo_name=c5.get("repo_name") or context.get("repo_name") or "hamanpaul/paulsha-cortex",
+            pr_labels=pr_labels,
         )
-    else:
-        results.append(
-            CheckResult(
-                check_id="language_conventions",
-                check_name="語言規範",
-                passed=True,
-            )
-        )
+    )
 
     # 6. unsubstantiated_quantification
     c6 = context.get("unsubstantiated_quantification") or {}
     text_for_quant = c6.get("text_content") or context.get("text_content") or ""
-    if text_for_quant:
-        results.append(
-            check_unsubstantiated_quantification(
-                text_content=text_for_quant,
-                pr_labels=pr_labels,
-            )
+    results.append(
+        check_unsubstantiated_quantification(
+            text_content=text_for_quant,
+            pr_labels=pr_labels,
         )
-    else:
-        results.append(
-            CheckResult(
-                check_id="unsubstantiated_quantification",
-                check_name="禁止無依據量化",
-                passed=True,
-            )
-        )
+    )
 
-    all_passed = all(r.passed for r in results)
+    all_passed = all(r.passed and not r.skipped for r in results)
     return AcceptanceReport(passed=all_passed, results=results)

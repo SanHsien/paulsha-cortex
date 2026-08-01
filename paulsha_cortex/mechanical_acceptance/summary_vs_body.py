@@ -48,6 +48,19 @@ def check_summary_vs_body(
             red_in_body = sum(1 for l in body_lines if re.search(r"\bRed\b", l, re.IGNORECASE))
             body_dict["Red"] = red_in_body
 
+    if not claims_dict:
+        return CheckResult(
+            check_id=check_id,
+            check_name=check_name,
+            passed=exempt,
+            exempted=exempt,
+            exemption_reason=reason if exempt else "",
+            skipped=not exempt,
+            skipped_reason="缺少摘要宣稱 context (未指定 summary_claims 且未在內文中檢出計數宣稱如 Red N 張)",
+            findings=findings,
+            details=details,
+        )
+
     mismatches = []
     for category, claimed_num in claims_dict.items():
         if category in body_dict:

@@ -18,7 +18,8 @@ def check_fact_freshness(
     commit_messages: Sequence[str] = (),
     referenced_files: Sequence[str] = (),
     repo_root: str | Path | None = None,
-    unresolved_issues: Sequence[int] = (),
+    unresolved_issues: Sequence[int] | None = None,
+    unresolved_issues_provided: bool = False,
     pr_labels: Sequence[str] = (),
 ) -> CheckResult:
     """第 4 項：事實新鮮度。
@@ -32,6 +33,51 @@ def check_fact_freshness(
 
     findings: list[str] = []
     details: dict[str, Any] = {}
+
+    if unresolved_issues is not None:
+        unresolved_issues_provided = True
+        unresolved_list = list(unresolved_issues)
+    else:
+        unresolved_list = []
+
+    has_content = bool(text_content or pr_body or commit_messages or referenced_files)
+    if not has_content:
+        return CheckResult(
+            check_id=check_id,
+            check_name=check_name,
+            passed=exempt,
+            exempted=exempt,
+            exemption_reason=reason if exempt else "",
+            skipped=not exempt,
+            skipped_reason="缺少待檢測文字、PR body 或 commit 訊息 context",
+            findings=findings,
+            details=details,
+        )
+
+    # 檢查是否有 closing keywords
+    closing_matches = []
+    for src_name, text in [("PR body", pr_body), ("text_content", text_content)]:
+        if text:
+            for kw, num_str in CLOSING_KEYWORDS_RE.findall(text):
+                closing_matches.append((src_name, kw, int(num_str)))
+    for idx, msg in enumerate(commit_messages):
+        if msg:
+            for kw, num_str in CLOSING_KEYWORDS_RE.findall(msg):
+                closing_matches.append((f"Commit msg #{idx+1}", kw, int(num_str)))
+
+    if closing_matches and not unresolved_issues_provided:
+        sample_src, sample_kw, sample_num = closing_matches[0]
+        return CheckResult(
+            check_id=check_id,
+            check_name=check_name,
+            passed=exempt,
+            exempted=exempt,
+            exemption_reason=reason if exempt else "",
+            skipped=not exempt,
+            skipped_reason=f"檢出 closing keyword '{sample_kw} #{sample_num}' ({sample_src})，但缺少 unresolved_issues 上下文，無法核對 issue 狀態",
+            findings=findings,
+            details=details,
+        )
 
     root = Path(repo_root) if repo_root is not None else Path.cwd()
 
@@ -55,7 +101,7 @@ def check_fact_freshness(
         details["obsolete_references"] = obsolete_references
 
     # 2. Closing Keyword (PR body + Commit messages 雙重來源檢查)
-    unresolved_set = set(unresolved_issues)
+    unresolved_set = set(unresolved_list)
     closing_violations = []
 
     if pr_body:

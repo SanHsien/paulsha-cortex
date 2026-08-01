@@ -24,6 +24,31 @@ def check_claim_vs_output(
     findings: list[str] = []
     details: dict[str, Any] = {}
 
+    has_input = any(
+        x is not None
+        for x in (
+            claimed_count,
+            claimed_fixed,
+            claimed_params,
+            canonical_params,
+            rerun_fn,
+            residual_findings,
+        )
+    )
+
+    if not has_input:
+        return CheckResult(
+            check_id=check_id,
+            check_name=check_name,
+            passed=exempt,
+            exempted=exempt,
+            exemption_reason=reason if exempt else "",
+            skipped=not exempt,
+            skipped_reason="缺少自我宣稱與產出比對 context (claimed_params/canonical_params/rerun_fn/residual_findings)",
+            findings=findings,
+            details=details,
+        )
+
     # 1. 檢查參數是否遭篡改（例如 #262 實例：subagent 修改 pr-body "Refs" -> "Fixes" 以利過關）
     if claimed_params is not None and canonical_params is not None:
         tampered_keys = []

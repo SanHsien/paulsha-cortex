@@ -30,11 +30,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="輸出 JSON 格式報告")
     parser.add_argument("--input-file", help="讀取 JSON 格式 context input file")
     parser.add_argument("--text-file", help="讀取待檢測的 Markdown/文字檔案")
+    parser.add_argument("--pr", help="指定 PR 編號（將自動使用 gh CLI 抓取 PR body/labels/commits 與 Issue 狀態）")
+    parser.add_argument("--unresolved-issues", help="以逗號分隔的未解決 Issue 編號（如 277,281）")
+    parser.add_argument("--repo-root", help="專案根目錄路徑（用於事實新鮮度核對）")
     parser.add_argument("--pr-labels", help="以逗號分隔的 PR labels（用於白名單豁免）")
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, gh_runner: Any = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
 
@@ -47,13 +50,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stderr.write(f"error: failed to read input file '{args.input_file}': {exc}\n")
             return 1
 
+    if args.pr:
+        from paulsha_cortex.mechanical_acceptance import collect_pr_context
+
+        kwargs: dict[str, Any] = {}
+        if gh_runner is not None:
+            kwargs["gh_runner"] = gh_runner
+        if args.repo_root:
+            kwargs["repo_root"] = args.repo_root
+        pr_context = collect_pr_context(args.pr, **kwargs)
+        for k, v in pr_context.items():
+            if k not in context or context[k] is None:
+                context[k] = v
+
     if args.text_file:
         try:
             text_content = Path(args.text_file).read_text(encoding="utf-8")
             context["text_content"] = text_content
+            if "pr_body" not in context:
+                context["pr_body"] = text_content
         except Exception as exc:
             sys.stderr.write(f"error: failed to read text file '{args.text_file}': {exc}\n")
             return 1
+
+    if args.unresolved_issues:
+        issues = []
+        for raw in args.unresolved_issues.split(","):
+            raw_clean = raw.strip().lstrip("#")
+            if raw_clean.isdigit():
+                issues.append(int(raw_clean))
+        context["unresolved_issues"] = issues
+
+    if args.repo_root:
+        context["repo_root"] = args.repo_root
 
     if args.pr_labels:
         labels = [l.strip() for l in args.pr_labels.split(",") if l.strip()]
@@ -64,13 +93,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n")
     else:
-        status_str = "PASS" if report.passed else "FAIL"
+        status_str = report.status_summary
         sys.stdout.write(f"Mechanical Acceptance Status: {status_str}\n")
         for res in report.results:
-            ex_str = f" (EXEMPTED: {res.exemption_reason})" if res.exempted else ""
-            res_str = "PASS" if res.passed else "FAIL"
-            sys.stdout.write(f"- [{res_str}] {res.check_name} ({res.check_id}){ex_str}\n")
+            if res.exempted:
+                res_str = "EXEMPTED"
+                info_str = f" (EXEMPTED: {res.exemption_reason})"
+            elif res.skipped:
+                res_str = "SKIPPED"
+                info_str = f" (缺少必要 context: {res.skipped_reason})"
+            elif res.passed:
+                res_str = "PASS"
+                info_str = ""
+            else:
+                res_str = "FAIL"
+                info_str = ""
+
+            sys.stdout.write(f"- [{res_str}] {res.check_name} ({res.check_id}){info_str}\n")
             for finding in res.findings:
                 sys.stdout.write(f"    * {finding}\n")
 
-    return 0 if report.passed else 1
+    if report.passed:
+        return 0
+    elif report.has_failures:
+        return 1
+    else:
+        return 2

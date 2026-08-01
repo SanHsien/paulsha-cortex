@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .claim_vs_output import check_claim_vs_output
 from .fact_freshness import check_fact_freshness
+from .gh_collector import collect_pr_context
 from .internal_consistency import check_internal_consistency
 from .language_conventions import check_language_conventions
 from .models import AcceptanceReport, CheckResult, is_exempted
@@ -18,6 +19,7 @@ __all__ = [
     "check_language_conventions",
     "check_summary_vs_body",
     "check_unsubstantiated_quantification",
+    "collect_pr_context",
     "is_exempted",
     "run_acceptance_checks",
 ]

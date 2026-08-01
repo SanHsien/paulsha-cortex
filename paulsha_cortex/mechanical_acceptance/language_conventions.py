@@ -49,6 +49,18 @@ def check_language_conventions(
     details: dict[str, Any] = {}
 
     full_text = f"{title}\n{text_content}" if title else text_content
+    if not full_text.strip():
+        return CheckResult(
+            check_id=check_id,
+            check_name=check_name,
+            passed=exempt,
+            exempted=exempt,
+            exemption_reason=reason if exempt else "",
+            skipped=not exempt,
+            skipped_reason="缺少待檢測文字內容 (text_content/title)",
+            findings=findings,
+            details=details,
+        )
 
     # 1. 簡繁/異體混用檢查 (例如標題用「采」內文用「採」)
     used_simplified: list[str] = []

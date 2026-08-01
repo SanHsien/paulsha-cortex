@@ -30,6 +30,19 @@ def check_unsubstantiated_quantification(
     findings: list[str] = []
     details: dict[str, Any] = {}
 
+    if not text_content or not text_content.strip():
+        return CheckResult(
+            check_id=check_id,
+            check_name=check_name,
+            passed=exempt,
+            exempted=exempt,
+            exemption_reason=reason if exempt else "",
+            skipped=not exempt,
+            skipped_reason="缺少待檢測文字內容 (text_content)",
+            findings=findings,
+            details=details,
+        )
+
     unsubstantiated_estimates = []
     lines = text_content.splitlines()
 
