@@ -1,6 +1,6 @@
 ---
 status: accepted
-work_item: design-task-type-taxonomy
+work_item: design-task-type-taxonomy-v2
 ---
 
 # design-task-type-taxonomy Design
@@ -18,4 +18,4 @@ work_item: design-task-type-taxonomy
 - 統一 log reader 與 status view 只定介面契約（來源路徑、欄位、責任邊界），實作留
   下游票；combo 值域缺口（實測最大宗 `fix` 無對應 combo）明載為 #202 的硬前提。
 
-詳細 D1–Dn 與風險緩解見 `docs/superpowers/specs/design-task-type-taxonomy-design.md`。
+詳細 D1–Dn 與風險緩解見 `docs/superpowers/specs/design-task-type-taxonomy-v2-design.md`。

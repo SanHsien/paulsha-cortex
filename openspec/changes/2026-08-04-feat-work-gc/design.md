@@ -1,6 +1,6 @@
 ---
 status: accepted
-work_item: feat-work-gc
+work_item: feat-work-gc-v2
 ---
 
 # feat-work-gc Design
@@ -20,4 +20,4 @@ work_item: feat-work-gc
 - closed-unmerged PR 偵測為 best-effort 註記，不參與回收判定；remote branch 刪除與
   registry 壓縮列為非目標。
 
-詳細 D1–D6 與風險緩解見 `docs/superpowers/specs/feat-work-gc-design.md`。
+詳細 D1–D6 與風險緩解見 `docs/superpowers/specs/feat-work-gc-v2-design.md`。
