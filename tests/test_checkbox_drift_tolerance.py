@@ -111,3 +111,17 @@ def test_non_plan_kind_checkbox_drift_fail_closed(tmp_path: Path) -> None:
             patterns=(REF,),
             coordinator_root=tmp_path / "coord",
         )
+
+
+def test_reviewer_authority_map_uses_candidate_hash_for_ticked_tasks(tmp_path: Path) -> None:
+    ticked = BASELINE.replace("- [ ] 1.1", "- [x] 1.1")
+    operator_root, worktree, run = _setup(tmp_path, ticked)
+    mapping = manager._authority_map_with_checkbox_tolerance(run, candidate_root=worktree)
+    assert mapping[REF] == hashlib.sha256(ticked.encode()).hexdigest()
+
+
+def test_reviewer_authority_map_keeps_baseline_on_substantive_change(tmp_path: Path) -> None:
+    mutated = BASELINE.replace("實作。", "偷改。")
+    operator_root, worktree, run = _setup(tmp_path, mutated)
+    mapping = manager._authority_map_with_checkbox_tolerance(run, candidate_root=worktree)
+    assert mapping[REF] == run.planning_authority[0].baseline_sha256
