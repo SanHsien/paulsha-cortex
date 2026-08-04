@@ -3177,6 +3177,36 @@ def _checkbox_insensitive_equal(baseline: bytes, current: bytes) -> bool:
     return normalize(base_text) == normalize(cur_text)
 
 
+def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict[str, str]:
+    """#310 補遺：reviewer 的 frozen authority 驗證沿用 checkbox-insensitive 容忍。
+
+    tasks/todo（kind=plan）在候選 worktree 的 checkbox 勾選不視為 drift；容忍
+    成立時以候選內容的實際 hash 作為 pinned 期望值——reviewer 收到的 input
+    snapshot 就是這份內容，hash 必須對得上實檔。其他差異維持 baseline，使
+    `verify_authority_in_input_snapshot` 照舊 fail-closed。baseline bytes 取自
+    operator_root 的同 ref 檔案，且必須先驗證其 hash 等於 authority baseline。
+    """
+    operator_root = Path(run.workspace_root).resolve()
+    mapping: dict[str, str] = {}
+    for item in run.planning_authority:
+        expected = item.baseline_sha256
+        if item.kind == "plan" and Path(item.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES:
+            candidate_matches = _safe_input_matches(candidate_root, item.ref)
+            baseline_matches = _safe_input_matches(operator_root, item.ref)
+            if len(candidate_matches) == 1 and len(baseline_matches) == 1:
+                candidate_data = candidate_matches[0].read_bytes()
+                baseline_data = baseline_matches[0].read_bytes()
+                digest = hashlib.sha256(candidate_data).hexdigest()
+                if (
+                    digest != expected
+                    and hashlib.sha256(baseline_data).hexdigest() == expected
+                    and _checkbox_insensitive_equal(baseline_data, candidate_data)
+                ):
+                    expected = digest
+        mapping[item.ref] = expected
+    return mapping
+
+
 def _workflow_input_snapshot(
     *,
     run,
@@ -6081,7 +6111,10 @@ def _dispatch_workflow_card(
     effective_inputs = _effective_workflow_inputs(run, step)
     if step.persona == "reviewer":
         reviewer_target = effective_repo_root
-        authority_map = {item.ref: item.baseline_sha256 for item in run.planning_authority}
+        # #310 補遺：checkbox 容忍成立的 tasks/todo 以候選實際 hash 為 pinned 期望值。
+        authority_map = _authority_map_with_checkbox_tolerance(
+            run, candidate_root=reviewer_target
+        )
         effective_inputs = _reviewer_input_patterns(run, effective_inputs)
         input_snapshot = _workflow_input_snapshot(
             run=run,
