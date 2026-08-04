@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 ### Fixed
+- **批次 W1 openspec design.md 補件（#295／#291、#260、#178、#139）**：design kind 的 authority 來源是 `openspec/changes/<change>/design.md`，缺檔時 planning completeness 永遠 incomplete、claim 後 define 繞進 brainstorm 並靜默 needs_human（7/30 批次全卡 define 的根因）。為四個 work item 補上 design.md，使 define 走 planning-complete deterministic 路徑。
 - **Issue #299：planning_released 釋放後同 claim_key 可重新 claim**：`work_bridge.start_canonical_workflow` 的 existing-run reuse guard 原對 `superseded` run 無條件短路，未 honor #256 D4 釋放語意，abandon→reclaim 永久死路。新增 `_claimable_existing_runs` 過濾已釋放 run，未釋放 superseded／done／ongoing 行為不變。
 - **Issue #277：pre-candidate 失敗恢復與 stale candidate 重評**：新增 `recover-pre-candidate` work/slice action 以處置 candidate 為 null 時的 builder 失敗並回收殘留 worktree；修復 completion 對 `candidate-worktree-dirty` 的快照競態，改為在 tick 時以當前 branch HEAD 動態重評。
 - **Issue #286：fanout plan pinning 以 spec 檔自身所在 repo 解析**：修復 `coordinator/autonomy.py` 中 `_infer_repo_root(spec_path)` 於 `PSC_REPO_ROOT` 環境變數存在時盲目回傳 manager host repo 的問題。調整為優先以 `spec_path` 所在目錄向上推導專案 Git repository root；當 spec 位於 manager host 外部的其他 repository（如 `serialwrap` 或 worktree）時，能正確將 relative plan glob 解析至該專案目錄，解決跨 repo ad-hoc 派工觸發 `DispatchReadyError: plan file unreadable` 的問題，並使 `ready` 與 `fanout` 階段對專案 repo_root 的判定維持一致。
