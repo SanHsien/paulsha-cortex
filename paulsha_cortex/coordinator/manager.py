@@ -2527,7 +2527,11 @@ def _terminal_parse_diagnostics(
 
 # #261 R2：會實際跑確定性 gate 的 phase。這些 phase 的 `passed` 必須有 manager 獨立
 # 產生的 gate ledger 背書；plan card 不改動 candidate、不跑 gate，故不在此列。
-GATE_LEDGER_REQUIRED_PHASES = frozenset({"build", "verify"})
+# #313：verify 亦不在此列——verification 卡以 review-only 沙箱啟動，
+# `launcher._should_run_gates` 依設計不讓唯讀 reviewer 跑 gate（也不寫 ledger），
+# 要求 ledger 等於讓 verification 卡結構性永不可過；verify 的獨立證據層是
+# deterministic verification report 管線（schema／binding／report 重驗）。
+GATE_LEDGER_REQUIRED_PHASES = frozenset({"build"})
 
 
 def _assert_terminal_gate_consistency(
