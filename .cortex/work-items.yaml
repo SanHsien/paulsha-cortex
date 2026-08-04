@@ -400,6 +400,10 @@ work_items:
         ref: docs/superpowers/workstreams/fix-persona-catalog-portability/todo.md
       - kind: path
         ref: docs/superpowers/specs/fix-persona-catalog-portability-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-persona-catalog-portability-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-persona-catalog-portability.md
   fix-repair-commit-recovery:
     title: repair commit 缺 terminal evidence 的窄化恢復與 stale job 選擇修正 (#260)
     links:
