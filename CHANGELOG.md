@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 ### Changed
+- **W1 canary v2 檔名對齊（#295／#291）**：build 卡 declared inputs 以 `*<work_id>*` glob 檔名，v2 僅改 frontmatter 導致 declared input missing；檔名與 workstream 目錄補 `-v2` 並同步引用。
 - **W1 canary 重識別為 fix-persona-catalog-portability-v2（#295／#291）**：三代 run 因 #299／#302／#303 基礎設施缺陷 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別續作（檔案路徑不動）。
 ### Fixed
 - **Issue #302：registry 載入層 claim_key 唯一性改為只約束 ongoing runs**：與 abandon→reclaim（#256 D4／#299）語意對齊；重 claim persist 後 manager 重啟不再無法載回狀態檔。run_id 唯一性維持全域。

@@ -22,4 +22,4 @@ work_item: fix-persona-catalog-portability-v2
 - `dispatch: auto` 對恰好一個 persona-scope check 的要求維持原樣（packaged fallback 已
   解除「必須宣告、宣告必失敗」的封閉矛盾）。
 
-詳細 D1–D5 與風險緩解見 `docs/superpowers/specs/fix-persona-catalog-portability-design.md`。
+詳細 D1–D5 與風險緩解見 `docs/superpowers/specs/fix-persona-catalog-portability-v2-design.md`。

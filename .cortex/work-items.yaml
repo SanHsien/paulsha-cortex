@@ -397,13 +397,13 @@ work_items:
       - kind: openspec
         ref: 2026-08-04-fix-persona-catalog-portability
       - kind: path
-        ref: docs/superpowers/workstreams/fix-persona-catalog-portability/todo.md
+        ref: docs/superpowers/workstreams/fix-persona-catalog-portability-v2/todo.md
       - kind: path
-        ref: docs/superpowers/specs/fix-persona-catalog-portability-spec.md
+        ref: docs/superpowers/specs/fix-persona-catalog-portability-v2-spec.md
       - kind: path
-        ref: docs/superpowers/specs/fix-persona-catalog-portability-design.md
+        ref: docs/superpowers/specs/fix-persona-catalog-portability-v2-design.md
       - kind: path
-        ref: docs/superpowers/plans/fix-persona-catalog-portability.md
+        ref: docs/superpowers/plans/fix-persona-catalog-portability-v2.md
   fix-repair-commit-recovery:
     title: repair commit 缺 terminal evidence 的窄化恢復與 stale job 選擇修正 (#260)
     links:
