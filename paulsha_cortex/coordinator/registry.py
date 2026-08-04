@@ -1646,6 +1646,18 @@ class JobRegistry:
         build_steps = [step for step in current.steps if step.phase == "build"]
         if not build_steps or any(step.gate_result != "passed" for step in build_steps):
             raise ValueError("retry-verify reset requires completed build phase")
+        # #315：operator 已以 CAS 顯式授權重跑 verification；舊 exited verify job
+        # 的 reviewer sandbox 依設計已清除、terminal 證據不可重驗，維持 "exited"
+        # 會讓 dispatch 先 terminalize 舊 job 而永遠卡在 input-snapshot-missing。
+        # 標記 failed 讓 explicit resume 走 replacement dispatch；build phase job
+        # 與 active job（前面 admission 已擋）不受影響。
+        for job in self._jobs:
+            if (
+                job.get("workflow_run_id") == current.run_id
+                and job.get("workflow_phase") == "verify"
+                and job.get("status") == "exited"
+            ):
+                job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "verify" else step
             for step in current.steps
