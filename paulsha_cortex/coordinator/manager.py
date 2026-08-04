@@ -5589,7 +5589,20 @@ def _workflow_job_prompt(
                 "schema_version", "kind", "reason", "findings", "reports",
                 *(["authority_hashes"] if authority_hashes_expected else []),
             ],
-            "fixed": {"schema_version": 1, "kind": "workflow-review-result"},
+            "fixed": {
+                "schema_version": 1,
+                "kind": "workflow-review-result",
+                # #315 補遺 2：sonnet reviewer 對「actually opened」措辭的條件性
+                # 解讀會整組省略 authority_hashes（實測 2/2）。expected 值由
+                # manager 原樣提供，列入 fixed 要求逐字照抄——照抄本身即攻證
+                # 「收到的 frozen authority 與 pinned hash 一致」；harvest 端
+                # 的精確比對不變。
+                **(
+                    {"authority_hashes": dict(authority_hashes_expected)}
+                    if authority_hashes_expected
+                    else {}
+                ),
+            },
             # #261 R1：選填欄位；review verdict 仍由 findings 決定，status 只用來
             # 誠實表達「這張 review card 自己沒能完成」。
             "optional": ["status"],
@@ -5613,9 +5626,10 @@ def _workflow_job_prompt(
         if authority_hashes_expected:
             terminal_schema["authority_hashes"] = {
                 "description": (
-                    "Echo back the pinned sha256 for every frozen planning authority ref you "
-                    "actually opened in source_material; the verdict is rejected unless it "
-                    "matches exactly."
+                    "MANDATORY: copy the expected mapping below verbatim into the "
+                    "authority_hashes field of your terminal JSON. It attests the frozen "
+                    "planning authority you received; the verdict is rejected if the field "
+                    "is missing or differs in any way."
                 ),
                 "expected": dict(authority_hashes_expected),
             }
