@@ -387,3 +387,49 @@ work_items:
         ref: docs/superpowers/workstreams/persona-enforce-required-check/todo.md
       - kind: path
         ref: docs/superpowers/specs/persona-enforce-required-check-spec.md
+  fix-persona-catalog-portability:
+    title: persona catalog 可攜性——非 cortex repo verification 不再卡 persona-catalog-unreadable (#295/#291)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#295
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#291
+      - kind: openspec
+        ref: 2026-08-04-fix-persona-catalog-portability
+      - kind: path
+        ref: docs/superpowers/workstreams/fix-persona-catalog-portability/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-persona-catalog-portability-spec.md
+  fix-repair-commit-recovery:
+    title: repair commit 缺 terminal evidence 的窄化恢復與 stale job 選擇修正 (#260)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#260
+      - kind: openspec
+        ref: 2026-08-04-fix-repair-commit-recovery
+      - kind: path
+        ref: docs/superpowers/workstreams/fix-repair-commit-recovery/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-repair-commit-recovery-spec.md
+  feat-work-gc:
+    title: cortex work gc——proposal-first 產物生命週期回收 (#178)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#178
+      - kind: openspec
+        ref: 2026-08-04-feat-work-gc
+      - kind: path
+        ref: docs/superpowers/workstreams/feat-work-gc/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/feat-work-gc-spec.md
+  design-task-type-taxonomy:
+    title: task_type taxonomy 契約定案與骨架——#8 叢集基礎 (#139)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#139
+      - kind: openspec
+        ref: 2026-08-04-design-task-type-taxonomy
+      - kind: path
+        ref: docs/superpowers/workstreams/design-task-type-taxonomy/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/design-task-type-taxonomy-spec.md
