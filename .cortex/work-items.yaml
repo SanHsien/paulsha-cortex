@@ -387,8 +387,8 @@ work_items:
         ref: docs/superpowers/workstreams/persona-enforce-required-check/todo.md
       - kind: path
         ref: docs/superpowers/specs/persona-enforce-required-check-spec.md
-  fix-persona-catalog-portability:
-    title: persona catalog 可攜性——非 cortex repo verification 不再卡 persona-catalog-unreadable (#295/#291)
+  fix-persona-catalog-portability-v2:
+    title: persona catalog 可攜性 v2 重識別——#218 世代熔斷後續作 (#295/#291)
     links:
       - kind: github_issue
         ref: hamanpaul/paulsha-cortex#295
