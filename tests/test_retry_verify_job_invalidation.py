@@ -174,3 +174,15 @@ def test_retry_review_reset_marks_exited_review_job_failed(tmp_path: Path) -> No
         run.run_id, expected_candidate=CANDIDATE
     )
     assert registry.get_job(job["job_id"])["status"] == "failed"
+
+
+def test_review_tool_schema_allows_authority_hashes() -> None:
+    """#315 補遺 3：StructuredOutput 工具 schema 必須開放 authority_hashes 屬性，
+    否則 additionalProperties:false 下模型無法交出 manager 驗證器要求的攻證欄位。"""
+    import json as _json
+
+    from paulsha_cortex.coordinator.launcher import _claude_review_json_schema
+
+    schema = _json.loads(_claude_review_json_schema("workflow-review-result"))
+    assert "authority_hashes" in schema["properties"]
+    assert schema["properties"]["authority_hashes"]["type"] == "object"
