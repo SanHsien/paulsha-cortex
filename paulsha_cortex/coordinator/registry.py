@@ -1722,6 +1722,17 @@ class JobRegistry:
         verify_steps = [step for step in current.steps if step.phase == "verify"]
         if not verify_steps or any(step.gate_result != "passed" for step in verify_steps):
             raise ValueError("retry-review reset requires completed verify phase")
+        # #315（review 版）：operator 已以 CAS 顯式授權重跑 review；舊 exited
+        # review job 的 reviewer sandbox 已清、terminal 不可重驗，維持 "exited"
+        # 會讓 resume 先 terminalize 舊 job 而卡死。標記 failed 讓 explicit
+        # resume 走 replacement dispatch；verify／build job 不受影響。
+        for job in self._jobs:
+            if (
+                job.get("workflow_run_id") == current.run_id
+                and job.get("workflow_phase") == "review"
+                and job.get("status") == "exited"
+            ):
+                job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "review" else step
             for step in current.steps
