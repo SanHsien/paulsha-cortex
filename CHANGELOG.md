@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #315：retry-verify 重置時失效舊 exited verification job**：沙箱已清的舊 job 維持 exited 會讓 dispatch 先 terminalize 而永遠 `input snapshot file missing`；reset 時標記 failed，resume 走 replacement dispatch。
 - **Issue #313：verify phase 移出 gate ledger 必要集**：verification 卡的 review-only 沙箱依設計不寫 ledger，要求 ledger＝verification 卡結構性永不可過。`GATE_LEDGER_REQUIRED_PHASES` 收斂為 `{build}`；verify 的獨立證據層是 deterministic verification report 管線。
 - **Issue #310 補遺：reviewer frozen authority 驗證沿用 checkbox 容忍**：`verify_authority_in_input_snapshot` 的 pinned 期望值改由 `_authority_map_with_checkbox_tolerance` 提供，checkbox 容忍成立的 tasks/todo 以候選實際 hash 比對；其他差異維持 fail-closed。
 - **Issue #310：pinned planning input 對 task checkbox 更新的 drift 容忍**：kind=plan 的 `tasks.md`／`todo.md` 於 raw-hash 不符時做 checkbox-insensitive 比對（baseline 取自 operator_root 並先驗 hash）；其他差異維持 fail-closed。修正卡片契約要求勾選 checkbox 與 verify 派工 drift 檢查的互斥。
