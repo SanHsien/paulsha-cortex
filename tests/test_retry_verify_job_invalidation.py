@@ -123,3 +123,54 @@ def test_reset_still_refuses_active_verify_job(tmp_path: Path) -> None:
         registry._manager_reset_workflow_for_retry_verify(
             run.run_id, expected_candidate=CANDIDATE
         )
+
+
+def test_retry_review_reset_marks_exited_review_job_failed(tmp_path: Path) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    build = WorkflowStep(
+        phase="build", persona="builder", card="subagent-build",
+        executor="copilot", model="gpt-5.4", domain="github",
+        inputs=(), outputs=(), gate_result="passed",
+    )
+    verify = WorkflowStep(
+        phase="verify", persona="reviewer", card="verification",
+        executor=None, model=None, domain=None,
+        inputs=(), outputs=(), gate_result="passed",
+    )
+    review = WorkflowStep(
+        phase="review", persona="reviewer", card="code-review",
+        executor=None, model=None, domain=None,
+        inputs=(), outputs=(), gate_result="needs_human",
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="retry-review-work",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "f" * 64,
+        source_revision="rev-f",
+        workspace_root="/tmp/workspace",
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=(build, verify, review),
+        issue_refs=("hamanpaul/paulsha-cortex#315",),
+        attempts={"claim": 1, "review": 1},
+        facets=("needs_human",),
+        candidate_head=CANDIDATE,
+        verified_head=CANDIDATE,
+    )
+    job = registry.create_job(
+        task="wf-demo-code-review",
+        persona="reviewer",
+        branch="feature/315-demo",
+        pane="",
+        worktree=str(tmp_path / "sandbox"),
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="code-review",
+        workflow_phase="review",
+    )
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    registry._manager_reset_workflow_for_retry_review(
+        run.run_id, expected_candidate=CANDIDATE
+    )
+    assert registry.get_job(job["job_id"])["status"] == "failed"
