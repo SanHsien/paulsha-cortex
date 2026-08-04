@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 ### Fixed
+- **Issue #310：pinned planning input 對 task checkbox 更新的 drift 容忍**：kind=plan 的 `tasks.md`／`todo.md` 於 raw-hash 不符時做 checkbox-insensitive 比對（baseline 取自 operator_root 並先驗 hash）；其他差異維持 fail-closed。修正卡片契約要求勾選 checkbox 與 verify 派工 drift 檢查的互斥。
 - **Issue #308：零 gate 設定下模型自述 gate_evidence 不再觸發 fail-closed**：ledger `gates: []` 時 `authorize_terminal` 跳過 unknown-gate 對照（#261 文件：零 gate＝無 R2 保護）；ledger 非空維持 fail-closed。
 ### Changed
 - **W1 canary v2 檔名對齊（#295／#291）**：build 卡 declared inputs 以 `*<work_id>*` glob 檔名，v2 僅改 frontmatter 導致 declared input missing；檔名與 workstream 目錄補 `-v2` 並同步引用。

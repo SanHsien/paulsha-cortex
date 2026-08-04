@@ -3160,6 +3160,23 @@ def _write_workflow_input_content(
     return str(path)
 
 
+_CHECKBOX_VOLATILE_PLAN_BASENAMES = frozenset({"tasks.md", "todo.md"})
+_CHECKBOX_RE = re.compile(r"^(\s*(?:[-+*]|\d+[.)])\s+)\[[xX]\]", re.M)
+
+
+def _checkbox_insensitive_equal(baseline: bytes, current: bytes) -> bool:
+    """#310：卡片契約要求 builder 勾選 tasks/todo 的 checkbox；只有 checkbox
+    狀態差異（``- [x]``→``- [ ]`` 正規化後相等）視為未漂移。任何其他 byte 差異
+    仍屬 drift。"""
+    try:
+        base_text = baseline.decode("utf-8")
+        cur_text = current.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    normalize = lambda text: _CHECKBOX_RE.sub(lambda m: m.group(1) + "[ ]", text)
+    return normalize(base_text) == normalize(cur_text)
+
+
 def _workflow_input_snapshot(
     *,
     run,
@@ -3230,7 +3247,26 @@ def _workflow_input_snapshot(
             digest = hashlib.sha256(data).hexdigest()
             bound = authority.get(ref)
             if bound is not None and digest != bound.baseline_sha256:
-                raise ValueError("workflow planning input drift")
+                # #310：tasks/todo（kind=plan）的 checkbox 勾選是卡片契約的既定
+                # 行為，不得視為 drift。baseline bytes 取自 operator_root 的同
+                # ref 檔案，且必須先驗證其 hash 等於 authority baseline，才可
+                # 作為 checkbox-insensitive 比對的基準；其餘任何差異 fail-closed。
+                tolerated = False
+                if (
+                    bound.kind == "plan"
+                    and Path(ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+                ):
+                    baseline_matches = _safe_input_matches(operator_root, ref)
+                    if len(baseline_matches) == 1:
+                        baseline_data = baseline_matches[0].read_bytes()
+                        if (
+                            hashlib.sha256(baseline_data).hexdigest()
+                            == bound.baseline_sha256
+                            and _checkbox_insensitive_equal(baseline_data, data)
+                        ):
+                            tolerated = True
+                if not tolerated:
+                    raise ValueError("workflow planning input drift")
             pattern_has_authority = any(
                 fnmatch.fnmatch(candidate_ref, pattern) for candidate_ref in authority
             )
