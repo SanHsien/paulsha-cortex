@@ -430,8 +430,6 @@ work_items:
   feat-work-gc-v2:
     title: cortex work gc v2 重識別——世代熔斷後續作 (#178)
     links:
-      - kind: github_issue
-        ref: hamanpaul/paulsha-cortex#178
       - kind: openspec
         ref: 2026-08-04-feat-work-gc
       - kind: path
@@ -441,8 +439,6 @@ work_items:
   design-task-type-taxonomy-v2:
     title: task_type taxonomy v2 重識別——世代熔斷後續作 (#139)
     links:
-      - kind: github_issue
-        ref: hamanpaul/paulsha-cortex#139
       - kind: openspec
         ref: 2026-08-04-design-task-type-taxonomy
       - kind: path
