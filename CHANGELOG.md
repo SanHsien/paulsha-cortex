@@ -6,7 +6,10 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Changed
+- **feat-work-gc 與 design-task-type-taxonomy 重識別為 -v2（#178／#139）**：三代 run 因基礎設施缺陷鏈 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別於修復齊備的 main 重跑。
 ### Fixed
+- **封存 14 個 7/25–26 遺留 active OpenSpec changes**：功能已 merge 但缺 specs delta，validate --all 14 fail 擋所有 ship preflight；官方 archive 後 0 failed。
 - **build 卡指引明令 pinned tasks/todo 僅可切換 checkbox**：修正 builder 註記 plan 文字超出 checkbox 容忍造成 drift 卡死。
 - **Issue #315 補遺 3：review StructuredOutput 工具 schema 開放 authority_hashes**：additionalProperties:false 下模型無法交出驗證器要求的攻證欄位（#219 佈線缺口）；工具 schema 開放屬性，必填與比對仍由 manager 驗證。
 - **Issue #315 補遺 2：review 派工 schema 把 authority_hashes 列入 fixed 逐字照抄**：修正 sonnet reviewer 條件性解讀導致整組省略、review terminal 恆 schema invalid；harvest 精確比對不變。
