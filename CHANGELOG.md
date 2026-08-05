@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 ### Fixed
+- **-v2 excludes 收窄至 openspec ref**：保留舊識別可尋址性（abandon 需 authority），僅排除實際碰撞的 openspec 認領。
 - **-v2 重識別補 excludes 斷開舊識別的 source 認領**：消除 confirmed source collision 造成的 repo provider degraded（比照 dispatch-reliability-batch 先例）。
 ### Changed
 - **feat-work-gc 與 design-task-type-taxonomy 重識別為 -v2（#178／#139）**：三代 run 因基礎設施缺陷鏈 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別於修復齊備的 main 重跑。

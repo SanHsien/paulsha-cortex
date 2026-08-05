@@ -421,16 +421,12 @@ work_items:
     excludes:
       - kind: openspec
         ref: 2026-08-04-feat-work-gc
-      - kind: github_issue
-        ref: hamanpaul/paulsha-cortex#178
   design-task-type-taxonomy:
     title: design-task-type-taxonomy（已由 -v2 重識別接手；舊 runs 為 superseded 審計）
     links: []
     excludes:
       - kind: openspec
         ref: 2026-08-04-design-task-type-taxonomy
-      - kind: github_issue
-        ref: hamanpaul/paulsha-cortex#139
   feat-work-gc-v2:
     title: cortex work gc v2 重識別——世代熔斷後續作 (#178)
     links:
