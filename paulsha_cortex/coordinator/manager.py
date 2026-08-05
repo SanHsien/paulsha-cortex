@@ -5488,13 +5488,19 @@ _LEGACY_CARD_EXECUTION = {
     ),
     "tdd-red": (
         "superpowers:test-driven-development",
-        "Use the accepted plan to add and commit a reproducible RED regression test.",
+        "Use the accepted plan to add and commit a reproducible RED regression test. "
+        "In pinned planning files (tasks.md / todo.md) you may ONLY toggle checkbox "
+        "state; never edit, rephrase, or annotate their text — any wording change "
+        "is planning-input drift and fails the run.",
         "required",
         "red-required",
     ),
     "subagent-build": (
         "superpowers:subagent-driven-development",
-        "Implement the accepted plan with the minimum diff and commit a tested candidate HEAD.",
+        "Implement the accepted plan with the minimum diff and commit a tested candidate HEAD. "
+        "In pinned planning files (tasks.md / todo.md) you may ONLY toggle checkbox "
+        "state; never edit, rephrase, or annotate their text — any wording change "
+        "is planning-input drift and fails the run.",
         "required",
         "focused",
     ),
