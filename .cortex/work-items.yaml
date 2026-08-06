@@ -420,22 +420,14 @@ work_items:
     links:
       - kind: path
         ref: docs/superpowers/workstreams/feat-work-gc/todo.md
-    excludes:
-      - kind: openspec
-        ref: 2026-08-04-feat-work-gc
   design-task-type-taxonomy:
     title: design-task-type-taxonomy（已由 -v2 重識別接手；舊 runs 為 superseded 審計）
     links:
       - kind: path
         ref: docs/superpowers/workstreams/design-task-type-taxonomy/todo.md
-    excludes:
-      - kind: openspec
-        ref: 2026-08-04-design-task-type-taxonomy
   feat-work-gc-v2:
     title: cortex work gc v2 重識別——世代熔斷後續作 (#178)
     links:
-      - kind: openspec
-        ref: 2026-08-04-feat-work-gc
       - kind: path
         ref: docs/superpowers/workstreams/feat-work-gc-v2/todo.md
       - kind: path
@@ -443,8 +435,6 @@ work_items:
   design-task-type-taxonomy-v2:
     title: task_type taxonomy v2 重識別——世代熔斷後續作 (#139)
     links:
-      - kind: openspec
-        ref: 2026-08-04-design-task-type-taxonomy
       - kind: path
         ref: docs/superpowers/workstreams/design-task-type-taxonomy-v2/todo.md
       - kind: path
