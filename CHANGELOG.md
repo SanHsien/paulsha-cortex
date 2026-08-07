@@ -6,6 +6,9 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+
+## [0.1.2] - 2026-08-07
+
 ### Added
 - **Issue #210：sizing 難度與能力封套校準設計文件——以 cortex 自身 run 歷史取代手估**：新增 `openspec/changes/2026-08-07-sizing-envelope-calibration/`、`docs/superpowers/specs/sizing-envelope-calibration-{spec,design}.md` 與 `docs/superpowers/plans/sizing-envelope-calibration.md`，定案 `calibration_source`／`calibrated_at` 只掛在 `#209` 的 `invariant_ceiling` 欄位（非全部四個供給側欄位）；定案難度後驗 estimator 改讀 `CompletionRecord.work_authority.merge_commit` 本地 diff，取代粒度不符（模組數 vs LOC）的 `sizing_declaration_drift`；**查證發現新缺口**——`invariant_ceiling` estimator 所需的 `invariant_count` 歷史值從未被 `CompletionRecord` 持久化，需先補一張前置票；定案「一次通過率」排除非 `model_repair` 的 `retry_classification`；定案 estimator 觸發時機比照 `cortex stat` 既有四個彙總旗標即時查詢；裁定不採納 issue 對 `consistency_scope` 的 glob 化建議，維持 `#209` 已凍結的產物種類集合契約。更新 `docs/superpowers/workstreams/cost-governance-cluster/todo.md` 更正 `#210` 舊有「零外部前置」註記。純設計文件，未實作任一 estimator、未改任何 `.py`。
 - **Issue #279：跨 repo ad-hoc 一次性派工——設計文件（design-doc）**：新增
@@ -40,8 +43,7 @@
   `resource-inventory.yaml`，遵循 `#209` 既定路徑。本票不實作任何程式碼、不開
   `openspec/changes/**`。複驗訂正：`#137` 的設計文件實際只存在於未合併分支
   `feature/137-oneshot-lesson-loop-design`（main 上不存在），初版誤標其為「已落地
-  設計」已訂正；另補上與已落地票 `#325`／`#324` 的介面關係查證。詳見
-  `changelog.d/cost-governance-judge-design.md`。
+  設計」已訂正；另補上與已落地票 `#325`／`#324` 的介面關係查證。
 - **Issue #137：交付 one-shot 成效閉環（lesson-loop + 棘輪計分）設計文件**：新增
   `docs/superpowers/specs/oneshot-lesson-loop-{spec,design}.md`。凍結 `task_type ×
   outcome` 計分 schema（計分鍵沿用 `#139` taxonomy 的 `(type, scope)` tuple、`outcome`
@@ -49,16 +51,8 @@
   影）；定案 session-health 為診斷特徵、不進 reward；定案 cortex 端只產出 lesson
   payload、不觸碰 `paulsha-hippo` `knowledge/` 目錄的跨 repo 邊界；定案棘輪介面契約與
   `#209 capable()` 既有簽章相容，建議掛點為 `capable()` 判準之一而非另開
-  `autonomy.py` 內部路徑。詳見 `changelog.d/oneshot-lesson-loop-design.md`。
+  `autonomy.py` 內部路徑。
 - **Issue #340：builder persona 契約新增 `completion_obligations`（結束前必須 commit）**：`PersonaContract` 新增 `completion_obligations` 欄位（fail-closed schema 檢查），`personas.yaml` 的 `builder` 角色新增義務宣告「完成前必須 git add＋git commit，worktree 不乾淨不得回報完成」，由 `render_contract_prompt` 注入實際派工的 dispatch prompt，補上既有 `commit_policy: required`（只管寫入權限）與 manager 端事後 dirty-worktree 安全網之間「事前宣告義務」的缺口；空清單角色不受影響。
-### Fixed
-- **Issue #339：run tick 對已有 needs_human 終局紀錄的 slice 不再重複 fanout**：`run_tick` 原本的冪等防護只排除 registry 中仍在 `dispatched`/`running` 的 job，job 一旦 poll 到 exited 就離開這個集合，不論其 `gate_status` 是 `needs_human`／`failed`／`passed`；`ready_units`/`default_is_satisfied` 只檢查「別人 depends_on 我」是否滿足，從未檢查「我自己是否已經跑過」，導致下一趟 tick 對已完成待人工的 slice 重新 fanout，撞 `ScriptWorktreeCreator.create` 的 `"worktree target already exists"`。現在派工前會掃描每個 slice 是否已有 handoff 終局紀錄，併入排除集合；此掃描不受 idle gate 影響，`require_idle` 擋下新工作時 `needs_human` 清單仍會回報。summary 新增 `needs_human: [{slice_id, gate_reason, handoff_path}, ...]` 欄位。
-- **paulshaclaw#264：status 條目補上明確 project 歸屬**：`recent_done`／`attention`／`slices` 現在投影明確的 `repo`；缺少來源時保留 `null`，不從 worktree 或 branch 猜測 project。
-- **Issue #295（primary）／#291（duplicate）：persona catalog 改以套件內建為 canonical 來源，非 cortex repo 的 slice 不再確定性卡 `persona-catalog-unreadable`**：`run_result_verification` 原本無條件從**目標 repo**讀 `paulsha_cortex/persona/personas.yaml`，該檔只存在於 paulsha-cortex 自身，跨 repo 治理必然卡 `needs_human`，且 `dispatch: auto` 又強制要求該 check 無法拿掉。改為先以 `git cat-file -e` 探測 `dispatch_base` tree 是否宣告 repo-local override：存在即維持既有 pin/fail-closed 行為；不存在則回退讀取 `paulsha_cortex.persona.loader.DEFAULT_PERSONAS_PATH` 套件內建 catalog 完成 scope 判定。override 壞損（不可讀／不合法）仍 fail-closed 不靜默回退；cortex repo 自身行為不退化。evidence 新增 `source`（`repo-local`／`packaged`）欄位可稽核判定依據。
-- **Issue #303：三個測試直讀 production coordinator 狀態檔，環境洩漏使本地 pytest gate 被宿主狀態污染**：`test_porcelain_inspect.py::test_inspect_missing_targets_exit_one[argv0-missing-job]`／`test_work_actions.py::test_auto_without_issue_mutates_every_mapped_issue`／`test_auto_without_issue_fails_closed_if_any_label_mutation_fails` 未隔離 coordinator root，未顯式覆寫 `PSC_*` 時經 `resolve_runtime_root()` 落回 `$HOME/.agents`，直讀宿主真實 `~/.agents/coordinator/jobs.json`；production 狀態異常時三測試連帶 fail-closed。同根因擴大排查後，`tests/conftest.py` 的 autouse `_clear_runtime_env` 改為同時把 `PSC_AGENTS_ROOT`／`PSC_CONFIG_ROOT` 指向每測試獨立的空 tmp 目錄（作為 fail-safe 安全網，覆蓋 coordinator／control／specs／monitor／project-config／run root 整個家族），並補上 5 支既有測試（`test_paths.py`／`test_install_service.py`／`test_coordinator_manager_daemon.py`）刻意驗證「未覆寫時落回 `$HOME`」語意所需的顯式 `PSC_AGENTS_ROOT` delenv。以 audit-hook 稽核與偽造 corrupted `jobs.json` 重現 W1 batch 情境驗證修復前後行為差異。詳見 `changelog.d/fix-test-production-state-leak.md`。
-### Changed
-- **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
-### Added
 - **Issue #275：發布 canonical engineering outcome contract 供外部 learning systems 消費**：新增
   `paulsha_cortex/coordinator/engineering_outcome.py`——append-only、一 repo 一檔的
   `engineering-outcomes/<repo-slug>.jsonl` outbox，`work_actions._ship_action`／
@@ -73,7 +67,7 @@
   `docs/superpowers/specs/engineering-outcome-contract-{spec,design}.md`。
 - **Issue #324：combo 搜尋改支援 instance-local override，新增 small-fix 輕量 combo**：`deck/schema.py` 新增 `resolve_combo_path()`／`iter_combo_files()`／`combo_search_dirs()`，一律先查 `$PSC_AGENTS_ROOT/config/combos/<id>.yaml`，找不到才 fallback 到套件內建目錄（同 id 時 instance-local 優先、reinstall 不覆寫自訂檔）；`deck/selector.py`／`deck/cli.py`／`coordinator/work_bridge.py`／`porcelain/init_sample.py` 全數改走這兩個入口。另新增卡片 `writing-plans-light`（只吃 spec/design doc、不依賴 openspec proposal）與參考 combo `small-fix`（7 張卡、2 條核心 gate_spine，覆蓋全 7 個 phase 各恰一張），打斷小任務不需要的 openspec requires 全鏈；`small-fix` 只能經 `--combo small-fix` explicit override 使用，不進自動選牌映射。
 - **Issue #204：新增 skill usage ledger、proposal-first park janitor 與 core/emergency 永久豁免**：新模組 `paulsha_cortex/coordinator/skill_ledger.py`（append-only、去重的 `~/.agents/registry/skill_usage.jsonl` terminal 執行事件記錄，欄位固定白名單不含任何自由格式 payload）與 `skill_janitor.py`（cold-skill 判定＋proposal-first park／restore，比照既有 `gc.py` 只分類不執行的精神）；`manager.run_tick` 新增 `ledger_recorder`／`skill_janitor` 兩個注入點（與既有 `reaper` 同款預設不啟用、例外不破壞 tick）；新 CLI `cortex skill inspect|list-proposals|propose|approve-proposal|park|restore`。`class: core`／`class: emergency`（`deck/schema.py` 既有 `CARD_CLASSES` schema 欄位的首個治理消費點）於 cold 判定與所有 park 入口皆二次防呆強制豁免。
-- **Issue #203：`cortex work intake` 把 link+start 合成單一「拿到一個 issue/task 就進件」入口，不復活低階直派**：新增 `work-action` 動作 `intake`——帶 `--issue`／`--kind`+`--ref` 且尚未反映在受監控快照時先建立 override link（等價 `cortex work link`），再原樣轉交既有 `start` 語意（`claim_key` 去重、`--combo` override 皆比照 `start`）；省略時直接沿用 work_id 現有的 confirmed authority。Intake 不會憑空建立新 authority——work_id 必須已在受監控權威快照中存在，且最終仍要求 confirmed Todo 或已授權的 issue/openspec/path 來源，否則 fail-closed，不建立 WorkflowRun。`contract.py`／`work_actions.py`／`manager.py`／`manager_daemon.py`／`cli.py`／`porcelain/run.py` 六處同步放行 `intake`；已停用的低階 `dispatch` 與既有 Telegram `/dispatch <slice_id>` 維持原樣，不在本次範圍內改動。詳見 `changelog.d/task-intake-work-authority.md`。
+- **Issue #203：`cortex work intake` 把 link+start 合成單一「拿到一個 issue/task 就進件」入口，不復活低階直派**：新增 `work-action` 動作 `intake`——帶 `--issue`／`--kind`+`--ref` 且尚未反映在受監控快照時先建立 override link（等價 `cortex work link`），再原樣轉交既有 `start` 語意（`claim_key` 去重、`--combo` override 皆比照 `start`）；省略時直接沿用 work_id 現有的 confirmed authority。Intake 不會憑空建立新 authority——work_id 必須已在受監控權威快照中存在，且最終仍要求 confirmed Todo 或已授權的 issue/openspec/path 來源，否則 fail-closed，不建立 WorkflowRun。`contract.py`／`work_actions.py`／`manager.py`／`manager_daemon.py`／`cli.py`／`porcelain/run.py` 六處同步放行 `intake`；已停用的低階 `dispatch` 與既有 Telegram `/dispatch <slice_id>` 維持原樣，不在本次範圍內改動。
 - **Issue #325：job record 收斂 token usage——per-lane 成本歸屬的最小底座**：新增
   `usage_extractors.py` 依 executor（codex／claude／copilot／agy）從 headless
   session log 抽取 token 用量，各自處理累計值 vs 逐行累加、欄位語意易混淆
@@ -89,7 +83,7 @@
   世代熔斷）收斂成 1-2 次 CLI 呼叫，取代現況要靠 5 個 PR、跨近 9 小時手動
   拉鋸 `.cortex/work-items.yaml` 的流程（`#326`–`#330` 實測記錄）；刻意維持
   `claim.py` 既有碰撞不變量與 source-owner-transfer 守門不變。純設計文件，
-  不含程式碼變動。詳見 `changelog.d/work-identity-migration-design.md`。
+  不含程式碼變動。
 - **Issue #276：builder 派工依 plan Task 邊界分段——設計文件（design-doc）**：新增
   `openspec/changes/2026-08-07-builder-task-boundary-segmentation/` 與
   `docs/superpowers/specs/builder-task-boundary-segmentation-{design,spec}.md`，
@@ -98,80 +92,12 @@
   commit 斷點語句、`classify_completion()` 新增 `context-exhausted` 分類、
   commit log 續跑進度帳，以及與 #277 的介面邊界；本票不動任何
   `paulsha_cortex/` 程式檔，code 落地拆為三張後續票。
-- **Issue #209：模型能力封套設計文件——定案 `capable()` 六項判準與 `resource-inventory` 四欄位契約**：新增 `openspec/changes/2026-08-07-design-model-capability-envelope/` 與 `docs/superpowers/specs/design-model-capability-envelope-{spec,design}.md`，定案 `#138` judge「能力配得上」謂詞的六項合取式與供給側四個靜態欄位契約；定案短期落地位置為既有 `model-identities.yaml`；定案三閘序（eligibility／admission／routing）並記錄與既有 `claim_readiness.CHECK_ORDER` 的落差；更正 issue §4 roster 現況——registry 全文只有一個身分，連 issue 自身修正 comment 的三身分表都對不上 main。純設計文件，未實作、未改任何 `.py`。詳見 `changelog.d/model-capability-envelope-design.md`。
+- **Issue #209：模型能力封套設計文件——定案 `capable()` 六項判準與 `resource-inventory` 四欄位契約**：新增 `openspec/changes/2026-08-07-design-model-capability-envelope/` 與 `docs/superpowers/specs/design-model-capability-envelope-{spec,design}.md`，定案 `#138` judge「能力配得上」謂詞的六項合取式與供給側四個靜態欄位契約；定案短期落地位置為既有 `model-identities.yaml`；定案三閘序（eligibility／admission／routing）並記錄與既有 `claim_readiness.CHECK_ORDER` 的落差；更正 issue §4 roster 現況——registry 全文只有一個身分，連 issue 自身修正 comment 的三身分表都對不上 main。純設計文件，未實作、未改任何 `.py`。
 - **Issue #323：`cortex jobs`／`stat` 對 workflow lane job 補 work_id／primary issue 歸屬欄**：`wf-xxxxxxxx-<card>-<n>` job 輸出新增 `workflow_work_id`／`workflow_primary_issue` 兩欄，於輸出端以既有 `workflow_run_id` join registry 的 workflow run，零額外持久化狀態；card 已由既有 `workflow_card` 欄位提供。非 workflow lane job 與其餘既有欄位皆不受影響。
 - **Issue #178：新增 `cortex work gc` 交付後產物回收命令**：proposal-first 回收殘留 build worktree 與已 merge 的 repo local branch；預設 dry-run 只輸出候選清單與逐項 `reclaim`／`keep`＋reason code，`--apply` 才執行且逐項重驗（TOCTOU-safe）。merged 判定改走內容層驗證鏈（`git merge-base --is-ancestor` → `git cherry` 內容等價），修正 squash-merge 後 ref-ancestry 失真、`git branch -d`／`--merged` 誤拒已合併分支的既有陷阱；任何疑義一律 `keep` 並附 reason code，closed-unmerged PR 分支保留。新模組 `paulsha_cortex/coordinator/gc.py` 由 umbrella CLI 攔截路由，不經 manager daemon、對 registry 唯讀、不動 remote。
 - **Refs #294：slice spec 可宣告 executor/model_id 並於派工前強制 registry 驗證**：`dispatch_ready` 支援逐 slice 的 builder identity 覆寫，unknown identity fail-closed 並列出可用 candidates；同時 `cortex fanout`／`tick` 的明確 `(executor, model)` 與 periodic tick 預設 model 也改為先查 `model-identities.yaml`，避免 typo 直到 session 內才失敗。
 - **Issue #202：task_type 自動選牌與 fix-standard combo**：新增 deck taxonomy loader／selector、`fix-standard` workflow combo、`WorkflowRun.combo_selection` provenance、`cortex work start --combo` authoritative override，以及 `cortex stat --combo-selections` 彙總。Refs #202。
 - **Issue #260：新增 `recover-repair-commit` work action**：repair job 失敗終止但已在 builder worktree 留下合法 descendant commit 時，以雙 CAS（`expected_run_id`＋`expected_candidate`）確定性 bind 為新 candidate；判準全部取自系統事實，不啟動任何 model session，冪等回報 `already-recovered`；`retry-build` 既有 CAS 與窄化入口原封不動。
-
-### Fixed
-- **Issue #260：resume／dispatch 不再重選 stale failed job**：`resume_workflow_run`／`_dispatch_workflow_card` 的 stale-terminal 判定補上「`exited` 且 exit code 非 0」，第一次 operator resume 即 dispatch replacement，不再空轉一輪；失敗回報附掛唯讀 `terminal_diagnostics`，不授予 candidate authority。
-
-### Fixed
-- **Issue #139：`task_type` taxonomy 契約補齊測試覆蓋並確認驗收面**：`paulsha_cortex/deck/data/task-types.yaml`（雙鎖值域＋scope 受控詞典）與 `paulsha_cortex/deck/task_types.py`（fail-closed loader、`classify_title` 五類判定）已隨 #202 提前落地，本票確認其符合 spec 的 R1–R6，並補齊 `tests/test_deck_task_types.py` 缺口測試（值域漂移拒載、空描述拒載、未知 combo 引用拒載、五類處置映射全稱驗證）；R7（統一 log reader／status view 介面契約）維持只定契約不實作。
-- **Issue #296：builder tick tasks.md 與 reviewer authority-proving 凍結
-  baseline 矛盾——確認已由 #310 修復，補 production-fidelity 迴歸測試**：
-  #296 與 #310 為同一起 2026-08-04 hippo 事故的獨立提報；#310 的修法（PR
-  #311／#312）已在 #296 提報後數小時落地，但 #296 未被關閉核實。新增
-  `tests/test_builder_tasks_tick_verify_dispatch.py` 以真實 git repo 重現
-  `_dispatch_workflow_card` reviewer 分支（verify／review 共用），涵蓋
-  checkbox-only 通過、tasks.md 文字改動仍擋、proposal.md 等 spec 檔改動仍擋
-  三種情境；無需再改動 production code。
-- **Issue #307：gate ledger 一致性檢查消費 `test_policy=red-required`，解除與 tdd-red 卡的結構性互斥**：`_assert_terminal_gate_consistency` 從 job 綁定的 `WorkflowRun.steps` 查出目前 card 的 `test_policy`，交給 `terminal_contract.authorize_terminal` 對 red-required 卡的 pytest gate 做精準語意反轉——只有 exit code 精確等於 `1`（測試如預期失敗）才視為合格 RED；exit code `0`（全綠）或 `2`／`3`／`4`／`5`（collection error／internal error／usage error／no tests collected）一律維持 fail closed。其他 gate 與一般卡不受影響。
-- **CI 測試閘門形同虛設（tests.yml 偵測誤判）**：`ls tests/test_*.py tests/*_test.py` 只要任一 glob 沒配到就回傳非零，本 repo 因此恆判為「無測試套件」而跳過整段 pytest 卻回報 success；改用 `find -print -quit`。
-- **Issue #263：ship validator 重排為本地 closeout 先於 PR metadata preflight**：archive commit 不再內嵌 push；pre-PR metadata preflight 失敗改回可 resume 的 `pr-preflight-blocked` typed stop、通過後照舊自動建立 PR；slice-based review worktree 補上 frozen authority materialize 與 hash 驗證。
-- **Issue #263 補遺（PR #336 code review）**：review worktree authority materialize 的路徑檢查改為先驗證後動作（拒絕 `..`／絕對路徑 ref 於任何 mkdir 之前）；`work_bridge._manager_archive_applied()` 改委派 `manager` 版避免與 `any(...)` 舊語意漂移；`_slice_review_authority_inputs()` 相對 plan/spec path 改以 repo_root 解析，對齊 `_pinned_input_mismatches()` 既有語意。
-- **Issue #202 補遺：durable snapshot 不可用時 combo 選擇改走 fail-soft**：`claim.mapped_issue_titles` 先前只在 snapshot hash mismatch 時 bypass；`_load_snapshot` 因 snapshot 不存在／不可讀／schema 損壞 raise 的 `ValueError`（含 `AuthorityValidationError`）未被攔截，會炸穿 `work_bridge.start_canonical_workflow`。現在一併回傳 `None` 落回 bypass-default combo，`load_work_authorities`／`load_work_authority` 維持 fail-hard 不變。
-- **Issue #202 code review 修復：override 驗證改用 `load_combo`、`combo` 收斂只在 start 可用**：`deck.selector.select_combo` 的 override 先前只靠 taxonomy 反查判定未知，會誤判 repo 內實際存在但無 task_type 映射的 legacy combo（如 `mcu-feature`）；改為直接以 `load_combo` 驗證。另外 `--combo` 雖標「start 專用」，CLI／porcelain／manager 先前對所有 work action 都會轉交 `combo`，`resume` 在特定時序下可能被未經驗證的 combo override 影響；四層（`control/contract.py` fail-closed 為收斂防線）同步收斂為只在 `action == "start"` 才夾帶／轉交 `combo`，並清除 `work_bridge.start_canonical_workflow` 內與 selector 重覆的驗證死碼。
-- **abandon 尋址窗口放寬至全額認領**：abandon 校驗 run refs 與 authority 全等；窗口期舊識別全額認領（撤 openspec exclude）、-v2 暫撤 openspec link。
-- **舊識別墓碑 todo（abandon 尋址窗口）**：authority 需檔案級來源，-v2 遷移後舊識別無檔化致 abandon 不可尋址；暫置墓碑 todo，abandon 後移除。
-- **-v2 issue links 暫撤（abandon 尋址窗口）**：解 issue contested → authority ambiguous → abandon 無從尋址的死鎖；隨後還原並補 excludes（abandon 先於 exclude 的正確時序）。
-- **-v2 excludes 收窄至 openspec ref**：保留舊識別可尋址性（abandon 需 authority），僅排除實際碰撞的 openspec 認領。
-- **-v2 重識別補 excludes 斷開舊識別的 source 認領**：消除 confirmed source collision 造成的 repo provider degraded（比照 dispatch-reliability-batch 先例）。
-### Changed
-- **feat-work-gc 與 design-task-type-taxonomy 重識別為 -v2（#178／#139）**：三代 run 因基礎設施缺陷鏈 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別於修復齊備的 main 重跑。
-### Fixed
-- **封存 14 個 7/25–26 遺留 active OpenSpec changes**：功能已 merge 但缺 specs delta，validate --all 14 fail 擋所有 ship preflight；官方 archive 後 0 failed。
-- **build 卡指引明令 pinned tasks/todo 僅可切換 checkbox**：修正 builder 註記 plan 文字超出 checkbox 容忍造成 drift 卡死。
-- **Issue #315 補遺 3：review StructuredOutput 工具 schema 開放 authority_hashes**：additionalProperties:false 下模型無法交出驗證器要求的攻證欄位（#219 佈線缺口）；工具 schema 開放屬性，必填與比對仍由 manager 驗證。
-- **Issue #315 補遺 2：review 派工 schema 把 authority_hashes 列入 fixed 逐字照抄**：修正 sonnet reviewer 條件性解讀導致整組省略、review terminal 恆 schema invalid；harvest 精確比對不變。
-- **Issue #315 補遺：retry-review 重置時同步失效舊 exited review job**：比照 retry-verify，reset 時標記 failed 讓 resume 走 replacement dispatch。
-- **Issue #315：retry-verify 重置時失效舊 exited verification job**：沙箱已清的舊 job 維持 exited 會讓 dispatch 先 terminalize 而永遠 `input snapshot file missing`；reset 時標記 failed，resume 走 replacement dispatch。
-- **Issue #313：verify phase 移出 gate ledger 必要集**：verification 卡的 review-only 沙箱依設計不寫 ledger，要求 ledger＝verification 卡結構性永不可過。`GATE_LEDGER_REQUIRED_PHASES` 收斂為 `{build}`；verify 的獨立證據層是 deterministic verification report 管線。
-- **Issue #310 補遺：reviewer frozen authority 驗證沿用 checkbox 容忍**：`verify_authority_in_input_snapshot` 的 pinned 期望值改由 `_authority_map_with_checkbox_tolerance` 提供，checkbox 容忍成立的 tasks/todo 以候選實際 hash 比對；其他差異維持 fail-closed。
-- **Issue #310：pinned planning input 對 task checkbox 更新的 drift 容忍**：kind=plan 的 `tasks.md`／`todo.md` 於 raw-hash 不符時做 checkbox-insensitive 比對（baseline 取自 operator_root 並先驗 hash）；其他差異維持 fail-closed。修正卡片契約要求勾選 checkbox 與 verify 派工 drift 檢查的互斥。
-- **Issue #308：零 gate 設定下模型自述 gate_evidence 不再觸發 fail-closed**：ledger `gates: []` 時 `authorize_terminal` 跳過 unknown-gate 對照（#261 文件：零 gate＝無 R2 保護）；ledger 非空維持 fail-closed。
-### Changed
-- **W1 canary v2 檔名對齊（#295／#291）**：build 卡 declared inputs 以 `*<work_id>*` glob 檔名，v2 僅改 frontmatter 導致 declared input missing；檔名與 workstream 目錄補 `-v2` 並同步引用。
-- **W1 canary 重識別為 fix-persona-catalog-portability-v2（#295／#291）**：三代 run 因 #299／#302／#303 基礎設施缺陷 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別續作（檔案路徑不動）。
-### Fixed
-- **Issue #302：registry 載入層 claim_key 唯一性改為只約束 ongoing runs**：與 abandon→reclaim（#256 D4／#299）語意對齊；重 claim persist 後 manager 重啟不再無法載回狀態檔。run_id 唯一性維持全域。
-- **批次 W1 openspec design.md 補件（#295／#291、#260、#178、#139）**：design kind 的 authority 來源是 `openspec/changes/<change>/design.md`，缺檔時 planning completeness 永遠 incomplete、claim 後 define 繞進 brainstorm 並靜默 needs_human（7/30 批次全卡 define 的根因）。為四個 work item 補上 design.md，使 define 走 planning-complete deterministic 路徑。
-- **Issue #299：planning_released 釋放後同 claim_key 可重新 claim**：`work_bridge.start_canonical_workflow` 的 existing-run reuse guard 原對 `superseded` run 無條件短路，未 honor #256 D4 釋放語意，abandon→reclaim 永久死路。新增 `_claimable_existing_runs` 過濾已釋放 run，未釋放 superseded／done／ongoing 行為不變。
-- **Issue #277：pre-candidate 失敗恢復與 stale candidate 重評**：新增 `recover-pre-candidate` work/slice action 以處置 candidate 為 null 時的 builder 失敗並回收殘留 worktree；修復 completion 對 `candidate-worktree-dirty` 的快照競態，改為在 tick 時以當前 branch HEAD 動態重評。
-- **Issue #286：fanout plan pinning 以 spec 檔自身所在 repo 解析**：修復 `coordinator/autonomy.py` 中 `_infer_repo_root(spec_path)` 於 `PSC_REPO_ROOT` 環境變數存在時盲目回傳 manager host repo 的問題。調整為優先以 `spec_path` 所在目錄向上推導專案 Git repository root；當 spec 位於 manager host 外部的其他 repository（如 `serialwrap` 或 worktree）時，能正確將 relative plan glob 解析至該專案目錄，解決跨 repo ad-hoc 派工觸發 `DispatchReadyError: plan file unreadable` 的問題，並使 `ready` 與 `fanout` 階段對專案 repo_root 的判定維持一致。
-- **Issue #273：修復 Monitor refresh 靜默失敗、同 Repo 多 Checkout 衝突與 Source Collision 歸零缺陷**：
-  - 缺陷一：`ProjectMonitorService._refresh_work_model` 不再靜默吞掉 `ValueError` / `OSError` 例外，加入 log 紀錄並於 store / status / snapshot 記錄 `last_refresh_error` 與連續失敗計數；`cortex work show` / `work start` 在 snapshot 停更或 refresh 失敗時直接回報真正原因。
-  - 缺陷二：`WorkModelRefresher` 掃描專案時依 git 身分去重同 repo 的多個 checkout，優先選擇 canonical checkout 避免 duplicate work item ID 錯誤，並在 status diagnostics 中明確標示碰撞目錄。
-  - 缺陷三：`correlate_work_sources` 與 `project_work_items` 發生 source collision 時，將影響限縮於相關 Work Item 並標記 `degraded` 診斷，不再導致整個 repo 的 Work Item projection 歸零。
-- **Issue #277：repo rebind 後 monitor 投影與 work authority 跟隨 `PSC_REPO_ROOT`**：
-  - monitor 設定解析遇到 deprecated legacy 設定（`PAULSHACLAW_CONFIG` 或 `paulshaclaw.yaml`）時改為 fail-loudly 拋出 `ValueError`，不再靜默降級至舊 repo 設定。
-  - monitor config 載入時自動將 `PSC_REPO_ROOT` 納入監控專案集，確保 instance 換綁 repo 後 monitor 投影能正確解析當前 repo 的 work items。
-  - `work link` / `unlink` 重寫 `.cortex/work-items.yaml` 時保留原始鍵（key）排序，避免無謂重排導致 git status 變 dirty，並於寫入後新增 readback 讀回驗證。
-- **Issue #284：persona 歷史回放測試改釘固定錨點**：原以浮動的 `main` ref 回放，merge／rebase 進行中 `prs_scanned` 可能落到 0 而讓斷言失敗（「掃不到」被誤判為「有誤殺」，實測 merge 期間出現過一次隨機紅）；且 `actions/checkout` 預設 shallow（實測 depth 1 的 clone `git log --merges -n 30` 回 0 個），CI 實際回放範圍遠少於宣稱的 30 個 PR 卻仍以「歷史回放零誤殺」通過。改釘固定 commit 錨點（`6813058`，即 #135 切換 enforce 當下的 main），使結果不隨 HEAD 移動而改變，並新增「錨點不可解析時明確 skip」的分支，避免在淺 clone 環境靜默宣稱零誤殺。偵測新 PR 誤殺仍由 CI `persona-scope` workflow 對 PR diff 負責，`replay.py` CLI 的動態回放能力不受影響。
-
-### Changed
-- **Issue #135：persona enforcement shadow → enforce**：切換前先以
-  `python -m paulsha_cortex.persona.replay`（新增，可重跑）回放最近已合併 PR 的
-  實際檔案清單，證明對現行 `builder` 派工慣例零誤殺，才把
-  `paulsha_cortex/persona/personas.yaml` 的 `enforcement` 由 `shadow` 切為
-  `enforce`。`persona-scope.yml`（`scope_ci.py`）現依 `enforcement` 動態決定放
-  行：違規時輸出含 persona／觸及路徑／違反規則的可定位 verdict 並 `exit 1`；
-  套用 `policy-exempt:persona-scope` label 時不阻擋，但違規內容仍完整輸出（不
-  靜音）。`persona-scope` 設為 main required status check 屬 GitHub repo 設定，
-  設定步驟見 `docs/persona-scope-enforcement.md`。
-### Added
 - **批次 W2 planning artifacts（#294、#263、#202）**：為三個 work item
   （`feat-slice-executor-model`、`fix-preflight-closeout-order`、`feat-task-type-combo-selector`）
   新增 spec／design／plan／todo 與 `openspec/changes/2026-08-04-<wi>/` planning artifacts，
@@ -199,10 +125,77 @@
   失敗時優先在既有 identity 順序與 independence domain 規則內 re-route，無合法替代才進入帶具體
   reason 的 `needs_human`，全程 model invocation 維持 0；`cortex inspect status` 顯示缺少的
   capability、使用中的 executor environment 與 snapshot 新鮮度。
-### Added
-- **Issue #205：per-work planner/builder/reviewer 模型鏈覆寫**：`WorkflowRun` 新增 `model_chain_override`（run-scoped 覆寫，claim/首次 dispatch 時凍結，只作用於本 run，不動共享 `model-identities.yaml`）與 `resolved_model_chain`（三段實際解析結果與來源 override/registry，供事後稽核）兩個 provenance-only 欄位；`_select_workflow_identity` 逐段優先讀凍結覆寫、未指定段落回退共享 registry，覆寫仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 fail closed 並列出可用 identity；`cortex run work start/resume/retry-build/retry-verify/retry-review/...` 新增 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model` 六個 run-scoped 覆寫參數。詳見 `changelog.d/per-work-model-chain.md`。
+- **Issue #205：per-work planner/builder/reviewer 模型鏈覆寫**：`WorkflowRun` 新增 `model_chain_override`（run-scoped 覆寫，claim/首次 dispatch 時凍結，只作用於本 run，不動共享 `model-identities.yaml`）與 `resolved_model_chain`（三段實際解析結果與來源 override/registry，供事後稽核）兩個 provenance-only 欄位；`_select_workflow_identity` 逐段優先讀凍結覆寫、未指定段落回退共享 registry，覆寫仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 fail closed 並列出可用 identity；`cortex run work start/resume/retry-build/retry-verify/retry-review/...` 新增 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model` 六個 run-scoped 覆寫參數。
+- **批次 B planning artifacts（#261／#256／#262／#205／#135）**：為五個 issue 各新增 spec／design／plan／workstream todo 與 openspec change（`2026-07-30-<work_item>`），並登錄 `.cortex/work-items.yaml`，作為 cortex work-item lifecycle 的 confirmed authority。五組皆通過 `assess_planning_completeness`（`status: accepted`、必要章節齊備、無 blocking marker）。本 PR 只提供 planning authority，實作由後續 cortex 派工的 build phase 完成。
+
+### Changed
+- **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
+- **feat-work-gc 與 design-task-type-taxonomy 重識別為 -v2（#178／#139）**：三代 run 因基礎設施缺陷鏈 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別於修復齊備的 main 重跑。
+- **W1 canary work item authority 補強（#295／#291）**：`fix-persona-catalog-portability` 於 `.cortex/work-items.yaml` 補綁 design／plan path 連結，並於 workstream todo 記錄首次 claim 環境性 stall 的 abandon 審計附註；使 authority digest 前進以重新 claim。
+- **W1 canary v2 檔名對齊（#295／#291）**：build 卡 declared inputs 以 `*<work_id>*` glob 檔名，v2 僅改 frontmatter 導致 declared input missing；檔名與 workstream 目錄補 `-v2` 並同步引用。
+- **W1 canary 重識別為 fix-persona-catalog-portability-v2（#295／#291）**：三代 run 因 #299／#302／#303 基礎設施缺陷 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別續作（檔案路徑不動）。
+- **Issue #135：persona enforcement shadow → enforce**：切換前先以
+  `python -m paulsha_cortex.persona.replay`（新增，可重跑）回放最近已合併 PR 的
+  實際檔案清單，證明對現行 `builder` 派工慣例零誤殺，才把
+  `paulsha_cortex/persona/personas.yaml` 的 `enforcement` 由 `shadow` 切為
+  `enforce`。`persona-scope.yml`（`scope_ci.py`）現依 `enforcement` 動態決定放
+  行：違規時輸出含 persona／觸及路徑／違反規則的可定位 verdict 並 `exit 1`；
+  套用 `policy-exempt:persona-scope` label 時不阻擋，但違規內容仍完整輸出（不
+  靜音）。`persona-scope` 設為 main required status check 屬 GitHub repo 設定，
+  設定步驟見 `docs/persona-scope-enforcement.md`。
 
 ### Fixed
+- **Issue #339：run tick 對已有 needs_human 終局紀錄的 slice 不再重複 fanout**：`run_tick` 原本的冪等防護只排除 registry 中仍在 `dispatched`/`running` 的 job，job 一旦 poll 到 exited 就離開這個集合，不論其 `gate_status` 是 `needs_human`／`failed`／`passed`；`ready_units`/`default_is_satisfied` 只檢查「別人 depends_on 我」是否滿足，從未檢查「我自己是否已經跑過」，導致下一趟 tick 對已完成待人工的 slice 重新 fanout，撞 `ScriptWorktreeCreator.create` 的 `"worktree target already exists"`。現在派工前會掃描每個 slice 是否已有 handoff 終局紀錄，併入排除集合；此掃描不受 idle gate 影響，`require_idle` 擋下新工作時 `needs_human` 清單仍會回報。summary 新增 `needs_human: [{slice_id, gate_reason, handoff_path}, ...]` 欄位。
+- **paulshaclaw#264：status 條目補上明確 project 歸屬**：`recent_done`／`attention`／`slices` 現在投影明確的 `repo`；缺少來源時保留 `null`，不從 worktree 或 branch 猜測 project。
+- **Issue #295（primary）／#291（duplicate）：persona catalog 改以套件內建為 canonical 來源，非 cortex repo 的 slice 不再確定性卡 `persona-catalog-unreadable`**：`run_result_verification` 原本無條件從**目標 repo**讀 `paulsha_cortex/persona/personas.yaml`，該檔只存在於 paulsha-cortex 自身，跨 repo 治理必然卡 `needs_human`，且 `dispatch: auto` 又強制要求該 check 無法拿掉。改為先以 `git cat-file -e` 探測 `dispatch_base` tree 是否宣告 repo-local override：存在即維持既有 pin/fail-closed 行為；不存在則回退讀取 `paulsha_cortex.persona.loader.DEFAULT_PERSONAS_PATH` 套件內建 catalog 完成 scope 判定。override 壞損（不可讀／不合法）仍 fail-closed 不靜默回退；cortex repo 自身行為不退化。evidence 新增 `source`（`repo-local`／`packaged`）欄位可稽核判定依據。
+- **Issue #303：三個測試直讀 production coordinator 狀態檔，環境洩漏使本地 pytest gate 被宿主狀態污染**：`test_porcelain_inspect.py::test_inspect_missing_targets_exit_one[argv0-missing-job]`／`test_work_actions.py::test_auto_without_issue_mutates_every_mapped_issue`／`test_auto_without_issue_fails_closed_if_any_label_mutation_fails` 未隔離 coordinator root，未顯式覆寫 `PSC_*` 時經 `resolve_runtime_root()` 落回 `$HOME/.agents`，直讀宿主真實 `~/.agents/coordinator/jobs.json`；production 狀態異常時三測試連帶 fail-closed。同根因擴大排查後，`tests/conftest.py` 的 autouse `_clear_runtime_env` 改為同時把 `PSC_AGENTS_ROOT`／`PSC_CONFIG_ROOT` 指向每測試獨立的空 tmp 目錄（作為 fail-safe 安全網，覆蓋 coordinator／control／specs／monitor／project-config／run root 整個家族），並補上 5 支既有測試（`test_paths.py`／`test_install_service.py`／`test_coordinator_manager_daemon.py`）刻意驗證「未覆寫時落回 `$HOME`」語意所需的顯式 `PSC_AGENTS_ROOT` delenv。以 audit-hook 稽核與偽造 corrupted `jobs.json` 重現 W1 batch 情境驗證修復前後行為差異。
+- **Issue #260：resume／dispatch 不再重選 stale failed job**：`resume_workflow_run`／`_dispatch_workflow_card` 的 stale-terminal 判定補上「`exited` 且 exit code 非 0」，第一次 operator resume 即 dispatch replacement，不再空轉一輪；失敗回報附掛唯讀 `terminal_diagnostics`，不授予 candidate authority。
+- **Issue #139：`task_type` taxonomy 契約補齊測試覆蓋並確認驗收面**：`paulsha_cortex/deck/data/task-types.yaml`（雙鎖值域＋scope 受控詞典）與 `paulsha_cortex/deck/task_types.py`（fail-closed loader、`classify_title` 五類判定）已隨 #202 提前落地，本票確認其符合 spec 的 R1–R6，並補齊 `tests/test_deck_task_types.py` 缺口測試（值域漂移拒載、空描述拒載、未知 combo 引用拒載、五類處置映射全稱驗證）；R7（統一 log reader／status view 介面契約）維持只定契約不實作。
+- **Issue #296：builder tick tasks.md 與 reviewer authority-proving 凍結
+  baseline 矛盾——確認已由 #310 修復，補 production-fidelity 迴歸測試**：
+  #296 與 #310 為同一起 2026-08-04 hippo 事故的獨立提報；#310 的修法（PR
+  #311／#312）已在 #296 提報後數小時落地，但 #296 未被關閉核實。新增
+  `tests/test_builder_tasks_tick_verify_dispatch.py` 以真實 git repo 重現
+  `_dispatch_workflow_card` reviewer 分支（verify／review 共用），涵蓋
+  checkbox-only 通過、tasks.md 文字改動仍擋、proposal.md 等 spec 檔改動仍擋
+  三種情境；無需再改動 production code。
+- **Issue #307：gate ledger 一致性檢查消費 `test_policy=red-required`，解除與 tdd-red 卡的結構性互斥**：`_assert_terminal_gate_consistency` 從 job 綁定的 `WorkflowRun.steps` 查出目前 card 的 `test_policy`，交給 `terminal_contract.authorize_terminal` 對 red-required 卡的 pytest gate 做精準語意反轉——只有 exit code 精確等於 `1`（測試如預期失敗）才視為合格 RED；exit code `0`（全綠）或 `2`／`3`／`4`／`5`（collection error／internal error／usage error／no tests collected）一律維持 fail closed。其他 gate 與一般卡不受影響。
+- **CI 測試閘門形同虛設（tests.yml 偵測誤判）**：`ls tests/test_*.py tests/*_test.py` 只要任一 glob 沒配到就回傳非零，本 repo 因此恆判為「無測試套件」而跳過整段 pytest 卻回報 success；改用 `find -print -quit`。
+- **測試套件在 Python 3.10／3.11 無法 parse**：`tests/test_coordinator_manager.py` 與 `tests/test_coordinator_candidate_verification.py` 的 `_persona_catalog` 在 f-string 表達式內嵌含反斜線的 f-string，PEP 701（3.12）之前不允許，導致宣稱支援 3.10 的專案在該版本連 collect 都失敗。改為先組好字串再內插，輸出等價。
+- **openspec 整合測試在缺 CLI 時硬失敗**：`tests/test_openspec_archive_purpose.py` 依賴 npm 套件 `@fission-ai/openspec`，不在 Python 依賴樹內；改為 `skipif` 明確標示並附原因，取代 `assert shutil.which(...)`。
+- **Issue #263：ship validator 重排為本地 closeout 先於 PR metadata preflight**：archive commit 不再內嵌 push；pre-PR metadata preflight 失敗改回可 resume 的 `pr-preflight-blocked` typed stop、通過後照舊自動建立 PR；slice-based review worktree 補上 frozen authority materialize 與 hash 驗證。
+- **Issue #263 補遺（PR #336 code review）**：review worktree authority materialize 的路徑檢查改為先驗證後動作（拒絕 `..`／絕對路徑 ref 於任何 mkdir 之前）；`work_bridge._manager_archive_applied()` 改委派 `manager` 版避免與 `any(...)` 舊語意漂移；`_slice_review_authority_inputs()` 相對 plan/spec path 改以 repo_root 解析，對齊 `_pinned_input_mismatches()` 既有語意。
+- **Issue #202 補遺：durable snapshot 不可用時 combo 選擇改走 fail-soft**：`claim.mapped_issue_titles` 先前只在 snapshot hash mismatch 時 bypass；`_load_snapshot` 因 snapshot 不存在／不可讀／schema 損壞 raise 的 `ValueError`（含 `AuthorityValidationError`）未被攔截，會炸穿 `work_bridge.start_canonical_workflow`。現在一併回傳 `None` 落回 bypass-default combo，`load_work_authorities`／`load_work_authority` 維持 fail-hard 不變。
+- **Issue #202 code review 修復：override 驗證改用 `load_combo`、`combo` 收斂只在 start 可用**：`deck.selector.select_combo` 的 override 先前只靠 taxonomy 反查判定未知，會誤判 repo 內實際存在但無 task_type 映射的 legacy combo（如 `mcu-feature`）；改為直接以 `load_combo` 驗證。另外 `--combo` 雖標「start 專用」，CLI／porcelain／manager 先前對所有 work action 都會轉交 `combo`，`resume` 在特定時序下可能被未經驗證的 combo override 影響；四層（`control/contract.py` fail-closed 為收斂防線）同步收斂為只在 `action == "start"` 才夾帶／轉交 `combo`，並清除 `work_bridge.start_canonical_workflow` 內與 selector 重覆的驗證死碼。
+- **abandon 尋址窗口放寬至全額認領**：abandon 校驗 run refs 與 authority 全等；窗口期舊識別全額認領（撤 openspec exclude）、-v2 暫撤 openspec link。
+- **舊識別墓碑 todo（abandon 尋址窗口）**：authority 需檔案級來源，-v2 遷移後舊識別無檔化致 abandon 不可尋址；暫置墓碑 todo，abandon 後移除。
+- **-v2 issue links 暫撤（abandon 尋址窗口）**：解 issue contested → authority ambiguous → abandon 無從尋址的死鎖；隨後還原並補 excludes（abandon 先於 exclude 的正確時序）。
+- **-v2 excludes 收窄至 openspec ref**：保留舊識別可尋址性（abandon 需 authority），僅排除實際碰撞的 openspec 認領。
+- **-v2 重識別補 excludes 斷開舊識別的 source 認領**：消除 confirmed source collision 造成的 repo provider degraded（比照 dispatch-reliability-batch 先例）。
+- **封存 14 個 7/25–26 遺留 active OpenSpec changes**：功能已 merge 但缺 specs delta，validate --all 14 fail 擋所有 ship preflight；官方 archive 後 0 failed。
+- **build 卡指引明令 pinned tasks/todo 僅可切換 checkbox**：修正 builder 註記 plan 文字超出 checkbox 容忍造成 drift 卡死。
+- **Issue #315 補遺 3：review StructuredOutput 工具 schema 開放 authority_hashes**：additionalProperties:false 下模型無法交出驗證器要求的攻證欄位（#219 佈線缺口）；工具 schema 開放屬性，必填與比對仍由 manager 驗證。
+- **Issue #315 補遺 2：review 派工 schema 把 authority_hashes 列入 fixed 逐字照抄**：修正 sonnet reviewer 條件性解讀導致整組省略、review terminal 恆 schema invalid；harvest 精確比對不變。
+- **Issue #315 補遺：retry-review 重置時同步失效舊 exited review job**：比照 retry-verify，reset 時標記 failed 讓 resume 走 replacement dispatch。
+- **Issue #315：retry-verify 重置時失效舊 exited verification job**：沙箱已清的舊 job 維持 exited 會讓 dispatch 先 terminalize 而永遠 `input snapshot file missing`；reset 時標記 failed，resume 走 replacement dispatch。
+- **Issue #313：verify phase 移出 gate ledger 必要集**：verification 卡的 review-only 沙箱依設計不寫 ledger，要求 ledger＝verification 卡結構性永不可過。`GATE_LEDGER_REQUIRED_PHASES` 收斂為 `{build}`；verify 的獨立證據層是 deterministic verification report 管線。
+- **Issue #310 補遺：reviewer frozen authority 驗證沿用 checkbox 容忍**：`verify_authority_in_input_snapshot` 的 pinned 期望值改由 `_authority_map_with_checkbox_tolerance` 提供，checkbox 容忍成立的 tasks/todo 以候選實際 hash 比對；其他差異維持 fail-closed。
+- **Issue #310：pinned planning input 對 task checkbox 更新的 drift 容忍**：kind=plan 的 `tasks.md`／`todo.md` 於 raw-hash 不符時做 checkbox-insensitive 比對（baseline 取自 operator_root 並先驗 hash）；其他差異維持 fail-closed。修正卡片契約要求勾選 checkbox 與 verify 派工 drift 檢查的互斥。
+- **Issue #308：零 gate 設定下模型自述 gate_evidence 不再觸發 fail-closed**：ledger `gates: []` 時 `authorize_terminal` 跳過 unknown-gate 對照（#261 文件：零 gate＝無 R2 保護）；ledger 非空維持 fail-closed。
+- **Issue #302：registry 載入層 claim_key 唯一性改為只約束 ongoing runs**：與 abandon→reclaim（#256 D4／#299）語意對齊；重 claim persist 後 manager 重啟不再無法載回狀態檔。run_id 唯一性維持全域。
+- **批次 W1 openspec design.md 補件（#295／#291、#260、#178、#139）**：design kind 的 authority 來源是 `openspec/changes/<change>/design.md`，缺檔時 planning completeness 永遠 incomplete、claim 後 define 繞進 brainstorm 並靜默 needs_human（7/30 批次全卡 define 的根因）。為四個 work item 補上 design.md，使 define 走 planning-complete deterministic 路徑。
+- **Issue #299：planning_released 釋放後同 claim_key 可重新 claim**：`work_bridge.start_canonical_workflow` 的 existing-run reuse guard 原對 `superseded` run 無條件短路，未 honor #256 D4 釋放語意，abandon→reclaim 永久死路。新增 `_claimable_existing_runs` 過濾已釋放 run，未釋放 superseded／done／ongoing 行為不變。
+- **Issue #277：pre-candidate 失敗恢復與 stale candidate 重評**：新增 `recover-pre-candidate` work/slice action 以處置 candidate 為 null 時的 builder 失敗並回收殘留 worktree；修復 completion 對 `candidate-worktree-dirty` 的快照競態，改為在 tick 時以當前 branch HEAD 動態重評。
+- **Issue #286：fanout plan pinning 以 spec 檔自身所在 repo 解析**：修復 `coordinator/autonomy.py` 中 `_infer_repo_root(spec_path)` 於 `PSC_REPO_ROOT` 環境變數存在時盲目回傳 manager host repo 的問題。調整為優先以 `spec_path` 所在目錄向上推導專案 Git repository root；當 spec 位於 manager host 外部的其他 repository（如 `serialwrap` 或 worktree）時，能正確將 relative plan glob 解析至該專案目錄，解決跨 repo ad-hoc 派工觸發 `DispatchReadyError: plan file unreadable` 的問題，並使 `ready` 與 `fanout` 階段對專案 repo_root 的判定維持一致。
+- **Issue #273：修復 Monitor refresh 靜默失敗、同 Repo 多 Checkout 衝突與 Source Collision 歸零缺陷**：
+  - 缺陷一：`ProjectMonitorService._refresh_work_model` 不再靜默吞掉 `ValueError` / `OSError` 例外，加入 log 紀錄並於 store / status / snapshot 記錄 `last_refresh_error` 與連續失敗計數；`cortex work show` / `work start` 在 snapshot 停更或 refresh 失敗時直接回報真正原因。
+  - 缺陷二：`WorkModelRefresher` 掃描專案時依 git 身分去重同 repo 的多個 checkout，優先選擇 canonical checkout 避免 duplicate work item ID 錯誤，並在 status diagnostics 中明確標示碰撞目錄。
+  - 缺陷三：`correlate_work_sources` 與 `project_work_items` 發生 source collision 時，將影響限縮於相關 Work Item 並標記 `degraded` 診斷，不再導致整個 repo 的 Work Item projection 歸零。
+- **Issue #277：repo rebind 後 monitor 投影與 work authority 跟隨 `PSC_REPO_ROOT`**：
+  - monitor 設定解析遇到 deprecated legacy 設定（`PAULSHACLAW_CONFIG` 或 `paulshaclaw.yaml`）時改為 fail-loudly 拋出 `ValueError`，不再靜默降級至舊 repo 設定。
+  - monitor config 載入時自動將 `PSC_REPO_ROOT` 納入監控專案集，確保 instance 換綁 repo 後 monitor 投影能正確解析當前 repo 的 work items。
+  - `work link` / `unlink` 重寫 `.cortex/work-items.yaml` 時保留原始鍵（key）排序，避免無謂重排導致 git status 變 dirty，並於寫入後新增 readback 讀回驗證。
+- **Issue #284：persona 歷史回放測試改釘固定錨點**：原以浮動的 `main` ref 回放，merge／rebase 進行中 `prs_scanned` 可能落到 0 而讓斷言失敗（「掃不到」被誤判為「有誤殺」，實測 merge 期間出現過一次隨機紅）；且 `actions/checkout` 預設 shallow（實測 depth 1 的 clone `git log --merges -n 30` 回 0 個），CI 實際回放範圍遠少於宣稱的 30 個 PR 卻仍以「歷史回放零誤殺」通過。改釘固定 commit 錨點（`6813058`，即 #135 切換 enforce 當下的 main），使結果不隨 HEAD 移動而改變，並新增「錨點不可解析時明確 skip」的分支，避免在淺 clone 環境靜默宣稱零誤殺。偵測新 PR 誤殺仍由 CI `persona-scope` workflow 對 PR diff 負責，`replay.py` CLI 的動態回放能力不受影響。
 - **Issue #261（收口）：gate ledger 由 manager 掌控的 wrapper 產生，canonical envelope 實際生效**：
   新增 `paulsha_cortex/coordinator/gate_ledger.py`，由 `launcher.build_wrapper_script` 產生的
   headless wrapper 在模型行程結束**之後**執行——`<模型 argv>; printf %s "$?" > <sentinel>;
@@ -235,15 +228,8 @@
   失敗原因的唯讀診斷，但與授權欄位分離儲存，可觀測不等於可授權。verifier 與 reviewer 的
   StructuredOutput schema 與 prompt contract 同步放開非通過狀態，非通過狀態由 manager
   fail closed 為可操作錯誤，而不是被誤判成 schema 壞掉。
-
 - **Issue #256：planning claim 前向恢復與放行語意修正**：`recover-planning` 新增環境/內容分類判定與 CAS 重入保護，`abandon` 加入 `planning_released` 釋放標記讓 `needs_human` 的同識別 work item 可重 claim，並讓 `resume` 對 `needs_human` 回傳合法 `next_actions`（停在 `define` 的環境類 planning 失敗才含 `recover-planning`，內容類仍只給 `abandon`）與具體 `blocking_reason`，恢復稽核紀錄亦保存前後 run 狀態；`work_actions`、`control/contract`、`coordinator/cli`、`porcelain/run`、`work bridge/registry` 均同步放行與解讀新動作。
-
 - **Issue #273（實例修正）：openspec change 內 frontmatter `work_item` 不一致**：`openspec/changes/fix-systemctl-install-failure/tasks.md` 的 `work_item` 與同目錄 `proposal.md`／`design.md` 不同，使同一 openspec source 被兩個 work item 宣告擁有，觸發 confirmed source collision，導致 `hamanpaul/paulsha-cortex` 的 monitor work item projection 由 43 個降為 0、任何 work item 皆無法 claim。本次對齊 frontmatter 使 projection 恢復；靜默吞例外與 collision 影響範圍過大的根本問題見 #273。
-
-### Added
-- **批次 B planning artifacts（#261／#256／#262／#205／#135）**：為五個 issue 各新增 spec／design／plan／workstream todo 與 openspec change（`2026-07-30-<work_item>`），並登錄 `.cortex/work-items.yaml`，作為 cortex work-item lifecycle 的 confirmed authority。五組皆通過 `assess_planning_completeness`（`status: accepted`、必要章節齊備、無 blocking marker）。本 PR 只提供 planning authority，實作由後續 cortex 派工的 build phase 完成。
-
-### Fixed
 - **Issue #270：CLAUDE.md 的 changelog 要求對齊 engine R-09**：agent 指引原先三處（改 code 時、
   claim done 前）都只要求 `CHANGELOG.md [Unreleased]`，與 R-09 實際檢查的 `changelog.d/*.md`
   fragment 不一致，導致照指引交付的 PR 必然掛在 `policy / check`（#266／#267／#268／#269
@@ -253,8 +239,6 @@
   因為 CI 會傳這五個參數並啟用一批 PR／diff-aware 規則）；並移除指向不存在檔案的
   `.github/pull_request_template.md` checklist 項目。`CLAUDE.md` 為 canonical 真檔，
   `AGENTS.md`／`GEMINI.md`／`.github/copilot-instructions.md` 的 symlink 自動同步。
-
-### Fixed
 - **Issue #155：修補 install/upgrade 未遷移 Codex 全域 relay hook**：新增
   `paulsha_cortex.deploy.hooks.reconcile_codex_hooks()`，於 `cortex install
   service` 流程中 idempotent 改寫 `$HOME/.codex/hooks.json` 內
@@ -280,7 +264,6 @@
   的既有寫法仍會被正確識別為 canonical agy planning identity（向後相容）。同步
   更新套件內建 `data/model-identities.yaml` 與 `README.md` / active openspec
   spec 的範例值。
-
 - **Issue #264：workflow phase job 收工不再誤走 slice lane gate**：`paulsha_cortex/coordinator/manager.py` 的 completion sweep 新增 `_is_workflow_lane_job()`（以 job 的 `workflow_run_id` 是否存在機械判定 lane 歸屬），completion sweep 對帶 `workflow_run_id` 的 job（workflow lane 的 phase job，本就不註冊進 `slices` 表）不再查 `slices` 表、不再產出 `needs_human`/`missing-slice-proof`，改寫入新的 `gate_status="workflow-tracked"`／`gate_reason="workflow-lane-job"`（job 失敗則 `gate_status="failed"`，`gate_reason` 仍為 `workflow-lane-job`，與 slice lane 的 `missing-slice-proof` 機械區分）；`missing-slice-proof` 保留給真正屬於 slice lane、但 slice 關聯缺失的情形，新增 regression test 釘死其 fail-closed 行為未被放寬。修正前受影響的 30 份誤判 manifest（`~/.agents/coordinator/handoff/*.json`，`gate_reason=missing-slice-proof` 且 `slice_id` 為 `wf-<hash>-<phase>` 形式）皆為歷史殘留、其對應 workflow 早已交付合併，建議標記為歷史誤判並保留供稽核（下次 completion sweep 對相同 job_id 為冪等 skip、不會自動覆寫；如需清理由使用者自行對 runtime state 執行 retention 操作，不在本次程式修改範圍內）。
 - **Issue #230／#265：`recent_done` 補投影欄位並加入 recency window**：`manager_daemon.py` 的
   `recent_done_provider()`（`build_runtime_status_provider()` 內）除既有 `slice_id`／`gate_status`／
@@ -296,12 +279,7 @@
   `paulsha_cortex.monitor.config._resolve_config_source` 中加入單一 process 內 per-key
   去重機制，保留既有 legacy 警告文案與設定解析順序，避免 legacy env 與 legacy
   file fallback 在同一 process 重複輸出警告。
-
-### Fixed
 - **Issue #253：系統 Service 安裝失敗改為可結構化回報**：`cortex install service` 在 `daemon-reload`、`enable monitor service` 或 `enable manager timer` 失敗時，不再拋出 traceback；改由回傳 `mode=systemd` 的非零 result，訊息固定帶出 systemd stderr、unit directory 與重試指令，並在第一個失敗步驟即停止後續流程。
-
-### Fixed
-
 - **Issue #252：安全化 `cortex doctor` preflight 與 identity 失敗診斷**：對 `PSC_PREFLIGHT_CMD` 與 `model-identities` 失敗做 allowlist 分類，輸出可執行修復方向且不外洩敏感細節，並補齊 fresh-install 相關 preflight 契約文件。
 
 ## [0.1.1] - 2026-07-28

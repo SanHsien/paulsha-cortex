@@ -1,1 +1,0 @@
-- **Issue #253：service installer 系統性失敗採結構化回報**：`daemon-reload`/`enable` 任一步驟返回非零時，`install_service_result()` 現改回傳 `mode=systemd` 的錯誤結果，訊息只含 stderr、unit directory 與 `systemctl --user ...` 重試指令。
