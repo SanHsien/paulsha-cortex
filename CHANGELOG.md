@@ -16,6 +16,14 @@
 ### Changed
 - **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added
+- **Issue #325：job record 收斂 token usage——per-lane 成本歸屬的最小底座**：新增
+  `usage_extractors.py` 依 executor（codex／claude／copilot／agy）從 headless
+  session log 抽取 token 用量，各自處理累計值 vs 逐行累加、欄位語意易混淆
+  （如 claude 的 `cache_read_input_tokens` vs `cache_creation_input_tokens`）與
+  copilot `result.usage` 不含 token 數的誤讀陷阱；全程 fail-soft 不影響 job 的
+  status/exit_code 判定。job record 新增 `usage`／`usage_raw`／`usage_reason`／
+  `started_at`／`exited_at` 欄位，並新增 `cortex stat --usage-by-run` 依
+  workflow run 彙總用量。
 - **Issue #136：新增 `cortex capacity-gate check` porcelain 命令與 `claude.json` PreToolUse 模板**：補上「agent 手動呼叫 `Task`/`Agent` 或以 `Bash` 啟動 `codex exec`/`claude -p`/`copilot -p` headless session」這條完全繞過 manager daemon 既有 fanout idle gate 的 ad-hoc 破口。純函式 `classify_tool`/`evaluate_gate` 讀既有 `control.client.read_status()` 的 `daemon.idle` 布林，忙碌或 `degraded`（保守視為忙碌，避免讀不到狀態時靜默放行）時回傳 Claude Code PreToolUse hook 協定的 `ask` 決策；`claude.json` 新增 `PreToolUse` 區塊（`Task`／`Bash` matcher）僅為模板，寫入使用者 live `~/.claude/settings.json` 的切點屬 paulshaclaw thin install，本 repo 不自動生效。
 - **Issue #331：`cortex work migrate` 原子動詞設計（ADR-0002）**：新增
   `docs/adr/0002-work-identity-migration.md`，定義用單一 atomic override
