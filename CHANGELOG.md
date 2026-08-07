@@ -7,6 +7,22 @@
 
 ## [Unreleased]
 ### Added
+- **Issue #138：交付成本治理 judge（cost-aware dispatch + 控速分流，不擋）設計文件**：新增
+  `docs/superpowers/specs/cost-governance-judge-{spec,design}.md` 與
+  `docs/superpowers/plans/cost-governance-judge.md`。凍結 `rate` 自追資料契約
+  （`RateSnapshot`）與新模組落點 `rate_tracker.py`；凍結控速分流層 `filter_ready()` 介面
+  契約，掛點為 `autonomy.ready_units()` 與 `dispatch_ready()` 之間，並與 `#136` 已落地的
+  `capacity_gate.py`（daemon-idle 布林閘）劃清「並行兩把閘、不同稀缺資源軸」的邊界；429
+  回授裁定重用 `manager_daemon._tick_backoff_seconds()` 的指數封頂公式、不重用其
+  daemon-level 狀態；凍結 judge MVP 四因子合取判斷式（`rate_available × quota_remaining
+  × capable() × track_record()`）與四個 interim stub 契約——`#137`／`#209` 尚未
+  code-landed 期間全恆真，行為與現況等價；串接 `#137` `session_health` opaque
+  pass-through 邊界，凍結 `should_terminate()` 五類終止觸發契約。裁定 MVP 不新增
+  `resource-inventory.yaml`，遵循 `#209` 既定路徑。本票不實作任何程式碼、不開
+  `openspec/changes/**`。複驗訂正：`#137` 的設計文件實際只存在於未合併分支
+  `feature/137-oneshot-lesson-loop-design`（main 上不存在），初版誤標其為「已落地
+  設計」已訂正；另補上與已落地票 `#325`／`#324` 的介面關係查證。詳見
+  `changelog.d/cost-governance-judge-design.md`。
 - **Issue #137：交付 one-shot 成效閉環（lesson-loop + 棘輪計分）設計文件**：新增
   `docs/superpowers/specs/oneshot-lesson-loop-{spec,design}.md`。凍結 `task_type ×
   outcome` 計分 schema（計分鍵沿用 `#139` taxonomy 的 `(type, scope)` tuple、`outcome`
