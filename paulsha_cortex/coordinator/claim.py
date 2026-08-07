@@ -259,6 +259,53 @@ def _load_snapshot(snapshot_path: str | Path | None = None) -> tuple[dict, str]:
     return payload, verification.canonical_json_hash(payload)
 
 
+def mapped_issue_titles(
+    authority: WorkAuthority,
+    *,
+    snapshot_path: str | Path | None = None,
+) -> dict[int, str | None] | None:
+    try:
+        payload, canonical_hash = _load_snapshot(snapshot_path)
+    except ValueError:
+        # 呼叫端（work_bridge.start_canonical_workflow → select_combo）已把
+        # None 當成「拿不到權威 issue 標題」的既定 bypass 訊號（見下方 hash
+        # mismatch 分支）。_load_snapshot 在 durable snapshot 不存在／不可
+        # 讀／schema 損壞，或（legacy schema）provider 區塊本身無效時皆會
+        # raise ValueError（AuthorityValidationError 亦是其子類別）——這些
+        # 都是「這次就是拿不到權威資料」的同一類情境，理應與 hash mismatch
+        # 走同一條 fail-soft 路徑，而不是讓例外一路炸穿到 claim 呼叫端。
+        # 其餘呼叫者（load_work_authorities／load_work_authority）需要的是
+        # 一個可信的 WorkAuthority 本體，沒有安全的預設值可以退，所以維持
+        # 現行的 fail-hard 行為不變，只有這裡改。
+        return None
+    if canonical_hash != authority.snapshot_hash:
+        return None
+    for row in payload.get("work_items", []):
+        if (
+            isinstance(row, dict)
+            and row.get("repo") == authority.repo
+            and row.get("work_id") == authority.work_id
+        ):
+            sources = row.get("sources")
+            if not isinstance(sources, list):
+                return {}
+            titles: dict[int, str | None] = {}
+            for source in sources:
+                if not isinstance(source, dict) or source.get("kind") != "github_issue":
+                    continue
+                match = re.fullmatch(
+                    rf"{re.escape(authority.repo)}#([1-9][0-9]*)",
+                    str(source.get("ref") or ""),
+                )
+                if match is None:
+                    continue
+                number = int(match.group(1))
+                title = source.get("title")
+                titles[number] = title if isinstance(title, str) else None
+            return titles
+    return {}
+
+
 def _authority_from_row(
     *, row: object, providers: dict, snapshot_hash: str
 ) -> WorkAuthority | None:

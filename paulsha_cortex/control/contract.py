@@ -106,6 +106,20 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
         ):
             raise ValueError(f"work-action {action} requires exact expected_candidate")
+        if action == "start" and "combo" in args:
+            combo = args.get("combo")
+            if (
+                not isinstance(combo, str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]*", combo) is None
+            ):
+                raise ValueError("work-action start combo invalid")
+        if action != "start" and "combo" in args:
+            # combo override 只在 start 有意義（見 --combo 說明）；其餘 action
+            # 夾帶 combo 一律 fail-closed 拒絕，contract 是所有入口的收斂點，
+            # 防止未經驗證的 combo 被 resume 等動作間接餵進
+            # start_canonical_workflow（見 code review finding：coordinator/
+            # cli.py、porcelain/run.py、coordinator/manager.py 三處縱深防禦）。
+            raise ValueError(f"work-action {action} must not include combo")
         if action == "recover-planning":
             expected_run_id = args.get("expected_run_id")
             failure_classification = args.get("failure_classification")
