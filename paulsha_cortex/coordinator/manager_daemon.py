@@ -185,6 +185,28 @@ def _parse_iso8601(value: Any) -> datetime | None:
     return parsed
 
 
+def _status_repo(*values: object) -> str | None:
+    """Return an explicit ``owner/repo`` value, never infer one from a path."""
+    for value in values:
+        if not isinstance(value, str) or value.count("/") != 1:
+            continue
+        owner, repo = value.split("/", 1)
+        if owner and repo:
+            return value
+    return None
+
+
+def _repo_from_manifest(payload: dict[str, Any]) -> str | None:
+    """Project attribution from persisted status data, with legacy fallbacks."""
+    authority = payload.get("work_authority")
+    authority_repo = authority.get("repo") if isinstance(authority, dict) else None
+    return _status_repo(
+        payload.get("repo"),
+        payload.get("workflow_repo"),
+        authority_repo,
+    )
+
+
 def _tick_backoff_seconds(base_interval: float, consecutive_failures: int) -> float:
     """Exponential backoff interval for the next periodic-tick retry.
 
@@ -355,6 +377,7 @@ def build_runtime_status_provider(
                         "gate_reason": payload.get("gate_reason"),
                         "job_id": payload.get("job_id"),
                         "branch": payload.get("branch"),
+                        "repo": _repo_from_manifest(payload),
                     },
                 )
             )

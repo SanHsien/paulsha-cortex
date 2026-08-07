@@ -515,22 +515,39 @@ def _resolve_ancestry_status(slice_row: dict, *, git_runner) -> dict[str, Any]:
     return summary
 
 
+def _status_repo(*values: object) -> str | None:
+    """Return an explicit ``owner/repo`` value, never infer one from a path."""
+    for value in values:
+        if not isinstance(value, str) or value.count("/") != 1:
+            continue
+        owner, repo = value.split("/", 1)
+        if owner and repo:
+            return value
+    return None
+
+
 def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runner=None) -> dict[str, Any]:
     slice_id = str(slice_row.get("slice_id") or "")
     builder_job_id = slice_row.get("builder_job_id")
     reviewer_job_id = slice_row.get("reviewer_job_id")
+    builder_job: dict[str, Any] | None = None
+    reviewer_job: dict[str, Any] | None = None
     builder_job_state: str | None = None
     reviewer_job_state: str | None = None
     if hasattr(registry, "get_job"):
         try:
             if isinstance(builder_job_id, str):
-                builder_job_state = str(registry.get_job(builder_job_id).get("status"))
+                builder_job = registry.get_job(builder_job_id)
+                builder_job_state = str(builder_job.get("status"))
         except Exception:
+            builder_job = None
             builder_job_state = None
         try:
             if isinstance(reviewer_job_id, str):
-                reviewer_job_state = str(registry.get_job(reviewer_job_id).get("status"))
+                reviewer_job = registry.get_job(reviewer_job_id)
+                reviewer_job_state = str(reviewer_job.get("status"))
         except Exception:
+            reviewer_job = None
             reviewer_job_state = None
     reason = None
     manifest = _read_manifest_payload(Path(handoff_dir) / f"{slice_id}.json")
@@ -546,6 +563,14 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
                 latest_action = latest.get("action")
                 if isinstance(latest_action, str) and latest_action:
                     reason = latest_action
+    authority = manifest.get("work_authority") if isinstance(manifest, dict) else None
+    authority_repo = authority.get("repo") if isinstance(authority, dict) else None
+    repo = _status_repo(
+        slice_row.get("repo"),
+        authority_repo,
+        reviewer_job.get("workflow_repo") if reviewer_job else None,
+        builder_job.get("workflow_repo") if builder_job else None,
+    )
     return {
         "slice_id": slice_id,
         "slice_state": slice_row.get("state"),
@@ -556,6 +581,7 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
         "reviewer_job_id": reviewer_job_id,
         "reviewer_job_state": reviewer_job_state,
         "reason": reason,
+        "repo": repo,
         "candidate": slice_row.get("candidate"),
         "target_remote": slice_row.get("target_remote"),
         "target_branch": slice_row.get("target_branch"),
