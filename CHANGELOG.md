@@ -18,6 +18,14 @@
 
 ### Fixed
 - **Issue #139：`task_type` taxonomy 契約補齊測試覆蓋並確認驗收面**：`paulsha_cortex/deck/data/task-types.yaml`（雙鎖值域＋scope 受控詞典）與 `paulsha_cortex/deck/task_types.py`（fail-closed loader、`classify_title` 五類判定）已隨 #202 提前落地，本票確認其符合 spec 的 R1–R6，並補齊 `tests/test_deck_task_types.py` 缺口測試（值域漂移拒載、空描述拒載、未知 combo 引用拒載、五類處置映射全稱驗證）；R7（統一 log reader／status view 介面契約）維持只定契約不實作。
+- **Issue #296：builder tick tasks.md 與 reviewer authority-proving 凍結
+  baseline 矛盾——確認已由 #310 修復，補 production-fidelity 迴歸測試**：
+  #296 與 #310 為同一起 2026-08-04 hippo 事故的獨立提報；#310 的修法（PR
+  #311／#312）已在 #296 提報後數小時落地，但 #296 未被關閉核實。新增
+  `tests/test_builder_tasks_tick_verify_dispatch.py` 以真實 git repo 重現
+  `_dispatch_workflow_card` reviewer 分支（verify／review 共用），涵蓋
+  checkbox-only 通過、tasks.md 文字改動仍擋、proposal.md 等 spec 檔改動仍擋
+  三種情境；無需再改動 production code。
 - **CI 測試閘門形同虛設（tests.yml 偵測誤判）**：`ls tests/test_*.py tests/*_test.py` 只要任一 glob 沒配到就回傳非零，本 repo 因此恆判為「無測試套件」而跳過整段 pytest 卻回報 success；改用 `find -print -quit`。
 - **Issue #263：ship validator 重排為本地 closeout 先於 PR metadata preflight**：archive commit 不再內嵌 push；pre-PR metadata preflight 失敗改回可 resume 的 `pr-preflight-blocked` typed stop、通過後照舊自動建立 PR；slice-based review worktree 補上 frozen authority materialize 與 hash 驗證。
 - **Issue #263 補遺（PR #336 code review）**：review worktree authority materialize 的路徑檢查改為先驗證後動作（拒絕 `..`／絕對路徑 ref 於任何 mkdir 之前）；`work_bridge._manager_archive_applied()` 改委派 `manager` 版避免與 `any(...)` 舊語意漂移；`_slice_review_authority_inputs()` 相對 plan/spec path 改以 repo_root 解析，對齊 `_pinned_input_mismatches()` 既有語意。
