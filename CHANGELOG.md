@@ -16,6 +16,7 @@
 ### Changed
 - **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added
+- **Issue #203：`cortex work intake` 把 link+start 合成單一「拿到一個 issue/task 就進件」入口，不復活低階直派**：新增 `work-action` 動作 `intake`——帶 `--issue`／`--kind`+`--ref` 且尚未反映在受監控快照時先建立 override link（等價 `cortex work link`），再原樣轉交既有 `start` 語意（`claim_key` 去重、`--combo` override 皆比照 `start`）；省略時直接沿用 work_id 現有的 confirmed authority。Intake 不會憑空建立新 authority——work_id 必須已在受監控權威快照中存在，且最終仍要求 confirmed Todo 或已授權的 issue/openspec/path 來源，否則 fail-closed，不建立 WorkflowRun。`contract.py`／`work_actions.py`／`manager.py`／`manager_daemon.py`／`cli.py`／`porcelain/run.py` 六處同步放行 `intake`；已停用的低階 `dispatch` 與既有 Telegram `/dispatch <slice_id>` 維持原樣，不在本次範圍內改動。詳見 `changelog.d/task-intake-work-authority.md`。
 - **Issue #325：job record 收斂 token usage——per-lane 成本歸屬的最小底座**：新增
   `usage_extractors.py` 依 executor（codex／claude／copilot／agy）從 headless
   session log 抽取 token 用量，各自處理累計值 vs 逐行累加、欄位語意易混淆

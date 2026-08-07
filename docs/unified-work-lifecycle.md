@@ -52,6 +52,7 @@ cortex list --repo owner/repo --state todo --explain
 cortex work show unified-work-lifecycle --repo owner/repo --json
 cortex work link unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
 cortex work unlink unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
+cortex work intake unified-work-lifecycle --repo owner/repo --issue 14
 cortex work start unified-work-lifecycle --repo owner/repo
 cortex work start unified-work-lifecycle --repo owner/repo --combo fix-standard
 cortex work resume unified-work-lifecycle --repo owner/repo
@@ -74,6 +75,22 @@ cortex doctor --probe-live --repo owner/repo --json
 
 `cortex stat --combo-selections` 會彙總 `source × task_type`，直接看出多少 run 是自動選牌、多少走 override、多少因 title 缺席／unparseable／combo 缺口而 bypass。`fix-standard` 雖然比 comment 草稿多了 `openspec-propose` 與 `writing-plans` 兩張 planner 卡，但這是為了滿足 `validate_manager_spine` 的完整 phase spine；verification 與 code-review 兩條核心 gate 維持不變。
 
+### Intake（`link` + `start` 合成，#203）
+
+`cortex work intake <work_id> --repo <owner/repo>` 是「拿到一個 issue/task 就進件」的單一入口，取代已停用的低階 `dispatch`。它等價於「（必要時）`link` 後接 `start`」，但收斂成一次呼叫：
+
+- 帶 `--issue N`（或 `--kind/--ref`）時，若該來源尚未反映在受監控快照的 `mapped_issues`／`mapped_openspec`／`mapped_todo_paths`，會先寫一筆 override link（與 `cortex work link` 相同語法、相同 fail-closed 驗證），再重新載入 authority。
+- 省略 `--issue`／`--kind`／`--ref` 時，直接沿用 work_id 現有的 confirmed authority（等價於單獨呼叫 `start`）——這是「work_id 已有 confirmed Todo 或已 link issue」時的常見用法。
+- 兩種路徑最終都轉交既有 `start` 語意（`claim_key` 去重、`--combo` override 皆比照 `start`），不繞過 `default_workflow_manifest`／`validate_manager_spine`。
+- **Intake 不會憑空建立新 authority**：`.cortex/work-items.yaml` 這份 override 檔與受監控的 `work-items.snapshot.json` 是兩份分開維護的狀態，override 寫入後仍要等下一輪 Monitor correlation 才會併入快照。因此若 work_id 既無 confirmed Todo、也未曾 link 過 issue，且本次呼叫也沒有帶 `--issue`／`--kind`/`--ref`，intake 會 fail-closed 拒絕，不建立 WorkflowRun；純文字任務仍需要先有明文授權來源（confirmed Todo 或 linked issue）才能進件。
+
+```bash
+cortex work intake unified-work-lifecycle --repo owner/repo --issue 14
+cortex work intake unified-work-lifecycle --repo owner/repo
+cortex work intake unified-work-lifecycle --repo owner/repo --issue 14 --combo fix-standard
+```
+
+Telegram 等 bot 宿主若要提供「貼一段文字/issue 就進件」的入口，應呼叫 `submit_work_action(action="intake", ...)`（`paulsha_cortex/control/client.py`）；既有的 `/dispatch <slice_id>` 走既存 slice_id 派工，維持原樣不變，不在本次範圍內改動。
 ### Work identity migration（設計中，見 ADR-0002）
 
 `link`／`unlink` 目前一次只能對單一 `(work_id, source)` pair 生效，重識別
