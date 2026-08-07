@@ -5,9 +5,14 @@ import pytest
 from paulsha_cortex.config import paths
 
 
-def test_defaults_under_agents(monkeypatch):
+def test_defaults_under_agents(monkeypatch, tmp_path):
     for var in ("PSC_AGENTS_ROOT", "PSC_CONTROL_ROOT", "PSC_COORDINATOR_ROOT", "PSC_SPECS_ROOT"):
         monkeypatch.delenv(var, raising=False)
+    # #303：本測試驗證「無 PSC_* 時預設落在 <home>/.agents」，會走 fallback
+    # 讀 <home>/.agents/core/runtime/cortex-manager.env；不隔離 HOME 就會讀到
+    # operator 的真實 bootstrap 檔。改用假 HOME，驗證意圖（相對於 home 的預設
+    # 路徑組成）完全不變。
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     home = Path.home()
     assert paths.control_root() == home / ".agents" / "control"
     assert paths.coordinator_root() == home / ".agents" / "coordinator"
@@ -35,6 +40,12 @@ def test_worktree_root_is_repo_sibling(monkeypatch, tmp_path):
 def test_run_root_default_and_env(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
     monkeypatch.delenv("PSC_INSTANCE", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    # #303：本測試驗證「無 PSC_* 時預設落在 <home>/.agents」，會走 fallback
+    # 讀 <home>/.agents/core/runtime/cortex-manager.env；不隔離 HOME 就會讀到
+    # operator 的真實 bootstrap 檔。改用假 HOME，驗證意圖（相對於 home 的預設
+    # 路徑組成）完全不變。
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     assert paths.run_root() == Path.home() / ".agents" / "run" / "cortex"
     monkeypatch.setenv("PSC_RUN_ROOT", str(tmp_path / "run"))
     assert paths.run_root() == tmp_path / "run"
@@ -51,6 +62,7 @@ def test_run_root_discovers_selected_installed_instance(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.setenv("PSC_INSTANCE", "beta")
 
     assert paths.run_root() == tmp_path / "custom-run"
@@ -63,6 +75,7 @@ def test_run_root_rejects_malformed_installed_environment(monkeypatch, tmp_path)
     (runtime / "cortex-manager.env").write_text("PSC_RUN_ROOT=relative/run\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.delenv("PSC_INSTANCE", raising=False)
 
     with pytest.raises(ValueError, match="絕對路徑"):
@@ -80,6 +93,7 @@ def test_run_root_accepts_quoted_values_in_selected_installed_instance(monkeypat
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.setenv("PSC_INSTANCE", "beta")
 
     assert paths.run_root() == tmp_path / "custom-run"
@@ -92,6 +106,12 @@ def test_config_path_default(monkeypatch):
 
 def test_project_config_root(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_PROJECT_CONFIG_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    # #303：本測試驗證「無 PSC_* 時預設落在 <home>/.agents」，會走 fallback
+    # 讀 <home>/.agents/core/runtime/cortex-manager.env；不隔離 HOME 就會讀到
+    # operator 的真實 bootstrap 檔。改用假 HOME，驗證意圖（相對於 home 的預設
+    # 路徑組成）完全不變。
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     assert paths.project_config_root() == Path.home() / ".agents" / "config" / "paulsha"
     monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "pc"))
     assert paths.project_config_root() == tmp_path / "pc"
