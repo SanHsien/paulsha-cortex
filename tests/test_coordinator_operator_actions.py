@@ -101,6 +101,7 @@ def _create_slice_in_needs_human(
     repo_root: Path,
     slice_id: str,
     builder_status: str = "failed",
+    workflow_repo: str | None = None,
 ) -> dict:
     spec_path, plan_path = _write_spec(repo_root, slice_id)
     builder_job = registry.create_job(
@@ -114,6 +115,7 @@ def _create_slice_in_needs_human(
         session_name=f"builder-{slice_id}",
         pid=1111,
         log_path=str(repo_root / "logs" / f"{slice_id}.jsonl"),
+        workflow_repo=workflow_repo,
     )
     if builder_status in {"exited", "failed"}:
         registry.update_headless_result(
@@ -272,6 +274,7 @@ def test_runtime_status_provider_includes_attention_next_actions(tmp_path):
         repo_root=repo_root,
         slice_id="slice-a",
         builder_status="exited",
+        workflow_repo="hamanpaul/paulsha-cortex",
     )
 
     evidence = verification.write_verification_evidence(
@@ -314,4 +317,5 @@ def test_runtime_status_provider_includes_attention_next_actions(tmp_path):
     assert attention["slice_id"] == "slice-a"
     assert attention["slice_state"] == "needs_human"
     assert attention["reason"] == "foreign-review-absent"
+    assert attention["repo"] == "hamanpaul/paulsha-cortex"
     assert set(attention["next_actions"]) == {"retry-build", "retry-verify", "retry-review", "abandon"}

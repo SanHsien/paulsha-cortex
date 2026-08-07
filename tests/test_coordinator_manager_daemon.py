@@ -1138,6 +1138,7 @@ def test_recent_done_provider_projects_gate_reason_job_id_branch(monkeypatch, tm
                 "gate_reason": "missing-slice-proof",
                 "job_id": "wf-abc-code-review-1",
                 "branch": "feature/xyz",
+                "work_authority": {"repo": "hamanpaul/paulsha-cortex"},
             }
         ),
         encoding="utf-8",
@@ -1166,9 +1167,11 @@ def test_recent_done_provider_projects_gate_reason_job_id_branch(monkeypatch, tm
     assert entries["slice-full"]["gate_reason"] == "missing-slice-proof"
     assert entries["slice-full"]["job_id"] == "wf-abc-code-review-1"
     assert entries["slice-full"]["branch"] == "feature/xyz"
+    assert entries["slice-full"]["repo"] == "hamanpaul/paulsha-cortex"
     assert entries["slice-sparse"]["gate_reason"] is None
     assert entries["slice-sparse"]["job_id"] is None
     assert entries["slice-sparse"]["branch"] is None
+    assert entries["slice-sparse"]["repo"] is None
 
 
 def test_recent_done_provider_applies_recency_window(monkeypatch, tmp_path):
