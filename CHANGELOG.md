@@ -16,6 +16,7 @@
 ### Changed
 - **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added
+- **Issue #136：新增 `cortex capacity-gate check` porcelain 命令與 `claude.json` PreToolUse 模板**：補上「agent 手動呼叫 `Task`/`Agent` 或以 `Bash` 啟動 `codex exec`/`claude -p`/`copilot -p` headless session」這條完全繞過 manager daemon 既有 fanout idle gate 的 ad-hoc 破口。純函式 `classify_tool`/`evaluate_gate` 讀既有 `control.client.read_status()` 的 `daemon.idle` 布林，忙碌或 `degraded`（保守視為忙碌，避免讀不到狀態時靜默放行）時回傳 Claude Code PreToolUse hook 協定的 `ask` 決策；`claude.json` 新增 `PreToolUse` 區塊（`Task`／`Bash` matcher）僅為模板，寫入使用者 live `~/.claude/settings.json` 的切點屬 paulshaclaw thin install，本 repo 不自動生效。
 - **Issue #331：`cortex work migrate` 原子動詞設計（ADR-0002）**：新增
   `docs/adr/0002-work-identity-migration.md`，定義用單一 atomic override
   transaction＋寫入前凍結 authority 的 abandon CAS，把識別遷移（如 `-v2`
