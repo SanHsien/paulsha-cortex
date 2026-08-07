@@ -1,1 +1,0 @@
-- **Issue #277：pre-candidate 失敗恢復與 stale candidate 重評**：新增 `recover-pre-candidate` work/slice action 以處置 candidate 為 null 時的 builder 失敗並回收殘留 worktree；修復 completion 對 `candidate-worktree-dirty` 的快照競態，改為在 tick 時以當前 branch HEAD 動態重評。
