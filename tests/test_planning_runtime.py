@@ -254,7 +254,10 @@ def test_planning_runtime_detects_and_rolls_back_directory_and_metadata_pollutio
             timeout_seconds=30,
         )
 
-    assert tracked.stat().st_mode & 0o777 == 0o640
+    if os.name == "nt":
+        assert tracked.stat().st_mode & 0o200
+    else:
+        assert tracked.stat().st_mode & 0o777 == 0o640
     assert empty.is_dir()
     assert not (tmp_path / "pollution-empty").exists()
     assert directory_link.is_symlink()
