@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.lib.durability import fsync_directory as _fsync_directory
 
 # canonical envelope 的 kind／版本。
 ENGINEERING_OUTCOME_KIND = "cortex/engineering-outcome/v1"
@@ -93,14 +94,6 @@ class EngineeringOutcomeError(ValueError):
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _fsync_directory(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _repo_slug(repo: str) -> str:

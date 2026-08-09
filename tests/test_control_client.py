@@ -16,14 +16,14 @@ def test_submit_request_writes_atomically(monkeypatch, tmp_path):
 
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
 
-    real_rename = contract.os.rename
-    rename_calls: list[tuple[str, str, bool, bool]] = []
+    real_replace = contract.os.replace
+    replace_calls: list[tuple[str, str, bool, bool]] = []
 
-    def spy_rename(src, dst):
-        rename_calls.append((str(src), str(dst), constants.requests_dir().glob("*.tmp") is not None, Path(src).exists(), Path(dst).exists()))
-        return real_rename(src, dst)
+    def spy_replace(src, dst):
+        replace_calls.append((str(src), str(dst), constants.requests_dir().glob("*.tmp") is not None, Path(src).exists(), Path(dst).exists()))
+        return real_replace(src, dst)
 
-    monkeypatch.setattr(contract.os, "rename", spy_rename)
+    monkeypatch.setattr(contract.os, "replace", spy_replace)
 
     req_id = client.submit_request("tick", {"executor": "copilot"}, "cockpit")
 
@@ -34,9 +34,9 @@ def test_submit_request_writes_atomically(monkeypatch, tmp_path):
     assert written["req_id"] == req_id
     assert written["type"] == "tick"
     assert written["requested_by"] == "cockpit"
-    assert rename_calls
-    assert rename_calls[0][3] is True
-    assert rename_calls[0][4] is False
+    assert replace_calls
+    assert replace_calls[0][3] is True
+    assert replace_calls[0][4] is False
     assert list(constants.requests_dir().glob("*.tmp")) == []
 
 
@@ -233,7 +233,7 @@ def test_read_status_degrades_immediately_when_daemon_pid_is_dead(monkeypatch, t
         ),
     )
 
-    monkeypatch.setattr(client.os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr(client, "pid_exists", lambda pid: False)
 
     dead = client.read_status()
 
@@ -309,7 +309,7 @@ def test_read_status_preserves_held_on_degraded_snapshots(monkeypatch, tmp_path)
         },
     )
 
-    monkeypatch.setattr(client.os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr(client, "pid_exists", lambda pid: False)
     stale = client.read_status()
     assert stale["degraded"] is True
     assert stale["held"] == held
@@ -455,10 +455,7 @@ def test_read_status_dead_pid_and_stale_is_degraded(monkeypatch, tmp_path):
     from paulsha_cortex.control import client
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
 
-    def _dead(pid, sig):
-        raise ProcessLookupError()
-
-    monkeypatch.setattr(client.os, "kill", _dead)
+    monkeypatch.setattr(client, "pid_exists", lambda pid: False)
     _write_status_file(tmp_path, pid=424242, age_seconds=60)
     status = client.read_status()
     assert status["degraded"] is True

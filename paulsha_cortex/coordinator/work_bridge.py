@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.compile import compile_combo
+from paulsha_cortex.lib.durability import fsync_directory
 from paulsha_cortex.deck.selector import ComboSelection, ComboSelectionError, select_combo
 from paulsha_cortex.deck.schema import (
     DEFAULT_CARDS_PATH,
@@ -505,11 +506,7 @@ def _write_json_evidence(root: Path, category: str, payload: dict) -> dict[str, 
                 os.fsync(handle.fileno())
             os.replace(temporary, target)
             target.chmod(0o400)
-            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(directory)
         finally:
             temporary.unlink(missing_ok=True)
     return {"ref": str(target), "hash": digest}
@@ -1221,11 +1218,7 @@ def _remove_canonical_untracked_reports(
         _write_json_evidence(state_root, "report-cleanup", cleanup_payload)
     for path in removals:
         path.unlink()
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(path.parent)
 
 
 def _run_exact_candidate_preflight(

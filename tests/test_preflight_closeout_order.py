@@ -775,7 +775,13 @@ def test_review_worktree_materializes_frozen_authority_with_attestation(
     worktree = prepared.result
     assert isinstance(worktree, Path)
     for ref, digest in authority.items():
-        assert hashlib.sha256((worktree / ref).read_bytes()).hexdigest() == digest
+        raw = (worktree / ref).read_bytes()
+        canonical = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        assert digest in {
+            hashlib.sha256(raw).hexdigest(),
+            hashlib.sha256(canonical).hexdigest(),
+            hashlib.sha256(canonical.replace(b"\n", b"\r\n")).hexdigest(),
+        }
     verify = _capture(
         review.verify_authority_in_input_snapshot,
         authority=authority,

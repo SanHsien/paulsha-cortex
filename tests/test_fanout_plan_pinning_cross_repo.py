@@ -141,5 +141,7 @@ def test_ready_and_fanout_missing_plan_consistency(tmp_path: Path, monkeypatch: 
     with pytest.raises(ValueError) as excinfo:
         autonomy.pin_dispatch_inputs(meta)
     # 報錯訊息必須顯示 repo_a 的正確路徑，而非 repo_b 錯的路徑
-    expected_path = (repo_a / "docs" / "superpowers" / "plans" / "non-existent.md").resolve().as_posix()
+    expected_path = str(
+        (repo_a / "docs" / "superpowers" / "plans" / "non-existent.md").resolve()
+    )
     assert expected_path in str(excinfo.value)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -49,6 +50,10 @@ def _write_stub(path: Path, name: str, body: str) -> Path:
 def _write_symlink_tool(bin_dir: Path, name: str, target_name: str) -> Path:
     target = shutil.which(target_name)
     assert target is not None
+    if os.name == "nt":
+        wrapper = bin_dir / f"{name}.cmd"
+        wrapper.write_text(f'@echo off\n"{target}" %*\n', encoding="utf-8")
+        return wrapper
     link = bin_dir / name
     link.symlink_to(target)
     return link
@@ -61,6 +66,47 @@ def _write_executor_stub(
     auth_status_rc: int,
     argv_log: Path | None = None,
 ) -> Path:
+    if os.name == "nt":
+        script = bin_dir / f"{name}.cmd"
+        log_line = f'echo %*>>"{argv_log}"' if argv_log is not None else ""
+        lines = ["@echo off"]
+        if name == "copilot":
+            lines.extend(
+                [
+                    'if "%~1"=="-p" (',
+                    f"  {log_line}" if log_line else "  rem no argv log",
+                    (
+                        "  exit /b 0"
+                        if auth_status_rc == 0
+                        else f"  echo please run copilot login 1>&2\n  exit /b {auth_status_rc}"
+                    ),
+                    ")",
+                ]
+            )
+        elif name == "claude":
+            lines.extend(
+                [
+                    'if "%~1"=="auth" if "%~2"=="status" exit /b '
+                    f"{auth_status_rc}",
+                ]
+            )
+        elif name == "codex":
+            lines.extend(
+                [
+                    'if "%~1"=="doctor" if "%~2"=="--json" (',
+                    (
+                        '  echo {"checks":{"auth.credentials":{"status":"ok"}}}'
+                        if auth_status_rc == 0
+                        else '  echo {"checks":{"auth.credentials":{"status":"fail"}}}'
+                    ),
+                    f"  exit /b {auth_status_rc}",
+                    ")",
+                ]
+            )
+        lines.append("exit /b 0")
+        script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return script
+
     log_line = ""
     if argv_log is not None:
         log_line = f'printf "%s\\n" "$*" >> "{argv_log}"'
@@ -110,7 +156,8 @@ def _configure_preflight_tools(
     runtime_executor: str | None = None,
     argv_log: Path | None = None,
 ) -> None:
-    _write_symlink_tool(bootstrap_runtime["bin_dir"], "bash", "bash")
+    if os.name != "nt":
+        _write_symlink_tool(bootstrap_runtime["bin_dir"], "bash", "bash")
     if include_git:
         _write_symlink_tool(bootstrap_runtime["bin_dir"], "git", "git")
     _write_executor_stub(
@@ -247,6 +294,19 @@ def test_bootstrap_preflight_reports_executor_login_fix(
     combined = (captured.out + captured.err).lower()
     assert login_hint in combined
     assert "executor" in combined
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows batch wrapper semantics")
+def test_bootstrap_batch_wrapper_rejects_cmd_metacharacters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap = importlib.import_module("paulsha_cortex.porcelain.bootstrap")
+    wrapper = tmp_path / "unsafe.cmd"
+    wrapper.write_text("@exit /b 0\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(ValueError, match="unsafe metacharacters"):
+        bootstrap._run(["unsafe", "safe&whoami"])
 
 
 def test_bootstrap_preflight_reports_actionable_repo_fix(

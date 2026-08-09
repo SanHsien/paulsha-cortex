@@ -64,7 +64,14 @@ def _unit_exec_path(unit_path: Path) -> str | None:
             continue
         value = line.split("=", 1)[1].lstrip("-@:+!")
         try:
-            argv = shlex.split(value)
+            argv = shlex.split(value, posix=os.name != "nt")
+            if os.name == "nt":
+                argv = [
+                    item[1:-1]
+                    if len(item) >= 2 and item[0] == item[-1] and item[0] in {"'", '"'}
+                    else item
+                    for item in argv
+                ]
         except ValueError:
             return None
         if not argv:

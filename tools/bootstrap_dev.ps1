@@ -1,29 +1,51 @@
 [CmdletBinding()]
-param(
-    [string]$Distribution = ""
-)
+param()
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-    throw "找不到 WSL。Cortex 的權威開發與測試環境需要 WSL2/Linux。"
-}
-
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$wslPrefix = @()
-if ($Distribution) {
-    $wslPrefix = @("-d", $Distribution)
+$venvRoot = Join-Path $repoRoot ".venv"
+
+$candidates = @()
+if (Get-Command py.exe -ErrorAction SilentlyContinue) {
+    $launcher = (Get-Command py.exe).Source
+    $candidates += ,@($launcher, "-3.13")
+    $candidates += ,@($launcher, "-3")
+}
+if (Get-Command python.exe -ErrorAction SilentlyContinue) {
+    $candidates += ,@((Get-Command python.exe).Source)
 }
 
-$wslRepoOutput = & wsl.exe @wslPrefix --cd $repoRoot -- pwd
-$wslExitCode = $LASTEXITCODE
-if ($wslExitCode -ne 0 -or -not $wslRepoOutput) {
-    throw "無法將 repo 路徑轉換為 WSL 路徑。"
+$pythonCommand = $null
+$pythonArgs = @()
+foreach ($candidate in $candidates) {
+    $candidateCommand = $candidate[0]
+    $candidateArgs = @($candidate | Select-Object -Skip 1)
+    & $candidateCommand @candidateArgs -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $pythonCommand = $candidateCommand
+        $pythonArgs = $candidateArgs
+        break
+    }
 }
-$wslRepoRoot = ($wslRepoOutput | Out-String).Trim()
+if (-not $pythonCommand) {
+    throw "找不到 Python 3.10+（建議 3.13）。"
+}
 
-& wsl.exe @wslPrefix -- bash "$wslRepoRoot/tools/bootstrap_dev.sh"
+if (-not (Test-Path (Join-Path $venvRoot "Scripts\python.exe"))) {
+    & $pythonCommand @pythonArgs -m venv $venvRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "建立 .venv 失敗。"
+    }
+}
+
+$venvPython = Join-Path $venvRoot "Scripts\python.exe"
+& $venvPython -m pip install --upgrade pip
+& $venvPython -m pip install -e "${repoRoot}[dev]"
 if ($LASTEXITCODE -ne 0) {
-    throw "WSL 開發環境建立失敗，exit code: $LASTEXITCODE"
+    throw "安裝開發依賴失敗。"
 }
+
+Write-Host "Windows 開發環境已就緒：$venvRoot"
+Write-Host "驗證：pwsh -File tools/dev_check.ps1"

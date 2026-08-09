@@ -188,7 +188,14 @@ def load_preflight_command(
     if not raw:
         raise ValueError("PSC_PREFLIGHT_CMD is required")
     try:
-        command = tuple(shlex.split(raw))
+        command = tuple(shlex.split(raw, posix=os.name != "nt"))
+        if os.name == "nt":
+            command = tuple(
+                item[1:-1]
+                if len(item) >= 2 and item[0] == item[-1] and item[0] in {"'", '"'}
+                else item
+                for item in command
+            )
     except ValueError as exc:
         raise ValueError("PSC_PREFLIGHT_CMD is malformed") from exc
     if not command:

@@ -12,6 +12,7 @@ from paulsha_cortex.monitor.server import MonitorServer
 from paulsha_cortex.monitor.server import _Subscriber
 from paulsha_cortex.monitor.models import ProjectState
 from paulsha_cortex.monitor.snapshot import ChangeEvent, SnapshotStore
+from paulsha_cortex.monitor.transport import connect_monitor_socket
 from paulsha_cortex.monitor.work_api import (
     WorkChangeEvent,
     WorkModelRefresher,
@@ -210,30 +211,25 @@ def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
     thread.start()
     assert server.wait_until_ready(timeout=2.0)
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(socket_path))
+        with connect_monitor_socket(socket_path) as client:
             _send(client, {"kind": "list_projects"})
             assert _recv(client)["data"]["projects"] == []
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(socket_path))
+        with connect_monitor_socket(socket_path) as client:
             _send(client, {"kind": "list_work_items"})
             payload = _recv(client)
             assert payload["ok"]
             assert payload["data"]["items"][0]["work_id"] == "active"
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(socket_path))
+        with connect_monitor_socket(socket_path) as client:
             _send(client, {"kind": "get_work_item", "work_id": "active"})
             assert _recv(client)["data"]["item"]["state"] == "on-going"
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(socket_path))
+        with connect_monitor_socket(socket_path) as client:
             _send(client, {"kind": "explain_work_item", "work_id": "active"})
             assert _recv(client)["data"]["explanation"]["work_id"] == "active"
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(socket_path))
+        with connect_monitor_socket(socket_path) as client:
             _send(client, {"kind": "subscribe_work_items", "work_ids": ["active"]})
             initial = _recv(client)
             assert initial["kind"] == "work_snapshot"
@@ -290,8 +286,7 @@ def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
     thread.start()
     assert server.wait_until_ready(timeout=2.0)
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(socket_path))
+        with connect_monitor_socket(socket_path) as client:
             _send(
                 client,
                 {
@@ -381,8 +376,8 @@ def test_old_server_teardown_does_not_unlink_replacement_socket(tmp_path):
             old_thread.join(timeout=2.0)
 
         assert socket_path.exists()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(socket_path))
+        with connect_monitor_socket(socket_path) as client:
+            assert client.fileno() >= 0
     finally:
         release_teardown.set()
         replacement_server.stop()

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import inspect
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.lib import file_lock
 from ..control import constants, contract
 from . import autonomy, manager, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
@@ -24,6 +26,7 @@ from .model_identities import load_model_identities
 from .registry import JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
 from .work_actions import safe_exception_summary
+from paulsha_cortex.lib.path_safety import redact_absolute_paths
 
 DEFAULT_TICK_INTERVAL = 300.0
 DEFAULT_POLL_INTERVAL = 3.0
@@ -64,7 +67,7 @@ class HeldLock:
     def release(self) -> None:
         if self.fd >= 0:
             try:
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                file_lock.unlock(self.fd)
             except OSError:
                 pass
             try:
@@ -72,7 +75,6 @@ class HeldLock:
             except OSError:
                 pass
             self.fd = -1
-        self.path.unlink(missing_ok=True)
 
 
 def acquire_lock(
@@ -82,12 +84,13 @@ def acquire_lock(
     pid_alive: Callable[[int], bool] | None = None,
     now_fn: Callable[[], str] = contract.utcnow,
 ) -> HeldLock | None:
-    """Acquire the single-instance lock via ``flock``.
+    """Acquire a kernel-released single-instance lock.
 
-    ``flock`` is held for the daemon's lifetime and released by the kernel on
+    The lock is held for the daemon's lifetime and released by the kernel on
     process death, so a stale lock file left by a crashed daemon is reclaimable
-    with no manual liveness check or unlink — eliminating the check-then-unlink
-    race a second contender could otherwise use to steal a live lock. ``pid``
+    with no manual liveness check or unlink. Keeping the pathname after release
+    also prevents an unlock-then-unlink race from splitting contenders across
+    two different inodes. ``pid``
     identifies the owner recorded in the file (for start.sh adoption); the
     ``pid_alive`` parameter is retained for API compatibility and is unused.
     """
@@ -100,24 +103,17 @@ def acquire_lock(
         "acquired_at": now_fn(),
     }
 
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    guard_path = lock_path.with_name(f".{lock_path.name}.guard")
+    fd = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o600)
+    if not file_lock.try_lock(fd):
         # Another live daemon holds the exclusive lock.
         os.close(fd)
         return None
     try:
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(
-            fd,
-            (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
-        )
-        os.fsync(fd)
+        contract.atomic_write_json(lock_path, payload)
     except OSError:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            file_lock.unlock(fd)
         except OSError:
             pass
         os.close(fd)
@@ -230,7 +226,7 @@ def _safe_tick_error_summary(exc: Exception) -> dict[str, str]:
     with a placeholder and the reason is capped to a bounded length.
     """
     reason = " ".join(str(exc).split())
-    reason = _MULTI_SEGMENT_PATH_PATTERN.sub("<path>", reason)
+    reason = redact_absolute_paths(reason)
     if len(reason) > TICK_ERROR_REASON_MAX_LENGTH:
         reason = reason[:TICK_ERROR_REASON_MAX_LENGTH].rstrip() + "…"
     return {"type": type(exc).__name__, "reason": reason}
@@ -1301,11 +1297,31 @@ def _lock_is_live(path: Path, pid_alive: Callable[[int], bool]) -> bool:
 
 
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            return False
+        command = (
+            "$ErrorActionPreference='Stop'; "
+            f"$process=Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
+            "if ($null -ne $process) { [Console]::Out.Write($process.CommandLine) }"
+        )
+        try:
+            result = subprocess.run(
+                [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0 and MANAGER_CMD_MARKER in result.stdout
+
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+    except (ProcessLookupError, PermissionError):
         return False
     try:
         raw_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")

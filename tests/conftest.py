@@ -3,8 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import shutil
+import tempfile
 
 import pytest
+
+
+if os.name == "nt":
+    # GitHub-hosted runners may expose %TEMP% through an 8.3 alias.  Product
+    # code intentionally canonicalizes paths, so tests must create fixtures
+    # from that same identity instead of comparing short and long spellings.
+    tempfile.tempdir = str(Path(tempfile.gettempdir()).resolve())
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +37,31 @@ def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     unset_root = tmp_path / "unset-psc-root-guard"
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(unset_root / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(unset_root / "config"))
+
+
+@pytest.fixture(autouse=True)
+def _skip_symlink_tests_without_windows_privilege(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip only when the host cannot create the symlink required by a test.
+
+    Windows requires Developer Mode or SeCreateSymbolicLinkPrivilege.  Linux CI
+    still exercises every symlink security assertion; native Windows reports a
+    precise skip instead of failing before product code is reached.
+    """
+    if os.name != "nt":
+        return
+    original = os.symlink
+
+    def guarded_symlink(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege is unavailable")
+            raise
+
+    monkeypatch.setattr(os, "symlink", guarded_symlink)
 
 
 @pytest.fixture(autouse=True)

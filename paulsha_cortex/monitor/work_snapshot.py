@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from paulsha_cortex.config.paths import work_items_snapshot_path
+from paulsha_cortex.lib.durability import fsync_directory
 
 from .work_models import ProviderSnapshot, WorkItem, parse_timestamp
 
@@ -313,11 +314,7 @@ class WorkSnapshotStore:
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.path)
             os.chmod(self.path, 0o600)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.path.parent)
         except BaseException:
             try:
                 os.close(fd)

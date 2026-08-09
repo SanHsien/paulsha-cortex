@@ -21,6 +21,7 @@ def _write_stub(p: Path) -> None:
     p.chmod(0o755)
 
 
+@unittest.skipIf(os.name == "nt", "legacy relay shell hook is POSIX-only")
 class RelayHookTests(unittest.TestCase):
     def test_emits_slice_tagged_payload(self) -> None:
         with tempfile.TemporaryDirectory() as d:

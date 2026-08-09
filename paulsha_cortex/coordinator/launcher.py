@@ -765,8 +765,9 @@ class SubprocessLauncher:
             }
             if self._relay_target is not None:
                 env["PSC_RELAY_TARGET"] = self._relay_target
-        # interpreter：job 以 `bash -lc` 啟動，其 python 由 env 的 PATH 決定，
-        # 因此以同一份 env 解析，而非用 manager 自己的 sys.executable。
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        # interpreter：job wrapper 使用目前的 Python；gate/model 的可執行檔仍由
+        # executor env 的 PATH 解析，避免 Windows 依賴 Bash。
         interpreter = shutil.which("python3", path=env.get("PATH", "")) or shutil.which(
             "python", path=env.get("PATH", "")
         )
@@ -825,10 +826,10 @@ class SubprocessLauncher:
             }
             if self._relay_target is not None:
                 env["PSC_RELAY_TARGET"] = self._relay_target
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
         log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
-        # 跨進程 durable 完成判定：以 bash -lc 包裝，子進程結束時把 $? 寫入 exit sentinel。
-        # 用 shlex.join 安全嵌入內層 argv（prompt 含換行/空白仍為單一 token），
-        # sentinel 路徑亦 shlex.quote。poll_headless_done 讀此 sentinel，不再靠 os.waitpid。
+        # 跨進程 durable 完成判定由 typed-argv Python wrapper 寫入 exit sentinel；
+        # 不經 shell，prompt 含換行／空白仍維持單一 token。
         sentinel = str(Path(log_dir) / f"{slice_id}.exit")
         # 重跑同一 slice_id 前先清掉上一輪殘留：移除舊 exit sentinel、log 以 wb 截斷。
         # 否則 poll_headless_done 會讀到上一輪的 sentinel / 末筆 JSONL，
@@ -837,16 +838,20 @@ class SubprocessLauncher:
         # #261：同理清掉上一輪的 gate ledger，避免 harvest 讀到前一次的 gate 結果。
         ledger = terminal_contract.gate_ledger_path(log_path)
         Path(ledger).unlink(missing_ok=True)
-        script = build_wrapper_script(
-            inner_argv=inner_argv,
-            sentinel=sentinel,
-            ledger=str(ledger),
-            worktree=worktree,
-            repo_root=env.get("PSC_REPO_ROOT"),
-            run_gates=self._should_run_gates(env),
-        )
-        # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
-        argv = ["bash", "-c" if self._review_only else "-lc", script]
+        argv = [
+            sys.executable,
+            "-m",
+            "paulsha_cortex.coordinator.process_wrapper",
+            "--sentinel",
+            sentinel,
+            "--ledger",
+            str(ledger),
+            "--worktree",
+            worktree,
+        ]
+        if self._should_run_gates(env):
+            argv.append("--run-gates")
+        argv.extend(["--", *inner_argv])
         with open(log_path, "wb") as logf:
             proc = subprocess.Popen(
                 argv,

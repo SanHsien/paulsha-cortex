@@ -247,7 +247,8 @@ work_items:
 
     assert loaded.work_items["work"].links == ()
     assert loaded.work_items["work"].excludes == (source,)
-    assert os.stat(tmp_path / ".cortex/work-items.yaml").st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert os.stat(tmp_path / ".cortex/work-items.yaml").st_mode & 0o777 == 0o600
 
 
 def test_exclusion_suppresses_frontmatter_confirmed_edge(tmp_path):

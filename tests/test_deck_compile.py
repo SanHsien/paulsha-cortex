@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -614,4 +615,4 @@ def test_emit_force_file_mode_consistent(tmp_path):
     emit(result, out)
     emit(result, out, force=True)
     mode = (out / result.slices[0].filename).stat().st_mode & 0o777
-    assert mode == 0o644
+    assert mode == (0o666 if os.name == "nt" else 0o644)

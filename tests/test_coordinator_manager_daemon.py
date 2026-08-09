@@ -1313,7 +1313,9 @@ def test_recent_done_provider_treats_naive_completed_at_as_utc(monkeypatch, tmp_
 
     original_tz = os.environ.get("TZ")
     monkeypatch.setenv("TZ", "Asia/Taipei")
-    time.tzset()
+    tzset = getattr(time, "tzset", None)
+    if tzset is not None:
+        tzset()
     try:
         provider = manager_daemon.build_runtime_status_provider(
             registry=FakeRegistry(),
@@ -1330,7 +1332,8 @@ def test_recent_done_provider_treats_naive_completed_at_as_utc(monkeypatch, tmp_
             os.environ.pop("TZ", None)
         else:
             os.environ["TZ"] = original_tz
-        time.tzset()
+        if tzset is not None:
+            tzset()
 
     slice_ids = {entry["slice_id"] for entry in status["recent_done"]}
     assert slice_ids == {"naive-fresh", "aware-fresh"}
@@ -2168,15 +2171,10 @@ def test_pid_alive_requires_manager_cmdline(tmp_path) -> None:
             proc.wait(timeout=10)
 
 
-def test_acquire_lock_uses_flock_for_single_instance() -> None:
+def test_acquire_lock_uses_cross_platform_kernel_lock() -> None:
     source = inspect.getsource(manager_daemon.acquire_lock)
 
-    # Single-instance is enforced by an exclusive flock (kernel-released on
-    # process death), so a stale lock is reclaimable with no check-then-unlink
-    # race that a second contender could use to steal a live lock.
-    assert "fcntl.flock" in source
-    assert "LOCK_EX" in source
-    assert "LOCK_NB" in source
+    assert "file_lock.try_lock" in source
     assert "os.O_EXCL" not in source
 
 

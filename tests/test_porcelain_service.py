@@ -12,6 +12,20 @@ from pathlib import Path
 import pytest
 
 SERVICE_SCHEMA = "cortex-porcelain/service/v1"
+requires_posix_service_commands = pytest.mark.skipif(
+    os.name == "nt",
+    reason="systemctl/journalctl executable integration is covered by Linux CI",
+)
+
+
+@pytest.fixture(autouse=True)
+def _exercise_posix_service_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This module validates the systemd/fallback backends on every CI OS."""
+    from paulsha_cortex.deploy import windows_service
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(windows_service, "available", lambda: False)
+    monkeypatch.setattr(installer, "_is_windows", lambda: False)
 
 
 def _load_cli():
@@ -315,6 +329,7 @@ def test_service_install_systemctl_failure_reports_expected_channel(
         assert "Traceback" not in combined
 
 
+@requires_posix_service_commands
 @pytest.mark.parametrize(("command", "verb"), [("start", "start"), ("stop", "stop"), ("restart", "restart")])
 def test_service_lifecycle_commands_operate_manager_service_and_timer_together(
     service_runtime: dict[str, Path],
@@ -369,6 +384,7 @@ def test_service_lifecycle_commands_fail_gracefully_without_systemd(
     assert "systemd 不可用" in payload["error"]
 
 
+@requires_posix_service_commands
 def test_service_status_reports_systemd_runtime_and_env_summary(
     service_runtime: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -443,6 +459,7 @@ def test_service_status_reports_none_mode_with_install_hint(
     assert payload["service"]["suggested_commands"] == ["cortex service install --instance beta"]
 
 
+@requires_posix_service_commands
 def test_service_logs_uses_journalctl_when_systemd_units_exist(
     service_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],
@@ -539,6 +556,7 @@ def test_service_logs_follow_rejects_fallback_mode(
     assert "不支援" in payload["error"]
 
 
+@requires_posix_service_commands
 def test_service_logs_json_failure_reports_envelope(
     service_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],
@@ -594,6 +612,7 @@ def test_service_start_human_output_reuses_service_payload_without_refresh(
     assert seen["payload"] == {"instance": "beta", "mode": "systemd", "status": "active/running"}
 
 
+@requires_posix_service_commands
 @pytest.mark.parametrize(("command", "expected_rc"), [("start", 5), ("uninstall", 6)])
 def test_service_json_failures_preserve_envelope_for_systemctl_errors(
     service_runtime: dict[str, Path],
@@ -620,6 +639,7 @@ def test_service_json_failures_preserve_envelope_for_systemctl_errors(
     assert "failed" in payload["error"]
 
 
+@requires_posix_service_commands
 @pytest.mark.parametrize(("purge", "env_exists"), [(False, True), (True, False)])
 def test_service_uninstall_only_purges_runtime_env_with_flag(
     service_runtime: dict[str, Path],

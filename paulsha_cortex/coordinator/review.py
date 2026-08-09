@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.lib.path_safety import has_parent_reference, is_absolute_any
+from paulsha_cortex.lib.filesystem import remove_tree
 
 from ..persona import render
 from ..project_policy import ProjectPolicyError, resolve_project_policy
@@ -246,7 +248,7 @@ def prepare_review_worktree(
             ["git", "-C", str(root), "worktree", "remove", "--force", str(worktree)],
             subprocess_runner=subprocess_runner,
         )
-        shutil.rmtree(worktree, ignore_errors=True)
+        remove_tree(worktree)
     result = _run_subprocess(
         ["git", "-C", str(root), "worktree", "add", "--detach", str(worktree), candidate],
         subprocess_runner=subprocess_runner,
@@ -294,7 +296,11 @@ def prepare_review_worktree(
             except ValueError as exc:
                 raise ValueError("review worktree authority seed escapes workspace") from exc
             if target.exists():
-                if not target.is_file() or target.read_bytes() != content:
+                if (
+                    not target.is_file()
+                    or workflow_manager._canonical_workflow_input_bytes(target.read_bytes())
+                    != workflow_manager._canonical_workflow_input_bytes(content)
+                ):
                     raise ValueError("review worktree authority seed conflict")
             else:
                 fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -360,12 +366,27 @@ def verify_authority_in_input_snapshot(
     )
     if missing:
         raise ValueError(f"review input snapshot missing frozen authority: {', '.join(missing)}")
-    drifted = sorted(ref for ref in authority if rows_by_path[ref].get("sha256") != authority[ref])
+    root = Path(workspace_root).resolve() if workspace_root is not None else None
+    drifted: list[str] = []
+    for ref, digest in authority.items():
+        if rows_by_path[ref].get("sha256") == digest:
+            continue
+        target = root / ref if root is not None else None
+        if target is not None and target.is_file() and not target.is_symlink():
+            raw = target.read_bytes()
+            canonical = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if digest in {
+                hashlib.sha256(raw).hexdigest(),
+                hashlib.sha256(canonical).hexdigest(),
+                hashlib.sha256(canonical.replace(b"\n", b"\r\n")).hexdigest(),
+            } and rows_by_path[ref].get("sha256") == hashlib.sha256(canonical).hexdigest():
+                continue
+        drifted.append(ref)
     if drifted:
-        raise ValueError(f"review input snapshot authority hash drift: {', '.join(drifted)}")
+        raise ValueError(f"review input snapshot authority hash drift: {', '.join(sorted(drifted))}")
     if workspace_root is None:
         return
-    root = Path(workspace_root).resolve()
+    assert root is not None
     missing_workspace = []
     drifted_workspace = []
     for ref, digest in authority.items():
@@ -378,7 +399,13 @@ def verify_authority_in_input_snapshot(
         except ValueError:
             missing_workspace.append(ref)
             continue
-        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        raw = target.read_bytes()
+        canonical = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        if digest not in {
+            hashlib.sha256(raw).hexdigest(),
+            hashlib.sha256(canonical).hexdigest(),
+            hashlib.sha256(canonical.replace(b"\n", b"\r\n")).hexdigest(),
+        }:
             drifted_workspace.append(ref)
     if missing_workspace:
         raise ValueError(
@@ -403,8 +430,7 @@ def _normalize_evidence_item(item: object, *, field: str) -> dict[str, Any]:
     if not isinstance(path, str) or not path.strip():
         raise ValueError(f"{field}.path must be a non-empty string")
     normalized_path = path.strip()
-    parts = Path(normalized_path).parts
-    if Path(normalized_path).is_absolute() or ".." in parts:
+    if is_absolute_any(normalized_path) or has_parent_reference(normalized_path):
         raise ValueError(f"{field}.path must be repo-relative")
     if line is not None and (not isinstance(line, int) or isinstance(line, bool) or line <= 0):
         raise ValueError(f"{field}.line must be a positive integer or null")

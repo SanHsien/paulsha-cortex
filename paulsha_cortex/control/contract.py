@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from paulsha_cortex.lib.durability import fsync_directory
+
 from . import constants
 
 REQUEST_TYPES = frozenset(
@@ -40,7 +42,10 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         with temp_path.open("x", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
-        os.rename(temp_path, target)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+        fsync_directory(target.parent)
     except BaseException:
         if temp_path.exists():
             temp_path.unlink()

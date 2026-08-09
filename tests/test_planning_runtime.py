@@ -254,7 +254,10 @@ def test_planning_runtime_detects_and_rolls_back_directory_and_metadata_pollutio
             timeout_seconds=30,
         )
 
-    assert tracked.stat().st_mode & 0o777 == 0o640
+    if os.name == "nt":
+        assert tracked.stat().st_mode & 0o200
+    else:
+        assert tracked.stat().st_mode & 0o777 == 0o640
     assert empty.is_dir()
     assert not (tmp_path / "pollution-empty").exists()
     assert directory_link.is_symlink()
@@ -277,13 +280,31 @@ def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_pa
     assert planning_runtime._tree_snapshot(tmp_path) == baseline
 
     empty.chmod(0o700)
-    assert planning_runtime._tree_snapshot(tmp_path) != baseline
+    if os.name == "nt":
+        assert planning_runtime._tree_snapshot(tmp_path) == baseline
+    else:
+        assert planning_runtime._tree_snapshot(tmp_path) != baseline
     empty.chmod(baseline_mode)
     assert planning_runtime._tree_snapshot(tmp_path) == baseline
 
     link.unlink()
     link.symlink_to("empty", target_is_directory=True)
     assert planning_runtime._tree_snapshot(tmp_path) != baseline
+
+
+def test_windows_symlink_kind_uses_reparse_attributes_without_following(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePath:
+        def lstat(self):
+            return type("Metadata", (), {"st_file_attributes": 0x10})()
+
+        def is_dir(self):
+            raise AssertionError("Windows symlink kind must not follow the target")
+
+    monkeypatch.setattr(planning_runtime.os, "name", "nt")
+
+    assert planning_runtime._symlink_targets_directory(FakePath()) is True
 
 
 def test_snapshot_permission_error_still_restores_operator_tree(tmp_path: Path) -> None:
@@ -312,7 +333,8 @@ def test_snapshot_permission_error_still_restores_operator_tree(tmp_path: Path) 
             timeout_seconds=30,
         )
 
-    assert protected.stat().st_mode & 0o777 == 0o750
+    if os.name != "nt":
+        assert protected.stat().st_mode & 0o777 == 0o750
     assert tracked.read_text(encoding="utf-8") == "baseline\n"
     if xattr_supported:
         assert os.getxattr(tracked, "user.cortex-test") == b"baseline"

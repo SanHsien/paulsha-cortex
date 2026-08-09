@@ -16,6 +16,10 @@ from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Protocol
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.lib.durability import fsync_directory
+from paulsha_cortex.lib.permissions import mode_matches
+from paulsha_cortex.lib.filesystem import remove_tree
+from paulsha_cortex.lib.path_safety import is_absolute_any
 
 from .._yaml import YAMLError, safe_load
 from ..lib import idle
@@ -1960,7 +1964,7 @@ def run_tick(
     handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
     require_idle: bool = False,
     max_load: float = 1.0,
-    idle_probe: Callable[[], tuple] = os.getloadavg,
+    idle_probe: Callable[[], tuple] = idle.system_load_average,
     clock: Callable[[], str] = _utcnow,
     reaper: Callable[[], dict] | None = None,
     ledger_recorder: Callable[[list[dict]], list[dict]] | None = None,
@@ -3394,11 +3398,7 @@ def _write_workflow_input_content(
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(path, 0o444)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(path.parent)
     return str(path)
 
 
@@ -3406,13 +3406,28 @@ _CHECKBOX_VOLATILE_PLAN_BASENAMES = frozenset({"tasks.md", "todo.md"})
 _CHECKBOX_RE = re.compile(r"^(\s*(?:[-+*]|\d+[.)])\s+)\[[xX]\]", re.M)
 
 
+def _canonical_workflow_input_bytes(data: bytes) -> bytes:
+    """Canonicalize UTF-8 text so authority hashes are checkout-platform stable."""
+    text = data.decode("utf-8")
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def _authority_hash_matches(data: bytes, expected: str) -> bool:
+    canonical = _canonical_workflow_input_bytes(data)
+    return expected in {
+        hashlib.sha256(data).hexdigest(),
+        hashlib.sha256(canonical).hexdigest(),
+        hashlib.sha256(canonical.replace(b"\n", b"\r\n")).hexdigest(),
+    }
+
+
 def _checkbox_insensitive_equal(baseline: bytes, current: bytes) -> bool:
     """#310：卡片契約要求 builder 勾選 tasks/todo 的 checkbox；只有 checkbox
     狀態差異（``- [x]``→``- [ ]`` 正規化後相等）視為未漂移。任何其他 byte 差異
     仍屬 drift。"""
     try:
-        base_text = baseline.decode("utf-8")
-        cur_text = current.decode("utf-8")
+        base_text = _canonical_workflow_input_bytes(baseline).decode("utf-8")
+        cur_text = _canonical_workflow_input_bytes(current).decode("utf-8")
     except UnicodeDecodeError:
         return False
     normalize = lambda text: _CHECKBOX_RE.sub(lambda m: m.group(1) + "[ ]", text)
@@ -3432,19 +3447,22 @@ def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict
     mapping: dict[str, str] = {}
     for item in run.planning_authority:
         expected = item.baseline_sha256
-        if item.kind == "plan" and Path(item.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES:
-            candidate_matches = _safe_input_matches(candidate_root, item.ref)
-            baseline_matches = _safe_input_matches(operator_root, item.ref)
-            if len(candidate_matches) == 1 and len(baseline_matches) == 1:
-                candidate_data = candidate_matches[0].read_bytes()
-                baseline_data = baseline_matches[0].read_bytes()
-                digest = hashlib.sha256(candidate_data).hexdigest()
-                if (
-                    digest != expected
-                    and hashlib.sha256(baseline_data).hexdigest() == expected
+        candidate_matches = _safe_input_matches(candidate_root, item.ref)
+        baseline_matches = _safe_input_matches(operator_root, item.ref)
+        if len(candidate_matches) == 1 and len(baseline_matches) == 1:
+            candidate_data = _canonical_workflow_input_bytes(candidate_matches[0].read_bytes())
+            baseline_raw = baseline_matches[0].read_bytes()
+            baseline_data = _canonical_workflow_input_bytes(baseline_raw)
+            digest = hashlib.sha256(candidate_data).hexdigest()
+            if _authority_hash_matches(baseline_raw, expected) and (
+                baseline_data == candidate_data
+                or (
+                    item.kind == "plan"
+                    and Path(item.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
                     and _checkbox_insensitive_equal(baseline_data, candidate_data)
-                ):
-                    expected = digest
+                )
+            ):
+                expected = digest
         mapping[item.ref] = expected
     return mapping
 
@@ -3481,8 +3499,9 @@ def _workflow_input_snapshot(
             if len(source_matches) != 1:
                 raise ValueError("workflow planning input missing")
             source = source_matches[0]
-            data = source.read_bytes()
-            if hashlib.sha256(data).hexdigest() != authority[ref].baseline_sha256:
+            source_data = source.read_bytes()
+            data = _canonical_workflow_input_bytes(source_data)
+            if not _authority_hash_matches(source_data, authority[ref].baseline_sha256):
                 raise ValueError("workflow planning input drift")
             seeds[ref] = data
 
@@ -3501,7 +3520,10 @@ def _workflow_input_snapshot(
         if destination.is_symlink():
             raise ValueError("workflow input seed symlink rejected")
         if destination.exists():
-            if not destination.is_file() or destination.read_bytes() != data:
+            if (
+                not destination.is_file()
+                or _canonical_workflow_input_bytes(destination.read_bytes()) != data
+            ):
                 raise ValueError("workflow input seed conflict")
             continue
         fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=parent)
@@ -3524,7 +3546,10 @@ def _workflow_input_snapshot(
             raise ValueError(f"workflow declared input missing: {pattern}")
         for resolved in matches:
             ref = resolved.relative_to(root).as_posix()
-            data = resolved.read_bytes()
+            try:
+                data = _canonical_workflow_input_bytes(resolved.read_bytes())
+            except UnicodeDecodeError as exc:
+                raise ValueError("workflow input must be UTF-8") from exc
             digest = hashlib.sha256(data).hexdigest()
             bound = authority.get(ref)
             if bound is not None and digest != bound.baseline_sha256:
@@ -3533,30 +3558,39 @@ def _workflow_input_snapshot(
                 # ref 檔案，且必須先驗證其 hash 等於 authority baseline，才可
                 # 作為 checkbox-insensitive 比對的基準；其餘任何差異 fail-closed。
                 tolerated = False
+                baseline_matches = _safe_input_matches(operator_root, ref)
+                if len(baseline_matches) == 1:
+                    baseline_raw = baseline_matches[0].read_bytes()
+                    tolerated = (
+                        _authority_hash_matches(baseline_raw, bound.baseline_sha256)
+                        and _canonical_workflow_input_bytes(baseline_raw) == data
+                    )
                 if (
+                    not tolerated
+                    and
                     bound.kind == "plan"
                     and Path(ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
                 ):
-                    baseline_matches = _safe_input_matches(operator_root, ref)
                     if len(baseline_matches) == 1:
-                        baseline_data = baseline_matches[0].read_bytes()
+                        baseline_data = _canonical_workflow_input_bytes(
+                            baseline_matches[0].read_bytes()
+                        )
                         if (
-                            hashlib.sha256(baseline_data).hexdigest()
-                            == bound.baseline_sha256
+                            _authority_hash_matches(baseline_raw, bound.baseline_sha256)
                             and _checkbox_insensitive_equal(baseline_data, data)
                         ):
                             tolerated = True
                 if not tolerated:
-                    raise ValueError("workflow planning input drift")
+                    raise ValueError(
+                        f"workflow planning input drift: {ref} "
+                        f"(expected={bound.baseline_sha256}, observed={digest})"
+                    )
             pattern_has_authority = any(
                 fnmatch.fnmatch(candidate_ref, pattern) for candidate_ref in authority
             )
             if pattern_has_authority and bound is None:
                 raise ValueError("workflow planning input lacks authority")
-            try:
-                content = data.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError("workflow input must be UTF-8") from exc
+            content = data.decode("utf-8")
             total_bytes += len(data)
             if total_bytes > 131072:
                 raise ValueError("workflow input envelope exceeds bound")
@@ -3649,7 +3683,11 @@ def _validate_workflow_input_snapshot(
         target = repo_root / ref
         if target.is_symlink() or not target.is_file():
             raise ValueError("workflow input snapshot file missing")
-        if hashlib.sha256(target.read_bytes()).hexdigest() != row["sha256"]:
+        try:
+            target_data = _canonical_workflow_input_bytes(target.read_bytes())
+        except UnicodeDecodeError as exc:
+            raise ValueError("workflow input must be UTF-8") from exc
+        if hashlib.sha256(target_data).hexdigest() != row["sha256"]:
             raise ValueError("workflow input snapshot hash drift")
         _read_workflow_input_content(row, coordinator_root=coordinator_root)
 
@@ -3802,11 +3840,7 @@ class _WorkflowReportPublicationTransaction:
                 os.fsync(stream.fileno())
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.journal_path)
-            directory_fd = os.open(self.journal_path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.journal_path.parent)
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -3921,11 +3955,7 @@ class _WorkflowReportPublicationTransaction:
             if not forward and not bool(operation["before_exists"]):
                 path.unlink(missing_ok=True)
                 if path.parent.exists():
-                    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
+                    fsync_directory(path.parent)
                 continue
             content_field = "after_content" if forward else "before_content"
             mode_field = "after_mode" if forward else "before_mode"
@@ -3952,11 +3982,7 @@ class _WorkflowReportPublicationTransaction:
     def commit(self) -> None:
         self.journal_path.unlink(missing_ok=True)
         if self.journal_path.parent.exists():
-            directory_fd = os.open(self.journal_path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.journal_path.parent)
 
     @classmethod
     def reconcile(
@@ -4281,7 +4307,7 @@ def _create_reviewer_sandbox(
         check=False,
     )
     if clone.returncode != 0:
-        shutil.rmtree(sandbox, ignore_errors=True)
+        remove_tree(sandbox)
         raise ValueError("workflow reviewer sandbox clone failed")
     checkout = subprocess.run(
         ["git", "-C", str(checkout_root), "checkout", "--quiet", "--detach", candidate],
@@ -4290,7 +4316,7 @@ def _create_reviewer_sandbox(
         check=False,
     )
     if checkout.returncode != 0:
-        shutil.rmtree(sandbox, ignore_errors=True)
+        remove_tree(sandbox)
         raise ValueError("workflow reviewer sandbox checkout failed")
     remove_origin = subprocess.run(
         ["git", "-C", str(checkout_root), "remote", "remove", "origin"],
@@ -4305,7 +4331,7 @@ def _create_reviewer_sandbox(
         check=False,
     )
     if remove_origin.returncode != 0 or remotes.returncode != 0 or remotes.stdout.strip():
-        shutil.rmtree(sandbox, ignore_errors=True)
+        remove_tree(sandbox)
         raise ValueError("workflow reviewer sandbox remote isolation failed")
     head = subprocess.run(
         ["git", "-C", str(checkout_root), "rev-parse", "HEAD"],
@@ -4314,7 +4340,7 @@ def _create_reviewer_sandbox(
         check=False,
     )
     if head.returncode != 0 or head.stdout.strip().lower() != candidate.lower():
-        shutil.rmtree(sandbox, ignore_errors=True)
+        remove_tree(sandbox)
         raise ValueError("workflow reviewer sandbox head mismatch")
     for link in checkout_root.rglob("*"):
         if not link.is_symlink():
@@ -4322,7 +4348,7 @@ def _create_reviewer_sandbox(
         try:
             link.resolve(strict=False).relative_to(checkout_root.resolve())
         except ValueError as exc:
-            shutil.rmtree(sandbox, ignore_errors=True)
+            remove_tree(sandbox)
             raise ValueError("workflow reviewer sandbox external symlink rejected") from exc
     try:
         for row in input_snapshot:
@@ -4337,8 +4363,15 @@ def _create_reviewer_sandbox(
             content = str(envelope["content"]).encode("utf-8")
             if target.is_symlink():
                 raise ValueError("workflow reviewer input symlink rejected")
-            if target.exists() and (not target.is_file() or target.read_bytes() != content):
-                raise ValueError("workflow reviewer input seed conflict")
+            if target.exists():
+                if not target.is_file():
+                    raise ValueError("workflow reviewer input seed conflict")
+                try:
+                    target_content = _canonical_workflow_input_bytes(target.read_bytes())
+                except UnicodeDecodeError as exc:
+                    raise ValueError("workflow reviewer input seed conflict") from exc
+                if target_content != content:
+                    raise ValueError("workflow reviewer input seed conflict")
             if not target.exists():
                 _PlanningPublicationTransaction._write_atomic(
                     target,
@@ -4347,7 +4380,7 @@ def _create_reviewer_sandbox(
                     expect_absent=True,
                 )
     except BaseException:
-        shutil.rmtree(sandbox, ignore_errors=True)
+        remove_tree(sandbox)
         raise
     return sandbox, checkout_root
 
@@ -4425,7 +4458,7 @@ def _discard_reviewer_sandbox(
     if not sandbox.exists() and not sandbox.is_symlink():
         return
     unchanged = candidate_root.is_dir() and planning_runtime._tree_snapshot(candidate_root) == expected
-    shutil.rmtree(sandbox, ignore_errors=True)
+    remove_tree(sandbox)
     if sandbox.exists() or sandbox.is_symlink():
         raise ValueError("reviewer sandbox cleanup incomplete")
     if require_candidate_unchanged and not unchanged:
@@ -4451,7 +4484,7 @@ def terminalize_workflow_job(
     if job.get("workflow_evidence") is not None:
         if job.get("persona") == "planner":
             sandbox_path = _planner_sandbox_path(job, coordinator_root)
-            shutil.rmtree(sandbox_path, ignore_errors=True)
+            remove_tree(sandbox_path)
         elif job.get("persona") == "reviewer":
             _discard_reviewer_sandbox(
                 job,
@@ -4465,7 +4498,7 @@ def terminalize_workflow_job(
             raise ValueError("planner job sandbox baseline missing")
         sandbox_path = _planner_sandbox_path(job, coordinator_root)
         if not sandbox_path.is_dir() or planning_runtime._tree_snapshot(sandbox_path) != expected_sandbox_hash:
-            shutil.rmtree(sandbox_path, ignore_errors=True)
+            remove_tree(sandbox_path)
             raise ValueError("planner modified disposable read-only sandbox")
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         raise ValueError("workflow job is not successful terminal")
@@ -4741,11 +4774,7 @@ def terminalize_workflow_job(
             except BaseException:
                 path.unlink(missing_ok=True)
                 raise
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(path.parent)
         bound = registry.bind_workflow_evidence(job_id, locator=locator, subject_head=candidate)
         if report_transaction is not None:
             report_transaction.commit()
@@ -4754,11 +4783,7 @@ def terminalize_workflow_job(
         if persisted is None:
             if created_evidence and path is not None:
                 path.unlink(missing_ok=True)
-                directory_fd = os.open(path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+                fsync_directory(path.parent)
             if report_transaction is not None:
                 report_transaction.rollback()
         elif report_transaction is not None:
@@ -4769,7 +4794,7 @@ def terminalize_workflow_job(
             )
         raise
     if sandbox_path is not None:
-        shutil.rmtree(sandbox_path, ignore_errors=True)
+        remove_tree(sandbox_path)
     return bound
 
 
@@ -5073,11 +5098,7 @@ class _PlanningPublicationTransaction:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, self.journal_path)
-            directory_fd = os.open(self.journal_path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.journal_path.parent)
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -5108,11 +5129,7 @@ class _PlanningPublicationTransaction:
                 ):
                     raise ValueError(f"planning artifact baseline CAS conflict: {path}")
                 os.replace(tmp, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(path.parent)
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -5147,8 +5164,12 @@ class _PlanningPublicationTransaction:
         existed = path.is_file()
         before = path.read_bytes() if existed else None
         before_hash = hashlib.sha256(before).hexdigest() if before is not None else None
-        idempotent_evidence = existed and before == content and kind == "evidence"
-        if idempotent_evidence and path.stat().st_mode & 0o7777 != mode:
+        idempotent_evidence = (
+            existed
+            and kind == "evidence"
+            and _canonical_workflow_input_bytes(before) == _canonical_workflow_input_bytes(content)
+        )
+        if idempotent_evidence and not mode_matches(path.stat().st_mode, mode):
             raise ValueError(f"planning immutable evidence mode conflict: {relative}")
         if existed and baseline_hash is None:
             if not idempotent_evidence:
@@ -5170,7 +5191,7 @@ class _PlanningPublicationTransaction:
                 base64.b64encode(before).decode("ascii") if before is not None else None
             ),
             "before_mode": (path.stat().st_mode & 0o7777) if existed else None,
-            "after_hash": hashlib.sha256(content).hexdigest(),
+            "after_hash": before_hash if idempotent_evidence else hashlib.sha256(content).hexdigest(),
             "after_mode": after_mode,
             "created_dirs": list(reversed(missing_dirs)),
             "mutation": not idempotent_evidence,
@@ -5201,6 +5222,10 @@ class _PlanningPublicationTransaction:
             "sha256": hashlib.sha256(content).hexdigest(),
         }
         self.publish(path, content, baseline_hash=None, mode=0o600, kind="evidence")
+        actual_hash = _sha256_path(Path(path))
+        if self.expected_gate_ref["sha256"] != actual_hash:
+            self.expected_gate_ref["sha256"] = actual_hash
+            self._persist()
 
     def rollback(self) -> None:
         for operation in reversed(self.operations):
@@ -5241,11 +5266,7 @@ class _PlanningPublicationTransaction:
             else:
                 path.unlink(missing_ok=True)
                 if path.parent.exists():
-                    directory_fd = os.open(path.parent, os.O_RDONLY)
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
+                    fsync_directory(path.parent)
             for directory in reversed(list(operation.get("created_dirs", []))):
                 try:
                     Path(str(directory)).rmdir()
@@ -5258,11 +5279,7 @@ class _PlanningPublicationTransaction:
         if self.journal_path is not None:
             self.journal_path.unlink(missing_ok=True)
             if self.journal_path.parent.exists():
-                directory_fd = os.open(self.journal_path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+                fsync_directory(self.journal_path.parent)
 
     def _validate_loaded_operation(self, value: object) -> dict[str, object]:
         if not isinstance(value, dict):
@@ -5371,7 +5388,7 @@ class _PlanningPublicationTransaction:
             raise PlanningPublicationDrift(f"planning committed artifact type drift: {path}")
         if _sha256_path(path) != operation["after_hash"]:
             raise PlanningPublicationDrift(f"planning committed artifact hash drift: {path}")
-        if metadata.st_mode & 0o7777 != operation["after_mode"]:
+        if not mode_matches(metadata.st_mode, int(operation["after_mode"])):
             raise PlanningPublicationDrift(f"planning committed artifact mode drift: {path}")
         if operation.get("kind") == "evidence":
             try:
@@ -6394,6 +6411,19 @@ def _dispatch_workflow_card(
             patterns=effective_inputs,
             coordinator_root=coordinator_root,
         )
+        # Snapshot construction already proves every bound row against frozen
+        # authority (including EOL and checkbox-only normalization).  Reviewers
+        # must attest the exact bytes they receive, so pin the terminal contract
+        # to those proven snapshot digests.
+        snapshot_hashes = {
+            str(row["path"]): str(row["sha256"])
+            for row in input_snapshot
+            if row.get("authority") == "planning-authority"
+        }
+        authority_map = {
+            ref: snapshot_hashes.get(ref, digest)
+            for ref, digest in authority_map.items()
+        }
         foreign_review.verify_authority_in_input_snapshot(
             authority=authority_map,
             input_snapshot=input_snapshot,
@@ -6603,7 +6633,7 @@ def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path
         and verification.SAFE_SHA_RE.fullmatch(ship["merge_commit"]) is not None
         and isinstance(authorization, dict)
         and isinstance(authorization.get("path"), str)
-        and Path(authorization["path"]).is_absolute()
+        and is_absolute_any(authorization["path"])
         and isinstance(authorization.get("hash"), str)
         and re.fullmatch(r"[0-9a-f]{64}", authorization["hash"]) is not None
         and isinstance(authorization_body, dict)

@@ -16,12 +16,12 @@
 - 在公開高嚴重度 issues、授權與平台邊界收斂前，不把 CI success、agent 自報或 PR 存在視為 production readiness。
 - 若本 fork 修正通用缺陷，優先整理為可回饋 upstream 的小型 PR；個人工作流偏好留在 fork 文件或薄包裝層。
 
-## 3. WSL/Linux 是權威環境
+## 3. 原生 Windows 是本 fork 的第一級環境
 
-- PowerShell 是 Windows 使用者入口；pytest、build、manager daemon 與 sandbox 驗證在 WSL/Linux 執行。
-- `.gitattributes` 強制 LF，避免 Windows `core.autocrlf=true` 破壞 Bash scripts。
-- venv 放在 WSL cache，不放 OneDrive；高頻全測建議使用 WSL Linux filesystem 的工作 clone。
-- 原生 Windows collection failure 不以 mock 掩蓋，也不宣稱 Windows runtime support。
+- PowerShell、repo-local `.venv`、native manager/monitor、Windows Startup service backend 與 Windows CI 是權威開發路徑。
+- POSIX `fcntl`、directory fsync、Unix socket、process signal 與 mode semantics 均有顯式 platform adapter，不在 import/collection 階段假設 Linux。
+- `.gitattributes` 仍強制 LF，保護跨平台 evidence hash 與保留的 Bash/systemd 相容檔案。
+- Linux/systemd 保持支援；bubblewrap foreign-review sandbox 明確列為 Linux-only，不偽裝成 Windows 已具備的隔離保證。
 
 ## 4. 不替 upstream 擅自決定授權
 

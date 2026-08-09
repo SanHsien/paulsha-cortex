@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import stat
 import tempfile
@@ -39,6 +40,54 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+
+def _remove_project_tree(path: Path) -> None:
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError as error:
+            if (
+                os.name != "nt"
+                or getattr(error, "winerror", None) != 32
+                or time.monotonic() >= deadline
+            ):
+                raise
+            time.sleep(0.02)
+
+
+class WindowsTreeRemovalTests(unittest.TestCase):
+    def test_retries_only_windows_sharing_violations(self) -> None:
+        target = Path("unused")
+        sharing_violation = PermissionError("file is in use")
+        sharing_violation.winerror = 32  # type: ignore[attr-defined]
+
+        with (
+            mock.patch.object(os, "name", "nt"),
+            mock.patch.object(
+                shutil,
+                "rmtree",
+                side_effect=[sharing_violation, None],
+            ) as remove,
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 0.1]),
+            mock.patch.object(time, "sleep") as sleep,
+        ):
+            _remove_project_tree(target)
+
+        self.assertEqual(remove.call_count, 2)
+        sleep.assert_called_once_with(0.02)
+
+        access_denied = PermissionError("access denied")
+        access_denied.winerror = 5  # type: ignore[attr-defined]
+        with (
+            mock.patch.object(os, "name", "nt"),
+            mock.patch.object(shutil, "rmtree", side_effect=access_denied),
+            self.assertRaises(PermissionError),
+        ):
+            _remove_project_tree(target)
+
 
 # Imports from the Phase 3 modules (do not exist yet — Red).
 try:
@@ -53,6 +102,10 @@ try:
         Watcher,
     )
     from paulsha_cortex.monitor.server import MonitorServer
+    from paulsha_cortex.monitor.transport import (
+        bind_monitor_listener,
+        connect_monitor_socket,
+    )
     from paulsha_cortex.monitor.service import ProjectMonitorService
     from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
 
@@ -361,12 +414,10 @@ class Stage9ServerTests(unittest.TestCase):
         deadline = time.time() + 1.0
         last_error: OSError | None = None
         while time.time() < deadline:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                sock.connect(str(self.socket_path))
-            except ConnectionRefusedError as error:
+                sock = connect_monitor_socket(self.socket_path)
+            except (OSError, ValueError) as error:
                 last_error = error
-                sock.close()
                 time.sleep(0.02)
                 continue
             self.addCleanup(sock.close)
@@ -423,6 +474,7 @@ class Stage9ServerTests(unittest.TestCase):
         self.assertGreater(change_msg["sequence"], snapshot_msg["sequence"])
         self.assertEqual(change_msg["project"]["project_id"], "projA")
 
+    @unittest.skipIf(os.name == "nt", "Windows ACLs are not represented by POSIX mode bits")
     def test_server_socket_has_0600_permission(self) -> None:
         mode = stat.S_IMODE(self.socket_path.stat().st_mode)
         self.assertEqual(mode, 0o600)
@@ -509,24 +561,25 @@ class Stage9ServerTests(unittest.TestCase):
 
     def test_server_reclaims_stale_socket_file(self) -> None:
         stale_path = self.tmp / "stale-monitor.sock"
-        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        stale.bind(str(stale_path))
+        stale = bind_monitor_listener(stale_path)
         stale.close()
 
         reclaimed = MonitorServer(store=self.store, socket_path=stale_path)
         reclaimed_thread = threading.Thread(target=reclaimed.serve_forever, daemon=True)
         reclaimed_thread.start()
         try:
+            self.assertTrue(
+                reclaimed.wait_until_ready(timeout=2.0),
+                "replacement server did not reclaim stale endpoint",
+            )
             deadline = time.time() + 1.0
             sock: socket.socket | None = None
             last_error: OSError | None = None
             while time.time() < deadline:
-                candidate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
-                    candidate.connect(str(stale_path))
-                except OSError as error:
+                    candidate = connect_monitor_socket(stale_path)
+                except (OSError, ValueError) as error:
                     last_error = error
-                    candidate.close()
                     time.sleep(0.02)
                     continue
                 sock = candidate
@@ -548,30 +601,19 @@ class Stage9ServerTests(unittest.TestCase):
         bad_path = self.tmp / "not-a-socket"
         bad_path.write_text("occupied", encoding="utf-8")
         contender = MonitorServer(store=self.store, socket_path=bad_path)
-        with self.assertRaisesRegex(RuntimeError, "不是 Unix socket"):
+        with self.assertRaisesRegex(RuntimeError, "不是 Unix socket|格式無效"):
             contender._prepare_socket_path()
         self.assertTrue(bad_path.exists())
 
     def test_server_timeout_probe_treats_socket_as_live(self) -> None:
         busy_path = self.tmp / "busy-monitor.sock"
-        busy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        busy.bind(str(busy_path))
-        busy.close()
+        busy = bind_monitor_listener(busy_path)
+        self.addCleanup(busy.close)
         contender = MonitorServer(store=self.store, socket_path=busy_path)
 
-        class _TimeoutProbe:
-            def settimeout(self, timeout: float) -> None:
-                self.timeout = timeout
-
-            def connect(self, path: str) -> None:
-                raise TimeoutError("probe timed out")
-
-            def close(self) -> None:
-                return None
-
         with mock.patch(
-            "paulsha_cortex.monitor.server.socket.socket",
-            return_value=_TimeoutProbe(),
+            "paulsha_cortex.monitor.server.connect_monitor_socket",
+            side_effect=TimeoutError("probe timed out"),
         ):
             with self.assertRaisesRegex(RuntimeError, "live monitor|already.*monitor"):
                 contender._prepare_socket_path()
@@ -634,12 +676,10 @@ class Stage9ServiceTests(unittest.TestCase):
         deadline = time.time() + 1.0
         last_error: OSError | None = None
         while time.time() < deadline:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                sock.connect(str(self.socket_path))
-            except ConnectionRefusedError as error:
+                sock = connect_monitor_socket(self.socket_path)
+            except (OSError, ValueError) as error:
                 last_error = error
-                sock.close()
                 time.sleep(0.02)
                 continue
             self.addCleanup(sock.close)
@@ -648,6 +688,7 @@ class Stage9ServiceTests(unittest.TestCase):
             f"service socket refused connections for 1s: {last_error}"
         )
 
+    @unittest.skipIf(os.name == "nt", "Windows ACLs are not represented by POSIX mode bits")
     def test_service_creates_run_dir_with_0700_permission(self) -> None:
         self.assertTrue(self.run_dir.exists())
         mode = stat.S_IMODE(self.run_dir.stat().st_mode)
@@ -746,7 +787,7 @@ class Stage9ServiceTests(unittest.TestCase):
             (self.project_dir / ".git" / "HEAD", False),
             (self.project_dir / ".git" / "refs", True),
         }
-        shutil.rmtree(self.project_dir)
+        _remove_project_tree(self.project_dir)
         self.stub_watcher.trigger(self.project_dir)
         deadline = time.time() + 2.0
         while time.time() < deadline and any(key in self.service._watched_paths for key in expected):
@@ -817,7 +858,7 @@ class Stage9ServiceTests(unittest.TestCase):
         _socket_send_request(sock, {"kind": "subscribe"})
         json.loads(_socket_recv_line(sock))  # consume initial snapshot
 
-        shutil.rmtree(self.project_dir)
+        _remove_project_tree(self.project_dir)
         self.stub_watcher.trigger(self.project_dir)
 
         change_msg = json.loads(_socket_recv_line(sock, timeout=3.0))

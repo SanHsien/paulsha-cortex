@@ -38,13 +38,18 @@ def test_checkout_contract_keeps_shell_scripts_lf() -> None:
         assert b"\r\n" not in content
 
 
-def test_powershell_wrappers_resolve_windows_paths_with_wsl_cd() -> None:
-    for script_name in ("bootstrap_dev.ps1", "dev_check.ps1"):
-        content = (ROOT / "tools" / script_name).read_text(encoding="utf-8")
-        assert "--cd $repoRoot -- pwd" in content
-        assert "wslpath" not in content
-        assert "$wslExitCode = $LASTEXITCODE" in content
-        assert "$wslRepoRoot = ($wslRepoOutput | Out-String).Trim()" in content
+def test_powershell_wrappers_are_native_windows_first() -> None:
+    bootstrap = (ROOT / "tools" / "bootstrap_dev.ps1").read_text(encoding="utf-8")
+    dev_check = (ROOT / "tools" / "dev_check.ps1").read_text(encoding="utf-8")
+
+    assert "wsl.exe" not in bootstrap
+    assert "wsl.exe" not in dev_check
+    assert '".venv"' in bootstrap
+    assert '"Scripts\\python.exe"' in bootstrap
+    assert ".venv\\Scripts\\python.exe" in dev_check
+    assert "-m pytest tests -q" in dev_check
+    assert "-m build --outdir" in dev_check
+    assert "-m twine check --strict" in dev_check
 
 
 def test_dev_extra_and_python_version_are_declared() -> None:
@@ -53,6 +58,7 @@ def test_dev_extra_and_python_version_are_declared() -> None:
     assert "[project.optional-dependencies]" in pyproject
     assert '"pytest>=' in pyproject
     assert '"build>=' in pyproject
+    assert '"twine>=' in pyproject
     assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.13"
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.lib.durability import fsync_directory as _fsync_directory
 from . import verification
 from .usage_extractors import extract_usage
 from .workflow import (
@@ -165,14 +166,6 @@ def _deepcopy_json(value: Any) -> Any:
 
 def _empty_legacy_records() -> dict[str, Any]:
     return {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []}
-
-
-def _fsync_directory(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _migration_error(path: Path, reason: str) -> ValueError:
@@ -376,13 +369,22 @@ class JobRegistry:
                 handle.write(original)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(tmp, 0o400)
             os.link(tmp, backup)
+            # Windows stores the read-only attribute on the underlying file,
+            # so chmod before unlink would also make the temporary hardlink
+            # name undeletable.  Publish first, remove the temporary name,
+            # then make the retained backup immutable.
+            tmp.unlink()
+            os.chmod(backup, 0o400)
             _fsync_directory(directory)
         except BaseException:
-            tmp.unlink(missing_ok=True)
+            if tmp.exists() or tmp.is_symlink():
+                os.chmod(tmp, 0o600)
+                tmp.unlink()
+            if backup.exists() or backup.is_symlink():
+                os.chmod(backup, 0o600)
+                backup.unlink()
             raise
-        tmp.unlink(missing_ok=True)
         return backup
 
     def _write_payload_atomically(self, payload: dict[str, Any]) -> None:
