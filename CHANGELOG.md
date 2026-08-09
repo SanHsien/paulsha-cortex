@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Added
+- **補齊 fork 的 WSL-first 開發與治理環境**：新增 `.editorconfig`、`.gitattributes`、Python 3.13/dev dependency 契約、VS Code 建議、PowerShell／WSL bootstrap 與 full gate、fork／開發／決策文件、contribution/security/code-of-conduct，以及 Issue／PR templates、Dependabot 與 Python CodeQL。文字檔強制 LF，避免 Windows checkout 使 Bash tests 產生假失敗；原生 Windows 與 upstream 無 LICENSE 的限制均明確記錄。
+
 ## [0.1.4] - 2026-08-08
 
 ### Changed

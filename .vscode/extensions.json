@@ -1,0 +1,9 @@
+{
+  "recommendations": [
+    "editorconfig.editorconfig",
+    "github.vscode-github-actions",
+    "ms-python.python",
+    "ms-vscode-remote.remote-wsl",
+    "redhat.vscode-yaml"
+  ]
+}

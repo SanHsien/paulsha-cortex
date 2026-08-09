@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞回報
+    url: https://github.com/SanHsien/paulsha-cortex/security/advisories/new
+    about: 請勿公開揭露疑似安全漏洞，改用 GitHub 私人漏洞回報。
+  - name: Upstream issues
+    url: https://github.com/hamanpaul/paulsha-cortex/issues
+    about: 通用 Cortex 缺陷請先搜尋 upstream 是否已有追蹤。
+  - name: 開發環境文件
+    url: https://github.com/SanHsien/paulsha-cortex/blob/main/docs/DEVELOPMENT.md
+    about: Windows、WSL、bootstrap 與驗證方式請先查閱本文件。
