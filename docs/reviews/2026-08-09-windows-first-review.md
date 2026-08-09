@@ -49,4 +49,5 @@ Production 尚未放行的理由不是 native Windows correctness，而是 upstr
 - PowerShell bootstrap 在僅有 Python 3.14、`py -3.13` 不存在的主機完成 `.venv` 與 dev dependencies 安裝；quick gate 為 `14 passed`。
 - 唯一 live service smoke `cortex-smoke-20260809`：隔離 HOME/APPDATA 下 install 成功，manager/monitor PID 在第二次 status 仍為 running，stop 後兩者歸零，uninstall/purge 成功；smoke 目錄已移至資源回收筒。
 - PR 首輪 Ubuntu CI 找到三個跨平台回歸：typed wrapper 後的 launcher 測試仍檢查舊 shell token、Unix monitor probe 未走 transport seam、POSIX immutable evidence 的 chmod/link 次序有崩潰窗口。三項均已修復；同輪 CodeQL 指出的 lock/evidence 權限與 `ctypes` import finding 亦已修復。
+- Ubuntu 3.10/3.11 matrix 另驗出 `shutil.rmtree(onexc=...)` 僅存在於 Python 3.12+；filesystem adapter 已依版本在舊 Python 使用 `onerror`，並以模擬 3.11 分支的 regression test 固定相容性。
 - 最終 Windows gate：`pwsh -File tools/dev_check.ps1` 通過，結果為 `2005 passed, 72 skipped, 32 subtests passed in 320.20s`；wheel/sdist build 成功，兩個 artifacts 的 `twine check --strict` 均為 PASSED。此 bullet 是 gate 後追加的文件 evidence，不改 runtime/package input。

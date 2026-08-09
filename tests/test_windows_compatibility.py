@@ -111,3 +111,26 @@ def test_pid_probe_does_not_terminate_process() -> None:
     finally:
         process.terminate()
         process.wait(timeout=10)
+
+
+def test_remove_tree_uses_legacy_callback_before_python_312(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from paulsha_cortex.lib import filesystem
+
+    target = tmp_path / "disposable"
+    target.mkdir()
+    captured: dict[str, object] = {}
+
+    def fake_rmtree(path, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+
+    monkeypatch.setattr(filesystem.sys, "version_info", (3, 11, 9))
+    monkeypatch.setattr(filesystem.shutil, "rmtree", fake_rmtree)
+
+    filesystem.remove_tree(target)
+
+    assert captured["path"] == target
+    assert callable(captured["onerror"])
+    assert "onexc" not in captured

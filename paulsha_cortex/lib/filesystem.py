@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import sys
 from pathlib import Path
 
 
@@ -16,4 +17,7 @@ def remove_tree(path: str | Path) -> None:
         os.chmod(value, stat.S_IWRITE | stat.S_IREAD)
         function(value)
 
-    shutil.rmtree(target, onexc=retry_readonly)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(target, onexc=retry_readonly)
+    else:
+        shutil.rmtree(target, onerror=retry_readonly)
