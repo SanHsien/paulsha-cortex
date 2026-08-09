@@ -277,7 +277,10 @@ def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_pa
     assert planning_runtime._tree_snapshot(tmp_path) == baseline
 
     empty.chmod(0o700)
-    assert planning_runtime._tree_snapshot(tmp_path) != baseline
+    if os.name == "nt":
+        assert planning_runtime._tree_snapshot(tmp_path) == baseline
+    else:
+        assert planning_runtime._tree_snapshot(tmp_path) != baseline
     empty.chmod(baseline_mode)
     assert planning_runtime._tree_snapshot(tmp_path) == baseline
 

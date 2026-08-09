@@ -3,8 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import shutil
+import tempfile
 
 import pytest
+
+
+if os.name == "nt":
+    # GitHub-hosted runners may expose %TEMP% through an 8.3 alias.  Product
+    # code intentionally canonicalizes paths, so tests must create fixtures
+    # from that same identity instead of comparing short and long spellings.
+    tempfile.tempdir = str(Path(tempfile.gettempdir()).resolve())
 
 
 @pytest.fixture(autouse=True)

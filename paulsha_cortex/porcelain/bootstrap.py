@@ -20,6 +20,7 @@ from . import service as service_family
 
 BOOTSTRAP_SCHEMA = "cortex-porcelain/bootstrap/v1"
 _EXECUTOR_CANDIDATES: tuple[str, ...] = ("claude", "codex", "copilot")
+_WINDOWS_BATCH_METACHARACTERS = re.compile(r"[\r\n&|<>%^!()]")
 def register_commands() -> None:
     if "bootstrap" in COMMANDS:
         return
@@ -56,7 +57,30 @@ def _bootstrap_envelope(**payload: Any) -> dict[str, Any]:
 
 
 def _run(argv: list[str], *, timeout: int = 10) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, check=False, capture_output=True, text=True, timeout=timeout)
+    effective_argv = argv
+    executable = shutil.which(argv[0])
+    if executable is not None:
+        suffix = Path(executable).suffix.lower()
+        if os.name == "nt" and suffix in {".cmd", ".bat"}:
+            if any(_WINDOWS_BATCH_METACHARACTERS.search(value) for value in argv[1:]):
+                raise ValueError("Windows batch command contains unsafe metacharacters")
+            comspec = os.environ.get("COMSPEC") or os.environ.get("ComSpec") or "cmd.exe"
+            effective_argv = [
+                comspec,
+                "/d",
+                "/s",
+                "/c",
+                subprocess.list2cmdline([executable, *argv[1:]]),
+            ]
+        else:
+            effective_argv = [executable, *argv[1:]]
+    return subprocess.run(
+        effective_argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 
 def _slugify(value: str) -> str:

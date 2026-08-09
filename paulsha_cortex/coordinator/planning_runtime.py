@@ -70,7 +70,12 @@ def _tree_snapshot(root: Path) -> str:
 
     def add_metadata(path: Path) -> os.stat_result:
         metadata = path.lstat()
-        digest.update(f"{metadata.st_mode}:{metadata.st_uid}:{metadata.st_gid}".encode())
+        stable_mode = metadata.st_mode
+        if os.name == "nt":
+            stable_mode = stat.S_IFMT(metadata.st_mode) | stat.S_IREAD
+            if metadata.st_mode & stat.S_IWRITE:
+                stable_mode |= stat.S_IWRITE
+        digest.update(f"{stable_mode}:{metadata.st_uid}:{metadata.st_gid}".encode())
         digest.update(b"\0")
         try:
             names = sorted(os.listxattr(path, follow_symlinks=False))

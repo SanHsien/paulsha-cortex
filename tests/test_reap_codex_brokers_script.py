@@ -4,6 +4,11 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="requires POSIX /proc and Bash")
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "paulsha_cortex/scripts/reap-codex-brokers.sh"
 

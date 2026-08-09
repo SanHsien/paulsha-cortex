@@ -789,6 +789,7 @@ class DispatchDisciplineCanaryTests(unittest.TestCase):
                 )
             )
 
+    @unittest.skipIf(os.name == "nt", "requires POSIX /proc and Bash")
     def test_reaper_never_signals_foreign_roots_or_changed_identity(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
