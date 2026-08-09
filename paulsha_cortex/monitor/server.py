@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .snapshot import ChangeEvent, SnapshotStore
+from .transport import bind_monitor_listener, connect_monitor_socket, uses_unix_socket
 from .work_api import (
     WORK_API_SCHEMA,
     AmbiguousWorkItemError,
@@ -117,6 +118,30 @@ class MonitorServer:
     def _prepare_socket_path(self) -> None:
         if not self._socket_path.exists():
             return
+        if not uses_unix_socket():
+            try:
+                probe = connect_monitor_socket(
+                    self._socket_path, timeout=SOCKET_PROBE_TIMEOUT_SECONDS
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"monitor endpoint path 已存在且格式無效：{self._socket_path}"
+                ) from exc
+            except TimeoutError as exc:
+                if not uses_unix_socket():
+                    self._socket_path.unlink(missing_ok=True)
+                    return
+                raise RuntimeError(
+                    f"live monitor already listening on {self._socket_path}"
+                ) from exc
+            except OSError:
+                self._socket_path.unlink(missing_ok=True)
+                return
+            else:
+                probe.close()
+                raise RuntimeError(
+                    f"live monitor already listening on {self._socket_path}"
+                )
         try:
             mode = self._socket_path.stat().st_mode
         except OSError as exc:
@@ -150,21 +175,15 @@ class MonitorServer:
         if self._stop_event.is_set():
             return
         self._socket_path.parent.mkdir(parents=True, exist_ok=True)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener: socket.socket | None = None
         bound = False
         socket_identity: tuple[int, int, int] | None = None
         owner_token: object | None = None
         try:
             with _SOCKET_PATH_LOCK:
                 self._prepare_socket_path()
-                previous_umask = os.umask(0o177)
-                try:
-                    listener.bind(str(self._socket_path))
-                    bound = True
-                finally:
-                    os.umask(previous_umask)
-                os.chmod(str(self._socket_path), 0o600)
-                listener.listen(16)
+                listener = bind_monitor_listener(self._socket_path, backlog=16)
+                bound = True
                 listener.settimeout(ACCEPT_TIMEOUT_SECONDS)
                 path_stat = self._socket_path.lstat()
                 socket_identity = (
@@ -198,12 +217,13 @@ class MonitorServer:
                     ]
                     self._connection_threads.append(t)
         finally:
-            self._teardown(
-                listener,
-                unlink_socket=bound,
-                socket_identity=socket_identity,
-                owner_token=owner_token,
-            )
+            if listener is not None:
+                self._teardown(
+                    listener,
+                    unlink_socket=bound,
+                    socket_identity=socket_identity,
+                    owner_token=owner_token,
+                )
 
     def stop(self) -> None:
         with self._lifecycle_lock:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -3717,6 +3718,7 @@ def test_idempotent_existing_evidence_records_expected_gate_before_registry_comm
     assert not (tmp_path / "planning-transactions/workflow-1.json").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows ACLs do not expose POSIX 0600 vs 0644")
 def test_idempotent_existing_evidence_rejects_noncanonical_mode(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence/brainstorm.json"
     evidence.parent.mkdir()

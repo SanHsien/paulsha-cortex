@@ -4,6 +4,14 @@ import sys
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _exercise_posix_service_installer(monkeypatch):
+    """These legacy tests cover the systemd backend even on Windows CI."""
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_is_windows", lambda: False)
+
 from paulsha_cortex.deploy.installer import render_units
 
 

@@ -14,9 +14,14 @@ from typing import Sequence
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deploy import hooks as hook_reconcile
+from paulsha_cortex.deploy import windows_service
 
 _INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 _SUPPORTED_EXECUTORS = frozenset({"copilot", "claude", "codex"})
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,7 @@ def _resolve_git_repo_root(repo_root: Path) -> Path:
         ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     if probe.returncode != 0:
         raise ValueError(f"{candidate} 不是 git repo")
@@ -218,6 +224,7 @@ def _resolve_repo_identity(repo_root: Path) -> str:
             ["git", "-C", str(resolved), "remote", "get-url", "origin"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
     except OSError:
         return f"path:{resolved}"
@@ -244,7 +251,7 @@ def _instance_env_file(runtime_dir: Path, instance: str) -> Path:
 def install_service_result(
     instance: str, interval: int, repo_root: Path, *, rebind: bool = False
 ) -> InstallServiceResult:
-    home = Path.home()
+    home = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
     bootstrap_root = home / ".agents"
     runtime_dir = bootstrap_root / "core" / "runtime"
     env_file = runtime_dir / f"{instance}-manager.env"
@@ -278,16 +285,18 @@ def install_service_result(
     # Units always bootstrap their EnvironmentFile from %h/.agents. The env
     # file then redirects all mutable/runtime data through PSC_AGENTS_ROOT and
     # the more-specific PSC_* roots.
+    service_directories = (() if _is_windows() else (unit_dir,))
     for directory in (
-        unit_dir,
+        *service_directories,
         runtime_dir,
         agents_root / "specs",
         agents_root / "monitor",
         agents_root / "config" / "paulsha",
     ):
         directory.mkdir(parents=True, exist_ok=True)
-    for name, content in render_units(instance, interval, repo_root=repo_root).items():
-        (unit_dir / name).write_text(content)
+    if not _is_windows():
+        for name, content in render_units(instance, interval, repo_root=repo_root).items():
+            (unit_dir / name).write_text(content)
     managed_env = {
         "PY": sys.executable,
         "PSC_INSTANCE": instance,
@@ -297,6 +306,7 @@ def install_service_result(
         "PSC_RUN_ROOT": str(agents_root / "run" / instance),
         "PSC_MONITOR_STATE_ROOT": str(agents_root / "monitor"),
         "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
+        "PSC_MANAGER_INTERVAL_SECONDS": str(interval),
     }
     executor_override = os.environ.get("PSC_MANAGER_EXECUTOR", "").strip()
     if executor_override:
@@ -319,6 +329,24 @@ def install_service_result(
         hook_reconcile.default_codex_hooks_path(home)
     )
     hook_note = f"codex hooks reconcile: {hook_reconcile_result.detail}"
+    if _is_windows():
+        if not windows_service.available():
+            return InstallServiceResult(
+                exit_code=1,
+                mode="windows-startup",
+                message=f"Windows per-user service backend 不可用。\n{hook_note}",
+            )
+        task_result = windows_service.install_startup(
+            instance=instance,
+            repo_root=repo_root,
+            runtime_dir=runtime_dir,
+            python_executable=Path(sys.executable),
+        )
+        return InstallServiceResult(
+            exit_code=task_result.returncode,
+            mode="windows-startup",
+            message=f"{task_result.message}\n{hook_note}",
+        )
     if not _systemctl_available():
         return InstallServiceResult(
             exit_code=0,

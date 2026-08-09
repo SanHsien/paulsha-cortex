@@ -92,7 +92,8 @@ def test_round_trip_writes_schema_0600_and_canonical_json(tmp_path):
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema"] == SNAPSHOT_SCHEMA == "work-items-snapshot/v1"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert store.load() == _snapshot()
 
 
@@ -124,7 +125,7 @@ def test_write_fsyncs_file_and_parent_directory(monkeypatch, tmp_path):
 
     monkeypatch.setattr(os, "fsync", record)
     WorkSnapshotStore(tmp_path / "work-items.snapshot.json").write(_snapshot())
-    assert len(calls) >= 2
+    assert len(calls) >= (1 if os.name == "nt" else 2)
 
 
 def test_unknown_schema_and_ownership_collision_fail_before_overwrite(tmp_path):

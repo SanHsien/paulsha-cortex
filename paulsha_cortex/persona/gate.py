@@ -20,7 +20,7 @@ def compute_changed_paths(base: str, head: str, repo: str | Path | None = None) 
     # core.quotepath=false：避免非 ASCII 路徑（zh-tw repo 常見）被
     # 引號包裹 + 八進位跳脫，導致 _normalize_path 誤判而出現 false violation。
     cmd += ["-c", "core.quotepath=false", "diff", "--name-only", f"{base}...{head}"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0:
         raise RuntimeError(f"git diff 失敗（fail-closed）: {proc.stderr.strip()}")
     return [line for line in proc.stdout.splitlines() if line.strip()]

@@ -9,12 +9,12 @@
 - Candidate、Verification、Independent Review、Merge Result 與 CompletionRecord 的一致性模型，直接對應多 agent／worktree／retry 情境的治理缺口。
 - upstream 有實際 Python runtime、GitHub delivery、manager daemon、monitor、persona 與大量 regression tests，不是概念展示。
 - upstream 在 2026-08-08 發布 v0.1.4，維護與修正節奏活躍。
-- 本 fork 可補上 Windows 使用者需要的 WSL-first 開發入口、LF checkout 契約與個人專案治理骨架。
+- 本 fork 已把核心 runtime、service lifecycle、monitor transport、process launcher 與完整 pytest 移植為原生 Windows-first，同時保留 Linux/systemd 相容性。
 
 ## 採用限制
 
 - 評估時 upstream 根目錄沒有 LICENSE。GitHub fork 機制不等於取得一般性的再散布、改作或套件發布授權；在 upstream 明確補授權前，不把衍生套件發佈到 GitHub 以外，也不聲稱本專案是已確認授權的開源發行版。
-- 核心 runtime 假設 Linux／WSL；原生 Windows 缺少 `fcntl`、`os.getloadavg` 與 foreign-review sandbox 所需的 Unix 能力。
+- foreign-review 的 bubblewrap 隔離仍需 Linux；Windows 會明確略過這個 POSIX-only sandbox，不把它誤報為已驗證。
 - 最新公開 issues 包含 verification evidence 可被 rigged、自報測試與實測背離、retry dead-end、handoff 殘留與 GitHub rate-limit 協調問題。production 採用前必須逐項重新評估，不能只看 CI 綠燈。
 - 目前主要 commit 歷史集中於單一維護者，fork 需保有獨立復原與上游追蹤能力。
 
@@ -43,4 +43,4 @@ gh pr list --repo hamanpaul/paulsha-cortex --state all --limit 20
 | upstream tip | `b868760` |
 | release | `v0.1.4` |
 | 評估日期 | 2026-08-09 |
-| 決策 | 值得作 research/development fork；暫不列為 production-ready |
+| 決策 | 值得維護為 Windows-first development fork；授權與 Linux-only sandbox 邊界收斂前不列為 production-ready |

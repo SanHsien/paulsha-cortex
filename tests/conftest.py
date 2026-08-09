@@ -32,6 +32,31 @@ def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _skip_symlink_tests_without_windows_privilege(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip only when the host cannot create the symlink required by a test.
+
+    Windows requires Developer Mode or SeCreateSymbolicLinkPrivilege.  Linux CI
+    still exercises every symlink security assertion; native Windows reports a
+    precise skip instead of failing before product code is reached.
+    """
+    if os.name != "nt":
+        return
+    original = os.symlink
+
+    def guarded_symlink(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege is unavailable")
+            raise
+
+    monkeypatch.setattr(os, "symlink", guarded_symlink)
+
+
+@pytest.fixture(autouse=True)
 def _prefer_local_openspec(monkeypatch: pytest.MonkeyPatch) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     wrapper = repo_root / "scripts" / "openspec"

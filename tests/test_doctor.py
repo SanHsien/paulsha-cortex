@@ -380,8 +380,10 @@ def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
         argv[0] == "/tools/srt" and argv[3:5] == ["--", "/tools/python3"]
         for argv in calls
     )
-    assert configured_sandbox["filesystem"]["denyRead"][-1] == "/run/docker.sock"
-    assert "/var/run/docker.sock" not in configured_sandbox["filesystem"]["denyRead"]
+    assert {
+        str(Path(value).resolve())
+        for value in ("/run/user", "/run/docker.sock", "/var/run/docker.sock")
+    }.issubset(set(configured_sandbox["filesystem"]["denyRead"]))
 
 
 def test_review_sandbox_probe_rejects_unsupported_claude_version(
@@ -487,11 +489,14 @@ def test_monitor_live_probe_requires_connectable_unix_socket(tmp_path: Path) -> 
 
 
 def test_monitor_protocol_probe_rejects_transport_only_listener(tmp_path: Path, monkeypatch) -> None:
+    from paulsha_cortex.monitor.transport import (
+        bind_monitor_listener,
+        connect_monitor_socket,
+    )
+
     socket_path = tmp_path / "run" / "project-monitor.sock"
     socket_path.parent.mkdir()
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(socket_path))
-    listener.listen(1)
+    listener = bind_monitor_listener(socket_path)
 
     def accept_then_close() -> None:
         connection, _address = listener.accept()
@@ -507,9 +512,7 @@ def test_monitor_protocol_probe_rejects_transport_only_listener(tmp_path: Path, 
             self.timeout = timeout
 
         def request(self, _payload):
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.settimeout(self.timeout)
-                client.connect(str(self.socket_path))
+            with connect_monitor_socket(self.socket_path, timeout=self.timeout) as client:
                 client.sendall(b'{"kind":"list_work_items"}\n')
                 if not client.recv(4096):
                     raise RuntimeError("monitor socket returned no response")

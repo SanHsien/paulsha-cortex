@@ -2,7 +2,19 @@
 
 # paulsha-cortex
 
+> **Windows-first fork:** `SanHsien/paulsha-cortex` 以原生 Windows 11 + PowerShell + Python 為第一級開發與執行環境。manager、monitor、launcher、workflow/review evidence、service lifecycle 與完整 pytest 都不需要 WSL。Linux/systemd 保持相容；bubblewrap foreign-review sandbox 仍是 Linux-only。
+
 `paulsha-cortex` 是由 orchestrator 主導的 harness 治理平面三件套：**persona 契約**、**coordinator 派工**、**control 檔案契約**。它把可移植的治理邏輯拆成獨立套件，讓主 repo 專注在產品行為，並把 Stage 3/4 的 guardrail、manager control plane、deck / monitor 以最小 runtime 依賴方式出貨。
+
+## 平台支援
+
+| 能力 | Windows 11 | Linux |
+| --- | --- | --- |
+| manager / monitor / workflow / review evidence | 原生支援 | 支援 |
+| 背景 service | per-user Startup + PID/lock | systemd `--user` |
+| monitor transport | loopback TCP endpoint manifest | Unix socket |
+| 完整 pytest / build | Windows CI 權威 gate | Linux CI 相容 gate |
+| bubblewrap foreign-review sandbox | 不支援（明確 skip） | 支援 |
 
 ## 定位
 
@@ -23,18 +35,25 @@ persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role p
 
 ## Install
 
-需求：Python 3.10+、Git，以及至少一個已安裝並登入的 headless executor CLI（`copilot`、`claude` 或 `codex`）。套件只安裝 Python runtime，不會代裝或登入 executor。
+需求：Windows 11（本 fork 主要平台）、PowerShell 7、Python 3.10+、Git，以及至少一個已安裝並登入的 headless executor CLI（`copilot`、`claude` 或 `codex`）。套件只安裝 Python runtime，不會代裝或登入 executor。
 
-```bash
-pipx install git+https://github.com/hamanpaul/paulsha-cortex.git
+```powershell
+pipx install git+https://github.com/SanHsien/paulsha-cortex.git
 cortex --help
 cortex --version
 ```
 
 也可在專案內直接安裝：
 
-```bash
+```powershell
 python -m pip install .
+```
+
+Fork 開發環境：
+
+```powershell
+pwsh -File tools/bootstrap_dev.ps1
+pwsh -File tools/dev_check.ps1 -Quick
 ```
 
 ## 新手上手
@@ -66,23 +85,21 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
 `--dry-run` 只會檢查 Python/Git/repo/登入態並預覽後續命令，不會修改任何檔案或啟動服務；正式執行時預設會 install + start，最後附上 `inspect status` / `inspect doctor` 的下一步指引。若想順手產生第一個 sample workflow，可加 `--sample feature-oneshot --task "demo feature"`；sample 失敗只會降級回報，不影響 bootstrap 核心步驟成功與否。
 
-1. 在被治理的目標 git repo 安裝 systemd `--user` 單元：
+1. 在被治理的目標 git repo 安裝目前平台的 service backend。Windows 會建立不需管理員權限的 per-user Startup launcher；Linux 會安裝 systemd `--user` units：
 
-   ```bash
-   cd /path/to/target-repo
-   cortex install service \
-     --instance cortex \
-     --repo-root "$(git rev-parse --show-toplevel)"
+   ```powershell
+   Set-Location C:\path\to\target-repo
+   cortex install service --instance cortex --repo-root (git rev-parse --show-toplevel)
    ```
 
-   Installer 會 render/copy units、執行 `daemon-reload`，並 enable manager timer 與 monitor service；**不會 start service**。`--interval` 只調整 deprecated timer 的 `OnUnitActiveSec`；長駐 daemon 的 tick 週期由 `PSC_MANAGER_INTERVAL_SECONDS` 控制。兩個 service 都會設定 `WorkingDirectory=<PSC_REPO_ROOT>`，因此服務執行時不受 `cwd` 影響。
+   Windows installer 會寫入 runtime env、service manifest 與 Startup launcher；**不會立即 start service**。`--interval` 會寫入 `PSC_MANAGER_INTERVAL_SECONDS`。Linux installer 保留既有 systemd 行為。
 
-2. 啟動 manager 並分別檢查 service/runtime 狀態：
+2. 啟動 manager/monitor 並檢查 service/runtime 狀態：
 
-   ```bash
-   systemctl --user start cortex-manager.service cortex-manager.timer
-   systemctl --user status cortex-manager.service
-   cortex status | jq
+   ```powershell
+   cortex service start --instance cortex --json
+   cortex service status --instance cortex --json
+   cortex status
    ```
 
    可在 `$HOME/.agents/core/runtime/cortex-manager.env` 加入 operator 設定；installer 重跑時會保留非 managed keys：
@@ -130,10 +147,9 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
      legacy_policy: hide
    ```
 
-   ```bash
-   cortex monitor --once | jq
-   systemctl --user start cortex-monitor.service
-   systemctl --user status cortex-monitor.service
+   ```powershell
+   cortex monitor --once
+   cortex service status --instance cortex --json
    ```
 
 6. 日常查詢：
@@ -169,7 +185,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    cortex inspect service --json
    ```
 
-9. 用 `service` 家族管理 installer、systemd runtime 與 fallback logs：
+9. 用 `service` 家族管理 Windows Startup 或 Linux systemd runtime 與 logs：
 
    ```bash
    cortex service install --instance cortex --repo-root "$(git rev-parse --show-toplevel)"
@@ -179,7 +195,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    cortex service uninstall --instance cortex --purge --json
    ```
 
-   `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
+   Windows status 會回報 `mode=windows-startup`、manager/monitor PID 與 log path；stop/restart 只會終止 command line 能驗證為同 instance/component 的 PID。Linux status 讀 systemd units，fallback 才讀前景 manager lock。Windows 若要持續追蹤 log，可使用 PowerShell `Get-Content <log> -Wait`。
    `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 落檔位置、重試 command（`systemctl --user ...`），並明確指出「unit 已寫入但僅 reload/enable 尚未完成」，不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
 
 10. 用 `run` 家族提交高階 mutation；不加 `--wait` 時會回傳 request ID 並以 exit 3 表示 accepted-pending：

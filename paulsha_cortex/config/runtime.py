@@ -55,7 +55,12 @@ def _installed_environment(
     *,
     home: Path | None,
 ) -> tuple[Path, dict[str, str]]:
-    selected_home = (Path.home() if home is None else Path(home)).expanduser()
+    environment_home = environment.get("HOME", "").strip()
+    selected_home = (
+        Path(environment_home) if home is None and environment_home else
+        Path.home() if home is None else
+        Path(home)
+    ).expanduser()
     if not selected_home.is_absolute():
         raise ValueError("runtime home 必須為絕對路徑")
     bootstrap = (

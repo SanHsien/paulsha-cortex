@@ -28,6 +28,7 @@ from typing import Callable, Iterable, Iterator, Mapping
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.schema import Card
+from paulsha_cortex.lib.durability import fsync_directory as _fsync_directory
 
 SCHEMA_VERSION = 1
 
@@ -104,14 +105,6 @@ def build_event(
         "workflow_id": workflow_id if isinstance(workflow_id, str) else None,
         "recorded_at": clock(),
     }
-
-
-def _fsync_directory(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def iter_events(path: Path) -> Iterator[dict]:

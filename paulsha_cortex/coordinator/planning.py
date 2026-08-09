@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
 from .._yaml import YAMLError, safe_load
+from ..lib.durability import fsync_directory
 from .model_identities import (
     CapabilityProbe,
     IdentityRegistry,
@@ -1057,11 +1058,7 @@ def _write_immutable_json(path: Path, payload: object) -> None:
     except Exception:
         path.unlink(missing_ok=True)
         raise
-    directory_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    fsync_directory(path.parent)
 
 
 def run_heterogeneous_brainstorm(

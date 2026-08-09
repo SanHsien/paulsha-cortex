@@ -10,6 +10,8 @@ from typing import Any, Sequence
 
 from paulsha_cortex.control import constants
 from paulsha_cortex.deploy import installer
+from paulsha_cortex.deploy import windows_service
+from paulsha_cortex.lib.processes import pid_exists
 
 from . import COMMANDS, PorcelainCommand, register
 from ._runtime_probe import probe_service_runtime
@@ -107,6 +109,20 @@ def install(*, instance: str, interval: int, repo_root: str, rebind: bool = Fals
 
 
 def start(*, instance: str) -> dict[str, Any]:
+    if windows_service.available():
+        result = windows_service.control_processes("start", instance=instance)
+        payload: dict[str, Any] = {
+            "result": {"exit_code": result.returncode},
+            "service": _status_payload(instance),
+        }
+        if result.returncode != 0:
+            payload["error"] = result.message
+        return _service_envelope(
+            "start",
+            instance,
+            mode="windows-startup",
+            **payload,
+        )
     if not _systemd_control_available():
         service = _control_service_state(instance)
         return _service_envelope(
@@ -222,13 +238,7 @@ def _env_summary(instance: str) -> dict[str, Any]:
 
 
 def _pid_is_live(pid: int | None) -> bool:
-    if pid is None or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    return pid_exists(pid) if pid is not None else False
 
 
 def _fallback_runtime(instance: str, version: str, units: dict[str, Any]) -> dict[str, Any] | None:
@@ -259,6 +269,21 @@ def _read_lock_payload() -> dict[str, Any]:
 
 
 def _status_payload(instance: str) -> dict[str, Any]:
+    if windows_service.available():
+        processes = windows_service.query_processes(instance)
+        if windows_service.installed(instance):
+            lock_payload = _read_lock_payload()
+            pid = lock_payload.get("pid")
+            live_pid = pid if isinstance(pid, int) and _pid_is_live(pid) else None
+            return {
+                "instance": instance,
+                "mode": "windows-startup",
+                "version": probe_service_runtime(instance).get("version", "0.0.0+unknown"),
+                "pid": live_pid,
+                "log_path": str(windows_service.log_path(instance, "manager")),
+                "env": _env_summary(instance),
+                "processes": processes,
+            }
     probe = probe_service_runtime(instance)
     if probe["mode"] == "systemd":
         units = probe.get("units", {})
@@ -285,7 +310,11 @@ def _systemd_control_available() -> bool:
 
 def _control_service_state(instance: str) -> dict[str, Any]:
     service = _status_payload(instance)
-    if _systemd_control_available() or service.get("mode") == "fallback":
+    if (
+        windows_service.available()
+        or _systemd_control_available()
+        or service.get("mode") == "fallback"
+    ):
         return service
     normalized = dict(service)
     normalized["mode"] = "none"
@@ -331,6 +360,11 @@ def _print_status(service: dict[str, Any]) -> None:
         if suggestion:
             line += f"\tsuggestion={suggestion}"
         sys.stdout.write(line + "\n")
+    for component, row in sorted(service.get("processes", {}).items()):
+        if isinstance(row, dict):
+            sys.stdout.write(
+                f"{component}\tstatus={row.get('status')}\tpid={row.get('pid') or '-'}\n"
+            )
     for command in service.get("suggested_commands", []):
         sys.stdout.write(f"suggested: {command}\n")
 
@@ -379,6 +413,31 @@ def _run_lifecycle(command: str, *, instance: str, json_output: bool) -> int:
             return exit_code
         service_payload = payload.get("service")
         _print_status(service_payload if isinstance(service_payload, dict) else _status_payload(instance))
+        return 0
+    if windows_service.available():
+        result = windows_service.control_processes(command, instance=instance)
+        if result.returncode != 0:
+            return _emit_command_error(
+                command,
+                instance,
+                json_output=json_output,
+                mode="windows-startup",
+                exit_code=result.returncode,
+                message=result.message,
+                service=_status_payload(instance),
+            )
+        if json_output:
+            _json_dump(
+                _service_envelope(
+                    command,
+                    instance,
+                    mode="windows-startup",
+                    result={"exit_code": 0},
+                    service=_status_payload(instance),
+                )
+            )
+            return 0
+        _print_status(_status_payload(instance))
         return 0
     if not _systemd_control_available():
         return _mode_error(
@@ -492,7 +551,10 @@ def _run_logs(*, instance: str, lines: int, follow: bool, json_output: bool) -> 
                 json_output=json_output,
                 mode=mode,
                 exit_code=1,
-                message="fallback mode 不支援 `cortex service logs --follow`；請直接 tail log 檔案。",
+                message=(
+                    f"{mode} mode 不支援 `cortex service logs --follow`；"
+                    "請直接使用 PowerShell `Get-Content -Wait` 追蹤 log 檔案。"
+                ),
                 service=service,
                 source="file",
                 lines=max(lines, 0),
@@ -524,6 +586,34 @@ def _remove_if_exists(path: Path) -> None:
 
 
 def _run_uninstall(*, instance: str, purge: bool, json_output: bool) -> int:
+    if windows_service.available():
+        result = windows_service.uninstall_startup(instance)
+        if result.returncode != 0:
+            return _emit_command_error(
+                "uninstall",
+                instance,
+                json_output=json_output,
+                mode="windows-startup",
+                exit_code=result.returncode,
+                message=result.message,
+                purge=purge,
+            )
+        env_path = _runtime_env_path(instance)
+        if purge:
+            _remove_if_exists(env_path)
+        if json_output:
+            _json_dump(
+                _service_envelope(
+                    "uninstall",
+                    instance,
+                    mode="windows-startup",
+                    purge=purge,
+                    result={"exit_code": 0},
+                )
+            )
+        else:
+            sys.stdout.write(f"uninstalled: {instance}\n")
+        return 0
     if not _systemd_control_available():
         return _mode_error(
             "uninstall",

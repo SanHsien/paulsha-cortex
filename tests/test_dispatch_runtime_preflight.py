@@ -34,7 +34,7 @@ from paulsha_cortex.coordinator.runtime_preflight import (
 def _executable(directory, name: str) -> str:
     """在 directory 內造一個可執行的 stub，回傳其路徑。"""
 
-    target = directory / name
+    target = directory / (f"{name}.exe" if os.name == "nt" else name)
     target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(target)
@@ -128,8 +128,6 @@ def test_missing_module_blocks_dispatch_with_zero_model_calls(tmp_path):
 
 def test_missing_executable_blocks_dispatch(tmp_path):
     """R2：reviewer sandbox 缺 socat 時同樣在 dispatch 前攔截。"""
-
-    assert shutil.which("sh") is not None, "host 必須有 sh 才能驗證 PATH 隔離語意"
 
     factory = _CountingLauncherFactory()
     decision = evaluate_dispatch_gate(
@@ -256,7 +254,9 @@ def test_card_capability_declaration_is_data_driven(tmp_path):
         identity=_BUILDER,
         environment=_host_env(tmp_path, path=str(empty)),
     )
-    assert bridge_ok.outcome is PreflightOutcome.OK
+    assert bridge_ok.outcome is (
+        PreflightOutcome.CAPABILITY_MISSING if os.name == "nt" else PreflightOutcome.OK
+    )
 
 
 # ------------------------------------------------------------------------ R3

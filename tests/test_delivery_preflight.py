@@ -25,17 +25,18 @@ HEAD = "a" * 40
 TREE = "b" * 40
 
 
-def test_initial_and_existing_pr_preflight_argv() -> None:
+def test_initial_and_existing_pr_preflight_argv(tmp_path: Path) -> None:
     command = ("/opt/tools/preflight.sh",)
+    metadata = tmp_path / "pr.json"
     initial = build_preflight_argv(
         command=command,
-        request=PreflightRequest(metadata_path="/tmp/pr.json"),
+        request=PreflightRequest(metadata_path=str(metadata)),
     )
     existing = build_preflight_argv(
         command=command,
         request=PreflightRequest(pr_number=15),
     )
-    assert initial == ["/opt/tools/preflight.sh", "--metadata", "/tmp/pr.json"]
+    assert initial == ["/opt/tools/preflight.sh", "--metadata", str(metadata)]
     assert existing == ["/opt/tools/preflight.sh", "--pr", "15"]
 
 

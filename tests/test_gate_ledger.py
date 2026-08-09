@@ -114,6 +114,7 @@ def test_ledger_is_written_even_with_no_declared_gates(tmp_path: Path) -> None:
     assert ledger_path.is_file()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="legacy Bash wrapper is POSIX-only")
 def test_wrapper_runs_gate_writer_after_sentinel_and_survives_model_failure(
     tmp_path: Path,
 ) -> None:

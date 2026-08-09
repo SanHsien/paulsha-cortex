@@ -46,6 +46,7 @@ def _make_unit(home: Path, instance: str) -> None:
     (unit_dir / f"{instance}-manager.timer").write_text("[Timer]\n", encoding="utf-8")
 
 
+@unittest.skipIf(os.name == "nt", "legacy systemd shell service is POSIX-only")
 class StartManagerServiceTests(unittest.TestCase):
     def test_disabled_skips(self) -> None:
         with tempfile.TemporaryDirectory() as d:

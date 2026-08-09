@@ -620,6 +620,7 @@ def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows hardlinks share the read-only attribute")
 def test_abandon_evidence_is_immutable_at_link_creation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

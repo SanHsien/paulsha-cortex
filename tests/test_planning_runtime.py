@@ -312,7 +312,8 @@ def test_snapshot_permission_error_still_restores_operator_tree(tmp_path: Path) 
             timeout_seconds=30,
         )
 
-    assert protected.stat().st_mode & 0o777 == 0o750
+    if os.name != "nt":
+        assert protected.stat().st_mode & 0o777 == 0o750
     assert tracked.read_text(encoding="utf-8") == "baseline\n"
     if xattr_supported:
         assert os.getxattr(tracked, "user.cortex-test") == b"baseline"

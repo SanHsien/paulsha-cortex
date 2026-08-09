@@ -157,6 +157,24 @@ class ExecutorEnvironment:
         """正式 job 會看到的環境變數（sandbox policy 的具體展現）。"""
 
         env = {"PATH": self.path, "HOME": self.home}
+        if os.name == "nt":
+            home = os.path.abspath(self.home)
+            env.update(
+                {
+                    key: os.environ[key]
+                    for key in ("COMSPEC", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "WINDIR")
+                    if key in os.environ
+                }
+            )
+            env.update(
+                {
+                    "USERPROFILE": home,
+                    "APPDATA": os.path.join(home, "AppData", "Roaming"),
+                    "LOCALAPPDATA": os.path.join(home, "AppData", "Local"),
+                    "TEMP": os.path.join(home, "AppData", "Local", "Temp"),
+                    "TMP": os.path.join(home, "AppData", "Local", "Temp"),
+                }
+            )
         env.update(self.extra_env)
         return env
 

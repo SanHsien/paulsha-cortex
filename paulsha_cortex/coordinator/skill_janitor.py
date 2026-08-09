@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from paulsha_cortex.deck.schema import Card
+from paulsha_cortex.lib.durability import fsync_directory as _fsync_directory
 
 from .skill_ledger import SkillUsageStats, load_usage_summary
 
@@ -49,14 +50,6 @@ def _utcnow() -> str:
 
 def _parse_iso8601(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-
-
-def _fsync_directory(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:

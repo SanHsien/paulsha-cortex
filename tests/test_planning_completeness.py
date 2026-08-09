@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -321,7 +322,8 @@ def test_brainstorm_is_heterogeneous_persists_immutable_peer_evidence_and_keeps_
     assert result.gate_refs.copilot is None
     evidence_path = Path(result.gate_refs.brainstorm_peer.ref)
     assert evidence_path.is_file()
-    assert evidence_path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert evidence_path.stat().st_mode & 0o777 == 0o600
     persisted = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert persisted["kind"] == "brainstorm-peer"
     assert persisted["scope"] == {

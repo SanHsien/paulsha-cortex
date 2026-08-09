@@ -4,7 +4,9 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,6 +18,7 @@ from paulsha_cortex.coordinator.launcher import (
     build_claude_argv,
     build_codex_argv,
 )
+from paulsha_cortex.lib.processes import pid_exists
 
 
 class ArgvTests(unittest.TestCase):
@@ -163,7 +166,7 @@ class ArgvTests(unittest.TestCase):
         self.assertNotIn("--remote", argv)  # smoke: codex exec 不吃 --remote（unexpected argument）
         self.assertNotIn("unix:/tmp/psc.sock", argv)
         self.assertIn("-C", argv)
-        self.assertIn("/wt/slice-a", argv)
+        self.assertIn(str(Path("/wt/slice-a").resolve()), argv)
         self.assertIn("--json", argv)
         self.assertIn("-o", argv)
 
@@ -214,26 +217,34 @@ class ArgvTests(unittest.TestCase):
         self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
         self.assertEqual(
             settings["sandbox"]["filesystem"]["denyWrite"],
-            ["/wt/reviewer/candidate"],
+            [str(Path("/wt/reviewer/candidate").resolve())],
         )
         self.assertEqual(
             settings["sandbox"]["filesystem"]["allowRead"][0],
-            "/wt/reviewer/candidate",
+            str(Path("/wt/reviewer/candidate").resolve()),
         )
         self.assertIn(
-            "/tools/sandbox-runtime",
+            str(Path("/tools/sandbox-runtime")),
             settings["sandbox"]["filesystem"]["allowRead"],
         )
         self.assertEqual(
             settings["sandbox"]["filesystem"]["denyRead"],
-            [str(Path.home().resolve()), "/run/user", "/run/docker.sock"],
+            [
+                str(Path.home().resolve()),
+                *[
+                    str(path)
+                    for path in dict.fromkeys(
+                        Path(value).resolve()
+                        for value in ("/run/user", "/run/docker.sock", "/var/run/docker.sock")
+                    )
+                ],
+            ],
         )
         protected_files = {
             row["path"] for row in settings["sandbox"]["credentials"]["files"]
         }
-        self.assertIn("/run/user", protected_files)
-        self.assertIn("/run/docker.sock", protected_files)
-        self.assertNotIn("/var/run/docker.sock", protected_files)
+        for value in ("/run/user", "/run/docker.sock", "/var/run/docker.sock"):
+            self.assertIn(str(Path(value).resolve()), protected_files)
         self.assertIn("--strict-mcp-config", claude)
         schema = json.loads(claude[claude.index("--json-schema") + 1])
         self.assertEqual(
@@ -593,7 +604,7 @@ class ArgvTests(unittest.TestCase):
         finally:
             launcher_module.subprocess.Popen = original
 
-        self.assertEqual(calls[0]["argv"][:2], ["bash", "-c"])
+        self.assertEqual(calls[0]["argv"][:3], [sys.executable, "-m", "paulsha_cortex.coordinator.process_wrapper"])
         for key in inherited_secrets:
             self.assertNotIn(key, calls[0]["env"])
         self.assertNotIn("PSC_REPO_ROOT", calls[0]["env"])
@@ -604,7 +615,7 @@ class ArgvTests(unittest.TestCase):
                 "HOME", "LANG", "LC_ADDRESS", "LC_ALL", "LC_COLLATE", "LC_CTYPE",
                 "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_MESSAGES", "LC_MONETARY",
                 "LC_NAME", "LC_NUMERIC", "LC_PAPER", "LC_TELEPHONE", "LC_TIME",
-                "LOGNAME", "PATH", "SHELL", "TMPDIR", "USER", "VIRTUAL_ENV",
+                "LOGNAME", "PATH", "PYTHONPATH", "SHELL", "TMPDIR", "USER", "VIRTUAL_ENV",
             },
         )
 
@@ -683,8 +694,8 @@ class ArgvTests(unittest.TestCase):
                 )
         finally:
             launcher_module.subprocess.Popen = original
-        script = calls[0]["argv"][2]
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", script)
+        argv = calls[0]["argv"]
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
 
     def test_subprocess_launcher_copilot_commit_required_adds_scoped_permissions(self) -> None:
         calls = []
@@ -741,14 +752,10 @@ class ArgvTests(unittest.TestCase):
             finally:
                 launcher_module.subprocess.Popen = original
 
-            script = calls[0]["argv"][2]
-            inner_argv = shlex.split(script.split(";", 1)[0])
-            self.assertIn("--allow-all-tools", script)
-            self.assertIn(f"--add-dir {shlex.quote(str(linked.resolve()))}", script)
-            self.assertIn(
-                f"--add-dir {shlex.quote(git_write_dirs[0])}",
-                script,
-            )
+            inner_argv = calls[0]["argv"][calls[0]["argv"].index("--") + 1 :]
+            self.assertIn("--allow-all-tools", inner_argv)
+            self.assertIn(str(linked.resolve()), inner_argv)
+            self.assertIn(git_write_dirs[0], inner_argv)
             self.assertNotIn("--allow-all", inner_argv)
 
     def test_prompt_is_single_element(self) -> None:
@@ -788,8 +795,6 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(calls[0]["env"]["PSC_RELAY_TARGET"], "/tmp/relay.out")
 
     def test_subprocess_launcher_wraps_with_exit_sentinel(self) -> None:
-        import shlex
-
         from paulsha_cortex.coordinator.dispatcher import exit_sentinel_path
 
         calls = []
@@ -816,16 +821,11 @@ class ArgvTests(unittest.TestCase):
             launcher_module.subprocess.Popen = original
 
         argv = calls[0]["argv"]
-        # 子進程經 bash -lc 包裝，結束時把 $? 寫到 sentinel（跨進程 durable 完成判定）
-        self.assertEqual(argv[0], "bash")
-        self.assertEqual(argv[1], "-lc")
-        script = argv[2]
+        self.assertEqual(argv[:3], [sys.executable, "-m", "paulsha_cortex.coordinator.process_wrapper"])
         sentinel = str(exit_sentinel_path(handle.log_path))
-        self.assertIn(shlex.quote(sentinel), script)
-        self.assertIn('"$?"', script)
-        # 內層 argv 經 shlex.join 安全嵌入；含 -p PROMPT
-        inner = shlex.join(["copilot", "-p", "PROMPT"])
-        self.assertIn(inner, script)
+        self.assertEqual(argv[argv.index("--sentinel") + 1], sentinel)
+        separator = argv.index("--")
+        self.assertEqual(argv[separator + 1 : separator + 4], ["copilot", "-p", "PROMPT"])
 
     def test_subprocess_launcher_clears_stale_sentinel_and_truncates_log(self) -> None:
         # 同一 slice_id 重跑：上一輪殘留的 .exit/.jsonl 必須在 launch 前清掉，
@@ -867,13 +867,13 @@ class ArgvTests(unittest.TestCase):
             launcher_module.subprocess.Popen = original
 
     def test_subprocess_launcher_sentinel_records_real_exit_code(self) -> None:
-        # 真跑 bash -lc 包裝，但內層 argv 覆寫成無害的 `exit 7`（絕不啟動真 copilot/codex），
+        # 真跑跨平台 Python 包裝，但內層 argv 覆寫成無害的 exit 7，
         # 驗證 sentinel 確實寫下內層命令的真實 exit code（跨進程 durable 機制端到端）。
         from paulsha_cortex.coordinator.dispatcher import exit_sentinel_path
 
         orig_builders = dict(launcher_module._ARGV_BUILDERS)
         launcher_module._ARGV_BUILDERS["copilot"] = (
-            lambda **_kw: ["sh", "-c", "exit 7"]
+            lambda **_kw: [sys.executable, "-c", "raise SystemExit(7)"]
         )
         try:
             with tempfile.TemporaryDirectory() as d:
@@ -891,14 +891,15 @@ class ArgvTests(unittest.TestCase):
                 # 進程一被 reap，sentinel 必然就緒；os.waitpid 同時回收 zombie（消除
                 # 先前的 `subprocess still running` ResourceWarning）。test 進程即 spawn
                 # 該子進程的父進程，故可 waitpid。
-                try:
-                    os.waitpid(handle.pid, 0)
-                except ChildProcessError:
-                    # 已被 subprocess 模組內部回收 → 能被回收代表已結束，sentinel 亦已寫出。
-                    pass
+                deadline = time.monotonic() + 10
+                while not sentinel.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.05)
                 # 斷言 MUST 在 with 內（tmpdir 尚未清除）
-                self.assertTrue(sentinel.is_file(), "sentinel exit 檔應由 bash 包裝寫出")
+                self.assertTrue(sentinel.is_file(), "sentinel exit 檔應由跨平台包裝寫出")
                 self.assertEqual(sentinel.read_text().strip(), "7")
+                deadline = time.monotonic() + 10
+                while pid_exists(handle.pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
         finally:
             launcher_module._ARGV_BUILDERS.clear()
             launcher_module._ARGV_BUILDERS.update(orig_builders)
@@ -966,8 +967,8 @@ class ArgvTests(unittest.TestCase):
                 )
         finally:
             launcher_module.subprocess.Popen = original
-        script = captured["argv"][2]
-        self.assertIn("--model claude-haiku-4.5", script)
+        argv = captured["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-haiku-4.5")
 
     def test_launch_sentinel_is_absolute_cwd_independent(self) -> None:
         # bug：相對 log_dir + 子進程 cwd=worktree → sentinel 寫到 worktree（poller 找不到）。
@@ -993,14 +994,14 @@ class ArgvTests(unittest.TestCase):
                 handle = SubprocessLauncher("copilot").launch(
                     slice_id="s", prompt="P", worktree=d, log_dir="runtime/dispatch/s"
                 )
+                os.chdir(original_cwd)
         finally:
             os.chdir(original_cwd)
             launcher_module.subprocess.Popen = original
-        script = captured["argv"][2]
-        m = _re.search(r">\s*(\S*s\.exit)", script)
-        self.assertIsNotNone(m, script)
-        self.assertTrue(m.group(1).startswith("/"), f"sentinel 非絕對: {m.group(1)}")
-        self.assertTrue(handle.log_path.startswith("/"), f"log_path 非絕對: {handle.log_path}")
+        argv = captured["argv"]
+        sentinel = argv[argv.index("--sentinel") + 1]
+        self.assertTrue(Path(sentinel).is_absolute(), f"sentinel 非絕對: {sentinel}")
+        self.assertTrue(Path(handle.log_path).is_absolute(), f"log_path 非絕對: {handle.log_path}")
 
 
 if __name__ == "__main__":

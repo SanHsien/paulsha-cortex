@@ -11,6 +11,7 @@ from typing import Mapping, Sequence
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator.workflow import WorkflowManifest, WorkflowStep
+from paulsha_cortex.lib.durability import fsync_directory
 
 from .schema import BAND_LEVELS, BandTriggeredSpine, Card, Combo, ComboEntry
 
@@ -685,11 +686,7 @@ def emit(result: CompileResult, target_dir: str | Path, *, force: bool = False) 
                     final_path.unlink(missing_ok=True)
                     raise
             written.append(final_path)
-        directory_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(directory)
     except Exception as exc:  # 任何寫入期例外（含編碼錯誤）都必須走同一套回滾，否則 finally 會刪掉備份
         if force:
             for final_path, backup_path in reversed(backups):

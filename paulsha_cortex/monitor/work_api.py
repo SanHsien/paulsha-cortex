@@ -366,10 +366,10 @@ class MonitorSocketClient:
         self.timeout = timeout
 
     def request(self, payload: Mapping) -> dict:
+        from .transport import connect_monitor_socket
+
         body = (json.dumps(dict(payload), ensure_ascii=False) + "\n").encode("utf-8")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(self.timeout)
-            client.connect(str(self.socket_path))
+        with connect_monitor_socket(self.socket_path, timeout=self.timeout) as client:
             client.sendall(body)
             chunks: list[bytes] = []
             while True:

@@ -4,6 +4,14 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _exercise_posix_service_installer(monkeypatch):
+    """These legacy tests cover the systemd backend even on Windows CI."""
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_is_windows", lambda: False)
+
+
 def _init_git_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(path)], check=True)

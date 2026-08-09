@@ -122,8 +122,12 @@ def _list_project_dirs_checked(
                 # previously healthy project, SnapshotStore can retain that
                 # exact last-good path without freezing unrelated projects.
                 items.append(entry)
-            # A non-project entry is not a transient workspace failure.
-            continue
+                continue
+            # The parent listing and lstat both prove the entry exists, while
+            # the followed stat says it does not.  Treat that contradictory
+            # view as a transient scan failure instead of authoritatively
+            # removing a previously healthy project.
+            return [], f"degraded: project unavailable during scan: {entry}"
         if not stat.S_ISDIR(entry_mode):
             continue
         items.append(entry)

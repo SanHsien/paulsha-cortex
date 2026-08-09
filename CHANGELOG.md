@@ -8,7 +8,10 @@
 ## [Unreleased]
 
 ### Added
-- **補齊 fork 的 WSL-first 開發與治理環境**：新增 `.editorconfig`、`.gitattributes`、Python 3.13/dev dependency 契約、VS Code 建議、PowerShell／WSL bootstrap 與 full gate、fork／開發／決策文件、contribution/security/code-of-conduct，以及 Issue／PR templates、Dependabot 與 Python CodeQL。文字檔強制 LF，避免 Windows checkout 使 Bash tests 產生假失敗；原生 Windows 與 upstream 無 LICENSE 的限制均明確記錄。
+- **建立 Windows-first fork 開發與治理環境**：新增原生 PowerShell bootstrap/full gate、Windows CI、typed-argv process wrapper、loopback TCP monitor transport與不需提權的 per-user Startup service backend；Linux/systemd 保持相容，bubblewrap foreign-review sandbox 的 Linux-only 邊界與 upstream 無 LICENSE 的限制均明確記錄。
+
+### Fixed
+- **完成 repository-wide Windows compatibility review**：修復會在 Windows 實際送 signal 的 PID probe、`fcntl`/`getloadavg`/directory fsync POSIX 假設、CRLF/LF evidence identity、immutable hardlink cleanup、cross-host path/mode semantics、monitor transient scan removal、registry v1 backup cleanup，以及測試寫入真實使用者 runtime 的隔離問題。完整 findings 與驗證清冊見 `docs/reviews/2026-08-09-windows-first-review.md`。
 
 ## [0.1.4] - 2026-08-08
 

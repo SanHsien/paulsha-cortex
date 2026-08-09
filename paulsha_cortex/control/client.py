@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime, timezone
 from typing import Any
+
+from paulsha_cortex.lib.processes import pid_exists
 
 from . import constants, contract
 
@@ -105,11 +106,7 @@ def _daemon_pid_alive(payload: dict[str, Any]) -> bool:
     if not _daemon_pid_present(payload):
         return False
     pid = payload["daemon"]["pid"]
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
+    return pid_exists(pid)
 
 
 def poll_done(req_id: str, timeout: float, poll_interval: float = 0.5) -> dict[str, Any] | None:

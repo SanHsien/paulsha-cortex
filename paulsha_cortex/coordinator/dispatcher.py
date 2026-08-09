@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 from typing import Callable
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.lib.processes import pid_exists
 
 from .completion import classify_completion
 from .registry import JobRegistry
@@ -16,7 +16,7 @@ GitRunner = Callable[[list[str]], str]
 # pid_waiter seam（向後相容）：收 pid，回該子進程的 exit code；仍在跑回 None。
 # 注入此 seam 時走「呼叫者直接判定 exit code」舊路徑（單元測試用）。
 PidWaiter = Callable[[int], int | None]
-# pid_alive seam：收 pid，回該進程是否仍存活。預設 os.kill(pid, 0)。
+# pid_alive seam：收 pid，回該進程是否仍存活。預設為跨平台 read-only probe。
 # 跨進程安全：不依賴 os.waitpid（只有 spawn 該子進程的進程能 reap）。
 PidAlive = Callable[[int], bool]
 
@@ -63,14 +63,8 @@ def _read_exit_sentinel(log_path: str | None) -> int | None:
 
 
 def _default_pid_alive(pid: int) -> bool:
-    """os.kill(pid, 0)：無錯=存活；ProcessLookupError=已死；PermissionError=存活（非本人但在）。"""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Read-only cross-platform process liveness probe."""
+    return pid_exists(pid)
 
 
 def _last_nonempty_line(path: str | None) -> str | None:
@@ -170,7 +164,7 @@ class Dispatcher:
 
         判定順序（不依賴 os.waitpid，故 systemd oneshot / 分離 tick 進程亦正確）：
           1. exit sentinel 檔存在 → 讀 exit code、配末筆 JSONL → classify → exited/failed。
-          2. 否則進程仍存活（os.kill(pid,0)）→ 維持 dispatched（仍在跑）。
+          2. 否則進程仍存活（read-only platform probe）→ 維持 dispatched（仍在跑）。
           3. 否則（進程已死、卻無 sentinel，或 crash 留下無 handle pre-launch row）→ failed。
 
         pid_waiter（向後相容 seam）：注入時沿用舊路徑——直接由 waiter(pid) 取 exit code

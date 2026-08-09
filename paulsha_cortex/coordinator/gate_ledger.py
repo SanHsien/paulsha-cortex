@@ -91,7 +91,14 @@ def load_gate_specs(env: Mapping[str, str] | None = None) -> tuple[GateSpec, ...
             # 空值等同「未宣告」，讓 operator 可以用空字串暫時停用某個 gate。
             continue
         try:
-            argv = tuple(shlex.split(raw))
+            argv = tuple(shlex.split(raw, posix=os.name != "nt"))
+            if os.name == "nt":
+                argv = tuple(
+                    item[1:-1]
+                    if len(item) >= 2 and item[0] == item[-1] and item[0] in {"'", '"'}
+                    else item
+                    for item in argv
+                )
         except ValueError as exc:
             raise GateSpecError(f"gate {name!r} 命令無法解析") from exc
         _validate_typed_command(name, argv)

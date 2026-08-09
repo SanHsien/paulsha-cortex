@@ -17,6 +17,8 @@ from uuid import uuid4
 
 from paulsha_cortex.config import paths
 from paulsha_cortex._yaml import safe_load
+from paulsha_cortex.lib.durability import fsync_directory
+from paulsha_cortex.lib.path_safety import is_absolute_any, redact_absolute_paths
 
 from .claim import (
     ClaimCandidate,
@@ -227,12 +229,9 @@ def _canonical_repo_root(value: object, *, repo: str) -> Path:
 # 等）的預設字串會內嵌絕對路徑，而 blocked 結果與 daemon summary 都會被寫進 durable
 # done record 與 log。這裡只保留型別名與清洗過的訊息：POSIX 絕對路徑與 ~ 展開路徑
 # 一律以 <path> 取代（R-21 tier: shareable，AI-SEC-001 禁止輸出個人絕對路徑）。
-_ABSOLUTE_PATH_RE = re.compile(r"(?:~|/)[^\s'\"]*/[^\s'\"]*")
-
-
 def safe_exception_summary(exc: BaseException) -> str:
     """把例外轉成不含絕對路徑的簡短摘要，供 durable 記錄與日誌使用。"""
-    return f"{type(exc).__name__}: {_ABSOLUTE_PATH_RE.sub('<path>', str(exc))}"
+    return f"{type(exc).__name__}: {redact_absolute_paths(str(exc))}"
 
 
 def _path_has_symlink(root: Path, relative: str) -> bool:
@@ -537,11 +536,7 @@ def _save_runs(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -800,6 +795,7 @@ def _authorization_record(
             raise RuntimeError("merge authorization evidence conflict")
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        created = False
         try:
             with temporary.open("x", encoding="utf-8") as handle:
                 json.dump(wrapper, handle, ensure_ascii=False, indent=2, sort_keys=True)
@@ -808,17 +804,24 @@ def _authorization_record(
                 os.fsync(handle.fileno())
             try:
                 os.link(temporary, target)
+                created = True
             except FileExistsError:
-                if target.is_symlink() or json.loads(target.read_text(encoding="utf-8")) != wrapper:
+                if (
+                    target.is_symlink()
+                    or target.stat().st_mode & 0o222
+                    or json.loads(target.read_text(encoding="utf-8")) != wrapper
+                ):
                     raise RuntimeError("merge authorization evidence conflict")
-            os.chmod(target, 0o444)
-            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
+        if created:
+            try:
+                os.chmod(target, 0o444)
+                fsync_directory(root)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                fsync_directory(root)
+                raise
     return {"payload": body, "hash": digest, "path": str(target)}
 
 
@@ -926,7 +929,7 @@ def _authorization_identity_matches(
         and body.get("head") == head
         and body.get("tree_hash") == tree_hash
         and isinstance(body.get("foreign_review_path"), str)
-        and Path(body["foreign_review_path"]).is_absolute()
+        and is_absolute_any(body["foreign_review_path"])
         and all(
             isinstance(body.get(field), str)
             and re.fullmatch(r"[0-9a-f]{64}", body[field]) is not None
@@ -954,7 +957,7 @@ def _authorization_identity_matches(
     if not (
         body.get("review_kind") == "maintainer-review"
         and isinstance(review_ref, str)
-        and Path(review_ref).is_absolute()
+        and is_absolute_any(review_ref)
         and not Path(review_ref).is_symlink()
         and Path(review_ref).is_file()
         and Path(review_ref).stat().st_mode & 0o222 == 0
@@ -1015,6 +1018,7 @@ def _maintainer_review_record(body: dict[str, Any], *, state_path: Path) -> dict
             raise RuntimeError("maintainer review evidence conflict")
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        created = False
         try:
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as handle:
@@ -1022,12 +1026,7 @@ def _maintainer_review_record(body: dict[str, Any], *, state_path: Path) -> dict
                 handle.flush()
                 os.fsync(handle.fileno())
             os.link(temporary, target)
-            os.chmod(target, 0o444)
-            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            created = True
         except FileExistsError:
             if (
                 target.is_symlink()
@@ -1037,6 +1036,14 @@ def _maintainer_review_record(body: dict[str, Any], *, state_path: Path) -> dict
                 raise RuntimeError("maintainer review evidence conflict")
         finally:
             temporary.unlink(missing_ok=True)
+        if created:
+            try:
+                os.chmod(target, 0o444)
+                fsync_directory(root)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                fsync_directory(root)
+                raise
     return {"ref": str(target), "hash": digest}
 
 
@@ -2013,6 +2020,7 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
         _validate_abandon_evidence_target(target, content)
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        created = False
         try:
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as error:
@@ -2023,20 +2031,22 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
                 handle.flush()
-                os.fchmod(handle.fileno(), 0o444)
                 os.fsync(handle.fileno())
             try:
                 os.link(temporary, target)
+                created = True
             except FileExistsError:
                 _validate_abandon_evidence_target(target, content)
-            else:
-                directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
+        if created:
+            try:
+                os.chmod(target, 0o444)
+                fsync_directory(root)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                fsync_directory(root)
+                raise
     return {"ref": str(target), "hash": digest}
 
 
@@ -2149,6 +2159,7 @@ def _recover_planning_record(
             raise RuntimeError("workflow planning recovery evidence conflict")
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        created = False
         try:
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as error:
@@ -2157,21 +2168,23 @@ def _recover_planning_record(
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
                 handle.flush()
-                os.fchmod(handle.fileno(), 0o444)
                 os.fsync(handle.fileno())
             try:
                 os.link(temporary, target)
+                created = True
             except FileExistsError:
                 if target.is_symlink() or target.read_bytes() != content:
                     raise RuntimeError("workflow planning recovery evidence conflict")
-            else:
-                directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
+        if created:
+            try:
+                os.chmod(target, 0o444)
+                fsync_directory(root)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                fsync_directory(root)
+                raise
     return {"ref": str(target), "hash": digest}
 
 
@@ -2707,6 +2720,7 @@ def _repair_adoption_record(
             raise RuntimeError("workflow repair-commit adoption evidence conflict")
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        created = False
         try:
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as error:
@@ -2717,23 +2731,25 @@ def _repair_adoption_record(
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
                 handle.flush()
-                os.fchmod(handle.fileno(), 0o444)
                 os.fsync(handle.fileno())
             try:
                 os.link(temporary, target)
+                created = True
             except FileExistsError:
                 if target.is_symlink() or target.read_bytes() != content:
                     raise RuntimeError(
                         "workflow repair-commit adoption evidence conflict"
                     )
-            else:
-                directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
+        if created:
+            try:
+                os.chmod(target, 0o444)
+                fsync_directory(root)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                fsync_directory(root)
+                raise
     return {"ref": str(target), "hash": digest}
 
 

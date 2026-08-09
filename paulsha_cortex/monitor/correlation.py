@@ -10,6 +10,8 @@ from typing import Mapping, Sequence
 
 import yaml
 
+from paulsha_cortex.lib.durability import fsync_directory
+
 from .work_models import WorkSource
 
 
@@ -485,11 +487,7 @@ def _atomic_write_overrides(root: Path, overrides: WorkItemOverrides) -> None:
             os.fsync(handle.fileno())
         os.replace(temp, path)
         os.chmod(path, 0o600)
-        dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        fsync_directory(path.parent)
     except BaseException:
         try:
             os.close(fd)
