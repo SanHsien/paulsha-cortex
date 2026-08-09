@@ -104,7 +104,7 @@ def acquire_lock(
     }
 
     guard_path = lock_path.with_name(f".{lock_path.name}.guard")
-    fd = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o600)
     if not file_lock.try_lock(fd):
         # Another live daemon holds the exclusive lock.
         os.close(fd)

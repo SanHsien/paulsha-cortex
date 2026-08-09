@@ -542,6 +542,18 @@ def _save_runs(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def _seal_evidence_before_link(path: Path) -> None:
+    """Make POSIX evidence immutable at the instant its hardlink is published."""
+    if os.name != "nt":
+        os.chmod(path, 0o400)
+
+
+def _seal_evidence_after_link(path: Path) -> None:
+    """Seal Windows evidence after the temporary hardlink name is removed."""
+    if os.name == "nt":
+        os.chmod(path, 0o400)
+
+
 def _canonical_workflow_run(*, workflow_registry, authority):
     digest = work_authority_digest(authority)
     matches = [
@@ -802,6 +814,7 @@ def _authorization_record(
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            _seal_evidence_before_link(temporary)
             try:
                 os.link(temporary, target)
                 created = True
@@ -816,7 +829,7 @@ def _authorization_record(
             temporary.unlink(missing_ok=True)
         if created:
             try:
-                os.chmod(target, 0o444)
+                _seal_evidence_after_link(target)
                 fsync_directory(root)
             except BaseException:
                 target.unlink(missing_ok=True)
@@ -1025,6 +1038,7 @@ def _maintainer_review_record(body: dict[str, Any], *, state_path: Path) -> dict
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
+            _seal_evidence_before_link(temporary)
             os.link(temporary, target)
             created = True
         except FileExistsError:
@@ -1038,7 +1052,7 @@ def _maintainer_review_record(body: dict[str, Any], *, state_path: Path) -> dict
             temporary.unlink(missing_ok=True)
         if created:
             try:
-                os.chmod(target, 0o444)
+                _seal_evidence_after_link(target)
                 fsync_directory(root)
             except BaseException:
                 target.unlink(missing_ok=True)
@@ -2032,6 +2046,7 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
+            _seal_evidence_before_link(temporary)
             try:
                 os.link(temporary, target)
                 created = True
@@ -2041,7 +2056,7 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
             temporary.unlink(missing_ok=True)
         if created:
             try:
-                os.chmod(target, 0o444)
+                _seal_evidence_after_link(target)
                 fsync_directory(root)
             except BaseException:
                 target.unlink(missing_ok=True)
@@ -2169,6 +2184,7 @@ def _recover_planning_record(
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
+            _seal_evidence_before_link(temporary)
             try:
                 os.link(temporary, target)
                 created = True
@@ -2179,7 +2195,7 @@ def _recover_planning_record(
             temporary.unlink(missing_ok=True)
         if created:
             try:
-                os.chmod(target, 0o444)
+                _seal_evidence_after_link(target)
                 fsync_directory(root)
             except BaseException:
                 target.unlink(missing_ok=True)
@@ -2732,6 +2748,7 @@ def _repair_adoption_record(
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
+            _seal_evidence_before_link(temporary)
             try:
                 os.link(temporary, target)
                 created = True
@@ -2744,7 +2761,7 @@ def _repair_adoption_record(
             temporary.unlink(missing_ok=True)
         if created:
             try:
-                os.chmod(target, 0o444)
+                _seal_evidence_after_link(target)
                 fsync_directory(root)
             except BaseException:
                 target.unlink(missing_ok=True)

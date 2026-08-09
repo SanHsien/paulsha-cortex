@@ -43,7 +43,12 @@ from pathlib import Path
 from typing import Iterable
 
 from .snapshot import ChangeEvent, SnapshotStore
-from .transport import bind_monitor_listener, connect_monitor_socket, uses_unix_socket
+from .transport import (
+    bind_monitor_listener,
+    connect_monitor_socket,
+    tcp_monitor_endpoint_has_owner,
+    uses_unix_socket,
+)
 from .work_api import (
     WORK_API_SCHEMA,
     AmbiguousWorkItemError,
@@ -129,8 +134,15 @@ class MonitorServer:
                 ) from exc
             except TimeoutError as exc:
                 if not uses_unix_socket():
-                    self._socket_path.unlink(missing_ok=True)
-                    return
+                    try:
+                        has_owner = tcp_monitor_endpoint_has_owner(self._socket_path)
+                    except ValueError as owner_exc:
+                        raise RuntimeError(
+                            f"monitor endpoint path 已存在且格式無效：{self._socket_path}"
+                        ) from owner_exc
+                    if not has_owner:
+                        self._socket_path.unlink(missing_ok=True)
+                        return
                 raise RuntimeError(
                     f"live monitor already listening on {self._socket_path}"
                 ) from exc
@@ -151,10 +163,10 @@ class MonitorServer:
                 f"monitor socket path 已存在且不是 Unix socket：{self._socket_path}"
             )
 
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            probe.settimeout(SOCKET_PROBE_TIMEOUT_SECONDS)
-            probe.connect(str(self._socket_path))
+            probe = connect_monitor_socket(
+                self._socket_path, timeout=SOCKET_PROBE_TIMEOUT_SECONDS
+            )
         except TimeoutError as exc:
             raise RuntimeError(
                 f"live monitor already listening on {self._socket_path}"
@@ -165,9 +177,7 @@ class MonitorServer:
             except OSError:
                 pass
             return
-        finally:
-            probe.close()
-
+        probe.close()
         raise RuntimeError(f"live monitor already listening on {self._socket_path}")
 
     def serve_forever(self) -> None:

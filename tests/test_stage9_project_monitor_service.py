@@ -556,22 +556,11 @@ class Stage9ServerTests(unittest.TestCase):
             contender._prepare_socket_path()
         self.assertTrue(bad_path.exists())
 
-    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix socket timeout semantics")
     def test_server_timeout_probe_treats_socket_as_live(self) -> None:
         busy_path = self.tmp / "busy-monitor.sock"
         busy = bind_monitor_listener(busy_path)
-        busy.close()
+        self.addCleanup(busy.close)
         contender = MonitorServer(store=self.store, socket_path=busy_path)
-
-        class _TimeoutProbe:
-            def settimeout(self, timeout: float) -> None:
-                self.timeout = timeout
-
-            def connect(self, path: str) -> None:
-                raise TimeoutError("probe timed out")
-
-            def close(self) -> None:
-                return None
 
         with mock.patch(
             "paulsha_cortex.monitor.server.connect_monitor_socket",

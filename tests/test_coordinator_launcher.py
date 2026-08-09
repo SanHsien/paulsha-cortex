@@ -648,8 +648,11 @@ class ArgvTests(unittest.TestCase):
             launcher_module.subprocess.Popen = original
 
         self.assertEqual(calls[0]["cwd"], str(actual.resolve()))
-        self.assertIn(f"-C {actual.resolve()}", calls[0]["argv"][2])
-        self.assertNotIn(str(alias), calls[0]["argv"][2])
+        argv = calls[0]["argv"]
+        inner_argv = argv[argv.index("--") + 1 :]
+        worktree_flag = inner_argv.index("-C")
+        self.assertEqual(inner_argv[worktree_flag + 1], str(actual.resolve()))
+        self.assertNotIn(str(alias), inner_argv)
 
     def test_subprocess_launcher_codex_default_no_sandbox_bypass(self) -> None:
         import shlex

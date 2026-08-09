@@ -104,5 +104,23 @@ def connect_monitor_socket(
     return socket.create_connection((host, port), timeout=timeout)
 
 
+def tcp_monitor_endpoint_has_owner(path: str | Path) -> bool:
+    """Return whether a Windows endpoint port is still exclusively owned."""
+    host, port = _read_tcp_endpoint(Path(path))
+    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if exclusive is None:
+        return True
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return True
+        return False
+    finally:
+        probe.close()
+
+
 def remove_monitor_endpoint(path: str | Path) -> None:
     Path(path).unlink(missing_ok=True)
