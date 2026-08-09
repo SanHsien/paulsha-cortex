@@ -289,6 +289,21 @@ def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_pa
     assert planning_runtime._tree_snapshot(tmp_path) != baseline
 
 
+def test_windows_symlink_kind_uses_reparse_attributes_without_following(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePath:
+        def lstat(self):
+            return type("Metadata", (), {"st_file_attributes": 0x10})()
+
+        def is_dir(self):
+            raise AssertionError("Windows symlink kind must not follow the target")
+
+    monkeypatch.setattr(planning_runtime.os, "name", "nt")
+
+    assert planning_runtime._symlink_targets_directory(FakePath()) is True
+
+
 def test_snapshot_permission_error_still_restores_operator_tree(tmp_path: Path) -> None:
     identity = ModelIdentity("codex", "primary", "openai", ("planning",))
     protected = tmp_path / "protected"

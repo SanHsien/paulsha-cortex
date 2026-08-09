@@ -125,6 +125,14 @@ def _copy_planning_sandbox(worktree: Path, destination: Path) -> None:
     )
 
 
+def _symlink_targets_directory(path: Path) -> bool:
+    if os.name == "nt":
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        directory_attribute = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+        return bool(attributes & directory_attribute)
+    return path.is_dir()
+
+
 def _make_tree_traversable(root: Path) -> None:
     """Restore enough owner access to inspect and replace a hostile tree.
 
@@ -162,7 +170,10 @@ def _restore_operator_tree(worktree: Path, baseline: Path) -> None:
     for source in baseline.iterdir():
         target = worktree / source.name
         if source.is_symlink():
-            target.symlink_to(os.readlink(source), target_is_directory=source.is_dir())
+            target.symlink_to(
+                os.readlink(source),
+                target_is_directory=_symlink_targets_directory(source),
+            )
         elif source.is_dir():
             shutil.copytree(source, target, symlinks=True)
         else:
