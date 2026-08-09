@@ -43,6 +43,9 @@ python -m pip install .
 
 - [Quickstart](docs/onboarding/quickstart.md)：從 `pipx install`、`cortex bootstrap` 到第一個 workflow。
 - [Upgrade](docs/onboarding/upgrade.md)：升級與 F1 pipx 快照過期處理。
+- [Development](docs/DEVELOPMENT.md)：Windows／WSL 開發環境、bootstrap 與權威驗證入口。
+- [Fork 維護說明](docs/FORK.md)：本 fork 的採用判斷、授權限制、upstream 水位與同步方法。
+- [現行決策](docs/DECISIONS.md)：仍影響本 fork 維護與實作的取捨。
 - [Rollback](docs/onboarding/rollback.md)：回退到上一個已知可用版本。
 - [Troubleshooting](docs/onboarding/troubleshooting.md)：manager degraded、request timeout、systemd、executor、stale venv 快速對照。
 - [Concepts](docs/onboarding/concepts.md)：`spec`、`job`、`slice`、`work` 名詞速查。
