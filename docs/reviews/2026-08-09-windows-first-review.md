@@ -52,5 +52,6 @@ Production 尚未放行的理由不是 native Windows correctness，而是 upstr
 - Ubuntu 3.10/3.11 matrix 另驗出 `shutil.rmtree(onexc=...)` 僅存在於 Python 3.12+；filesystem adapter 已依版本在舊 Python 使用 `onerror`，並以模擬 3.11 分支的 regression test 固定相容性。
 - Hosted Windows runner 另揭露 8.3 `%TEMP%` alias、非 UTF-8 console、`.cmd/.bat` executor 與 POSIX Bash test 誤入 Windows 的差異；測試 temp identity 已 canonicalize、CI 固定 UTF-8、bootstrap 安全解析 batch wrapper、tree snapshot 僅比較 Windows 可表達的 metadata，Bash `/proc` 測試明確留在 Linux gate。
 - Windows matrix 收斂至單一 directory-symlink restore failure 後，改以不跟隨 reparse point 的 `st_file_attributes` 判斷 symlink 類型，避免 `Path.is_dir()` 對 unreadable target 觸發 `WinError 5`。
+- Monitor integration 刪除 fixture 偶爾與背景掃描的短暫 directory handle 相撞；測試 helper 僅對 Windows sharing violation `WinError 32` 做最長 1 秒的有界等待，其他錯誤立即失敗。
 - 上述 Windows CI 失敗涉及的 12 個模組聚焦回歸為 `228 passed, 18 skipped, 9 subtests passed`。
 - 最終 Windows gate：`pwsh -File tools/dev_check.ps1` 通過，結果為 `2005 passed, 72 skipped, 32 subtests passed in 320.20s`；wheel/sdist build 成功，兩個 artifacts 的 `twine check --strict` 均為 PASSED。此 bullet 是 gate 後追加的文件 evidence，不改 runtime/package input。
