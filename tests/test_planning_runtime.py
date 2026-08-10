@@ -315,6 +315,13 @@ def test_questioner_and_integrator_prompts_include_json_output_contract(
     assert len(prompts) >= 2
     assert contract in prompts[-2]
     assert contract in prompts[-1]
+    # issue #406：integrator prompt 必須把 validate_primary_integration 的
+    # 結構約束講成語意（不只是欄位名），否則模型會把 artifact_refs 留空。
+    integrator_prompt = prompts[-1]
+    assert "Resolve every question exactly once" in integrator_prompt
+    assert "without its 'missing-' prefix" in integrator_prompt
+    assert "NON-EMPTY list of the destination path(s)" in integrator_prompt
+    assert "must equal the union of all artifact_refs" in integrator_prompt
 
 
 def test_planning_source_material_rejects_symlink_traversal(tmp_path: Path) -> None:
