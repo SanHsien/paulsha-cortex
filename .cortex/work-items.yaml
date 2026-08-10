@@ -598,3 +598,11 @@ work_items:
     - kind: path
       ref: docs/superpowers/workstreams/fix-log-error-dedup-v3/todo.md
     excludes: []
+  fix-log-error-dedup-v2:
+    title: （墓碑）v2 孤兒 run 救援錨點——見 issue 410
+    links:
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-log-error-dedup-v2/todo.md
+    excludes:
+    - kind: github_issue
+      ref: hamanpaul/paulsha-cortex#374
