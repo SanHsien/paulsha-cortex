@@ -489,42 +489,56 @@ work_items:
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#374
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-log-error-dedup/todo.md
     excludes: []
   fix-deck-verification-skeleton:
     title: deck compile verification 骨架由 project policy 導出
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#380
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-deck-verification-skeleton/todo.md
     excludes: []
   fix-packaging-release-path:
     title: README release 安裝路徑與 packaging smoke matrix
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#385
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-packaging-release-path/todo.md
     excludes: []
   feat-digest-outbox:
     title: 排程觸發的跨系統 digest 出口
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#372
+    - kind: path
+      ref: docs/superpowers/workstreams/feat-digest-outbox/todo.md
     excludes: []
   fix-authority-restart-loop:
     title: authority-restart 迴圈與 binding mismatch 抑制
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#373
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-authority-restart-loop/todo.md
     excludes: []
   fix-registry-atomic-transitions:
     title: record_action 原子性與 gate_state 轉換表
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#382
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-registry-atomic-transitions/todo.md
     excludes: []
   fix-handoff-manifest-reconcile:
     title: 殘留 handoff manifest 與 registry 對帳
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#383
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-handoff-manifest-reconcile/todo.md
     excludes: []
   fix-installer-managed-env:
     title: installer managed_env 與 lock/specs 路徑合併修正
@@ -533,40 +547,54 @@ work_items:
       ref: hamanpaul/paulsha-cortex#371
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#375
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-installer-managed-env/todo.md
     excludes: []
   fix-rate-limit-classification:
     title: GitHub rate limit 分類與 durable 退避
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#370
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-rate-limit-classification/todo.md
     excludes: []
   fix-spawn-admission-limiter:
     title: per-provider spawn admission limiter
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#381
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-spawn-admission-limiter/todo.md
     excludes: []
   feat-executor-auth-preflight:
     title: dispatch 前 executor 登入態驗證與 provider 探測接線
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#369
+    - kind: path
+      ref: docs/superpowers/workstreams/feat-executor-auth-preflight/todo.md
     excludes: []
   feat-provider-failure-semantics:
     title: LLM provider failure typed semantics 與 bounded recovery
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#384
+    - kind: path
+      ref: docs/superpowers/workstreams/feat-provider-failure-semantics/todo.md
     excludes: []
   feat-adversarial-evidence-review:
     title: 對抗式 evidence 驗證掛卡
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#378
+    - kind: path
+      ref: docs/superpowers/workstreams/feat-adversarial-evidence-review/todo.md
     excludes: []
   fix-gate-provenance:
     title: gate 清單來源改 spec/plan 導出與判準不可變
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#379
+    - kind: path
+      ref: docs/superpowers/workstreams/fix-gate-provenance/todo.md
     excludes: []
