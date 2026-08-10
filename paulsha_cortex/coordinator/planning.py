@@ -240,8 +240,21 @@ def _build_default_question_pack(
     assessments: tuple[ArtifactAssessment, ...], missing_kinds: tuple[str, ...]
 ) -> QuestionPack:
     questions: list[PlanningQuestion] = []
+    # #408（補完）：missing-{kind} 問題的 source_refs 過去只取「同 kind 的
+    # assessments refs」。同 kind 有草稿（rejected/draft）時這是對的——重寫要
+    # 以草稿為本（見 test_rejected_artifacts_remain_authoritative_sources_...）；
+    # 但 todo 錨定的 work item（如 small-fix combo）該 kind 完全不存在，
+    # source_refs 恆為空 tuple，造成兩個下游斷點：
+    # (a) `_planning_destinations` 的 openspec／workstream 錨點推導拿不到任何
+    #     路徑 → destinations 空 → integrator 發明路徑必被 governed-roots 拒；
+    # (b) `_planning_source_material` 無檔可讀 → secondary planner 兩手空空。
+    # 故補 fallback：同 kind refs 為空時退到全部 accepted artifacts 的 refs
+    # ——既有權威素材正是「建立 accepted {kind} 需要什麼權威內容」的來源。
+    accepted_refs = tuple(
+        assessment.artifact.ref for assessment in assessments if assessment.accepted
+    )
     for kind in missing_kinds:
-        source_refs = tuple(
+        same_kind_refs = tuple(
             assessment.artifact.ref
             for assessment in assessments
             if assessment.artifact.kind == kind
@@ -250,7 +263,7 @@ def _build_default_question_pack(
             _make_question(
                 f"missing-{kind}",
                 f"What authoritative content is required to create an accepted {kind}?",
-                source_refs,
+                same_kind_refs or accepted_refs,
             )
         )
     for assessment in assessments:

@@ -1,0 +1,2 @@
+### Fixed
+- **missing-kind 問題的 source_refs 補 accepted fallback（#408 補完）**：`_build_default_question_pack` 對 `missing-{kind}` 只取同 kind refs——同 kind 有草稿時語意正確（重寫以草稿為本），但 todo 錨定的 work item 該 kind 完全不存在，refs 恆空，`_planning_destinations` 與 `_planning_source_material` 雙雙斷炊（PR #409 的 workstream 推導因此拿不到料，v3 gen1 實測 destinations 仍空、模型輸出裸路徑被 governed-roots 拒）。同 kind refs 為空時 fallback 至全部 accepted refs；端對端實測 brainstorm 三棒＋integration 驗證全通、destinations 正確導出。

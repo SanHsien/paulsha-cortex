@@ -175,6 +175,26 @@ def test_rejected_artifacts_remain_authoritative_sources_for_missing_kind_questi
     ]
 
 
+def test_missing_kind_questions_fall_back_to_accepted_refs_when_kind_absent() -> None:
+    """issue #408（補完）：todo 錨定的 work item（small-fix combo）缺 spec/design
+    時，同 kind 完全不存在 → source_refs 過去恆為空，destinations 推導與
+    secondary source material 雙雙斷炊。fallback 到 accepted refs 後，
+    `_planning_destinations` 能從 workstream todo 路徑導出目的地。"""
+    todo_ref = "docs/superpowers/workstreams/fix-demo-v3/todo.md"
+    report = assess_planning_completeness(
+        [
+            _artifact(
+                "plan",
+                "---\nstatus: accepted\nwork_item: fix-demo-v3\n---\n## Tasks\n- [ ] 修好它。\n",
+                todo_ref,
+            )
+        ]
+    )
+    assert report.missing_kinds == ("spec", "design")
+    for question in report.default_question_pack.questions:
+        assert question.source_refs == (todo_ref,)
+
+
 def test_any_blocking_marker_triggers_brainstorm_even_when_an_alternate_artifact_is_accepted() -> None:
     report = assess_planning_completeness(
         [
