@@ -590,11 +590,11 @@ work_items:
     - kind: path
       ref: docs/superpowers/workstreams/fix-gate-provenance/todo.md
     excludes: []
-  fix-log-error-dedup-v2:
+  fix-log-error-dedup-v3:
     title: manager_daemon _log_error 多槽去重
     links:
     - kind: github_issue
       ref: hamanpaul/paulsha-cortex#374
     - kind: path
-      ref: docs/superpowers/workstreams/fix-log-error-dedup-v2/todo.md
+      ref: docs/superpowers/workstreams/fix-log-error-dedup-v3/todo.md
     excludes: []

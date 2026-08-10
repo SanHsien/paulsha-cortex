@@ -542,6 +542,24 @@ def _planning_destinations(pack: Mapping[str, object]) -> dict[str, str]:
         and (parts := PurePosixPath(ref).parts)[:2] == ("openspec", "changes")
         and len(parts) >= 4
     }
+    if not slugs:
+        # #408：small-fix 等無 openspec-propose 卡的 combo，work item 錨點是
+        # workstream todo（docs/superpowers/workstreams/<slug>/todo.md）——
+        # 沒有這個 fallback 時 destinations 恆為空，integrator 被要求
+        # 「Use the supplied destination paths」卻拿到空 dict，只能自行發明
+        # 路徑、必被 _publish_planning_artifacts 的 governed-roots 驗證拒收。
+        # openspec 錨點優先；兩者皆無或歧義（多 slug）維持空 dict 的
+        # 既有 fail-closed 行為。
+        slugs = {
+            parts[3]
+            for question in questions if isinstance(question, dict)
+            for ref in question.get("source_refs", [])
+            if isinstance(ref, str)
+            and (parts := PurePosixPath(ref).parts)[:3]
+            == ("docs", "superpowers", "workstreams")
+            and len(parts) >= 5
+            and parts[4] == "todo.md"
+        }
     if len(slugs) != 1:
         return {}
     slug = next(iter(slugs))
