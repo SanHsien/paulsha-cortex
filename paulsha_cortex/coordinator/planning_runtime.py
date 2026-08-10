@@ -213,31 +213,116 @@ def _restore_operator_tree(worktree: Path, baseline: Path) -> None:
         raise RuntimeError("planning operator restore verification failed")
 
 
+_FENCED_JSON = re.compile(
+    r"```(?:json)?\s*\n(?P<body>\{.*\})\s*\n```",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+# issue #401 巢狀欄位名——CLI launcher（claude/codex/agy）的成功 envelope
+# 用來裝「模型實際輸出」的欄位名不一而足，沿用既有偵測順序。
+_ENVELOPE_KEYS = ("result", "content", "message", "text")
+
+# issue #401：questioner／integrator／secondary planner 的 prompt 過去只用
+# 「Return only ... JSON」這類軟性措辭，模型（實測 sonnet 對 questioner
+# prompt）偶爾仍回散文推理夾雜 JSON，甚至純散文。附加這段明確的輸出契約，
+# 降低模型不遵守純 JSON 格式的機率；即使模型仍不遵守，`_extract_json` 也
+# 已改為 fail-closed（見上）而非把 CLI envelope 誤當輸出本體。
+_JSON_OUTPUT_CONTRACT = (
+    "Output contract: reply with exactly one JSON object and nothing else — "
+    "no prose, no explanation, no code fences. Your reply MUST start with '{'."
+)
+
+
+def _find_json_object(text: str, *, allow_partial: bool = False) -> object | None:
+    """從字串中盡量抽出一個 JSON 物件；找不到回傳 ``None``（不拋例外）。
+
+    - 先去除整段以 ```/```json 包裹的 code fence（沿用既有 regex，只接受
+      「整串」剛好是單一 fenced code block 的情形）。
+    - 再嘗試對整串做 `json.loads`。
+    - `allow_partial=True` 時才進一步做**平衡大括號掃描**：找到第一個
+      `{`，逐字元計數 `{`/`}` 深度（用簡單狀態機忽略字串字面值內、含跳脫
+      序列 `\"`/`\\` 的大括號），抓出第一個平衡區塊後再嘗試 `json.loads`。
+      這個平衡掃描刻意只在 `allow_partial=True` 時啟用——只給「從散文中
+      抽取內嵌 JSON」的呼叫端使用（見 `_extract_json` 對 envelope 巢狀
+      欄位的處理）。頂層候選字串（CLI 原始 stdout／`--output-file` 內容）
+      必須維持既有的嚴格「整串才算」語意，否則像
+      `"Commentary.\\n```json\\n{...}\\n```\\n"` 這種帶前言的輸出會被
+      誤判為合法 JSON，弱化既有防呆
+      （見 `test_planning_json_parser_accepts_only_whole_fenced_object`）。
+    """
+    text = text.strip()
+    fenced = _FENCED_JSON.fullmatch(text)
+    if fenced is not None:
+        text = fenced.group("body")
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if not allow_partial:
+        return None
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                block = text[start : index + 1]
+                try:
+                    return json.loads(block)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+    return None
+
+
 def _extract_json(stdout: str, output_path: Path) -> object:
     candidates = [stdout.strip()]
     if output_path.is_file():
         candidates.insert(0, output_path.read_text(encoding="utf-8").strip())
     for candidate in candidates:
-        fenced = re.fullmatch(
-            r"```(?:json)?\s*\n(?P<body>\{.*\})\s*\n```",
-            candidate,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if fenced is not None:
-            candidate = fenced.group("body")
-        try:
-            value = json.loads(candidate)
-        except (json.JSONDecodeError, TypeError):
+        value = _find_json_object(candidate)
+        if not isinstance(value, dict):
             continue
-        if isinstance(value, dict):
-            for key in ("result", "content", "message", "text"):
+        if any(key in value for key in _ENVELOPE_KEYS):
+            # issue #401：這是 CLI launcher 的成功 envelope（例如 claude CLI
+            # 的 `api_error_status` 等 20+ 鍵），不是模型輸出本體。模型有時
+            # 不遵守「只回 JSON」的指示、在 envelope 的巢狀欄位裡回散文推理
+            # （內容可能正確、格式不從）。依序嘗試每個巢狀欄位：先整串
+            # `json.loads`，失敗再從散文中抽取內嵌 JSON 物件；任何一個成功
+            # 就回傳抽出的物件。
+            fallback_snippet: str | None = None
+            for key in _ENVELOPE_KEYS:
                 nested = value.get(key)
-                if isinstance(nested, str):
-                    try:
-                        return json.loads(nested)
-                    except json.JSONDecodeError:
-                        pass
-            return value
+                if not isinstance(nested, str):
+                    continue
+                extracted = _find_json_object(nested, allow_partial=True)
+                if extracted is not None:
+                    return extracted
+                if fallback_snippet is None:
+                    fallback_snippet = nested[:160]
+            # 全部抽取失敗：絕不能 fall through 把整個 envelope dict 當成
+            # 輸出本體回傳（修復前的行為）——那會讓下游驗證（例如
+            # `validate_question_pack`）報出 `unexpected key: api_error_status`
+            # 這種完全誤導的診斷。改為明確 raise，訊息帶散文片段方便除錯。
+            detail = fallback_snippet if fallback_snippet is not None else "<no string field>"
+            raise ValueError(f"planning launcher result is not JSON: {detail}")
+        return value
     raise ValueError("planning launcher returned no JSON object")
 
 
@@ -463,7 +548,9 @@ def build_production_planning_runtime(
 
     def questioner(report: Mapping[str, object]) -> object:
         return invoke_primary(
-            "Return only the exact question-pack JSON required to resolve this completeness report: "
+            "Return only the exact question-pack JSON required to resolve this completeness report. "
+            + _JSON_OUTPUT_CONTRACT
+            + " Input: "
             + json.dumps(report, ensure_ascii=False, sort_keys=True)
         )
 
@@ -475,7 +562,7 @@ def build_production_planning_runtime(
             "source material. Return exactly one JSON object with keys schema_version=1, "
             "question_pack_id, and evidence. Evidence must contain every question exactly once; "
             "each row has only question_id, non-empty claims string list, and non-empty source_refs "
-            "string list naming supplied sources. Input: "
+            "string list naming supplied sources. " + _JSON_OUTPUT_CONTRACT + " Input: "
             + json.dumps(
                 {"question_pack": pack, "source_material": source_material},
                 ensure_ascii=False,
@@ -493,7 +580,8 @@ def build_production_planning_runtime(
             "and artifacts. Each resolution has only question_id, decision, artifact_kind, artifact_refs. "
             "Each artifact has only kind, path, content; content must be complete UTF-8 Markdown with "
             "frontmatter status: accepted, the matching work_item, and required headings: Requirements "
-            "for spec, Decisions for design, Tasks for plan. Use the supplied destination paths. Input: "
+            "for spec, Decisions for design, Tasks for plan. Use the supplied destination paths. "
+            + _JSON_OUTPUT_CONTRACT + " Input: "
             + json.dumps(
                 {
                     "question_pack": pack,
