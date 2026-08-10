@@ -572,6 +572,104 @@ def test_brainstorm_reason_includes_underlying_exception_summary_for_questioner(
     assert "questioner exploded" in result.reason
 
 
+def test_brainstorm_reason_includes_underlying_exception_summary_for_artifact_write(
+    tmp_path: Path,
+) -> None:
+    """Issue #408：artifact-write 分支是 #397 儀器化時漏掉的第四個裸吞
+    `except Exception`——canary v2 gen3 只看得到 `primary-artifact-write-rejected`
+    卻查不到是哪條驗證拒的。這裡讓整條 brainstorm 走到 artifact_writer，
+    驗證 reason 併入例外型別與訊息片段。"""
+    report = assess_planning_completeness([_artifact("spec", ACCEPTED_SPEC)])
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy",
+                "model_id": "Gemini 3.1 Pro (High)",
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": "agy-plan-sandbox",
+            },
+        ]
+    )
+    probes = {
+        ("agy", "Gemini 3.1 Pro (High)"): CapabilityProbe.ready_for(
+            "agy", "Gemini 3.1 Pro (High)", "google"
+        )
+    }
+
+    def questioner(_report_payload):
+        return report.default_question_pack.to_dict()
+
+    def secondary(pack_payload, identity):
+        return {
+            "schema_version": 1,
+            "question_pack_id": pack_payload["pack_id"],
+            "evidence": [
+                {
+                    "question_id": q["question_id"],
+                    "claims": ["No accepted artifact found."],
+                    "source_refs": ["docs/planning-index.md:1"],
+                }
+                for q in pack_payload["questions"]
+            ],
+        }
+
+    kind_to_body = {"design": ACCEPTED_DESIGN, "plan": ACCEPTED_PLAN}
+
+    def integrator(pack_payload, evidence_payload):
+        resolutions = []
+        artifacts = []
+        for question in pack_payload["questions"]:
+            artifact_kind = question["kind"].removeprefix("missing-")
+            artifact_ref = f"docs/{artifact_kind}.md"
+            resolutions.append(
+                {
+                    "question_id": question["question_id"],
+                    "decision": "Create and accept the missing artifact.",
+                    "artifact_kind": artifact_kind,
+                    "artifact_refs": [artifact_ref],
+                }
+            )
+            artifacts.append(
+                {"kind": artifact_kind, "path": artifact_ref, "content": kind_to_body[artifact_kind]}
+            )
+        return {
+            "schema_version": 1,
+            "question_pack_id": pack_payload["pack_id"],
+            "secondary_evidence_hash": evidence_payload["evidence_hash"],
+            "resolutions": resolutions,
+            "artifacts": artifacts,
+        }
+
+    def exploding_writer(_rows):
+        raise RuntimeError("publication transaction refused")
+
+    result = run_heterogeneous_brainstorm(
+        report=report,
+        primary=("codex", "primary"),
+        registry=registry,
+        probes=probes,
+        evidence_dir=tmp_path,
+        artifact_root=tmp_path,
+        scope=SCOPE,
+        primary_questioner=questioner,
+        secondary_planner=secondary,
+        primary_integrator=integrator,
+        artifact_writer=exploding_writer,
+    )
+    assert result.state == "needs_human"
+    assert result.reason is not None
+    assert result.reason.startswith("primary-artifact-write-rejected:")
+    assert "RuntimeError" in result.reason
+    assert "publication transaction refused" in result.reason
+
+
 def test_primary_must_write_accepted_artifacts_before_brainstorm_gate_passes(tmp_path: Path) -> None:
     report = assess_planning_completeness([_artifact("spec", ACCEPTED_SPEC)])
     registry = IdentityRegistry.from_rows(

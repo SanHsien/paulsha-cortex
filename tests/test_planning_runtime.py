@@ -165,6 +165,46 @@ def test_secondary_prompt_embeds_bounded_repo_sources_without_tool_access(
     )["plan"] == "docs/superpowers/plans/demo.md"
 
 
+def test_planning_destinations_derives_slug_from_workstream_todo_anchor() -> None:
+    """issue #408：small-fix 等無 openspec-propose 卡的 combo，work item 錨點是
+    workstream todo——destinations 必須能從
+    docs/superpowers/workstreams/<slug>/todo.md 推導，否則 integrator 拿到空
+    destinations、發明路徑、必被 governed-roots 驗證拒收。"""
+    destinations = planning_runtime._planning_destinations(
+        {
+            "questions": [
+                {"source_refs": ["docs/superpowers/workstreams/fix-demo-v2/todo.md"]},
+                {"source_refs": ["docs/superpowers/workstreams/fix-demo-v2/todo.md"]},
+            ]
+        }
+    )
+    assert destinations == {
+        "spec": "docs/superpowers/specs/fix-demo-v2-spec.md",
+        "design": "docs/superpowers/specs/fix-demo-v2-design.md",
+        "plan": "docs/superpowers/plans/fix-demo-v2.md",
+    }
+    # openspec 錨點優先：兩種 ref 並存時仍以 openspec slug 為準。
+    assert planning_runtime._planning_destinations(
+        {
+            "questions": [
+                {"source_refs": [
+                    "openspec/changes/demo/proposal.md",
+                    "docs/superpowers/workstreams/other/todo.md",
+                ]}
+            ]
+        }
+    )["plan"] == "docs/superpowers/plans/demo.md"
+    # 歧義（多個 workstream slug）維持 fail-closed 空 dict。
+    assert planning_runtime._planning_destinations(
+        {
+            "questions": [
+                {"source_refs": ["docs/superpowers/workstreams/a/todo.md"]},
+                {"source_refs": ["docs/superpowers/workstreams/b/todo.md"]},
+            ]
+        }
+    ) == {}
+
+
 def test_planning_argv_claude_branch_omits_permission_mode(tmp_path: Path) -> None:
     """issue #404：plan 模式的系統提示（「必須產出計畫或呼叫
     ExitPlanMode」）與這裡「必須回傳純 JSON」的確定性回聲任務衝突——issue

@@ -1,0 +1,2 @@
+### Fixed
+- **`_planning_destinations` 支援 workstream todo 錨點，修復 small-fix combo 的 artifact write 必拒**：過去只從 `openspec/changes/<slug>/…` 形 source_refs 導出目的地，todo.md 錨定的 work item（無 openspec-propose 卡的 combo）拿到空 destinations，integrator 只能發明路徑、必被 `_publish_planning_artifacts` 的 governed-roots 驗證拒收（canary v2 gen3 實測）。新增 `docs/superpowers/workstreams/<slug>/todo.md` 推導（openspec 優先、歧義維持 fail-closed 空 dict）；並補上 #397 漏掉的第四個裸吞分支——artifact-write 失敗的 reason 現在附例外摘要。另附 work item `-v3` 重識別（v2 三世代同樣全數耗於基礎設施缺陷）。

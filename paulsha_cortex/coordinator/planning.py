@@ -1143,10 +1143,13 @@ def run_heterogeneous_brainstorm(
             if not integration.get("artifacts"):
                 raise ValueError("structured artifact content missing")
             rollback_publication = artifact_writer(integration.get("artifacts", []))
-        except Exception:
+        except Exception as exc:
+            # #408：這是 #397 儀器化時漏掉的第四個裸吞分支——artifact write 的
+            # 實際拒絕原因（哪條驗證、哪個路徑）必須透傳進 reason，與其餘三個
+            # 分支的例外摘要格式一致。
             return BrainstormResult(
                 "needs_human",
-                "primary-artifact-write-rejected",
+                f"primary-artifact-write-rejected: {type(exc).__name__}: {str(exc)[:160]}",
                 selection.identity.independence_domain,
                 empty_refs,
                 None,
