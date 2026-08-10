@@ -148,6 +148,12 @@ def test_secondary_prompt_embeds_bounded_repo_sources_without_tool_access(
     assert result["question_pack_id"] == "qp-demo"
     assert "Do not call tools" in prompts[-1]
     assert "Evidence." in prompts[-1]
+    # issue #401：secondary planner 的 prompt 也必須強制純 JSON 輸出契約，
+    # 降低模型回散文推理夾雜 JSON、觸發 `_extract_json` fail-closed 的機率。
+    assert (
+        "Output contract: reply with exactly one JSON object and nothing else"
+        in prompts[-1]
+    )
     assert planning_runtime._planning_destinations(
         {
             "questions": [
@@ -166,6 +172,129 @@ def test_planning_json_parser_accepts_only_whole_fenced_object(tmp_path: Path) -
         planning_runtime._extract_json(
             'Commentary.\n```json\n{"schema_version": 1}\n```\n', output
         )
+
+
+def _cli_envelope(result: str) -> dict:
+    """建構一個近似 claude CLI 成功 envelope 的 dict：`result` 才是模型輸出，
+    其餘 20+ 鍵（`api_error_status` 等）是 launcher 包裝，不該被下游驗證
+    誤當成輸出本體的欄位。"""
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "duration_ms": 4321,
+        "duration_api_ms": 4000,
+        "num_turns": 1,
+        "session_id": "session-401",
+        "total_cost_usd": 0.01,
+        "usage": {"input_tokens": 10, "output_tokens": 20},
+        "api_error_status": None,
+        "result": result,
+    }
+
+
+def test_extract_json_pulls_embedded_object_out_of_envelope_prose(tmp_path: Path) -> None:
+    """issue #401：模型（實測 sonnet 對 questioner prompt）有時不遵守「只回
+    JSON」指示，在 CLI envelope 的 `result` 欄位回散文推理夾雜 JSON。修復後
+    必須從散文中抽出內嵌 JSON 物件，而不是整個 envelope 一起回傳、也不是
+    直接放棄。"""
+    envelope = _cli_envelope(
+        "Let me think through this step by step.\n\n"
+        'The question pack is {"schema_version": 1, "question_pack_id": "qp-1"} '
+        "which resolves the completeness report.\n\nDone."
+    )
+    output = tmp_path / "missing.json"
+    result = planning_runtime._extract_json(json.dumps(envelope), output)
+    assert result == {"schema_version": 1, "question_pack_id": "qp-1"}
+
+
+def test_extract_json_raises_on_pure_prose_result_without_leaking_envelope(
+    tmp_path: Path,
+) -> None:
+    """issue #401 的核心迴歸：`result` 是純散文（不含任何 JSON 物件）時，
+    修復前的程式碼會 fall through 把整個 envelope dict（含
+    `api_error_status` 等 20+ 鍵）當成輸出本體回傳，讓下游
+    `validate_question_pack` 報出 `unexpected key: api_error_status` 這種
+    完全誤導的診斷。修復後必須 raise ValueError，訊息帶散文片段方便除錯，
+    且絕不能包含 envelope 自身的鍵名。"""
+    prose = "I believe the answer is forty-two, but I will not format it as JSON here."
+    envelope = _cli_envelope(prose)
+    output = tmp_path / "missing.json"
+    with pytest.raises(ValueError) as excinfo:
+        planning_runtime._extract_json(json.dumps(envelope), output)
+    message = str(excinfo.value)
+    assert "forty-two" in message
+    assert "api_error_status" not in message
+
+
+def test_extract_json_envelope_result_pure_json_string_is_unchanged(tmp_path: Path) -> None:
+    """既有行為不變：`result` 本身就是純 JSON 字串（模型有遵守指示）時，
+    照樣直接抽出巢狀物件。"""
+    envelope = _cli_envelope(json.dumps({"schema_version": 1, "question_pack_id": "qp-2"}))
+    output = tmp_path / "missing.json"
+    result = planning_runtime._extract_json(json.dumps(envelope), output)
+    assert result == {"schema_version": 1, "question_pack_id": "qp-2"}
+
+
+def test_extract_json_top_level_output_without_envelope_keys_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    """既有行為不變：頂層 candidate 本身就是輸出 JSON（不含 result/content/
+    message/text 任一鍵，非 envelope 形），維持現行為直接回傳。"""
+    output = tmp_path / "missing.json"
+    payload = {"schema_version": 1, "question_pack_id": "qp-3"}
+    result = planning_runtime._extract_json(json.dumps(payload), output)
+    assert result == payload
+
+
+def test_questioner_and_integrator_prompts_include_json_output_contract(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """issue #401：questioner／integrator 的 prompt 過去只用「Return only
+    ... JSON」這類軟性措辭，未強制「純 JSON、不得夾雜散文」。兩處都必須附加
+    明確的輸出契約字句。"""
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "primary", "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy", "model_id": AGY_MODEL_ID, "independence_domain": "google",
+                "capabilities": ["planning"], "live_probe": "agy-plan-sandbox",
+            },
+        ]
+    )
+    monkeypatch.setattr(planning_runtime, "load_model_identities", lambda: registry)
+    prompts: list[str] = []
+
+    def runner(argv, **kwargs):
+        if argv == ["agy", "models"]:
+            return _completed(f"{AGY_MODEL_ID}\n")
+        prompt = argv[argv.index("--print") + 1] if "--print" in argv else argv[2]
+        prompts.append(prompt)
+        for marker in (
+            "Return only this compact JSON object and perform no tool calls: ",
+            "Return only this JSON object and do not call tools: ",
+        ):
+            if marker in prompt:
+                return _completed(prompt.split(marker, 1)[1] + "\n")
+        return _completed(json.dumps({"schema_version": 1, "question_pack_id": "qp-x"}))
+
+    runtime = planning_runtime.build_production_planning_runtime(
+        primary=("codex", "primary"), worktree=tmp_path, runner=runner
+    )
+
+    runtime.primary_questioner({"missing": ["x"]})
+    runtime.primary_integrator(
+        {"schema_version": 1, "question_pack_id": "qp-x", "questions": []},
+        {"schema_version": 1, "question_pack_id": "qp-x", "evidence": []},
+    )
+
+    contract = "Output contract: reply with exactly one JSON object and nothing else"
+    assert len(prompts) >= 2
+    assert contract in prompts[-2]
+    assert contract in prompts[-1]
 
 
 def test_planning_source_material_rejects_symlink_traversal(tmp_path: Path) -> None:
