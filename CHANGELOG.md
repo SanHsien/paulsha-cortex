@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **work item 重識別 `-v4` 並移除 v2 墓碑**：v3 三世代分別耗於 #408 補完前、#414 前與 #416（棄單殘留 artifacts 地雷）；三修復皆已 merge，本次改名前已先棄單（#410 順序教訓）。v2 墓碑錨點（#411）任務完成（孤兒 run 已由 #412 救援通道清除），一併移除。
+
 ### Fixed
 - **Issue #414：plan 卡 deterministic pass 不驗證宣告 outputs，導致下一棒 build 的 declared input 必缺**：`assess_planning_completeness` 只看 kind 覆蓋率，workstream todo（kind=plan、accepted）就足以讓 planning 判定 complete，`manager._dispatch_workflow_card` 於是把 plan 卡（如 `writing-plans-light`）deterministic pass，卻從未檢查卡片宣告的 `produces` glob 是否真的命中檔案，todo 的 ref 通常不落在該 pattern 內，下一棒 build 卡的 declared input 檢查因此必缺（生產實測 run workflow-e18785acc54e5ad87836，`ValueError: workflow declared input missing: ...`）。新增 `_plan_card_declared_outputs_present`（比照 build 端 `_workflow_input_snapshot` 的 glob 語意）於 deterministic pass 前驗證；缺席時由 `_materialize_plan_card_output` 把已 accepted 的 kind=plan 內容 materialize 到卡片宣告的 canonical 路徑並併入 `planning_authority`（走既有 `_PlanningPublicationTransaction`，registry 提交失敗會 rollback）；不可 materialize 時 fail-closed 不跳過。新增 3 個回歸測試，修正前已確認重現生產事故的確切 `ValueError`。
 
