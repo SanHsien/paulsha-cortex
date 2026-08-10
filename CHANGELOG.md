@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **abandon 孤兒救援窄放行（issue 410 建議 2）**：work item 改名／重識別後，舊識別 authority 失去 issue／openspec 映射，run refs 與 authority 恆不相等，嚴格相等守衛使孤兒 run 永遠不可 abandon、其 issue 認領持續與新識別相撞。僅在「authority 兩類映射皆空、run 仍留 refs」的孤兒簽名下放行（expected_run_id／actor／reason 強制項與單一 ongoing 檢查不變、evidence 照常落盤）；authority 映射非空的真 refs 漂移維持 fail-closed。
+
 ### Changed
 - **v2 墓碑錨點（issue 410 改名死結短期解）**：`fix-log-error-dedup-v2` 改名 v3 時仍有 ongoing run，形成「孤兒 run 不可 abandon（authority 隨改名消失）→ 其 issue 認領與 v3 相撞 → repo provider degraded → 全域凍結」三環死結。重加 v2 tombstone row（僅 path 錨點＋明示 exclude issue 374）恢復 authority 以 abandon 孤兒；abandon 後於收尾打掃移除。
 

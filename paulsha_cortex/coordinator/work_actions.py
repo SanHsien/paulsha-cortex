@@ -2335,7 +2335,21 @@ def _abandon_action(
         f"{authority.repo}#{number}" for number in authority.mapped_issues
     )
     if run.issue_refs != expected_issues or run.openspec_refs != authority.mapped_openspec:
-        raise RuntimeError("abandon WorkflowRun refs differ from current WorkAuthority")
+        # #410（孤兒救援，建議 2 的窄放行）：work item 改名／重識別後，舊識別的
+        # authority 會失去 issue/openspec 映射（例如 tombstone row 只剩 path 錨點、
+        # 或 collision 使 correlation 不再把 issue 分派給本 work_id），此時 run 的
+        # refs 與 authority 恆不相等，孤兒 run 永遠不可 abandon——與 v3 相撞的
+        # 認領也永遠無法釋放。僅在「authority 完全失去 issue 與 openspec 映射、
+        # 而 run 仍留有 refs」這個孤兒簽名下放行；一般 abandon（authority 映射
+        # 完整）維持嚴格相等。expected_run_id／actor／reason 的強制項與上方的
+        # 單一 ongoing 檢查不變，abandon evidence 照常落盤留稽核。
+        orphan_rescue = (
+            not authority.mapped_issues
+            and not authority.mapped_openspec
+            and bool(run.issue_refs or run.openspec_refs)
+        )
+        if not orphan_rescue:
+            raise RuntimeError("abandon WorkflowRun refs differ from current WorkAuthority")
     body = {
         "schema": "cortex-work-abandon/v1",
         "repo": authority.repo,
