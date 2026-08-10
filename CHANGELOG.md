@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Fixed
+- **missing-kind 問題的 source_refs 補 accepted fallback（#408 補完）**：`_build_default_question_pack` 對 `missing-{kind}` 只取同 kind refs——同 kind 有草稿時語意正確（重寫以草稿為本），但 todo 錨定的 work item 該 kind 完全不存在，refs 恆空，`_planning_destinations` 與 `_planning_source_material` 雙雙斷炊（PR #409 的 workstream 推導因此拿不到料，v3 gen1 實測 destinations 仍空、模型輸出裸路徑被 governed-roots 拒）。同 kind refs 為空時 fallback 至全部 accepted refs；端對端實測 brainstorm 三棒＋integration 驗證全通、destinations 正確導出。
+
+### Fixed
 - **abandon 孤兒救援窄放行（issue 410 建議 2）**：work item 改名／重識別後，舊識別 authority 失去 issue／openspec 映射，run refs 與 authority 恆不相等，嚴格相等守衛使孤兒 run 永遠不可 abandon、其 issue 認領持續與新識別相撞。僅在「authority 兩類映射皆空、run 仍留 refs」的孤兒簽名下放行（expected_run_id／actor／reason 強制項與單一 ongoing 檢查不變、evidence 照常落盤）；authority 映射非空的真 refs 漂移維持 fail-closed。
 
 ### Changed
