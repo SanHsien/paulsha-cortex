@@ -620,10 +620,16 @@ def build_production_planning_runtime(
         )
 
     def integrator(pack: Mapping[str, object], evidence: Mapping[str, object]) -> object:
+        # #406：prompt 必須把 validate_primary_integration 的結構約束逐條講給模型，
+        # 只列欄位名（不給語意）時模型會把不確定的 artifact_refs 留空 → 必然驗證失敗。
         return invoke_primary(
             "Do not call tools or edit files. Integrate only the supplied evidence. Return exactly one "
             "JSON object with schema_version=1, question_pack_id, secondary_evidence_hash, resolutions, "
             "and artifacts. Each resolution has only question_id, decision, artifact_kind, artifact_refs. "
+            "Resolve every question exactly once. artifact_kind must equal the question kind without its "
+            "'missing-' prefix. artifact_refs must be a NON-EMPTY list of the destination path(s) this "
+            "resolution's artifact(s) are written to — the same strings used as artifacts[].path. "
+            "The set of all artifacts[].path values must equal the union of all artifact_refs. "
             "Each artifact has only kind, path, content; content must be complete UTF-8 Markdown with "
             "frontmatter status: accepted, the matching work_item, and required headings: Requirements "
             "for spec, Decisions for design, Tasks for plan. Use the supplied destination paths. "

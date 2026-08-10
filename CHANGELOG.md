@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **integrator prompt 補結構語意，修復必然的空 `artifact_refs` 驗證失敗**：`build_production_planning_runtime` 的 integrator prompt 過去只列欄位名，未說明 `artifact_refs` 須為非空的 destination path 清單、`artifact_kind` 須對應 question kind 去掉 `missing-` 前綴、artifacts path 集合須恰等於 refs 聯集、每題恰一 resolution——模型在無語意指引下把不確定欄位留空，`validate_primary_integration` 必然拒收（canary v2 gen2 實測）。prompt 補上四項約束並以回歸測試釘住關鍵語句；validator 不動。
+
 ### Changed
 - **work item `fix-log-error-dedup` 重識別為 `-v2`**：v1 的三個 run 世代全數消耗於基礎設施缺陷（#390/#397/#399/#401），觸發 #218 語意重宣告熔斷（`semantic-reclaim-budget-exhausted`）；依熔斷設計的逃生門改用新識別，issue 374 連結與 workstream todo 隨遷。此案例同時佐證 #331（-v2 重識別摩擦）所述成本。
 
