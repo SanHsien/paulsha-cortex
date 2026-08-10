@@ -1091,17 +1091,31 @@ def run_heterogeneous_brainstorm(
             "default_question_pack": report.default_question_pack.to_dict(),
         }
         pack = validate_question_pack(primary_questioner(questioner_input), report=report)
-    except Exception:
-        return BrainstormResult("needs_human", "question-pack-malformed", None, empty_refs, None)
+    except Exception as exc:
+        # issue #397：這三處 `except Exception` 過去把底層例外整段壓平成單一
+        # 字面值 reason，操作者只看得到分支名稱、看不到底層是哪種例外、訊息
+        # 內容是什麼——排障要另外重跑加 print 才查得到（曾經雙重誤導：真正
+        # 原因是 planning launcher 把 operator worktree 判成被汙染而
+        # ValueError，卻只顯示成籠統的「question-pack-malformed」）。這裡併入
+        # 例外型別與訊息前 160 字，供 #393 的 planning-failure evidence 與
+        # recover-planning 的 `_read_planning_failure_record` 直接讀出；兩者
+        # 都只要求 reason 為非空字串，加長不影響既有契約。
+        return BrainstormResult(
+            "needs_human",
+            f"question-pack-malformed: {type(exc).__name__}: {str(exc)[:160]}",
+            None,
+            empty_refs,
+            None,
+        )
     try:
         secondary = validate_secondary_evidence(
             secondary_planner(pack.to_dict(), selection.identity),
             question_pack=pack,
         )
-    except Exception:
+    except Exception as exc:
         return BrainstormResult(
             "needs_human",
-            "secondary-output-malformed",
+            f"secondary-output-malformed: {type(exc).__name__}: {str(exc)[:160]}",
             selection.identity.independence_domain,
             empty_refs,
             None,
@@ -1115,10 +1129,10 @@ def run_heterogeneous_brainstorm(
             question_pack=pack,
             secondary_evidence_hash=evidence_hash,
         )
-    except Exception:
+    except Exception as exc:
         return BrainstormResult(
             "needs_human",
-            "primary-integration-malformed",
+            f"primary-integration-malformed: {type(exc).__name__}: {str(exc)[:160]}",
             selection.identity.independence_domain,
             empty_refs,
             None,

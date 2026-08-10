@@ -98,6 +98,20 @@ def _tree_snapshot(root: Path) -> str:
             for child in sorted(path.iterdir(), key=lambda item: item.name):
                 if child.name == ".git":
                     continue
+                # issue #397：本機部署常見拓撲是 daemon 與 planning launcher
+                # 共用同一棵 operator 工作樹（daemon 以 repo 為
+                # WorkingDirectory 常駐），daemon 對既有模組的 lazy import
+                # 會隨時在快照窗口內重編 `__pycache__/*.pyc`。這是可由原始碼
+                # 100% 重生的 bytecode 快取、不是 operator 內容，計入雜湊會把
+                # 這種正常 churn 誤判成「planner 汙染 operator worktree」而
+                # fail-closed 到整段 raise + rollback。跳過的盲點取捨：CPython
+                # 的 .pyc 是 timestamp/hash-based 驗證（PEP 552），植入的孤兒
+                # .pyc 若與對應 .py 的 mtime／hash 不符會被直接忽略重新編譯，
+                # 不會被 import 採用，因此跳過雜湊不會讓惡意 bytecode 有機可乘
+                # ——真正的程式碼污染仍必須經過 .py／其他原始檔變更，那些不受
+                # 此例外規則影響，fail-closed 行為維持不變。
+                if child.name == "__pycache__" or child.name.endswith(".pyc"):
+                    continue
                 visit(child, relative / child.name)
         elif stat.S_ISREG(metadata.st_mode):
             digest.update(b"file\0")
@@ -112,11 +126,15 @@ def _tree_snapshot(root: Path) -> str:
 
 
 def _copy_planning_sandbox(worktree: Path, destination: Path) -> None:
+    # issue #397：sandbox 是拋棄式複本，bytecode 可由原始碼重生、不必複製；
+    # 排除它同時避免 copytree 過程中 daemon 正在改寫／汰換 __pycache__ 內容
+    # 造成 race read（複製到一半 .pyc 消失或被截斷）引發與 planner 汙染無關
+    # 的例外。
     shutil.copytree(
         worktree,
         destination,
         symlinks=True,
-        ignore=shutil.ignore_patterns(".git"),
+        ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
     )
 
 
