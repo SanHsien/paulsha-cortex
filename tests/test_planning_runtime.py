@@ -423,6 +423,112 @@ def test_planning_runtime_tolerates_shared_worktree_pycache_churn(tmp_path: Path
     assert (tmp_path / "__pycache__" / "tracked.cpython-312.pyc").exists()
 
 
+def test_tree_snapshot_ignores_root_level_runtime_directory(tmp_path: Path) -> None:
+    """Issue #399：本機部署常見拓撲是 manager daemon 以 repo 為
+    `WorkingDirectory` 常駐，`.gitignore:8` 明列的 `/runtime/` 是它的狀態殘留
+    （例如 `runtime/handoff/wf-*.json` 每個 periodic tick 都會被重寫、內容
+    含時間戳必變）。這棵目錄不受版控、且 verification gate 是讀 git diff 來
+    判斷候選檔案，gitignored 的內容本就不會進候選清單，跳過它的雜湊盲點
+    可控；不跳過的話，快照窗口內只要撞上一次 tick 就會被 `_invoke_json`
+    的 operator 前後比對誤判成「planner 汙染 operator worktree」。
+    """
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    baseline = planning_runtime._tree_snapshot(tmp_path)
+
+    runtime_dir = tmp_path / "runtime"
+    handoff = runtime_dir / "handoff"
+    handoff.mkdir(parents=True)
+    handoff_file = handoff / "wf-1.json"
+    handoff_file.write_text('{"tick": 1}\n', encoding="utf-8")
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+    # daemon 每 tick 都整個重寫檔案內容（含時間戳）
+    handoff_file.write_text('{"tick": 2}\n', encoding="utf-8")
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+    # 新增另一個 handoff 檔案同樣不該觸發 mismatch
+    (handoff / "wf-2.json").write_text('{"tick": 3}\n', encoding="utf-8")
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+
+def test_tree_snapshot_still_hashes_nested_runtime_lookalike_directory(
+    tmp_path: Path,
+) -> None:
+    """跳過規則只能鎖定快照 root 直下的 `runtime/`；深層同名目錄
+    （例如 `pkg/runtime/`）不是 daemon 狀態殘留，仍必須被雜湊，
+    避免用比對 dir name 而非 relative path 的實作方式過度排除。"""
+    nested_runtime = tmp_path / "pkg" / "runtime"
+    nested_runtime.mkdir(parents=True)
+    tracked = nested_runtime / "file.txt"
+    tracked.write_text("original\n", encoding="utf-8")
+    baseline = planning_runtime._tree_snapshot(tmp_path)
+
+    tracked.write_text("mutated\n", encoding="utf-8")
+    assert planning_runtime._tree_snapshot(tmp_path) != baseline
+
+    tracked.write_text("original\n", encoding="utf-8")
+    (nested_runtime / "new-file.txt").write_text("added\n", encoding="utf-8")
+    assert planning_runtime._tree_snapshot(tmp_path) != baseline
+
+
+def test_copy_planning_sandbox_excludes_root_level_runtime_directory(
+    tmp_path: Path,
+) -> None:
+    """sandbox 是拋棄式複本，daemon 的 `/runtime/` 狀態殘留不必複製；
+    與 `_tree_snapshot` 保持同語意，只排除 worktree root 直下的
+    `runtime/`，深層同名目錄仍應被複製。"""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "tracked.py").write_text("value = 1\n", encoding="utf-8")
+    handoff = worktree / "runtime" / "handoff"
+    handoff.mkdir(parents=True)
+    (handoff / "wf-1.json").write_text('{"tick": 1}\n', encoding="utf-8")
+    nested_runtime = worktree / "pkg" / "runtime"
+    nested_runtime.mkdir(parents=True)
+    (nested_runtime / "file.txt").write_text("keep-me\n", encoding="utf-8")
+
+    destination = tmp_path / "sandbox"
+    planning_runtime._copy_planning_sandbox(worktree, destination)
+
+    assert (destination / "tracked.py").is_file()
+    assert not (destination / "runtime").exists()
+    assert (destination / "pkg" / "runtime" / "file.txt").is_file()
+
+
+def test_planning_runtime_tolerates_shared_worktree_runtime_handoff_churn(
+    tmp_path: Path,
+) -> None:
+    """Issue #399 的整合回歸：`_invoke_json` 在快照窗口內若只看到
+    `runtime/handoff/wf-*.json` churn（manager daemon periodic tick 重寫，
+    issue #373 的迴圈使其每 ~55 秒必然發生一次），不得 raise「planning
+    launcher modified operator worktree」。修復前，這個測試會在 runner
+    回傳成功後才被 finally 區塊的 operator 快照比對炸掉，即使底層
+    launcher 呼叫本身完全正常。"""
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("value = 1\n", encoding="utf-8")
+
+    def runner(argv, **kwargs):
+        handoff = tmp_path / "runtime" / "handoff"
+        handoff.mkdir(parents=True, exist_ok=True)
+        (handoff / "wf-1.json").write_text(
+            json.dumps({"tick": os.urandom(4).hex()}), encoding="utf-8"
+        )
+        return _completed(json.dumps({"ok": True}))
+
+    result = planning_runtime._invoke_json(
+        identity,
+        "return JSON",
+        worktree=tmp_path,
+        runner=runner,
+        timeout_seconds=30,
+    )
+    assert result == {"ok": True}
+    # 沒有觸發 mismatch，就不該跑 restore；churn 出來的 handoff 檔案原樣留在原地。
+    assert (tmp_path / "runtime" / "handoff" / "wf-1.json").exists()
+
+
 def test_operator_restore_fault_is_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -112,6 +112,19 @@ def _tree_snapshot(root: Path) -> str:
                 # 此例外規則影響，fail-closed 行為維持不變。
                 if child.name == "__pycache__" or child.name.endswith(".pyc"):
                     continue
+                # issue #399：`.gitignore:8` 的 `/runtime/` 是 manager daemon
+                # 以 repo 為 WorkingDirectory 常駐時的狀態殘留（例如
+                # `runtime/handoff/wf-*.json` 每個 periodic tick 都會被整份
+                # 重寫，內容含時間戳必變，issue #373 的迴圈使其每 ~55 秒
+                # 必然發生一次）。它不受版控，verification gate 是讀 git
+                # diff 來判斷候選檔案，gitignored 的內容本就不會進候選
+                # 清單，跳過它的雜湊盲點可控——真正的程式碼污染必須經過
+                # git 追蹤的檔案，不受此例外規則影響，fail-closed 行為維持
+                # 不變。只跳過快照 root 直下的 `runtime/`（用 relative path
+                # 判斷，而非只比對 dir name），避免誤跳深層同名目錄（例如
+                # `tests/fixtures/runtime/`）。
+                if relative == Path(".") and child.name == "runtime":
+                    continue
                 visit(child, relative / child.name)
         elif stat.S_ISREG(metadata.st_mode):
             digest.update(b"file\0")
@@ -130,11 +143,26 @@ def _copy_planning_sandbox(worktree: Path, destination: Path) -> None:
     # 排除它同時避免 copytree 過程中 daemon 正在改寫／汰換 __pycache__ 內容
     # 造成 race read（複製到一半 .pyc 消失或被截斷）引發與 planner 汙染無關
     # 的例外。
+    pycache_ignore = shutil.ignore_patterns(".git", "__pycache__", "*.pyc")
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = set(pycache_ignore(directory, names))
+        # issue #399：與 `_tree_snapshot` 同語意排除 worktree root 直下的
+        # `/runtime/`（daemon 狀態殘留，見該函式內註解）；sandbox 不需要
+        # 這份內容，同時避免複製途中 daemon 正在改寫 handoff 檔案造成
+        # race read。`shutil.ignore_patterns` 是按名稱全樹匹配，若直接
+        # 加入 "runtime" pattern 會連深層同名目錄（例如
+        # `pkg/runtime/`）一併誤殺，因此改用自訂 callable，只在走訪到
+        # worktree 根目錄時才把 "runtime" 加進忽略清單。
+        if Path(directory) == worktree and "runtime" in names:
+            ignored.add("runtime")
+        return ignored
+
     shutil.copytree(
         worktree,
         destination,
         symlinks=True,
-        ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+        ignore=ignore,
     )
 
 
