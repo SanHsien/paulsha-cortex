@@ -318,6 +318,111 @@ def test_snapshot_permission_error_still_restores_operator_tree(tmp_path: Path) 
         assert os.getxattr(tracked, "user.cortex-test") == b"baseline"
 
 
+def test_tree_snapshot_ignores_pycache_directories_and_pyc_files(tmp_path: Path) -> None:
+    """Issue #397：本機部署讓 daemon 與 planning launcher 共用同一棵工作樹，
+    daemon 對既有模組的 lazy import 會隨時重編 `__pycache__/*.pyc`。這些是
+    可由原始碼重生的 bytecode 快取，不是 operator 內容變更，不該被算進
+    mismatch 判定——否則共享工作樹拓撲下每次 planning 呼叫都有機率被
+    daemon 的正常 churn 誤判成「planner 汙染 operator worktree」。
+    """
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    baseline = planning_runtime._tree_snapshot(tmp_path)
+
+    pycache = tmp_path / "__pycache__"
+    pycache.mkdir()
+    pyc = pycache / "tracked.cpython-312.pyc"
+    pyc.write_bytes(b"\x00\x01fake-bytecode-v1")
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+    # daemon 重新編譯，bytecode 內容整個換掉（模擬 timestamp 命中後的 rewrite）
+    pyc.write_bytes(b"\xff\xfe totally different recompiled bytecode")
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+    # 散落在既有目錄下、不在 __pycache__ 資料夾內的 .pyc 同樣視為 bytecode
+    stray = tmp_path / "stray.pyc"
+    stray.write_bytes(b"stray-bytecode")
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+    # 巢狀套件目錄底下的 __pycache__ 也要能被忽略（非只有 root 層級）
+    nested = tmp_path / "pkg"
+    nested.mkdir()
+    (nested / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    baseline_with_pkg = planning_runtime._tree_snapshot(tmp_path)
+    nested_pycache = nested / "__pycache__"
+    nested_pycache.mkdir()
+    (nested_pycache / "mod.cpython-312.pyc").write_bytes(b"nested-bytecode")
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline_with_pkg
+
+
+def test_tree_snapshot_still_detects_non_pycache_file_mutations(tmp_path: Path) -> None:
+    """忽略 __pycache__／.pyc 不得放寬既有 fail-closed：任何其他新增或修改
+    的檔案仍必須讓快照改變，才能繼續攔下真正的 operator worktree 污染。"""
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    baseline = planning_runtime._tree_snapshot(tmp_path)
+
+    (tmp_path / "evil.txt").write_text("polluted\n", encoding="utf-8")
+    assert planning_runtime._tree_snapshot(tmp_path) != baseline
+
+
+def test_copy_planning_sandbox_excludes_pycache(tmp_path: Path) -> None:
+    """sandbox 是要丟棄的一次性複本，bytecode 可由原始碼重生、不必複製；
+    同時避免 copytree 期間 daemon 正在改寫／刪除 .pyc 造成 race read 例外
+    （複製到一半 .pyc 消失導致 shutil.copytree 炸掉，而這與 planner 汙染
+    無關，不該讓整段流程失敗）。"""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "tracked.py").write_text("value = 1\n", encoding="utf-8")
+    pycache = worktree / "__pycache__"
+    pycache.mkdir()
+    (pycache / "tracked.cpython-312.pyc").write_bytes(b"bytecode")
+    nested = worktree / "pkg"
+    nested.mkdir()
+    (nested / "mod.py").write_text("y = 2\n", encoding="utf-8")
+    nested_pycache = nested / "__pycache__"
+    nested_pycache.mkdir()
+    (nested_pycache / "mod.cpython-312.pyc").write_bytes(b"nested-bytecode")
+    (nested / "compiled.pyc").write_bytes(b"stray-in-pkg")
+
+    destination = tmp_path / "sandbox"
+    planning_runtime._copy_planning_sandbox(worktree, destination)
+
+    assert (destination / "tracked.py").is_file()
+    assert not (destination / "__pycache__").exists()
+    assert (destination / "pkg" / "mod.py").is_file()
+    assert not (destination / "pkg" / "__pycache__").exists()
+    assert not (destination / "pkg" / "compiled.pyc").exists()
+
+
+def test_planning_runtime_tolerates_shared_worktree_pycache_churn(tmp_path: Path) -> None:
+    """Issue #397 的整合回歸：`_invoke_json` 在快照窗口內若只看到
+    `__pycache__` churn（daemon 對共享工作樹既有模組的 lazy import 重編），
+    不得 raise「planning launcher modified operator worktree」。修復前，
+    這個測試會在 runner 回傳成功後才被 finally 區塊的 operator 快照比對
+    炸掉，即使底層 launcher 呼叫本身完全正常。"""
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("value = 1\n", encoding="utf-8")
+
+    def runner(argv, **kwargs):
+        pycache = tmp_path / "__pycache__"
+        pycache.mkdir(exist_ok=True)
+        (pycache / "tracked.cpython-312.pyc").write_bytes(os.urandom(32))
+        return _completed(json.dumps({"ok": True}))
+
+    result = planning_runtime._invoke_json(
+        identity,
+        "return JSON",
+        worktree=tmp_path,
+        runner=runner,
+        timeout_seconds=30,
+    )
+    assert result == {"ok": True}
+    # 沒有觸發 mismatch，就不該跑 restore；churn 出來的 .pyc 原樣留在原地。
+    assert (tmp_path / "__pycache__" / "tracked.cpython-312.pyc").exists()
+
+
 def test_operator_restore_fault_is_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

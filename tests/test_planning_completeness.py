@@ -474,7 +474,12 @@ def test_brainstorm_fails_closed_when_no_heterogeneous_peer_or_output_is_malform
         primary_integrator=lambda *_: {},
     )
     assert malformed.state == "needs_human"
-    assert malformed.reason == "secondary-output-malformed"
+    # Issue #397：reason 不再是壓平後的單一字面值，必須透傳底層例外型別與
+    # 訊息片段（`validate_secondary_evidence` 這裡是 ValueError: secondary
+    # evidence identity invalid），排障時才看得出真正壞在哪一段驗證。
+    assert malformed.reason is not None
+    assert malformed.reason.startswith("secondary-output-malformed:")
+    assert "ValueError" in malformed.reason
     assert malformed.gate_refs.brainstorm_peer is None
 
     valid_secondary = lambda pack, _identity: {
@@ -505,10 +510,66 @@ def test_brainstorm_fails_closed_when_no_heterogeneous_peer_or_output_is_malform
         secondary_planner=valid_secondary,
         primary_integrator=lambda *_: {},
     )
-    assert (malformed_primary.state, malformed_primary.reason) == (
-        "needs_human",
-        "primary-integration-malformed",
+    assert malformed_primary.state == "needs_human"
+    # 同上：integrator 分支同型 `except Exception` 也要透傳例外摘要。
+    assert malformed_primary.reason is not None
+    assert malformed_primary.reason.startswith("primary-integration-malformed:")
+    assert "ValueError" in malformed_primary.reason
+
+
+def test_brainstorm_reason_includes_underlying_exception_summary_for_questioner(
+    tmp_path: Path,
+) -> None:
+    """Issue #397：`question-pack-malformed` 分支同樣要透傳底層例外——過去
+    三處 `except Exception` 全部把例外壓平成單一字面值，操作者只看得到分支
+    名稱、看不到底層是 ValueError 還是別的、訊息內容是什麼，排障要另外重跑
+    加 print 才查得到。這裡直接讓 primary_questioner raise，驗證 reason 併入
+    例外型別與訊息片段（供 #393 的 planning-failure evidence／recover-planning
+    的 `_read_planning_failure_record` 直接讀出，兩者都只要求非空字串）。"""
+    report = assess_planning_completeness([_artifact("spec", ACCEPTED_SPEC)])
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy",
+                "model_id": "Gemini 3.1 Pro (High)",
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": "agy-plan-sandbox",
+            },
+        ]
     )
+    probes = {
+        ("agy", "Gemini 3.1 Pro (High)"): CapabilityProbe.ready_for(
+            "agy", "Gemini 3.1 Pro (High)", "google"
+        )
+    }
+
+    def raising_questioner(_input: object) -> object:
+        raise RuntimeError("questioner exploded")
+
+    result = run_heterogeneous_brainstorm(
+        report=report,
+        primary=("codex", "primary"),
+        registry=registry,
+        probes=probes,
+        evidence_dir=tmp_path,
+        artifact_root=tmp_path,
+        scope=SCOPE,
+        primary_questioner=raising_questioner,
+        secondary_planner=lambda *_: {},
+        primary_integrator=lambda *_: {},
+    )
+    assert result.state == "needs_human"
+    assert result.reason is not None
+    assert result.reason.startswith("question-pack-malformed:")
+    assert "RuntimeError" in result.reason
+    assert "questioner exploded" in result.reason
 
 
 def test_primary_must_write_accepted_artifacts_before_brainstorm_gate_passes(tmp_path: Path) -> None:
