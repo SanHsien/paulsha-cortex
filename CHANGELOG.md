@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Issue #418：#414 materialize 出的 canonical plan 檔與 brainstorm evidence 對帳必炸**：`_validated_brainstorm_planning_authority` 過去單純用 `set(persisted) - set(scanned)` 非空即 raise，`_materialize_plan_card_output`（#414）為對齊 build 端 declared input pattern 而產生的 canonical plan 副本天生不在 brainstorm evidence 列表內，每次 resume 對帳必 `needs_human`。新增合法副本例外路徑：`kind`／`work_id`／`baseline_sha256`（byte-copy）／ref 落在 plan phase output pattern 內四條全符合才排除於 omission 之外，其餘真正的 omission 維持 raise；回傳的 authority tuple 仍保留該副本以 seed 進 build worktree。新增 3 個回歸測試，修正前已確認重現 `omits persisted authority` 的 RED。
+
 ### Changed
 - **work item 重識別 `-v4` 並移除 v2 墓碑**：v3 三世代分別耗於 #408 補完前、#414 前與 #416（棄單殘留 artifacts 地雷）；三修復皆已 merge，本次改名前已先棄單（#410 順序教訓）。v2 墓碑錨點（#411）任務完成（孤兒 run 已由 #412 救援通道清除），一併移除。
 
