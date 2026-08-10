@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Protocol
+from uuid import uuid4
 
 from paulsha_cortex.config import paths
 
@@ -6998,6 +6999,96 @@ def resume_workflow_run(
     return result
 
 
+def _write_planning_failure_evidence(
+    *,
+    coordinator_root: Path,
+    run_id: str,
+    classification: str,
+    reason: str,
+) -> str:
+    """#393：define needs_human 三條靜默失敗路徑落 `cortex-planning-failure/v1`
+    evidence，供 `work_actions._read_planning_failure_record`／
+    `_planning_failure_hint` 消費，讓 `recover-planning` 對 define 失敗結構性
+    可用（過去全庫只有 reader、沒有任何 producer，recover-planning 對這個
+    它最該覆蓋的場景永遠 fail-closed）。
+
+    原子寫入模式與 `work_bridge._write_json_evidence` 一致（tmp、fsync、
+    rename、0400）；body 直接落 reader 要求的頂層欄位（不套 envelope），
+    因為 reader 直接讀 `schema`/`run_id`/`classification`/`reason`，
+    `_write_json_evidence` 的 `{"payload": ..., "hash": ...}` envelope 與
+    content-hash 檔名不符這裡的讀取契約，故不直接共用、改用同樣手法的
+    小工廠避免跨模組奇怪依賴。目錄名必須是 `planning-recovery`——
+    reader 用 `path.parent.name` 判斷。
+    """
+
+    body = {
+        "schema": "cortex-planning-failure/v1",
+        "run_id": run_id,
+        "classification": classification,
+        "reason": reason,
+        "created_at": _utcnow(),
+    }
+    digest = verification.canonical_json_hash(body)
+    directory = coordinator_root.resolve() / "evidence" / "planning-recovery"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{run_id}-{digest}.json"
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content:
+            raise RuntimeError("workflow planning failure evidence conflict")
+        return str(target)
+    temporary = directory / f".{target.name}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        target.chmod(0o400)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(target)
+
+
+def _record_planning_failure_evidence(
+    run,
+    *,
+    coordinator_root: Path,
+    classification: str,
+    reason: str,
+) -> tuple[str, ...]:
+    """呼叫端 wrapper：evidence 寫入失敗不得讓 define 路徑爆炸（fail-open
+    僅限 evidence 記錄本身），失敗時只 log 註記、`run.evidence_refs` 原樣
+    帶回，needs_human 仍照舊落地——不因為記不下證據就讓整個 define
+    請求跟著炸。
+    """
+
+    try:
+        evidence_path = _write_planning_failure_evidence(
+            coordinator_root=coordinator_root,
+            run_id=run.run_id,
+            classification=classification,
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence 記錄本身 fail-open
+        logger.error(
+            "planning-failure-evidence-write-failed run_id=%s classification=%s error=%s: %s",
+            run.run_id,
+            classification,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return run.evidence_refs
+    return (*run.evidence_refs, evidence_path)
+
+
 def apply_workflow_action(
     registry,
     *,
@@ -7645,8 +7736,26 @@ def apply_workflow_action(
                 worktree=_required_workflow_string(args, "artifact_root"),
             )
         except Exception as exc:
+            # #393：recover-planning 靠 `cortex-planning-failure/v1` evidence
+            # 判定能不能恢復——過去全庫只有 reader（work_actions.
+            # _read_planning_failure_record）、這三條 needs_human 路徑沒有任何
+            # 一條寫 evidence，導致 recover-planning 對 define 靜默失敗結構性
+            # 不可用。這裡歸類 `environment`（runtime 初始化本身出問題，非
+            # 內容缺陷），reason 沿用 #392 已組好的字串再併上例外摘要。
+            failure_reason = (
+                f"planning-runtime-initialization-failed: {type(exc).__name__}: {str(exc)[:200]}"
+            )
+            evidence_refs = _record_planning_failure_evidence(
+                run,
+                coordinator_root=transaction_root,
+                classification="environment",
+                reason=failure_reason,
+            )
             run = registry._manager_update_workflow_run(
-                run.run_id, facets=("needs_human",), brainstorm_required=True
+                run.run_id,
+                facets=("needs_human",),
+                brainstorm_required=True,
+                evidence_refs=evidence_refs,
             )
             # #391：needs_human 的 reason 過去只塞進回傳值——daemon periodic
             # tick 觸發時（未經活人在旁的 request/response）沒人消費回傳值，
@@ -7672,8 +7781,20 @@ def apply_workflow_action(
         secondary_planner = runtime.secondary_planner
         primary_integrator = runtime.primary_integrator
     if primary_questioner is None or secondary_planner is None or primary_integrator is None:
+        # #393：同上一條路徑，補 evidence 才能讓 recover-planning 對這條
+        # needs_human 出口可用；沒有底層 exception 可附，classification 仍歸
+        # `environment`（runtime 元件缺失，非內容缺陷）。
+        evidence_refs = _record_planning_failure_evidence(
+            run,
+            coordinator_root=transaction_root,
+            classification="environment",
+            reason="planning-runtime-unavailable",
+        )
         run = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), brainstorm_required=True
+            run.run_id,
+            facets=("needs_human",),
+            brainstorm_required=True,
+            evidence_refs=evidence_refs,
         )
         # #391：runtime_factory 沒被呼叫（或呼叫成功但沒補齊三個角色）時同樣
         # 落一筆 log，理由同上——reason 不能只活在回傳值裡。
@@ -7723,8 +7844,22 @@ def apply_workflow_action(
     )
     if result.state != "ready" or result.gate_refs.brainstorm_peer is None:
         publication.rollback()
+        # #393：brainstorm 未收斂屬內容缺陷（非 runtime 環境問題），
+        # classification 歸 `content`——`_read_planning_failure_record` 仍接受
+        # 此值，但 `_resume_decision` 對 `content` 一律不浮現 recover-planning
+        # （見 claim.py 的 fail-closed 判準），行為與 issue 393 的 fail-closed
+        # 意圖一致。`result.reason` 理論上不應為空，仍防禦性 fallback 避免
+        # evidence 的 reason 欄位落空字串。
         run = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), brainstorm_required=True
+            run.run_id,
+            facets=("needs_human",),
+            brainstorm_required=True,
+            evidence_refs=_record_planning_failure_evidence(
+                run,
+                coordinator_root=transaction_root,
+                classification="content",
+                reason=result.reason or "brainstorm-not-ready",
+            ),
         )
         # #391：run_heterogeneous_brainstorm 沒能收斂到 ready 狀態時，同樣的
         # reason-只活在回傳值裡問題——比照上面兩條 runtime 缺失路徑補一筆 log。

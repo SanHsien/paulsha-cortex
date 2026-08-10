@@ -14,7 +14,7 @@ from paulsha_cortex.control import constants, contract
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
     manager, manager_daemon, planning_runtime, registry as registry_module, review,
-    terminal_contract, verification, work_bridge,
+    terminal_contract, verification, work_actions, work_bridge,
 )
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -66,6 +66,45 @@ def _manifest() -> WorkflowManifest:
     result = compile_combo(combo, cards, "production wiring", change="production-wiring")
     assert result.workflow_manifest is not None
     return result.workflow_manifest
+
+
+def _assert_planning_failure_evidence_recoverable(
+    *,
+    coordinator_root: Path,
+    persisted: WorkflowRun,
+    classification: str,
+    reason: str,
+) -> None:
+    """issue #393 回歸樁：define needs_human 靜默失敗必須留下
+    `cortex-planning-failure/v1` evidence，且該 evidence 要能被
+    `work_actions._read_planning_failure_record`／`_planning_failure_hint`
+    讀到——這正是 `recover-planning` 的前置成立條件。過去全庫只有 reader、
+    沒有任何 producer，這條斷言在修復前必然 FAIL（RuntimeError: recover-
+    planning requires planning failure evidence／`_planning_failure_hint`
+    回 None）。
+    """
+
+    evidence_dir = coordinator_root / "evidence" / "planning-recovery"
+    evidence_paths = sorted(evidence_dir.glob(f"{persisted.run_id}-*.json"))
+    assert evidence_paths, f"未見 planning-recovery evidence，目錄內容：{list(evidence_dir.glob('*'))}"
+    assert len(evidence_paths) == 1
+    evidence_path = evidence_paths[0]
+    body = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert body["schema"] == "cortex-planning-failure/v1"
+    assert body["run_id"] == persisted.run_id
+    assert body["classification"] == classification
+    assert body["reason"] == reason
+    assert isinstance(body.get("created_at"), str) and body["created_at"]
+    assert str(evidence_path) in persisted.evidence_refs
+
+    record = work_actions._read_planning_failure_record(run=persisted, run_id=persisted.run_id)
+    assert record["classification"] == classification
+    assert record["reason"] == reason
+    assert record["evidence_ref"] == str(evidence_path)
+
+    hint = work_actions._planning_failure_hint(persisted)
+    assert hint is not None
+    assert hint["classification"] == classification
 
 
 def _done_ship_run(registry: JobRegistry, root: Path) -> WorkflowRun:
@@ -270,6 +309,15 @@ def test_control_queue_workflow_action_is_the_production_mutation_path(
         "planning-runtime-unavailable" in record.message and persisted.run_id in record.message
         for record in caplog.records
     )
+    # issue #393：這條 needs_human 出口過去沒有任何 producer 寫
+    # `cortex-planning-failure/v1` evidence，recover-planning 對它結構性
+    # 不可用；修復後必須留下可被 reader 消費的 evidence。
+    _assert_planning_failure_evidence_recoverable(
+        coordinator_root=tmp_path,
+        persisted=persisted,
+        classification="environment",
+        reason="planning-runtime-unavailable",
+    )
 
 
 def test_planning_runtime_initialization_failure_logs_reason_and_records_needs_human(
@@ -311,6 +359,14 @@ def test_planning_runtime_initialization_failure_logs_reason_and_records_needs_h
     assert matching, f"未見結構化 log，實際紀錄：{[r.message for r in caplog.records]}"
     assert "RuntimeError" in matching[0].message
     assert "sandbox worktree creation refused" in matching[0].message
+    # issue #393：runtime_factory 例外路徑同樣要留 evidence；reason 併上
+    # #392 已組好的字串與例外摘要。
+    _assert_planning_failure_evidence_recoverable(
+        coordinator_root=tmp_path,
+        persisted=persisted,
+        classification="environment",
+        reason="planning-runtime-initialization-failed: RuntimeError: sandbox worktree creation refused",
+    )
 
 
 def test_brainstorm_not_ready_logs_reason_before_needs_human(
@@ -362,6 +418,16 @@ def test_brainstorm_not_ready_logs_reason_before_needs_human(
     assert any(
         "no-heterogeneous-planner" in record.message and persisted.run_id in record.message
         for record in caplog.records
+    )
+    # issue #393：brainstorm 未 ready 歸類 content（非 environment）——
+    # `_resume_decision` 對 content 一律不浮現 recover-planning，
+    # 與 fail-closed 意圖一致（見 test_planning_claim_recovery 的
+    # test_resume_hides_recovery_for_content_failure）。
+    _assert_planning_failure_evidence_recoverable(
+        coordinator_root=tmp_path,
+        persisted=persisted,
+        classification="content",
+        reason="no-heterogeneous-planner",
     )
 
 
