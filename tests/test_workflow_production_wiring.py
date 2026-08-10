@@ -2230,6 +2230,202 @@ def test_brainstorm_authority_resolves_exact_manager_archive_after_active_path_m
         )
 
 
+def _materialize_authority_fixture(
+    tmp_path: Path,
+    *,
+    extra_digest_matches_todo: bool = True,
+    extra_ref_matches_plan_pattern: bool = True,
+) -> tuple[SimpleNamespace, Path, str]:
+    """issue #418 樁：重現 #414 deterministic plan pass materialize 出的
+    canonical plan 檔（與 brainstorm 實際發佈的
+    `docs/superpowers/workstreams/<slug>/todo.md` 是同一份內容的
+    byte-copy，只是路徑不同，為了對齊 build 端 declared input pattern）與
+    brainstorm evidence 對帳。回傳 ``(run, coordinator_root, canonical_ref)``。
+    """
+
+    slug = "materialize-authority-repro"
+    workspace = tmp_path / "workspace"
+    coordinator_root = tmp_path / "coordinator"
+    plan_body = "---\nstatus: accepted\n---\n# Plan\n## Tasks\n- Ship.\n"
+    other_plan_body = "---\nstatus: accepted\n---\n# Plan\n## Tasks\n- Different.\n"
+    spec_body = "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n"
+    design_body = "---\nstatus: accepted\n---\n# Design\n## Decisions\nBound.\n"
+
+    todo_ref = f"docs/superpowers/workstreams/{slug}/todo.md"
+    spec_ref = f"docs/superpowers/specs/{slug}-spec.md"
+    design_ref = f"docs/superpowers/specs/{slug}-design.md"
+    canonical_ref = (
+        f"docs/superpowers/plans/{slug}-plan.md"
+        if extra_ref_matches_plan_pattern
+        else f"docs/superpowers/plans-archive/{slug}-plan.md"
+    )
+
+    def _write(ref: str, body: str) -> Path:
+        path = workspace / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    todo_path = _write(todo_ref, plan_body)
+    spec_path = _write(spec_ref, spec_body)
+    design_path = _write(design_ref, design_body)
+    canonical_path = _write(
+        canonical_ref, plan_body if extra_digest_matches_todo else other_plan_body
+    )
+
+    artifact_rows = [
+        {"kind": "plan", "ref": todo_ref, "sha256": manager._sha256_path(todo_path)},
+        {"kind": "spec", "ref": spec_ref, "sha256": manager._sha256_path(spec_path)},
+        {"kind": "design", "ref": design_ref, "sha256": manager._sha256_path(design_path)},
+    ]
+    evidence = coordinator_root / "evidence" / "planning" / "brainstorm.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "brainstorm-peer",
+                "scope": {
+                    "repo": "hamanpaul/paulsha-cortex",
+                    "work_id": slug,
+                    "source_revision": "2" * 64,
+                },
+                "artifacts": artifact_rows,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    define_step = WorkflowStep(
+        phase="define",
+        persona="planner",
+        card="brainstorming",
+        executor=None,
+        model=None,
+        domain=None,
+        inputs=(),
+        outputs=(
+            f"docs/superpowers/specs/*{slug}*-spec.md",
+            f"docs/superpowers/specs/*{slug}*-design.md",
+        ),
+        gate_result="passed",
+    )
+    plan_step = WorkflowStep(
+        phase="plan",
+        persona="planner",
+        card="writing-plans",
+        executor=None,
+        model=None,
+        domain=None,
+        inputs=(),
+        outputs=(f"docs/superpowers/plans/*{slug}*.md",),
+        gate_result="passed",
+    )
+
+    planning_authority = (
+        PlanningArtifactAuthority(
+            ref=spec_ref,
+            kind="spec",
+            work_id=slug,
+            baseline_sha256=manager._sha256_path(spec_path),
+        ),
+        PlanningArtifactAuthority(
+            ref=design_ref,
+            kind="design",
+            work_id=slug,
+            baseline_sha256=manager._sha256_path(design_path),
+        ),
+        PlanningArtifactAuthority(
+            ref=todo_ref,
+            kind="plan",
+            work_id=slug,
+            baseline_sha256=manager._sha256_path(todo_path),
+        ),
+        # #414 materialize 出的 canonical plan 副本：不在 brainstorm evidence
+        # 的 artifacts 列表中（brainstorm 只發佈了 todo_ref），但已隨
+        # deterministic plan pass 併入 `run.planning_authority`。
+        PlanningArtifactAuthority(
+            ref=canonical_ref,
+            kind="plan",
+            work_id=slug,
+            baseline_sha256=manager._sha256_path(canonical_path),
+        ),
+    )
+
+    run = SimpleNamespace(
+        repo="hamanpaul/paulsha-cortex",
+        work_id=slug,
+        workspace_root=str(workspace),
+        steps=(define_step, plan_step),
+        openspec_refs=(slug,),
+        brainstorm_required=True,
+        planning_source_revision="2" * 64,
+        planning_authority=planning_authority,
+        gate_refs=(
+            GateEvidenceRef("brainstorm", str(evidence), manager._sha256_path(evidence)),
+        ),
+    )
+    return run, coordinator_root, canonical_ref
+
+
+def test_brainstorm_authority_accepts_materialized_plan_byte_copy(tmp_path: Path) -> None:
+    """issue #418：materialized canonical plan（`docs/superpowers/plans/<slug>.md`）
+    是 brainstorm 發佈的 `todo.md` 的 byte-copy（同 digest、同 kind=plan、同
+    work_id），且 ref 落在 plan phase 宣告的 output pattern 內——這是合法副本，
+    不應被判定為 evidence omission；回傳的 authority 仍要保留這筆副本，讓
+    build worktree 能繼續透過 authority_refs fallback seed 到它。修正前
+    （單純 `set(persisted) - set(scanned)` 非空即 raise）本測試必 RED。"""
+
+    run, coordinator_root, canonical_ref = _materialize_authority_fixture(tmp_path)
+
+    authority, source_revision = manager._validated_brainstorm_planning_authority(
+        run,
+        coordinator_root=coordinator_root,
+    )
+
+    assert authority == run.planning_authority
+    assert source_revision == "2" * 64
+    assert canonical_ref in {item.ref for item in authority}
+
+
+def test_brainstorm_authority_rejects_materialized_plan_with_different_digest(
+    tmp_path: Path,
+) -> None:
+    """負向樁：canonical plan 副本內容與任何已驗證的 brainstorm kind=plan
+    entry 皆不同（非 byte-copy）——這是真正的 omission，必須維持 raise，
+    不可被 #418 的例外路徑誤放行。"""
+
+    run, coordinator_root, _canonical_ref = _materialize_authority_fixture(
+        tmp_path, extra_digest_matches_todo=False,
+    )
+
+    with pytest.raises(ValueError, match="omits persisted authority"):
+        manager._validated_brainstorm_planning_authority(
+            run,
+            coordinator_root=coordinator_root,
+        )
+
+
+def test_brainstorm_authority_rejects_persisted_ref_outside_plan_output_pattern(
+    tmp_path: Path,
+) -> None:
+    """負向樁：即使 digest 對得上，若多出的 persisted ref 不落在 plan phase
+    宣告的 output pattern 內，就不是 `_materialize_plan_card_output` 會產生
+    的路徑形狀——必須維持 raise，避免例外路徑被濫用成任意 ref 的 omission
+    漏洞。"""
+
+    run, coordinator_root, _canonical_ref = _materialize_authority_fixture(
+        tmp_path, extra_ref_matches_plan_pattern=False,
+    )
+
+    with pytest.raises(ValueError, match="omits persisted authority"):
+        manager._validated_brainstorm_planning_authority(
+            run,
+            coordinator_root=coordinator_root,
+        )
+
+
 def test_operator_resume_dispatch_error_restores_needs_human(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

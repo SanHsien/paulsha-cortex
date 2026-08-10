@@ -2461,6 +2461,20 @@ def _validated_brainstorm_planning_authority(
         if step.persona == "planner" and step.phase in {"define", "plan"}
         for pattern in step.outputs
     )
+    # #418：plan 卡 deterministic pass materialize 出的 canonical plan 檔
+    # （`_materialize_plan_card_output`）與 brainstorm 實際發佈的 plan
+    # artifact（例如 workstreams/<slug>/todo.md）路徑不同、卻是同一份內容
+    # 的 byte-copy，僅為滿足 build 端 declared input pattern
+    # （`docs/superpowers/plans/*<slug>*.md`）而落地。下面單獨算出 plan
+    # phase 宣告的 output patterns，用來把這種合法副本從「omission」判定
+    # 中排除——與 `declared_patterns`（含 define phase）分開，避免誤放行
+    # 不相干的 define 階段路徑。
+    plan_output_patterns = tuple(
+        pattern
+        for step in run.steps
+        if step.persona == "planner" and step.phase == "plan"
+        for pattern in step.outputs
+    )
     persisted = {item.ref: item for item in run.planning_authority}
     scanned: dict[str, PlanningArtifactAuthority] = {}
     workspace = Path(run.workspace_root).resolve()
@@ -2525,8 +2539,36 @@ def _validated_brainstorm_planning_authority(
             baseline_sha256=digest,
         )
 
-    if set(persisted) - set(scanned):
-        raise ValueError("workflow brainstorm evidence omits persisted authority")
+    missing = set(persisted) - set(scanned)
+    if missing:
+        # #418：materialized plan 副本本身不在 brainstorm evidence 的
+        # artifacts 列表裡（它是 plan 卡 deterministic pass 之後才產生
+        # 的），因此天生落在 `persisted - scanned` 差集中。逐一檢查是否
+        # 為「合法副本」：kind=plan、work_id 對得上這個 run、內容
+        # （baseline_sha256）與某個已通過 brainstorm 驗證的 kind=plan
+        # entry 完全一致（byte-copy）、且 ref 落在 plan phase 宣告的
+        # output pattern 內（即 build 端會讀的那個 canonical 路徑）。四條
+        # 全符合才視為合法副本、不計入 omission；其餘（真正的 omission）
+        # 維持 raise，fail-closed 語意不變。
+        scanned_plan_digests = {
+            entry.baseline_sha256 for entry in scanned.values() if entry.kind == "plan"
+        }
+        unresolved = {
+            ref
+            for ref in missing
+            if not (
+                persisted[ref].kind == "plan"
+                and persisted[ref].work_id == run.work_id
+                and persisted[ref].baseline_sha256 in scanned_plan_digests
+                and any(fnmatch.fnmatch(ref, pattern) for pattern in plan_output_patterns)
+            )
+        }
+        if unresolved:
+            raise ValueError("workflow brainstorm evidence omits persisted authority")
+    # `ordered` 起始自 `run.planning_authority`（即 `persisted` 的來源），
+    # 因此上面被判定為合法副本的 materialized plan entry 原樣留在回傳值
+    # 裡——它必須繼續存在，好讓 build worktree 透過 `_workflow_input_snapshot`
+    # 的 authority_refs fallback seed 到這份 canonical plan 檔。
     ordered = list(run.planning_authority)
     ordered.extend(scanned[ref] for ref in scanned if ref not in persisted)
     return tuple(ordered), evidence_source_revision
