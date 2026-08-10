@@ -74,7 +74,9 @@ def test_production_runtime_loads_registry_and_probes_only_safe_launchers(
         str(tmp_path / "runtime-output"),
         tmp_path,
     )
-    assert claude_argv[claude_argv.index("--permission-mode") + 1] == "plan"
+    # issue #404：plan 模式的系統提示與確定性回聲任務衝突，安全層改由
+    # no-tools＋disposable sandbox＋樹快照＋hermetic 配置共同承擔。
+    assert "--permission-mode" not in claude_argv
     assert claude_argv[claude_argv.index("--tools") + 1] == ""
 
 
@@ -161,6 +163,24 @@ def test_secondary_prompt_embeds_bounded_repo_sources_without_tool_access(
             ]
         }
     )["plan"] == "docs/superpowers/plans/demo.md"
+
+
+def test_planning_argv_claude_branch_omits_permission_mode(tmp_path: Path) -> None:
+    """issue #404：plan 模式的系統提示（「必須產出計畫或呼叫
+    ExitPlanMode」）與這裡「必須回傳純 JSON」的確定性回聲任務衝突——issue
+    404 的實測矩陣顯示模型會以此為由拒絕直接回 JSON。安全層改由
+    no-tools（`--tools ""`）＋`_invoke_json` 的一次性 disposable
+    sandbox＋operator 樹快照比對＋hermetic `CLAUDE_CONFIG_DIR` 共同承擔，
+    不再依賴 plan 模式。"""
+    argv = planning_runtime._planning_argv(
+        ModelIdentity("claude", "claude-plan", "anthropic", ("planning",)),
+        "prompt",
+        str(tmp_path / "runtime-output"),
+        tmp_path,
+    )
+    assert "--permission-mode" not in argv
+    assert "plan" not in argv
+    assert argv[argv.index("--tools") + 1] == ""
 
 
 def test_planning_json_parser_accepts_only_whole_fenced_object(tmp_path: Path) -> None:
@@ -681,3 +701,114 @@ def test_operator_restore_fault_is_fail_closed(
             timeout_seconds=30,
         )
     assert tracked.read_text(encoding="utf-8") == "baseline\n"
+
+
+def test_invoke_json_seeds_hermetic_claude_config_dir_from_home_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """issue #404：拿掉 `--permission-mode plan` 之後，claude 呼叫若不做
+    任何額外隔離，會直接繼承 operator `~/.claude`（superpowers
+    plugin、記憶 hooks、user 層 CLAUDE.md、user MCP servers 全部注入）。
+    `_invoke_json` 對 claude 身分必須在本次呼叫專用的 tempdir 下建一個
+    一次性 hermetic config 目錄，只播種登入用的 credentials，藉此同時
+    隔離上述注入項，但不影響登入態。"""
+    fake_home = tmp_path / "fake-home"
+    credentials_dir = fake_home / ".claude"
+    credentials_dir.mkdir(parents=True)
+    credentials_file = credentials_dir / ".credentials.json"
+    credentials_file.write_text('{"token": "fake-token"}', encoding="utf-8")
+    credentials_file.chmod(0o600)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "tracked.md").write_text("operator\n", encoding="utf-8")
+
+    identity = ModelIdentity("claude", "claude-plan", "anthropic", ("planning",))
+    captured: dict[str, object] = {}
+
+    def runner(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env is not None, "claude 呼叫必須帶 env 覆寫"
+        config_dir = Path(env["CLAUDE_CONFIG_DIR"])
+        captured["config_dir_exists"] = config_dir.is_dir()
+        captured["config_dir_mode"] = config_dir.stat().st_mode & 0o777
+        seeded = config_dir / ".credentials.json"
+        captured["seeded_exists"] = seeded.is_file()
+        captured["seeded_content"] = seeded.read_text(encoding="utf-8")
+        captured["seeded_mode"] = seeded.stat().st_mode & 0o777
+        captured["env_inherits_path"] = env.get("PATH") == os.environ.get("PATH")
+        return _completed(json.dumps({"ok": True}))
+
+    result = planning_runtime._invoke_json(
+        identity, "return JSON", worktree=worktree, runner=runner, timeout_seconds=30,
+    )
+
+    assert result == {"ok": True}
+    assert captured["config_dir_exists"] is True
+    assert captured["config_dir_mode"] == 0o700
+    assert captured["seeded_exists"] is True
+    assert captured["seeded_content"] == '{"token": "fake-token"}'
+    assert captured["seeded_mode"] == 0o600
+    assert captured["env_inherits_path"] is True
+
+
+def test_invoke_json_skips_config_dir_env_when_credentials_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """issue #404：查無登入憑證時不代為猜測——維持不設
+    `CLAUDE_CONFIG_DIR`，讓 claude CLI 依原生行為自行回報 not logged
+    in；`--bare` 或空的 `CLAUDE_CONFIG_DIR` 都會弄丟登入態（issue 404
+    實測矩陣已驗證不可用），因此缺檔時不得改用空目錄頂替。"""
+    fake_home = tmp_path / "fake-home-empty"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "tracked.md").write_text("operator\n", encoding="utf-8")
+
+    identity = ModelIdentity("claude", "claude-plan", "anthropic", ("planning",))
+    captured: dict[str, object] = {}
+
+    def runner(argv, **kwargs):
+        captured["has_env"] = "env" in kwargs
+        return _completed(json.dumps({"ok": True}))
+
+    result = planning_runtime._invoke_json(
+        identity, "return JSON", worktree=worktree, runner=runner, timeout_seconds=30,
+    )
+
+    assert result == {"ok": True}
+    assert captured["has_env"] is False
+
+
+def test_invoke_json_does_not_set_env_override_for_non_claude_executors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """issue #404 的行為外溢防呆：hermetic `CLAUDE_CONFIG_DIR` 只給
+    claude 身分；codex／agy 呼叫必須維持原本不帶 env 覆寫的行為，即使
+    operator 帳號下確實存在 claude 登入憑證。"""
+    fake_home = tmp_path / "fake-home"
+    credentials_dir = fake_home / ".claude"
+    credentials_dir.mkdir(parents=True)
+    (credentials_dir / ".credentials.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "tracked.md").write_text("operator\n", encoding="utf-8")
+
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    captured: dict[str, object] = {}
+
+    def runner(argv, **kwargs):
+        captured["has_env"] = "env" in kwargs
+        return _completed(json.dumps({"ok": True}))
+
+    result = planning_runtime._invoke_json(
+        identity, "return JSON", worktree=worktree, runner=runner, timeout_seconds=30,
+    )
+
+    assert result == {"ok": True}
+    assert captured["has_env"] is False

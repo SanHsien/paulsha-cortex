@@ -50,9 +50,20 @@ def _planning_argv(identity: ModelIdentity, prompt: str, temp_dir: str, worktree
             "-C", str(worktree), "--skip-git-repo-check",
         ]
     if identity.executor == "claude":
+        # issue #404：刻意不帶 `--permission-mode plan`——plan 模式的系統
+        # 提示要求模型「必須產出計畫或呼叫 ExitPlanMode」，與這裡「必須
+        # 回傳純 JSON」的確定性回聲任務直接衝突（issue 404 實測矩陣：兩者
+        # 同時存在時，模型會以「須先給一份計畫」為由拒絕直接回 JSON）。
+        # 安全層改由其他機制共同承擔：`--tools ""` 讓模型完全沒有工具可
+        # 呼叫；`_invoke_json` 的一次性 disposable sandbox 讓任何輸出頂多
+        # 落在拋棄式複本；operator 樹在呼叫前後各做一次 `_tree_snapshot`
+        # 比對，任何 operator 內容變化一律 fail-closed 並回滾；`_invoke_json`
+        # 另外對 claude 身分注入 hermetic `CLAUDE_CONFIG_DIR`，同時隔離
+        # operator 帳號下的 user MCP servers／plugins／hooks／使用者層
+        # CLAUDE.md，避免這些注入項讓模型敘事跑題或繞過純 JSON 契約。
         return [
             "claude", "-p", prompt, "--output-format", "json",
-            "--permission-mode", "plan", "--tools", "", "--model", identity.model_id,
+            "--tools", "", "--model", identity.model_id,
             "--add-dir", str(worktree),
         ]
     raise ValueError(f"unsupported read-only planning executor: {identity.executor}")
@@ -326,6 +337,33 @@ def _extract_json(stdout: str, output_path: Path) -> object:
     raise ValueError("planning launcher returned no JSON object")
 
 
+def _seed_hermetic_claude_env(temp_dir: str) -> dict[str, str] | None:
+    """issue #404：拿掉 `--permission-mode plan` 後，claude 呼叫若不做任何
+    額外隔離，會直接繼承 operator `~/.claude`（superpowers plugin、記憶
+    hooks、user 層 CLAUDE.md、user MCP servers 全部注入），讓 planning 呼叫
+    的模型輸出摻雜與本次規劃無關的敘事。改為在本次呼叫專用的 tempdir 下
+    建一個一次性 hermetic config 目錄，只播種登入所需的 credentials，藉此
+    同時隔離上述注入項，但不影響登入態。
+
+    查無登入憑證（`~/.claude/.credentials.json` 不存在）時不代為猜測——
+    回傳 ``None``，維持不設 `CLAUDE_CONFIG_DIR`，讓 claude CLI 依原生行為
+    自行回報 not logged in。`--bare` 與空的 `CLAUDE_CONFIG_DIR` 都會直接
+    弄丟登入態（issue 404 實測矩陣已驗證不可用），因此缺檔時不得改用空
+    目錄頂替，只能整組跳過。
+    """
+
+    source_credentials = Path.home() / ".claude" / ".credentials.json"
+    if not source_credentials.is_file():
+        return None
+    config_dir = Path(temp_dir) / "claude-config"
+    config_dir.mkdir()
+    config_dir.chmod(0o700)
+    destination_credentials = config_dir / ".credentials.json"
+    shutil.copy2(source_credentials, destination_credentials)
+    destination_credentials.chmod(0o600)
+    return {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
+
+
 def _invoke_json(
     identity: ModelIdentity,
     prompt: str,
@@ -343,6 +381,13 @@ def _invoke_json(
         sandbox_before = _tree_snapshot(sandbox)
         output_path = Path(temp_dir) / "last.json"
         argv = _planning_argv(identity, prompt, temp_dir, sandbox)
+        run_kwargs: dict[str, object] = {}
+        if identity.executor == "claude":
+            # 僅 claude 路徑帶 env 覆寫；其他 executor（codex/agy）維持不帶，
+            # 避免行為外溢。
+            env = _seed_hermetic_claude_env(temp_dir)
+            if env is not None:
+                run_kwargs["env"] = env
         failure: BaseException | None = None
         result: object | None = None
         try:
@@ -353,6 +398,7 @@ def _invoke_json(
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                **run_kwargs,
             )
             returncode = getattr(raw, "returncode", None)
             stdout = getattr(raw, "stdout", None)
