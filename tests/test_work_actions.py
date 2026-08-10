@@ -620,6 +620,70 @@ def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
         )
 
 
+def test_abandon_orphan_rescue_allows_refs_drift_when_authority_lost_all_mappings(
+    tmp_path: Path,
+) -> None:
+    """issue #410（孤兒救援窄放行）：work item 改名／重識別後，舊識別的
+    authority 失去 issue 與 openspec 映射（tombstone row 只剩 path 錨點），
+    run 的 refs 與 authority 恆不相等——嚴格相等守衛使孤兒 run 永遠不可
+    abandon。僅在「authority 兩類映射皆空、run 仍留 refs」的孤兒簽名下放行；
+    authority 映射非空但內容不同（真正的 refs 漂移）仍必須 fail-closed。"""
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    args = {
+        "action": "abandon",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "issue 410 孤兒救援：改名後清理舊識別的 ongoing run。",
+    }
+
+    # 真正的 refs 漂移（authority 仍有映射、只是內容不同）必須維持 fail-closed。
+    drifted = _snapshot(
+        tmp_path / "snapshot-drifted.json",
+        issues=(13,),
+        source_revisions=("issue:13@open", "openspec:demo@1"),
+    )
+    with pytest.raises(RuntimeError, match="refs differ"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=drifted,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+    # 孤兒簽名：authority 失去全部 issue／openspec 映射（僅剩 todo 錨點）。
+    orphaned = _snapshot(
+        tmp_path / "snapshot-orphan.json",
+        issues=(),
+        changes=(),
+        prs=(),
+        source_revisions=("todo:docs/todo.md@1",),
+    )
+    result = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=orphaned,
+        state_path=state,
+        workflow_registry=registry,
+    )
+    assert result["result"]["action"] == "abandoned"
+    rescued = registry.get_workflow_run(run_id)
+    assert rescued.status == "superseded"
+
+
 def test_abandon_evidence_is_immutable_at_link_creation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
