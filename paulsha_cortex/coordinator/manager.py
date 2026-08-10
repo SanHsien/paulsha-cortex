@@ -2220,6 +2220,121 @@ def _load_run_planning_artifacts(run) -> tuple[PlanningArtifact, ...] | None:
     return tuple(artifacts)
 
 
+# --- #414：deterministic pass plan 卡前的 declared-outputs 驗證 -------------
+#
+# 根因（生產實測 run workflow-e18785ac）：`assess_planning_completeness` 只看
+# kind 覆蓋率——workstream todo（kind=plan、accepted）就足以讓 planning 判定
+# complete，manager 因此把 plan 卡（如 writing-plans-light）deterministic
+# pass，卻從未檢查卡片自己宣告的 `produces` glob（如
+# `docs/superpowers/plans/*<task-slug>*.md`）是否真的命中檔案——todo 的
+# ref 通常不落在該 pattern 內。下一棒 build 卡宣告同一 pattern 為
+# declared input，`_workflow_input_snapshot`（見上方 `_safe_input_matches`
+# 用法）找不到檔案便直接 raise，整個 run 卡死在 needs_human。
+#
+# 這裡補上與 build 端對稱的檢查：deterministic pass 之前，用同一套
+# `_safe_input_matches` glob 語意驗證 outputs 是否已存在；缺席時嘗試把
+# 已 accepted 的 kind=plan 內容 materialize 到卡片宣告的 canonical 路徑
+# （`_materialize_plan_card_output`）。plan 卡目前沒有「planning_complete
+# 為真時仍會走正常派工」的路徑（見 `_dispatch_workflow_card` 讀碼：一旦
+# `planning_complete` 為真，本函式只會 needs_decomposition／needs_human／
+# plan-review 重試／deterministic pass 四選一，從不落到下面建立真實 job
+# 的路徑），materialize 因此是唯一可行的最小修法；不可 materialize 時
+# （宣告了非單一 output pattern、或找不到已 accepted 的 kind=plan 內容）
+# fail-closed：不跳過、不動 registry，交由下一輪 dispatch 重新判定。
+def _plan_card_declared_outputs_present(root: Path, patterns: tuple[str, ...]) -> bool:
+    """驗證 plan 卡宣告的 outputs glob patterns 是否皆已在 ``root``
+    （run.workspace_root）命中至少一個實檔。空 patterns 視為已滿足。"""
+    return all(_safe_input_matches(root, pattern) for pattern in patterns)
+
+
+def _plan_card_canonical_output_path(pattern: str) -> str:
+    """把單一 `*`-only 萬用字元 output glob pattern 收斂為 canonical 具體
+    路徑（移除 `*`）。非此形狀（含 `?`／`[...]`，或移除萬用字元後路徑不
+    合法）一律 raise，交由呼叫端視為不可 materialize。"""
+    if "*" not in pattern or "?" in pattern or "[" in pattern:
+        raise ValueError(f"plan output pattern 不支援 materialize：{pattern!r}")
+    canonical = pattern.replace("*", "")
+    relative = Path(canonical)
+    if (
+        not canonical
+        or canonical.endswith("/")
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or relative.as_posix() != canonical
+    ):
+        raise ValueError(f"plan output pattern materialize 路徑不合法：{pattern!r}")
+    return canonical
+
+
+def _materialize_plan_card_output(
+    *,
+    run,
+    step,
+    artifacts: tuple[PlanningArtifact, ...],
+    workspace_root: Path,
+):
+    """把已 accepted 的 kind=plan 規劃內容原樣 materialize 到 ``step`` 宣告
+    的（唯一）output pattern 之 canonical 路徑，透過既有 planning
+    publication 機制（`_PlanningPublicationTransaction.publish`）做
+    CAS-safe 的 atomic 寫入。成功時回傳
+    ``(更新後的 artifacts, 新的 PlanningArtifactAuthority, transaction)``——
+    呼叫端需把 authority 併入 ``run.planning_authority`` 一併提交（build
+    worktree 是獨立 git worktree，declared input 檢查缺席時要靠
+    authority 記錄從 workspace_root seed 進去，見 `_workflow_input_snapshot`
+    的 authority_refs fallback），並在後續 registry 提交失敗時呼叫
+    ``transaction.rollback()``。不可 materialize 時回傳 ``None``（不寫檔、
+    不動 registry）。
+
+    ``journal_root=None``：此次寫入與呼叫端的 registry 提交在同一次
+    dispatch 呼叫內完成，不借用 brainstorm 那份跨 run 的
+    crash-recoverable journal（避免與其 `reconcile()` 語意〔預期
+    kind=evidence 的 brainstorm gate ref〕互相干擾）；殘餘風險是寫入成功
+    後、registry 提交前這極窄的視窗內若 manager 崩潰，materialize 出的
+    檔案會變成未登記的孤兒——下一輪 dispatch 會重新判定 outputs 是否存在
+    並可能需要人工介入，但不劣於修復前 100% 必炸的現狀。
+    """
+    if len(step.outputs) != 1:
+        return None
+    try:
+        canonical_relative = _plan_card_canonical_output_path(step.outputs[0])
+    except ValueError:
+        return None
+    accepted_plan = next(
+        (
+            assessment.artifact
+            for assessment in assess_planning_completeness(artifacts).assessments
+            if assessment.artifact.kind == "plan" and assessment.accepted
+        ),
+        None,
+    )
+    if accepted_plan is None:
+        return None
+    destination = workspace_root / canonical_relative
+    if destination.is_symlink():
+        return None
+    cursor = workspace_root
+    for part in Path(canonical_relative).parent.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return None
+    content = accepted_plan.text.encode("utf-8")
+    transaction = _PlanningPublicationTransaction(
+        root=workspace_root, run_id=run.run_id, journal_root=None,
+    )
+    try:
+        transaction.publish(destination, content, baseline_hash=None, mode=0o644, kind="artifact")
+    except ValueError:
+        return None
+    materialized = PlanningArtifact(kind="plan", ref=canonical_relative, text=accepted_plan.text)
+    authority = PlanningArtifactAuthority(
+        ref=canonical_relative,
+        kind="plan",
+        work_id=run.work_id,
+        baseline_sha256=hashlib.sha256(content).hexdigest(),
+    )
+    return artifacts + (materialized,), authority, transaction
+
+
 def _manager_archive_applied(run) -> bool:
     archives = [
         step
@@ -6227,6 +6342,26 @@ def _dispatch_workflow_card(
                     plan_review_passed_now = True
                 # gate_outcome is None：輸入不可得（fail-soft），落到下面正常推進，
                 # 維持現行為，不掛 plan_review_passed。
+            # #414：deterministic pass 這張 plan 卡之前，先驗證卡片宣告的
+            # outputs glob 是否已在 workspace_root 命中實檔——不對稱地只驗
+            # build 端 declared input、卻放過 plan 端 declared output，正是
+            # 生產事故（run workflow-e18785ac）的根因。缺席時嘗試
+            # materialize；不可 materialize 時 fail-closed 不跳過（詳見
+            # `_materialize_plan_card_output` docstring）。
+            workspace_root = Path(run.workspace_root).resolve()
+            new_authority: PlanningArtifactAuthority | None = None
+            publication: _PlanningPublicationTransaction | None = None
+            if not _plan_card_declared_outputs_present(workspace_root, step.outputs):
+                materialize_result = _materialize_plan_card_output(
+                    run=run, step=step, artifacts=artifacts, workspace_root=workspace_root,
+                )
+                if materialize_result is None:
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "reason": "plan-outputs-missing",
+                    }
+                artifacts, new_authority, publication = materialize_result
             next_phase = run.current_phase
             attempts = run.attempts
             if is_last_pending:
@@ -6235,21 +6370,31 @@ def _dispatch_workflow_card(
                     **run.attempts,
                     next_phase: run.attempts.get(next_phase, 0) + 1,
                 }
-            registry._manager_update_workflow_run(
-                run.run_id,
-                current_phase=next_phase,
-                steps=_audit_phase_steps(
-                    run.steps,
-                    phase=run.current_phase,
-                    executor="cortex-manager",
-                    model="deterministic",
-                    domain="cortex",
-                    outputs=tuple(artifact.ref for artifact in artifacts),
-                    card_id=step.card,
-                ),
-                attempts=attempts,
-                **({"plan_review_passed": True} if plan_review_passed_now else {}),
-            )
+            try:
+                registry._manager_update_workflow_run(
+                    run.run_id,
+                    current_phase=next_phase,
+                    steps=_audit_phase_steps(
+                        run.steps,
+                        phase=run.current_phase,
+                        executor="cortex-manager",
+                        model="deterministic",
+                        domain="cortex",
+                        outputs=tuple(artifact.ref for artifact in artifacts),
+                        card_id=step.card,
+                    ),
+                    attempts=attempts,
+                    **({"plan_review_passed": True} if plan_review_passed_now else {}),
+                    **(
+                        {"planning_authority": run.planning_authority + (new_authority,)}
+                        if new_authority is not None
+                        else {}
+                    ),
+                )
+            except BaseException:
+                if publication is not None:
+                    publication.rollback()
+                raise
             return None
     # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
     # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider

@@ -260,7 +260,16 @@ def _write_planning_artifacts(root: Path, *, missing: set[str] | None = None) ->
     }
     authority: list[PlanningArtifactAuthority] = []
     for kind, body in bodies.items():
-        ref = f"docs/{kind}.md"
+        # #414：plan 的 ref 必須落在 writing-plans 卡宣告的 canonical outputs
+        # glob（`docs/superpowers/plans/*<task-slug>*.md`）內，否則
+        # deterministic pass 前的 declared-outputs 驗證會判定缺席、觸發
+        # materialize fallback，讓 `planner.outputs` 多出一筆——這裡的測試
+        # 目的是驗證「outputs 已存在」的既有正路，故 ref 需真的匹配宣告。
+        ref = (
+            "docs/superpowers/plans/production-wiring.md"
+            if kind == "plan"
+            else f"docs/{kind}.md"
+        )
         path = root / ref
         if kind not in missing:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -4673,7 +4682,14 @@ def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> 
     }
     rows = []
     for kind, body in bodies.items():
-        ref = f"docs/{kind}.md"
+        # #414：同上——plan 的 ref 需落在 writing-plans 卡宣告的 canonical
+        # outputs glob 內，否則 deterministic pass 前的驗證判定缺席，觸發
+        # materialize fallback，多出一筆 planning_authority。
+        ref = (
+            "docs/superpowers/plans/production-wiring.md"
+            if kind == "plan"
+            else f"docs/{kind}.md"
+        )
         path = tmp_path / ref
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")

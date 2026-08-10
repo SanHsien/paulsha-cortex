@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #414：plan 卡 deterministic pass 不驗證宣告 outputs，導致下一棒 build 的 declared input 必缺**：`assess_planning_completeness` 只看 kind 覆蓋率，workstream todo（kind=plan、accepted）就足以讓 planning 判定 complete，`manager._dispatch_workflow_card` 於是把 plan 卡（如 `writing-plans-light`）deterministic pass，卻從未檢查卡片宣告的 `produces` glob 是否真的命中檔案，todo 的 ref 通常不落在該 pattern 內，下一棒 build 卡的 declared input 檢查因此必缺（生產實測 run workflow-e18785acc54e5ad87836，`ValueError: workflow declared input missing: ...`）。新增 `_plan_card_declared_outputs_present`（比照 build 端 `_workflow_input_snapshot` 的 glob 語意）於 deterministic pass 前驗證；缺席時由 `_materialize_plan_card_output` 把已 accepted 的 kind=plan 內容 materialize 到卡片宣告的 canonical 路徑並併入 `planning_authority`（走既有 `_PlanningPublicationTransaction`，registry 提交失敗會 rollback）；不可 materialize 時 fail-closed 不跳過。新增 3 個回歸測試，修正前已確認重現生產事故的確切 `ValueError`。
+
+### Fixed
 - **missing-kind 問題的 source_refs 補 accepted fallback（#408 補完）**：`_build_default_question_pack` 對 `missing-{kind}` 只取同 kind refs——同 kind 有草稿時語意正確（重寫以草稿為本），但 todo 錨定的 work item 該 kind 完全不存在，refs 恆空，`_planning_destinations` 與 `_planning_source_material` 雙雙斷炊（PR #409 的 workstream 推導因此拿不到料，v3 gen1 實測 destinations 仍空、模型輸出裸路徑被 governed-roots 拒）。同 kind refs 為空時 fallback 至全部 accepted refs；端對端實測 brainstorm 三棒＋integration 驗證全通、destinations 正確導出。
 
 ### Fixed
