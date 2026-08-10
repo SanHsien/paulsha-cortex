@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import hashlib
+import logging
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from paulsha_cortex.coordinator.model_identities import (
     CapabilityProbe,
     IdentityRegistry,
 )
+from paulsha_cortex.coordinator.planning import BrainstormResult, PlanningGateRefs
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import (
     GateEvidenceRef,
@@ -238,7 +240,9 @@ def _write_planning_artifacts(root: Path, *, missing: set[str] | None = None) ->
     return tuple(authority)
 
 
-def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path: Path) -> None:
+def test_control_queue_workflow_action_is_the_production_mutation_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
     manifest = _manifest()
@@ -250,7 +254,8 @@ def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path:
         handoff_dir=str(tmp_path / "handoff"),
     )
 
-    result = executor(build_request(req_type="workflow-action", args=_workflow_args(manifest_path, tmp_path), requested_by="operator"))
+    with caplog.at_level(logging.ERROR, logger="paulsha_cortex.coordinator.manager"):
+        result = executor(build_request(req_type="workflow-action", args=_workflow_args(manifest_path, tmp_path), requested_by="operator"))
 
     persisted = registry.get_workflow_run(result["run_id"])
     assert persisted.current_phase == "define"
@@ -258,6 +263,106 @@ def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path:
     assert result["reason"] == "planning-runtime-unavailable"
     assert not hasattr(registry, "create_workflow_run")
     assert not hasattr(registry, "update_workflow_run")
+    # #391：daemon periodic tick 觸發時沒人消費回傳值，reason 過去只活在
+    # return dict 裡就蒸發；needs_human 落地時必須同時留一筆可查的結構化 log
+    # （run_id + reason），不能只靠呼叫端讀 return 值。
+    assert any(
+        "planning-runtime-unavailable" in record.message and persisted.run_id in record.message
+        for record in caplog.records
+    )
+
+
+def test_planning_runtime_initialization_failure_logs_reason_and_records_needs_human(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """issue #391：runtime_factory 本身 raise（例如 sandbox 建立失敗）時，
+    manager.apply_workflow_action 過去只把 exception 整個吞掉、reason 只塞進
+    回傳值——daemon periodic tick 觸發時沒有呼叫端讀這個回傳值，reason 蒸發，
+    只留下一個查不出原因的 needs_human facet。修復後必須落一筆含 run_id、
+    reason、底層 exception 型別與訊息的結構化 log。
+    """
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    args = _workflow_args(manifest_path, tmp_path)
+
+    def failing_runtime_factory(*, primary, worktree):
+        raise RuntimeError("sandbox worktree creation refused")
+
+    with caplog.at_level(logging.ERROR, logger="paulsha_cortex.coordinator.manager"):
+        result = manager.apply_workflow_action(
+            registry,
+            args=args,
+            runtime_factory=failing_runtime_factory,
+            coordinator_root=tmp_path,
+        )
+
+    persisted = registry.get_workflow_run(result["run_id"])
+    assert persisted.current_phase == "define"
+    assert persisted.facets == ("needs_human",)
+    assert result["reason"] == "planning-runtime-initialization-failed"
+    matching = [
+        record
+        for record in caplog.records
+        if "planning-runtime-initialization-failed" in record.message
+        and persisted.run_id in record.message
+    ]
+    assert matching, f"未見結構化 log，實際紀錄：{[r.message for r in caplog.records]}"
+    assert "RuntimeError" in matching[0].message
+    assert "sandbox worktree creation refused" in matching[0].message
+
+
+def test_brainstorm_not_ready_logs_reason_before_needs_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """issue #391：run_heterogeneous_brainstorm 沒收斂到 ready 狀態時的
+    needs_human 分支，比照另外兩條 runtime 缺失路徑，reason 也不能只活在
+    回傳值裡——必須留一筆含 run_id／state／reason 的結構化 log。
+    """
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    args = _workflow_args(manifest_path, tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "gpt-primary",
+                "independence_domain": "openai", "capabilities": ["planning"],
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        manager,
+        "run_heterogeneous_brainstorm",
+        lambda **_: BrainstormResult(
+            state="needs_human",
+            reason="no-heterogeneous-planner",
+            secondary_domain=None,
+            gate_refs=PlanningGateRefs(),
+        ),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="paulsha_cortex.coordinator.manager"):
+        result = manager.apply_workflow_action(
+            registry,
+            args=args,
+            identity_registry=identities,
+            primary_questioner=lambda *a, **k: None,
+            secondary_planner=lambda *a, **k: None,
+            primary_integrator=lambda *a, **k: None,
+            coordinator_root=tmp_path,
+        )
+
+    persisted = registry.get_workflow_run(result["run_id"])
+    assert persisted.current_phase == "define"
+    assert persisted.facets == ("needs_human",)
+    assert result["reason"] == "no-heterogeneous-planner"
+    assert any(
+        "no-heterogeneous-planner" in record.message and persisted.run_id in record.message
+        for record in caplog.records
+    )
 
 
 def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(

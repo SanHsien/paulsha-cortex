@@ -4,6 +4,7 @@ import base64
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -54,6 +55,8 @@ from .workflow import (
     WorkflowManifest,
     validate_workflow_phase_transition,
 )
+
+logger = logging.getLogger(__name__)
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
@@ -7641,9 +7644,22 @@ def apply_workflow_action(
                 primary=primary,
                 worktree=_required_workflow_string(args, "artifact_root"),
             )
-        except Exception:
+        except Exception as exc:
             run = registry._manager_update_workflow_run(
                 run.run_id, facets=("needs_human",), brainstorm_required=True
+            )
+            # #391：needs_human 的 reason 過去只塞進回傳值——daemon periodic
+            # tick 觸發時（未經活人在旁的 request/response）沒人消費回傳值，
+            # reason 隨呼叫堆疊蒸發，run row 只留下一個查不出原因的
+            # needs_human facet。這裡結構化落一筆 log（run_id／reason／底層
+            # exception 型別與訊息前 200 字），至少留下可追查的軌跡；exception
+            # 本身仍整段吞掉不重拋，維持既有 fail-soft 行為不變。
+            logger.error(
+                "planning-runtime-initialization-failed run_id=%s reason=%s error=%s: %s",
+                run.run_id,
+                "planning-runtime-initialization-failed",
+                type(exc).__name__,
+                str(exc)[:200],
             )
             return {
                 "run_id": run.run_id,
@@ -7658,6 +7674,13 @@ def apply_workflow_action(
     if primary_questioner is None or secondary_planner is None or primary_integrator is None:
         run = registry._manager_update_workflow_run(
             run.run_id, facets=("needs_human",), brainstorm_required=True
+        )
+        # #391：runtime_factory 沒被呼叫（或呼叫成功但沒補齊三個角色）時同樣
+        # 落一筆 log，理由同上——reason 不能只活在回傳值裡。
+        logger.error(
+            "planning-runtime-unavailable run_id=%s reason=%s",
+            run.run_id,
+            "planning-runtime-unavailable",
         )
         return {
             "run_id": run.run_id,
@@ -7702,6 +7725,14 @@ def apply_workflow_action(
         publication.rollback()
         run = registry._manager_update_workflow_run(
             run.run_id, facets=("needs_human",), brainstorm_required=True
+        )
+        # #391：run_heterogeneous_brainstorm 沒能收斂到 ready 狀態時，同樣的
+        # reason-只活在回傳值裡問題——比照上面兩條 runtime 缺失路徑補一筆 log。
+        logger.error(
+            "brainstorm-not-ready run_id=%s state=%s reason=%s",
+            run.run_id,
+            result.state,
+            result.reason,
         )
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": result.reason}
     try:
