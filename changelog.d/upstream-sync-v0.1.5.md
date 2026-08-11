@@ -8,3 +8,4 @@
 ### Fixed
 - 修正 upstream 合併後的 Windows-only 回歸：POSIX service 測試分流、planning fixture newline authority、Windows mode 語意、hermetic home 隔離、PowerShell PID probe decoding，以及 digest delivery command 的反斜線 argv 解析。
 - `cg` prompt 改走真正的 OS stdin pipe，不再進入 wrapper command line，避開 Windows `CreateProcess` 長度上限與 prompt 洩漏。
+- Windows bootstrap 依 `.python-version` 優先使用 uv-managed Python，並拒絕超出 package 上限的 Python 3.14。

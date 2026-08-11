@@ -46,6 +46,14 @@ def test_powershell_wrappers_are_native_windows_first() -> None:
     assert "wsl.exe" not in dev_check
     assert '".venv"' in bootstrap
     assert '"Scripts\\python.exe"' in bootstrap
+    assert 'uv.exe python find $desiredPython' in bootstrap
+    assert '(3, 10) <= sys.version_info < (3, 14)' in bootstrap
+    assert 'foreach ($version in @("3.13", "3.12", "3.11", "3.10"))' in bootstrap
+    assert '$candidates += ,@($launcher, "-$version")' in bootstrap
+    assert "既有 .venv 使用不支援的 Python" in bootstrap
+    assert bootstrap.count("(3, 10) <= sys.version_info < (3, 14)") == 2
+    assert bootstrap.index('$venvPython = Join-Path $venvRoot') < bootstrap.index("$candidates = @()")
+    assert '} else {\n    $candidates = @()' in bootstrap
     assert ".venv\\Scripts\\python.exe" in dev_check
     assert "-m pytest tests -q" in dev_check
     assert "-m build --outdir" in dev_check
