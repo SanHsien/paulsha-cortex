@@ -152,6 +152,44 @@ def _existing_manifest_job_id(path: Path) -> str | None:
     return job_id if isinstance(job_id, str) else None
 
 
+def _supersede_handoff_manifest(
+    *,
+    handoff_dir: str,
+    slice_id: str,
+    action: str,
+    actor: str,
+    clock: Callable[[], str] = _utcnow,
+) -> None:
+    """操作者復原動作（recover-pre-candidate／abandon）後，替殘留 handoff manifest
+    補上 superseded 稽核標記（issue #383）。
+
+    `run_tick()`/`dispatch_gate_scan()` 的 fanout 放行判定改成與 registry 現況
+    對帳（`_manifest_still_blocks_fanout`），本函式失敗與否都不影響「復原後
+    下一輪 tick 能不能重派」這個驗收條件——這裡純粹補稽核可見性，讓直接檢視
+    manifest 檔的人（非只看 tick 行為）也能看出這份終局紀錄已經過期，而不是
+    誤以為它仍是這個 slice 的最新狀態。
+
+    不刪檔（保留稽核紀錄）；只在既有 payload 補 `superseded_at`/`superseded_by`/
+    `superseded_reason` 三欄後覆寫回同一路徑。manifest 不存在（尚未跑過任何
+    job）／壞檔／symlink／已標記過，皆 best-effort no-op——復原是主動作，
+    manifest 標記是次要動作，不得讓次要動作的失敗連帶讓復原本身 raise。
+    """
+    manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+    if manifest_path.is_symlink():
+        return
+    payload = _read_manifest_payload(manifest_path)
+    if payload is None or payload.get("superseded_at") is not None:
+        return
+    payload = dict(payload)
+    payload["superseded_at"] = clock()
+    payload["superseded_by"] = actor
+    payload["superseded_reason"] = action
+    try:
+        handoff.write_manifest(manifest_path, payload)
+    except OSError:
+        pass
+
+
 def _is_workflow_lane_job(job: dict) -> bool:
     """job 屬於 workflow lane 的判定（issue #264）。
 
@@ -1290,6 +1328,13 @@ def apply_slice_action(
             consumed_at=consumed_at,
             result="ok",
         )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-abandon",
+            actor=actor,
+            clock=clock,
+        )
         latest = registry.get_slice(slice_id)
         return {
             "slice_id": slice_id,
@@ -1362,6 +1407,13 @@ def apply_slice_action(
             gate_state="pending",
             builder_job_id=None,
             candidate=None,
+        )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-recover-pre-candidate",
+            actor=actor,
+            clock=clock,
         )
         latest = registry.get_slice(slice_id)
         return {
@@ -1964,6 +2016,91 @@ def complete_tick(
     return summary
 
 
+def _manifest_still_blocks_fanout(registry, slice_id: str) -> bool:
+    """判斷殘留 handoff 終局 manifest 是否仍該擋本輪 fanout（issue #383 提案 2）。
+
+    manifest 只反映「某個 job 曾經跑到終局」，不代表「這個 slice 現在仍該被
+    跳過」——`apply_slice_action` 的 `recover-pre-candidate`／`abandon` 等復原
+    動作會把 registry state 撥回 `"pending"`（可重派），但沒有義務刪除舊
+    manifest（保留稽核紀錄）。此處與 registry 現況對帳，而不是只看 handoff
+    目錄有沒有檔案：
+
+    - registry 查無此 slice（從未建過 slice row，例如純 handoff-only 情境）
+      → 無法確認已復原，保守照舊擋。
+    - `state == "pending"` → 已被復原到可重派狀態，manifest 過期，不擋。
+    - 其餘狀態（needs_human/failed/building/verified/completed 等）→ 與
+      manifest 描述的終局一致，照舊擋。
+    """
+    if registry is None:
+        return True
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return True
+    return str(slice_row.get("state")) != "pending"
+
+
+def dispatch_gate_scan(
+    metas: list[dict],
+    *,
+    handoff_dir: str,
+    registry,
+) -> tuple[list[dict], dict[str, dict], list[dict]]:
+    """算出本輪允許進 `dispatch_ready()`/`ready_units()` 就緒判定的 meta 子集。
+
+    `run_tick()` 與 `manager_daemon.py` 的 `request_type == "fanout"` 分支皆呼叫
+    本函式，消除兩條路徑各自維護一份過濾邏輯導致的分歧（issue #383 複驗指出
+    「fanout 路徑不只沒 already_terminal 過濾、連 in-flight active 過濾也沒
+    有」）。兩層過濾疊加：
+
+    1. in-flight 過濾：registry 中仍 dispatched/running 的 job 對應 slice 本趟
+       不重派（同一 slice 一 job 不變量，review F-A）。
+    2. handoff 終局過濾：已有 handoff 終局紀錄（needs_human/failed/passed/
+       verified 皆算）的 slice 預設不重派（issue #339 冪等）——但終局是否仍
+       該擋，改與 registry 現況對帳而非只看檔案存不存在（`_manifest_still_blocks_fanout`，
+       issue #383 提案 2），避免復原後的 slice 被殘留 manifest 永久靜默跳過。
+
+    回 `(fanout_metas, already_terminal, needs_human)`：
+    - `fanout_metas`：真正該餵給 `dispatch_ready()` 的子集。
+    - `already_terminal`：slice_id -> manifest payload，供呼叫端組 needs_human
+      清單用途——不論是否阻擋 fanout 皆收，維持既有回報語意（不受本次對帳
+      影響，複驗要求 needs_human 回傳語意不變）。
+    - `needs_human`：manifest `gate_status == "needs_human"` 的清單（維持既有
+      語意；即使已復原也照列，這是操作者可見的歷史軌跡，不是「靜默」問題）。
+    """
+    already_terminal: dict[str, dict] = {}
+    needs_human: list = []
+    blocking: set[str] = set()
+    for meta in metas:
+        slice_id = meta.get("slice_id") if isinstance(meta, dict) else None
+        if not isinstance(slice_id, str) or not slice_id:
+            continue
+        manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        already_terminal[slice_id] = payload
+        if payload.get("gate_status") == "needs_human":
+            needs_human.append(
+                {
+                    "slice_id": slice_id,
+                    "gate_reason": payload.get("gate_reason"),
+                    "handoff_path": str(manifest_path),
+                }
+            )
+        if _manifest_still_blocks_fanout(registry, slice_id):
+            blocking.add(slice_id)
+
+    active: set[str] = set()
+    if registry is not None:
+        active = {j.get("task") for j in registry.list_jobs() if j.get("status") in IN_FLIGHT_STATUSES}
+    fanout_metas = [m for m in metas if m.get("slice_id") not in active and m.get("slice_id") not in blocking]
+    return fanout_metas, already_terminal, needs_human
+
+
 def run_tick(
     dispatcher,
     *,
@@ -2022,47 +2159,19 @@ def run_tick(
     # 不論 dispatch_skipped 與否都要掃描——這段刻意放在 idle 判斷之前、兩分支共用，
     # 因為「idle gate 擋不擋新工作」跟「有沒有 job 卡在 needs_human 待人工」是兩件事，
     # 高負載（not-idle）時操作者更需要看到 needs_human 清單，不能被 idle-skip 短路成空清單。
-    already_terminal: dict[str, dict] = {}
-    needs_human: list = []
-    for meta in metas:
-        slice_id = meta.get("slice_id") if isinstance(meta, dict) else None
-        if not isinstance(slice_id, str) or not slice_id:
-            continue
-        manifest_path = Path(handoff_dir) / f"{slice_id}.json"
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        already_terminal[slice_id] = payload
-        if payload.get("gate_status") == "needs_human":
-            needs_human.append(
-                {
-                    "slice_id": slice_id,
-                    "gate_reason": payload.get("gate_reason"),
-                    "handoff_path": str(manifest_path),
-                }
-            )
+    # fanout_metas 已與 registry 現況對帳（dispatch_gate_scan，issue #383 提案 2）：
+    # 復原動作（recover-pre-candidate 等）把 slice 撥回 pending 後，殘留的舊終局
+    # manifest 不再讓它被永久跳過。
+    registry = getattr(dispatcher, "_registry", None)
+    fanout_metas, already_terminal, needs_human = dispatch_gate_scan(
+        metas, handoff_dir=handoff_dir, registry=registry
+    )
     # idle gate 只擋「派工側（新工作，會啟 agent，昂貴）」；完成側（poll→manifest，便宜的
     # 回收/記帳）一律跑，否則高負載時 job 完成/失敗狀態與下游釋放會被埋住（review F-C）。
     if require_idle and not idle.is_idle(max_load=max_load, probe=idle_probe):
         dispatch_skipped: str | bool = "not-idle"
     else:
         dispatch_skipped = False
-        # 冪等：跳過 registry 中已有 dispatched/running job 的 slice，避免 oneshot+timer
-        # 反覆對同一 slice 重派（review F-A：一 slice 一 job 不變量）。
-        registry = getattr(dispatcher, "_registry", None)
-        active = (
-            {j.get("task") for j in registry.list_jobs() if j.get("status") in IN_FLIGHT_STATUSES}
-            if registry is not None
-            else set()
-        )
-        fanout_metas = [
-            m
-            for m in metas
-            if m.get("slice_id") not in active and m.get("slice_id") not in already_terminal
-        ]
         try:
             dispatched = autonomy.dispatch_ready(
                 fanout_metas,
@@ -5915,12 +6024,123 @@ def _specialize_workflow_launcher(launcher, step):
     return launcher
 
 
-def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher_factory):
+# #369：provider capability 探測的死碼修復。修復前 `_runtime_preflight_gate`
+# 呼叫 `evaluate_dispatch_gate` 時從未傳入 `snapshot_lookup`／`provider_prober`
+# （兩者預設 None）——`_resolve_provider_freshness` 在 `snapshot_lookup is None`
+# 時直接回 STALE_SNAPSHOT，而 STALE_SNAPSHOT 不在 `_BLOCKING_OUTCOMES`（只有
+# CAPABILITY_MISSING／PROVIDER_UNAVAILABLE 會擋），所以任何 `provider:` 宣告
+# 在生產環境永遠放行，等於整條路徑是死碼。以下兩個 factory 把它接上真正的
+# 資料源：GitHub 走既有 monitor durable snapshot（唯讀，無快照時安全回退成
+# STALE_SNAPSHOT，不變更行為的保守面）；executor 走 dispatch-time 的登入態
+# 探測（`coordinator.executor_auth`），以 process-level 快取避免每次 dispatch
+# 都重新 spawn CLI 子行程（見 `_EXECUTOR_AUTH_CACHE`）。
+#
+# cards.yaml 尚未有卡片宣告 `provider:executor`（見 #369 changelog 的風險
+# 說明）：sentinel 機制已就緒且有完整測試覆蓋，但要接上前先確認 CI／各執行
+# 環境對 claude／codex／copilot CLI 的可得性，避免 dispatch 熱路徑意外 spawn
+# 子行程；`provider:github:<repo>` 純讀 monitor 快照檔，無此風險，已直接接上
+# openspec-archive／policy-commit 兩張 ship-phase 卡。
+_EXECUTOR_AUTH_CACHE: dict[str, object] = {}
+
+
+def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> object | None:
+    from paulsha_cortex.monitor.work_models import parse_timestamp
+
+    from .runtime_preflight import DEFAULT_PROVIDER_TTL_SECONDS, ProviderFreshness
+
+    try:
+        snapshot = snapshot_store.load()
+    except Exception:  # noqa: BLE001 - monitor 快照壞掉不得拖垮 dispatch
+        return None
+    if snapshot is None:
+        return None
+    provider = snapshot.providers.get(provider_id)
+    if provider is None:
+        return None
+    try:
+        observed_at = parse_timestamp(provider.last_attempt_at).timestamp()
+    except ValueError:
+        return None
+    reason = "; ".join(provider.diagnostics) if provider.diagnostics else None
+    return ProviderFreshness(
+        provider_id=provider.provider_id,
+        status=provider.status,
+        observed_at=observed_at,
+        ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
+        source="monitor-snapshot",
+        reason=reason,
+    )
+
+
+def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
+    """#369：executor 登入態的「快照」層——實際是 process-level 快取。
+
+    沒有既有的 durable executor-auth snapshot 基礎設施（GitHub 有，monitor
+    daemon 會定期掃描並落盤；executor CLI 登入態沒有），因此第一次查詢時合成
+    一筆「已過期」的紀錄，讓 `_resolve_provider_freshness` 的 stale 分支去
+    呼叫 `provider_prober` 做一次真正探測；探測結果回寫這個 cache，後續在
+    TTL 內的查詢會直接命中 `is_fresh()`、不再重新 spawn 子行程。
+    """
+
+    from .runtime_preflight import ProviderFreshness
+
+    cached = _EXECUTOR_AUTH_CACHE.get(provider_id)
+    if cached is not None:
+        return cached
+    from .executor_auth import EXECUTOR_AUTH_TTL_SECONDS
+
+    return ProviderFreshness(
+        provider_id=provider_id,
+        status="degraded",
+        observed_at=0.0,
+        ttl_seconds=EXECUTOR_AUTH_TTL_SECONDS,
+        source="cold-start",
+        reason="no prior executor auth probe",
+    )
+
+
+def _executor_auth_prober(provider_id: str) -> object | None:
+    from .executor_auth import check_executor_auth
+
+    result = check_executor_auth(provider_id)
+    _EXECUTOR_AUTH_CACHE[provider_id] = result
+    return result
+
+
+def _combined_provider_snapshot_lookup(*, snapshot_store) -> Callable[[str], object | None]:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    def _lookup(provider_id: str) -> object | None:
+        if provider_id in EXECUTOR_CANDIDATES:
+            return _executor_auth_snapshot_lookup(provider_id)
+        return _monitor_provider_snapshot_lookup(provider_id, snapshot_store=snapshot_store)
+
+    return _lookup
+
+
+def _combined_provider_prober(provider_id: str) -> object | None:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    if provider_id in EXECUTOR_CANDIDATES:
+        return _executor_auth_prober(provider_id)
+    # GitHub 目前只用 monitor snapshot，不做額外 live probe：monitor daemon
+    # 本身已定期刷新該快照，再疊一層 live probe 只是重複付網路成本
+    # （#369 範圍界定，見 changelog）。
+    return None
+
+
+def _runtime_preflight_gate(
+    run, step, *, identities: IdentityRegistry, launcher_factory, snapshot_store=None
+):
     """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
 
     回傳 None 代表這張 card 未宣告任何 capability，呼叫端照原路徑走；否則回傳
     `DispatchGateDecision`，其中 `launcher` 只在通過 preflight 的 identity 上建立
     ——被擋下的 identity 不會產生任何 model session。
+
+    `snapshot_store` 預設 None 時延後到真正需要時才建立
+    `monitor.work_snapshot.WorkSnapshotStore()`（讀既有 monitor durable
+    snapshot）；測試可注入指向 tmp_path 的 store，不觸碰真實安裝路徑。
     """
 
     from .runtime_preflight import card_runtime_requirements, evaluate_dispatch_gate
@@ -5956,12 +6176,20 @@ def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher
 
         return host_environment()
 
+    active_store = snapshot_store
+    if active_store is None:
+        from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+        active_store = WorkSnapshotStore()
+
     return evaluate_dispatch_gate(
         card=step.card,
         requirements=requirements,
         candidates=candidates,
         environment_for=_environment_for,
         launcher_factory=_launcher_for,
+        snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
+        provider_prober=_combined_provider_prober,
     )
 
 

@@ -262,6 +262,48 @@ def test_abandon_marks_slice_failed_and_records_result(tmp_path):
     assert slice_row["actions"][-1]["result"] == "ok"
 
 
+def test_abandon_supersedes_stale_handoff_manifest(tmp_path):
+    # issue #383：復原/終結動作應在殘留 handoff manifest 上留下 superseded 稽核
+    # 標記，讓直接檢視 manifest 檔的人不會誤以為它仍是這個 slice 的最新狀態
+    # （run_tick 的放行判定已改成跟 registry 對帳，不依賴這個標記，見
+    # dispatch_gate_scan/_manifest_still_blocks_fanout；這裡純粹驗證稽核可見性）。
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+    state_path = tmp_path / "runtime" / "coordinator" / "jobs.json"
+    registry = JobRegistry(state_path=state_path)
+    _create_slice_in_needs_human(registry, repo_root=repo_root, slice_id="slice-a")
+    dispatcher = Dispatcher(
+        registry=registry,
+        pane_sender=_PaneSender(),
+        worktree_creator=_WorktreeCreator(tmp_path / "worktrees"),
+        git_runner=_git_runner,
+    )
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = handoff_dir / "slice-a.json"
+    manifest_path.write_text(
+        json.dumps({"slice_id": "slice-a", "job_id": "old-job", "gate_status": "needs_human"}),
+        encoding="utf-8",
+    )
+
+    manager.apply_slice_action(
+        dispatcher,
+        slice_id="slice-a",
+        action="abandon",
+        actor="operator",
+        specs_dir=str(repo_root / "specs"),
+        handoff_dir=str(handoff_dir),
+        git_runner=_git_runner,
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["slice_id"] == "slice-a"
+    assert manifest["gate_status"] == "needs_human"
+    assert manifest["superseded_by"] == "operator"
+    assert manifest["superseded_reason"] == "operator-abandon"
+    assert isinstance(manifest["superseded_at"], str) and manifest["superseded_at"]
+
+
 def test_runtime_status_provider_includes_attention_next_actions(tmp_path):
     repo_root = tmp_path / "repo"
     (repo_root / ".git").mkdir(parents=True, exist_ok=True)
