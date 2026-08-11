@@ -2719,6 +2719,20 @@ def _audit_phase_steps(
             inputs=step.inputs,
             outputs=outputs if step.phase == phase and (card_id is None or step.card == card_id) else step.outputs,
             gate_result=gate_result if step.phase == phase and (card_id is None or step.card == card_id) else step.gate_result,
+            # #379 複驗發現：此函式過去重建每個 step 時漏傳
+            # skill_ref/action/commit_policy/test_policy，導致 WorkflowStep 的
+            # dataclass 預設值（None）覆寫掉「完全不在本次 (phase, card_id)
+            # 範圍內」的其他 step 的既有值——包含尚未輪到的 build phase 卡片。
+            # 實務上，run 通常在 claim phase 就先 advance 過一次，因此 build
+            # phase 卡片的 test_policy 在真正被拿來跑之前就已經被抹成 None，
+            # #307 的 red-required 語意反轉、以及 #379 由 test_policy 導出
+            # 應驗 gate 名稱的機制都會因此變成 dead code。這四個欄位本就只
+            # 該由 deck compile 決定、run 存續期間不變，故一律原樣帶過，不
+            # 受 (phase, card_id) 命中與否影響。
+            skill_ref=step.skill_ref,
+            action=step.action,
+            commit_policy=step.commit_policy,
+            test_policy=step.test_policy,
         )
         for step in steps
     )
@@ -3029,6 +3043,49 @@ def _workflow_step_test_policy(registry, job: Mapping[str, object]) -> str | Non
     return None
 
 
+def _expected_gate_names_for_test_policy(test_policy: str | None) -> frozenset[str]:
+    """#379：從 plan 的驗收條件（deck compile 依 combo/cards.yaml 綁在每個 build
+    phase 卡片上的 ``test_policy``）機械導出這個 phase 應驗的 gate 名稱集合。
+
+    ``test_policy`` 目前是 workflow lane 裡唯一由 spec/plan（而非 operator 的
+    ``PSC_GATE_CMD_*`` env）決定的驗收訊號：``None``／``"none"`` 代表卡片本就
+    不要求測試（例如 worktree-isolation 這類不動 candidate 程式碼的卡），維持
+    既有 #308 的合法空 ledger 放行語意；其餘合法值（``"red-required"``／
+    ``"focused"``／``"full"``）皆代表這張卡的正確產出需要跑測試，對應 ledger
+    裡 :data:`terminal_contract.RED_REQUIRED_TEST_GATE_NAME`（"pytest"）這個
+    gate 名稱——與 #307 red-required 反轉引用的是同一個名稱來源，不另立一套。
+    """
+
+    if test_policy in (None, "none"):
+        return frozenset()
+    return frozenset({terminal_contract.RED_REQUIRED_TEST_GATE_NAME})
+
+
+def _workflow_acceptance_definition_drifted(
+    job: Mapping[str, object], *, fresh_test_policy: str | None
+) -> bool:
+    """#379：驗收判準（test_policy）pinned-input drift 偵測，比照既有
+    ``_pinned_input_mismatches``／``_review_inputs_drifted`` 的「派工當下 pin
+    一份快照、harvest 時與現況比對」模式。
+
+    ``job["workflow_test_policy"]`` 是 :func:`_dispatch_workflow_card` 派工當下
+    寫入的快照（見該函式對 ``registry.create_job`` 的呼叫）；``fresh_test_policy``
+    是 harvest 當下重新從 registry 現有 ``WorkflowRun.steps`` 讀到的值。兩者不
+    一致代表這張卡的驗收判準在派工之後被動過——無論肇因是 operator／其他行程
+    的合法變更，還是任何讓 builder 自報得以「改判準讓自報成真」的路徑，都必須
+    fail closed，不得沿用新值靜默通過。
+
+    ``job`` 沒有 ``workflow_test_policy`` 欄位（例如非經
+    :func:`_dispatch_workflow_card` 真正派工路徑建立的 legacy／測試 job）時視為
+    「未 pin」，不受本檢查約束——維持既有行為，不因為新增這道保護而誤殺舊資料。
+    """
+
+    pinned = job.get("workflow_test_policy")
+    if pinned is None:
+        return False
+    return pinned != fresh_test_policy
+
+
 def _assert_terminal_gate_consistency(
     raw: Mapping[str, object],
     *,
@@ -3050,6 +3107,14 @@ def _assert_terminal_gate_consistency(
     ``test_policy=red-required``（tdd-red）卡對測試 gate 的語意反轉在
     :func:`terminal_contract.authorize_terminal` 生效；未提供或解析不到時
     ``test_policy`` 視為 ``None``，行為與反轉前完全相同。
+
+    #379：同一份 ``test_policy`` 另外餵給 :func:`_expected_gate_names_for_test_policy`
+    導出這個 phase 應驗的 gate 名稱集合，交給 ``authorize_terminal`` 的
+    ``expected_gate_names`` 參數把 #308 的空/局部 ledger 早退收斂成「只有 plan
+    本就沒有應驗 gate 時才放行」。派工當下 pin 進 job 的 ``workflow_test_policy``
+    與這裡重新解析出的現值不一致時（:func:`_workflow_acceptance_definition_drifted`），
+    在呼叫 ``authorize_terminal`` 之前就先 fail closed，不讓「判準本身被動過」
+    偽裝成一次乾淨的 gate 驗證。
     """
 
     try:
@@ -3061,11 +3126,27 @@ def _assert_terminal_gate_consistency(
     log_path = job.get("log_path")
     if not isinstance(log_path, str) or not log_path:
         return
+    test_policy = _workflow_step_test_policy(registry, job)
+    if _workflow_acceptance_definition_drifted(job, fresh_test_policy=test_policy):
+        raise terminal_contract.TerminalContractError(
+            "workflow card 的驗收判準（test_policy）自派工後已變動："
+            f"pinned={job.get('workflow_test_policy')!r}，現值={test_policy!r}；"
+            "不得沿用新值讓 builder 自報靜默通過",
+            reason="workflow-acceptance-definition-drift",
+            validation_path="$.gate_evidence",
+            errors=(
+                {
+                    "pinned_test_policy": job.get("workflow_test_policy"),
+                    "current_test_policy": test_policy,
+                },
+            ),
+        )
     terminal_contract.authorize_terminal(
         envelope,
         ledger_path=terminal_contract.gate_ledger_path(log_path),
         require_ledger=job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES,
-        test_policy=_workflow_step_test_policy(registry, job),
+        test_policy=test_policy,
+        expected_gate_names=_expected_gate_names_for_test_policy(test_policy),
     )
 
 
@@ -6925,6 +7006,10 @@ def _dispatch_workflow_card(
             workflow_sandbox_hash=sandbox_hash,
             workflow_output_baseline=output_baseline,
             workflow_builder_job_id=builder_job_id if step.persona == "reviewer" else None,
+            # #379：派工當下 pin 住這張卡的驗收判準（test_policy），供 harvest 時
+            # 與 registry 現有 WorkflowRun.steps 的現值比對出 drift（見
+            # manager._workflow_acceptance_definition_drifted）。
+            workflow_test_policy=step.test_policy,
         )
     except BaseException:
         if planner_sandbox is not None:
