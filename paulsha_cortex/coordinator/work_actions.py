@@ -1612,11 +1612,33 @@ def _claim_action(
         active = canonical_run.to_dict()
         active["reason"] = decision.reason
     elif canonical_run is not None:
-        if args.get("action") == "resume" and decision.action in {
-            "resume",
-            "needs_human",
-            "blocked",
-        }:
+        # #420：`decision.action == "resume"` 只代表 `_resume_decision` 判定
+        # `active_status == "ongoing"`（needs_human/blocked/done/
+        # needs_decomposition 都有自己的專屬分支，不會落到這裡）——即 facets
+        # 乾淨、單純還在跑。explicit `cortex work resume`（`args["action"] ==
+        # "resume"`）本就會在這裡重呼叫 `workflow_starter`，讓仍卡在 define
+        # phase（`apply_workflow_action(action="start")` 的 claim→define→plan
+        # 同步續推段被中途打斷，例如 `_load_planning_artifacts` 之類未被
+        # needs_human 分支接住的例外）的 run 有機會重跑一次。periodic
+        # auto-claim scan（`automatic=True`，`args["action"] == "auto-scan"`）
+        # 過去完全不滿足 `args.get("action") == "resume"` 這個字面比對，導致
+        # 同一個 claim_key 每輪都只落到下面 `active = canonical_run.to_dict()`
+        # 的原樣反映——`workflow_starter` 永遠不會再被呼叫。這正是 auto-claim
+        # 建立的 run 完成 define 前若被中斷，就永久卡住、explicit intake 卻能
+        # 在同一 request 內同步續推的根因（#420）。這裡加上
+        # `automatic and decision.action == "resume"` 這個等價觸發，且刻意
+        # **不**擴及 needs_human/blocked：那兩個分支仍只在明確
+        # `args["action"] == "resume"`（即人工介入）時才重試，維持 #373 的
+        # 守衛——auto-claim 不得自動清除或重試 needs_human run。
+        # `start_canonical_workflow` 對非 define phase 的既有 run 本就是原樣
+        # early return（見 work_bridge.py `_claimable_existing_runs`／
+        # `existing_run.current_phase != "define"` 短路），故對 plan/build/
+        # verify/review 等已推進的 run 重呼叫 `workflow_starter` 是安全的
+        # no-op，不會產生非預期的重派工。
+        if (
+            args.get("action") == "resume"
+            and decision.action in {"resume", "needs_human", "blocked"}
+        ) or (automatic and decision.action == "resume"):
             if workflow_starter is None:
                 raise RuntimeError("canonical workflow starter unavailable")
             canonical_run = workflow_starter(
