@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #380：deck compile 產出的 verification 骨架寫死 pytest**：`_verification_skeleton` 過去對 `checks[name=policy]`、`tests`、`full_suite` 三處無條件硬寫 `python3 -m pytest -q`，`name` 宣告 `"policy"` 但實際執行的是測試而非任何 policy 驗證。改吃新增的 `compile_combo(..., repo_root=...)` 參數，透過 `resolve_project_policy()` 讀 `.project-policy.yml` 的 `preflight.steps`（`kind: validation` → policy check argv/timeout，`kind: tests` → tests/full_suite argv/timeout）；偵測不到對應 step 時不留空（`validate_verification_contract` 會拒收），改填 fail-closed placeholder（誤執行必非零退出）並印醒目 `[WARNING]`，`name` 維持 `"policy"` 以滿足 auto_dispatch 前提。同步修正建議樣板 doc 與 `init_sample.py` 過時的 `target_branch`／`verification` 提示文字（自 #101 起已非 `null`）。新增 3 個回歸測試，修正前皆已確認 FAIL。
+
+### Fixed
 - **Issue #418：#414 materialize 出的 canonical plan 檔與 brainstorm evidence 對帳必炸**：`_validated_brainstorm_planning_authority` 過去單純用 `set(persisted) - set(scanned)` 非空即 raise，`_materialize_plan_card_output`（#414）為對齊 build 端 declared input pattern 而產生的 canonical plan 副本天生不在 brainstorm evidence 列表內，每次 resume 對帳必 `needs_human`。新增合法副本例外路徑：`kind`／`work_id`／`baseline_sha256`（byte-copy）／ref 落在 plan phase output pattern 內四條全符合才排除於 omission 之外，其餘真正的 omission 維持 raise；回傳的 authority tuple 仍保留該副本以 seed 進 build worktree。新增 3 個回歸測試，修正前已確認重現 `omits persisted authority` 的 RED。
 
 ### Changed
