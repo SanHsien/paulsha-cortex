@@ -59,14 +59,48 @@ SLICE_STATE_TRANSITIONS = {
     "verified": frozenset({"verified", "completed", "needs_human"}),
     "completed": frozenset({"completed"}),
     "needs_human": frozenset({"needs_human", "pending", "building", "reviewing", "verified", "failed", "completed"}),
-    "failed": frozenset({"failed", "pending", "needs_human"}),
+    # "building" 併入 failed 的合法離開路徑（#382）：repin_slice() 刻意保留
+    # slice state（同 needs_human 的既有行為，見
+    # test_repin_slice_preserves_needs_human_until_explicit_retry_transition），
+    # 只重置 gate_state；retry-build 的實際派工路徑
+    # （autonomy.dispatch_ready -> _mark_slice_building）緊接著會把 state 從
+    # repin 前的原值直接轉成 "building"。needs_human 早就允許這條直接跳轉，
+    # failed 原本沒有，導致 repin 成功後下一步 _mark_slice_building 仍會
+    # raise，retry-build 整條路徑還是走不完。
+    "failed": frozenset({"failed", "pending", "needs_human", "building"}),
 }
 GATE_STATE_TRANSITIONS = {
     "pending": frozenset({"pending", "passed", "failed", "needs_human"}),
     "passed": frozenset({"passed"}),
-    "failed": frozenset({"failed", "needs_human"}),
+    # "failed" -> "pending" 對齊 SLICE_STATE_TRANSITIONS["failed"]（同樣允許
+    # failed -> pending）：兩張表原本不對稱是 #382 死鎖根因之一——slice state
+    # 可以復原、gate_state 卻永久卡死，讓 repin_slice()／retry-build 對
+    # failed/failed slice 保證失敗。
+    "failed": frozenset({"failed", "needs_human", "pending"}),
     "needs_human": frozenset({"needs_human", "pending", "passed", "failed"}),
 }
+
+# repin_slice() 接受重派的 slice state 集合。"failed" 併入此集合（#382）：
+# SLICE_STATE_TRANSITIONS 早就允許 failed -> pending，但 repin_slice() 自己
+# 這道硬編閘門沒跟上，導致宣告的 retry-build 對 failed slice 保證被拒。
+# 仍然刻意排除進行中／終局狀態（building/dispatched/running/exited/
+# reviewing/verified/completed）——repin 不該蓋過一個 active 中的 job。
+REPINNABLE_SLICE_STATES = frozenset({"pending", "needs_human", "failed"})
+
+
+def slice_repin_eligible(slice_row: dict[str, Any]) -> bool:
+    """判斷 `repin_slice()` 目前是否會接受這個 slice 的 `(state, gate_state)`。
+
+    `repin_slice()` 與 `manager.allowed_slice_actions()` 共用同一套判準
+    （同一份 REPINNABLE_SLICE_STATES／GATE_STATE_TRANSITIONS），確保
+    `allowed_slice_actions()` 宣告的 `retry-build` 一定是 `repin_slice()`
+    真的會接受的動作，不會宣告一個保證失敗的操作（#382）。
+    """
+    if str(slice_row.get("state")) not in REPINNABLE_SLICE_STATES:
+        return False
+    gate_state = str(slice_row.get("gate_state"))
+    return "pending" in GATE_STATE_TRANSITIONS.get(gate_state, frozenset())
+
 
 # StageExecutionKey 涵蓋的內容定址欄位（#214）：repo/work_id/card/phase/executor/
 # model/base_sha/candidate_sha/frozen_input_hashes/action/test_policy 任一改變都必須
@@ -1038,9 +1072,10 @@ class JobRegistry:
         dispatch_base: str | None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
-        if str(slice_row["state"]) not in {"pending", "needs_human"}:
+        if str(slice_row["state"]) not in REPINNABLE_SLICE_STATES:
             raise ValueError(
-                f"非法 slice state repin: {slice_row['state']!r}（只允許 pending/needs_human 重派）"
+                f"非法 slice state repin: {slice_row['state']!r}"
+                "（只允許 pending/needs_human/failed 重派）"
             )
         _validate_transition(
             field="gate_state",
@@ -1091,6 +1126,28 @@ class JobRegistry:
         verification_hash: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+
+        # Phase 1 — validate every provided field against the live row
+        # *without* mutating anything. #382: the previous validate-then-write
+        # ordering was interleaved per field, so a later field (e.g.
+        # gate_state) failing validation could raise *after* an earlier field
+        # (e.g. state) had already been written into the live `slice_row`
+        # object. That partial write was never persisted (the raise happens
+        # before `_persist()`), but it also never got corrected — the next
+        # *unrelated* `_persist()` call (from any other job/slice mutation)
+        # would flush the tainted in-memory row to disk. Validating
+        # everything up front means a rejected call cannot leave any trace,
+        # in memory or on disk.
+        new_current_evidence_refs = None
+        if current_evidence_refs is not None:
+            if not _is_ref_list(current_evidence_refs):
+                raise ValueError("current_evidence_refs 必須為字串陣列")
+            new_current_evidence_refs = _copy_ref_list(current_evidence_refs)
+        new_current_evaluation_refs = None
+        if current_evaluation_refs is not None:
+            if not _is_ref_list(current_evaluation_refs):
+                raise ValueError("current_evaluation_refs 必須為字串陣列")
+            new_current_evaluation_refs = _copy_ref_list(current_evaluation_refs)
         if state is not None:
             if state not in VALID_SLICE_STATES:
                 raise ValueError(f"非法 slice state: {state!r}")
@@ -1100,7 +1157,6 @@ class JobRegistry:
                 new=state,
                 allowed=SLICE_STATE_TRANSITIONS,
             )
-            slice_row["state"] = state
         if gate_state is not None:
             if gate_state not in VALID_GATE_STATES:
                 raise ValueError(f"非法 gate_state: {gate_state!r}")
@@ -1110,20 +1166,23 @@ class JobRegistry:
                 new=gate_state,
                 allowed=GATE_STATE_TRANSITIONS,
             )
-            slice_row["gate_state"] = gate_state
-        if current_evidence_refs is not None:
-            if not _is_ref_list(current_evidence_refs):
-                raise ValueError("current_evidence_refs 必須為字串陣列")
-            slice_row["current_evidence_refs"] = _copy_ref_list(current_evidence_refs)
-        if current_evaluation_refs is not None:
-            if not _is_ref_list(current_evaluation_refs):
-                raise ValueError("current_evaluation_refs 必須為字串陣列")
-            slice_row["current_evaluation_refs"] = _copy_ref_list(current_evaluation_refs)
         if builder_job_id is not None:
             self._validate_existing_job_ref("builder_job_id", builder_job_id)
-            slice_row["builder_job_id"] = builder_job_id
         if reviewer_job_id is not None:
             self._validate_existing_job_ref("reviewer_job_id", reviewer_job_id)
+
+        # Phase 2 — everything validated; apply every field together.
+        if state is not None:
+            slice_row["state"] = state
+        if gate_state is not None:
+            slice_row["gate_state"] = gate_state
+        if new_current_evidence_refs is not None:
+            slice_row["current_evidence_refs"] = new_current_evidence_refs
+        if new_current_evaluation_refs is not None:
+            slice_row["current_evaluation_refs"] = new_current_evaluation_refs
+        if builder_job_id is not None:
+            slice_row["builder_job_id"] = builder_job_id
+        if reviewer_job_id is not None:
             slice_row["reviewer_job_id"] = reviewer_job_id
         if candidate is not None:
             slice_row["candidate"] = candidate
@@ -1153,6 +1212,22 @@ class JobRegistry:
         result: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+
+        # Phase 1 — validate every provided field before mutating anything
+        # (#382, same rationale as update_slice above): a rejected multi-field
+        # transition must never leave a half-applied write sitting in the
+        # live `slice_row`, or an unrelated later `_persist()` call flushes
+        # the tainted row to disk.
+        new_evidence_refs = None
+        if evidence_refs is not None:
+            if not _is_ref_list(evidence_refs):
+                raise ValueError("evidence_refs 必須為字串陣列")
+            new_evidence_refs = _copy_ref_list(evidence_refs)
+        new_evaluation_refs = None
+        if evaluation_refs is not None:
+            if not _is_ref_list(evaluation_refs):
+                raise ValueError("evaluation_refs 必須為字串陣列")
+            new_evaluation_refs = _copy_ref_list(evaluation_refs)
         if state is not None:
             if state not in VALID_SLICE_STATES:
                 raise ValueError(f"非法 slice state: {state!r}")
@@ -1162,7 +1237,6 @@ class JobRegistry:
                 new=state,
                 allowed=SLICE_STATE_TRANSITIONS,
             )
-            slice_row["state"] = state
         if gate_state is not None:
             if gate_state not in VALID_GATE_STATES:
                 raise ValueError(f"非法 gate_state: {gate_state!r}")
@@ -1172,22 +1246,22 @@ class JobRegistry:
                 new=gate_state,
                 allowed=GATE_STATE_TRANSITIONS,
             )
+
+        # Phase 2 — everything validated; apply every field together, then
+        # persist exactly once.
+        if state is not None:
+            slice_row["state"] = state
+        if gate_state is not None:
             slice_row["gate_state"] = gate_state
-        if evidence_refs is not None:
-            if not _is_ref_list(evidence_refs):
-                raise ValueError("evidence_refs 必須為字串陣列")
-            refs = _copy_ref_list(evidence_refs)
-            slice_row["current_evidence_refs"] = refs
+        if new_evidence_refs is not None:
+            slice_row["current_evidence_refs"] = new_evidence_refs
             slice_row["evidence_history"].append(
-                {"action": action, "actor": actor, "refs": refs, "at": _now_iso()}
+                {"action": action, "actor": actor, "refs": new_evidence_refs, "at": _now_iso()}
             )
-        if evaluation_refs is not None:
-            if not _is_ref_list(evaluation_refs):
-                raise ValueError("evaluation_refs 必須為字串陣列")
-            refs = _copy_ref_list(evaluation_refs)
-            slice_row["current_evaluation_refs"] = refs
+        if new_evaluation_refs is not None:
+            slice_row["current_evaluation_refs"] = new_evaluation_refs
             slice_row["evaluation_history"].append(
-                {"action": action, "actor": actor, "refs": refs, "at": _now_iso()}
+                {"action": action, "actor": actor, "refs": new_evaluation_refs, "at": _now_iso()}
             )
         if candidate is not None:
             slice_row["candidate"] = candidate

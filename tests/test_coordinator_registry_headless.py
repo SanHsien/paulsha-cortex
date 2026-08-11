@@ -331,7 +331,16 @@ class SliceRecordTests(unittest.TestCase):
             self.assertEqual(repinned["state"], "needs_human")
             self.assertEqual(repinned["gate_state"], "pending")
 
-    def test_repin_slice_rejects_illegal_failed_state_rewind(self) -> None:
+    def test_repin_slice_recovers_failed_state_by_resetting_gate_only(self) -> None:
+        """#382: `failed` 曾經是永久不可 repin 的死角——slice state 可以
+        `failed -> pending`（SLICE_STATE_TRANSITIONS 早就允許），但 repin_slice()
+        自己的硬編閘門只認 pending/needs_human，加上 GATE_STATE_TRANSITIONS
+        當時不允許 `failed -> pending`，兩者疊加讓 retry-build 對 failed slice
+        保證失敗。修復後 `failed` 併入可 repin 集合，行為對齊既有的
+        needs_human 案例（見上面
+        test_repin_slice_preserves_needs_human_until_explicit_retry_transition）：
+        repin_slice() 保留 slice state 不動，只把 gate_state 重置回 pending，
+        留給派工路徑下一步（_mark_slice_building）真正推進 state。"""
         with tempfile.TemporaryDirectory() as d:
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
             reg.create_slice(
@@ -348,6 +357,42 @@ class SliceRecordTests(unittest.TestCase):
             )
             reg.update_slice("slice-a", state="running")
             reg.update_slice("slice-a", state="failed", gate_state="failed")
+
+            repinned = reg.repin_slice(
+                "slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha-2",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha-2",
+                target_branch="feature/slice-a",
+                target_remote="origin",
+                verification_hash="verification-sha-2",
+                verification={"docs_class": "code"},
+                dispatch_base="base-sha-2",
+            )
+
+            self.assertEqual(repinned["state"], "failed")
+            self.assertEqual(repinned["gate_state"], "pending")
+
+    def test_repin_slice_still_rejects_in_flight_running_state(self) -> None:
+        """安全底線不變：repin_slice() 仍然不得蓋過一個 active in-flight 的
+        builder job（`running`／`building`／`dispatched` 等）。#382 只把
+        `failed`（已終結、需要復原）併入可 repin 集合，不是全面放寬。"""
+        with tempfile.TemporaryDirectory() as d:
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha",
+                target_branch="feature/slice-a",
+                dispatch_base="base-sha",
+                builder_job_id=None,
+                reviewer_job_id=None,
+                candidate=None,
+            )
+            reg.update_slice("slice-a", state="running")
 
             with self.assertRaisesRegex(ValueError, "slice state"):
                 reg.repin_slice(

@@ -31,6 +31,7 @@ from . import seams
 from . import review as foreign_review
 from . import terminal_contract
 from . import verification
+from .registry import slice_repin_eligible
 from ..config.paths import worktree_root_for
 from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
 from .model_identities import (
@@ -451,7 +452,16 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
     )
     state = slice_row.get("state")
     if state == "failed":
-        return ["retry-build", "recover-pre-candidate", "abandon"] if not valid_candidate else ["retry-build", "abandon"]
+        # retry-build 底層即 registry.repin_slice()。只有在 repin_slice()
+        # 真的會接受目前 (state, gate_state) 組合時才宣告 retry-build——
+        # slice_repin_eligible() 與 repin_slice() 共用同一張表／同一判準
+        # （registry.REPINNABLE_SLICE_STATES / GATE_STATE_TRANSITIONS），
+        # 讓「宣告的動作」與「mutation 端實際接受的動作」保持一致，不再宣告
+        # 一個保證失敗的 retry-build（#382）。
+        actions = ["recover-pre-candidate", "abandon"] if not valid_candidate else ["abandon"]
+        if slice_repin_eligible(slice_row):
+            actions = ["retry-build"] + actions
+        return actions
     if state != "needs_human":
         return []
     if not valid_candidate:
