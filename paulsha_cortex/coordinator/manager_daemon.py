@@ -10,6 +10,7 @@ import signal
 import sys
 import tempfile
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1333,12 +1334,26 @@ def _install_signal_handlers() -> None:
 # _reset_log_error_dedup_state() -- called at the top of run_loop -- so a
 # fresh daemon process (or a fresh test invocation of run_loop) never
 # inherits suppression counters from a previous run.
-_LOG_ERROR_DEDUP_STATE: dict[str, Any] = {"signature": None, "repeat_count": 0}
+#
+# issue #374：早期實作是「單槽」——整個 dedup state 只存一筆
+# signature+count，一輪 tick 交錯出現多個不同 signature（實測每輪 14 個，
+# 來自 #373 的 14 個受害 run）時，下一筆一旦 signature 不同就把槽位整個
+# 重置，導致 ``signature != state["signature"]`` 恆真、每筆都印、抑制摘要
+# 永遠不會觸發——#249 想解決的洪水問題在多 signature 交錯下形同虛設。
+# 改為「多槽 LRU」：以 signature 為 key，各自獨立計數與抑制；
+# ``OrderedDict`` 提供 O(1) 的 move-to-end／popitem(last=False)，
+# 用來實作有界容量下「淘汰最久未用者」的 LRU 語意，避免
+# signature 含 source_revision（#373 的迴圈會改寫它）時無界成長。
+_LOG_ERROR_DEDUP_STATE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+# LRU 容量上限：#373 情境下實測每輪最多交錯 14 個並行 signature，64 留有
+# 充裕餘裕，同時避免長時間運行的 daemon 因 signature 種類持續增生
+# （例如 source_revision 不斷變動）而讓 dedup state 無界成長。
+LOG_ERROR_DEDUP_MAX_SLOTS = 64
 
 
 def _reset_log_error_dedup_state() -> None:
-    _LOG_ERROR_DEDUP_STATE["signature"] = None
-    _LOG_ERROR_DEDUP_STATE["repeat_count"] = 0
+    _LOG_ERROR_DEDUP_STATE.clear()
 
 
 def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None:
@@ -1355,6 +1370,14 @@ def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None
     LOG_ERROR_SUMMARY_INTERVAL occurrences, so a persistently failing tick
     can no longer flood the log the way it did in #249 -- while still
     leaving evidence that the failure is ongoing.
+
+    Multi-slot LRU (#374): suppression state is keyed per signature (up to
+    ``LOG_ERROR_DEDUP_MAX_SLOTS`` concurrently-tracked signatures), so
+    interleaved errors of different signatures each get their own
+    independent count/suppression instead of resetting a single shared
+    slot on every mismatch. Slots beyond the cap are evicted least-recently
+    -used first; an evicted signature is treated as first-seen again on its
+    next occurrence.
     """
     timestamp = contract.utcnow()
     signature = f"{type(exc).__name__}: {exc}"
@@ -1362,16 +1385,21 @@ def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None
         details = " ".join(f"{key}={value}" for key, value in context.items() if value is not None)
         if details:
             signature = f"{signature} ({details})"
-    state = _LOG_ERROR_DEDUP_STATE
-    if state["signature"] != signature:
-        state["signature"] = signature
-        state["repeat_count"] = 0
+
+    slot = _LOG_ERROR_DEDUP_STATE.get(signature)
+    if slot is None:
+        # 首見（或先前被 LRU 淘汰）：獨立開一個新槽，一律印出完整行。
+        if len(_LOG_ERROR_DEDUP_STATE) >= LOG_ERROR_DEDUP_MAX_SLOTS:
+            _LOG_ERROR_DEDUP_STATE.popitem(last=False)  # 淘汰最久未用的 slot
+        _LOG_ERROR_DEDUP_STATE[signature] = {"repeat_count": 0}
         print(f"{timestamp} manager_daemon error: {signature}", file=sys.stderr)
         return
-    state["repeat_count"] += 1
-    if state["repeat_count"] % LOG_ERROR_SUMMARY_INTERVAL == 0:
+
+    _LOG_ERROR_DEDUP_STATE.move_to_end(signature)  # 標記為最近使用，維持 LRU 順序
+    slot["repeat_count"] += 1
+    if slot["repeat_count"] % LOG_ERROR_SUMMARY_INTERVAL == 0:
         print(
-            f"{timestamp} manager_daemon error (repeated {state['repeat_count']}x since "
+            f"{timestamp} manager_daemon error (repeated {slot['repeat_count']}x since "
             f"first occurrence, most recent at {timestamp}): {signature}",
             file=sys.stderr,
         )
