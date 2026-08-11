@@ -18,6 +18,10 @@ PHASE_CARDS = [
     "policy-commit",        # 10 policy gate + commit（slice_group: ship）
 ]
 
+# issue #378：mcu-feature 是本 repo 現有的 evidence-claim 類 combo（硬體證據
+# hw-evidence.md），adversarial-review 強制掛在 code-review 之後、不透過
+# band_triggered（此 combo 本無 band 概念）——evidence-claim 類 slice 不論 band
+# 都要對抗式檢視 rigged setup。
 MCU_FEATURE_CARDS = [
     "mcu-hw-evidence",
     "writing-plans",
@@ -25,6 +29,7 @@ MCU_FEATURE_CARDS = [
     "tdd-red",
     "subagent-build",
     "code-review",
+    "adversarial-review",
     "receiving-code-review",
     "verification",
 ]
@@ -34,6 +39,26 @@ def test_cards_yaml_loads_and_covers_11_phases():
     cards = load_cards(DEFAULT_CARDS_PATH)
     for cid in PHASE_CARDS:
         assert cid in cards, f"缺 phase 卡: {cid}"
+
+
+# issue #378：builder 產出的「實證」可能是 rigged setup（兩條對照臂共用可變狀態、
+# 差異由 setup 順序而非被測性質產生、verdict 判準為恆真式），既有 verification
+# gate（persona-scope／command／artifacts exists）不驗證「結論是否站得住腳」。
+# adversarial-review 卡的任務描述必須明確指示對抗式檢視 rigging，且指向
+# review.py 既有的 fail-closed blocking category。
+def test_adversarial_review_card_task_description_covers_rigged_evidence_review():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    card = cards["adversarial-review"]
+
+    assert card.action is not None, "adversarial-review 缺 execution.action 任務描述"
+    action = card.action
+    assert "rigged" in action.lower()
+    assert "verification-bypass" in action
+    assert "acceptance" in action
+    # 三個具體 rigging 檢查面向都要點名，不能只是空泛提醒
+    assert "setup" in action.lower()  # setup-order dependency / 共用狀態
+    assert "恆真" in action or "tautolog" in action.lower()  # 恆真式判準
+    assert "觀測" in action  # 結論須由觀測值導出，不得預設寫死
 
 
 def test_interactive_headless_typing():
@@ -90,8 +115,13 @@ def test_mcu_feature_combo_loads():
     assert [entry.ref for entry in combo.cards] == MCU_FEATURE_CARDS
     assert [(gate.after, gate.exists) for gate in combo.gate_spine] == [
         ("mcu-hw-evidence", ("docs/superpowers/specs/*<task-slug>*-hw-evidence.md",)),
+        ("adversarial-review", ("reports/review/*<task-slug>*-adversarial.md",)),
     ]
+    # #378：無 band_triggered 加掛層——adversarial-review 直接落在核心層，
+    # 不論 band 評估結果都會派工，不能被 band 評估跳過。
     assert combo.band_triggered is None
+    adversarial_entry = next(entry for entry in combo.cards if entry.ref == "adversarial-review")
+    assert adversarial_entry.depends_on == ("code-review",)
 
 
 def test_mcu_feature_real_data_compiles_to_hold_specs(tmp_path):
@@ -102,10 +132,12 @@ def test_mcu_feature_real_data_compiles_to_hold_specs(tmp_path):
     combo = load_combo(DEFAULT_COMBOS_DIR / "mcu-feature.yaml", cards)
     result = compile_combo(combo, cards, "cc2674 pwm led bring-up", allow_external=True)
     slug = result.task_slug
-    # 對抗審查補強：鎖定 slice 結構（build 三卡合組 + 三個獨立 slice）
+    # 對抗審查補強：鎖定 slice 結構（build 三卡合組 + 四個獨立 slice，
+    # #378 起 adversarial-review 落在 code-review 與 receiving-code-review 之間）
     assert [s.slice_id for s in result.slices] == [
         f"{slug}-build",
         f"{slug}-code-review",
+        f"{slug}-adversarial-review",
         f"{slug}-receiving-code-review",
         f"{slug}-verification",
     ]
@@ -115,8 +147,12 @@ def test_mcu_feature_real_data_compiles_to_hold_specs(tmp_path):
         "writing-plans: openspec/changes/<change>/proposal.md",
     )
     assert f"cortex deck verify mcu-hw-evidence --task-slug {slug}" in result.verify_commands
+    assert f"cortex deck verify adversarial-review --task-slug {slug}" in result.verify_commands
     # hw-evidence gate 與卡 produces 一致
     assert combo.gate_spine[0].exists == cards["mcu-hw-evidence"].produces
+    # adversarial-review gate 與卡 produces 一致（#378：evidence-claim 類 slice
+    # 強制掛的對抗式檢視，不論 band 都需 exists 這份報告）
+    assert combo.gate_spine[1].exists == cards["adversarial-review"].produces
     out = tmp_path / "specs"
     emit(result, out)
     metas = scan_specs(out)
