@@ -45,3 +45,7 @@
 - Quickstart：知道 `dispatch: hold` 為什麼要改成 `dispatch: auto`
 - 排錯：知道自己是在查 request、job、slice 還是 work
 - 維運：知道 `cortex status` 與 `cortex list` 看的是不同層次
+- Claim 一個 `work`：`cortex work intake`／`cortex work start` 要求 work item
+  先進到 `todo` state 才會產生可 claim 的 `start` next_action；只 link 一個
+  GitHub issue（`topic` state）並不夠。四態 read model 定義與 claim 前置
+  條件見 `docs/unified-work-lifecycle.md`。

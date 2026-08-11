@@ -8,6 +8,7 @@ import pytest
 
 from paulsha_cortex.coordinator.claim import (
     AUTO_LABEL,
+    AuthorityValidationError,
     ClaimCandidate,
     WorkAuthority,
     build_claim_key,
@@ -341,7 +342,12 @@ def test_loader_accepts_pr_a_canonical_durable_snapshot(tmp_path: Path) -> None:
         "openspec:acme/demo:lifecycle@identity:lifecycle;state:active",
         "todo:docs/todo.md@identity:docs/todo.md",
     )
-    with pytest.raises(ValueError, match="missing or ambiguous"):
+    # #389：這個 row 存在但 sources 全為 inferred，屬於三個獨立可診斷的
+    # return-None 分支之一（authority-all-inferred），不再落回與「row 不存在」
+    # 共用的泛化 missing/ambiguous 訊息。
+    with pytest.raises(AuthorityValidationError) as excinfo:
         load_work_authority(
             repo="acme/demo", work_id="display-only", snapshot_path=path
         )
+    assert excinfo.value.reason_code == "authority-all-inferred"
+    assert excinfo.value.work_id == "display-only"

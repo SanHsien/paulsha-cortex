@@ -37,6 +37,16 @@ REASON_PROVIDER_INVALID_LEGACY = "provider-authority-invalid-legacy"
 # authority-invalid 情境（missing/malformed/停擺）分開分類，讓 resume 的
 # durable backoff 能認得出「等待 reset 即可」而非「需要人工排查」。
 REASON_PROVIDER_RATE_LIMITED_CANONICAL = "provider-authority-rate-limited-canonical"
+# #389：canonical row 本身存在、可解析，但因 lifecycle 尚未給出可 claim 的形狀
+# 而被 `_authority_from_canonical_row` 略過的三種情境。修法前這三種分支一律
+# `return None`：呼叫端（`_load_work_authorities_with_diagnostics`）只把它們
+# 當成「這列不算」悄悄丟棄、不留診斷，於是 `load_work_authority` 找不到目標
+# 也找不到 skip 診斷，只能落回與「row 根本不存在」「issue 被多個 work_id 認領」
+# 共用的泛化 `confirmed work authority missing or ambiguous`。三者各自獨立
+# reason code，讓 load_work_authority 能對「目標就是這一種」給專屬訊息。
+REASON_AUTHORITY_ALL_INFERRED = "authority-all-inferred"
+REASON_AUTHORITY_NOT_STARTABLE = "authority-not-startable"
+REASON_AUTHORITY_NO_TODO_SOURCE = "authority-no-confirmed-todo-source"
 
 _UNSAFE_LABEL_PREFIXES = ("/", "~")
 
@@ -472,8 +482,22 @@ def _authority_from_canonical_row(
             work_id=work_id_label,
             field="sources",
         )
+    # #389 診斷訊息一律用 `work_id_label`（已過 `_diagnostic_label` 安全過濾），
+    # 不得直接把 `work_id` 原始值嵌進訊息文字——此時 `work_id` 只確定是
+    # `str`，尚未通過下方的 identity 安全正規式驗證，直接嵌入會繞過
+    # `_diagnostic_label` 既有的「拒絕看似檔案路徑的值」防線（tier: shareable
+    # — AI-SEC-001 契約，見檔案頂部 `_diagnostic_label` docstring）。
+    safe_work_id = work_id_label or "<redacted>"
     if sources and all(source["confidence"] == "inferred" for source in sources):
-        return None
+        raise AuthorityValidationError(
+            f"work item '{safe_work_id}' has no confirmed sources yet (all "
+            "sources are inferred): cannot be evaluated for claiming until "
+            "at least one source is confirmed",
+            reason_code=REASON_AUTHORITY_ALL_INFERRED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="sources",
+        )
     confirmed = [
         source
         for source in sources
@@ -481,10 +505,28 @@ def _authority_from_canonical_row(
     ]
     has_workflow = any(source.get("kind") == "workflow_run" for source in confirmed)
     if next_actions is not None and "start" not in next_actions and not has_workflow:
-        return None
+        state_label = _diagnostic_label(row.get("state")) or "not-startable"
+        raise AuthorityValidationError(
+            f"work item '{safe_work_id}' is in '{state_label}' state: needs "
+            "an active todo source (workstream todo.md path link or openspec "
+            "change) to become claimable",
+            reason_code=REASON_AUTHORITY_NOT_STARTABLE,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="next_actions",
+        )
     todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
     if not any(source.get("kind") in todo_kinds for source in confirmed):
-        return None
+        raise AuthorityValidationError(
+            f"work item '{safe_work_id}' has no confirmed todo-kind source "
+            "(todo/superpowers_spec/superpowers_plan/openspec): needs an "
+            "active todo source (workstream todo.md path link or openspec "
+            "change) to become claimable",
+            reason_code=REASON_AUTHORITY_NO_TODO_SOURCE,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="sources",
+        )
     if re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
         raise AuthorityValidationError(
             "canonical work authority identity invalid",
