@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Added
+- **Issue #372：cortex/hippo 缺排程觸發的跨系統 digest 出口**：新增 `paulsha_cortex/coordinator/digest.py`，把既有 `read_status()` 快照（`attention`／`ready`／`held`／`degraded`／`recent_done`）彙整成結構化 `cortex-coordinator/digest/v1` JSON（含人類可讀 `summary_text`）。投遞層二擇一、不 fallback：預設寫入無外部依賴的檔案 outbox（`<coordinator_root>/digest/outbox/<timestamp>-<random>.json`，時間戳採既有 `now_fn` 注入慣例）；設定 `PSC_DIGEST_DELIVERY_CMD`（typed argv，比照 `PSC_PREFLIGHT_CMD`）時改把 digest JSON 從 stdin pipe 給該命令（`subprocess`、`shell=False`、逾時保護），命令失敗直接 fail-closed，不靜默改寫檔案。刻意不 import custom-skills（維持 cortex 對外零 runtime 依賴定位），也不把孤兒 `coordinator_telegram_notifier.py`（僅單元測試 import、production 零呼叫）接上。新增 porcelain 子命令 `cortex digest emit`，供外部 timer/cron 排程觸發；`cortex --help` 自動列出。另修復 `porcelain/inspect.py` 文字模式漏印 `attention`（`--json` 早已有）。新增 22 個回歸測試，修正前已確認 RED。
+
 ### Fixed
 - **Issue #418：#414 materialize 出的 canonical plan 檔與 brainstorm evidence 對帳必炸**：`_validated_brainstorm_planning_authority` 過去單純用 `set(persisted) - set(scanned)` 非空即 raise，`_materialize_plan_card_output`（#414）為對齊 build 端 declared input pattern 而產生的 canonical plan 副本天生不在 brainstorm evidence 列表內，每次 resume 對帳必 `needs_human`。新增合法副本例外路徑：`kind`／`work_id`／`baseline_sha256`（byte-copy）／ref 落在 plan phase output pattern 內四條全符合才排除於 omission 之外，其餘真正的 omission 維持 raise；回傳的 authority tuple 仍保留該副本以 seed 進 build worktree。新增 3 個回歸測試，修正前已確認重現 `omits persisted authority` 的 RED。
 
