@@ -7,17 +7,18 @@
 | fork | `SanHsien/paulsha-cortex` |
 | upstream | `hamanpaul/paulsha-cortex` |
 | 前次 review watermark | `b868760`（2026-08-09） |
-| 本次 upstream main | `b79c74aa20e7229c08b279fb0ec062751a8dbeca` |
+| 首輪 upstream main | `b79c74aa20e7229c08b279fb0ec062751a8dbeca` |
+| 追補 upstream main | `8b34e3e097f4f598b883df0db11669271f83d31f` |
 | upstream release | `v0.1.5`（tag `efec061fb322ad174a3312c3f5a626e680048856`） |
 | merge 前 origin main | `b354a42d215370ab2d95e05cd879e591ecf58342` |
-| review 範圍 | watermark 後 104 commits、41 merged PR、0 open PR、1 open issue |
-| 本輪決策 | 採用最新 `upstream/main`；衝突逐檔保留 Windows-first adapters |
+| 首輪 review 範圍 | watermark 後 104 commits、41 merged PR、0 open PR、1 open issue |
+| 本輪決策 | 採用 `upstream/main` 到 `8b34e3e`（含 `#450`）；`#451` 尚未合併且 CI 失敗，延後 |
 
 ## 2026-08-11 PR review ledger
 
-上游沒有待合併的 open PR。以下是自前次 watermark 後已進入 `upstream/main` 的
-merged PR；本 fork 以 merge 保留 upstream ancestry，並逐一檢查 30 個與
-Windows-first fork 重疊的檔案。
+首輪檢查時上游沒有待合併的 open PR。以下是自前次 watermark 後已進入
+`upstream/main` 的 merged PR；本 fork 以 merge 保留 upstream ancestry，並逐一
+檢查 30 個與 Windows-first fork 重疊的檔案。合併後 live recheck 新出現的項目另列於下節。
 
 | 分組 | PR | 決策與理由 |
 | --- | --- | --- |
@@ -33,10 +34,25 @@ Windows-first fork 重疊的檔案。
 `#403`、`#405`、`#407`、`#409`、`#411`、`#412`、`#413`、`#415`、`#417`、
 `#419`、`#421`、`#422`、`#423`、`#424`、`#426`、`#427`、`#428`、`#429`、
 `#430`、`#431`、`#432`、`#433`、`#434`、`#435`、`#436`、`#437`、`#438`、
-`#440`、`#441`、`#443`、`#444`、`#446`、`#447`、`#448`。下次只評估
-`b79c74aa20e7229c08b279fb0ec062751a8dbeca..upstream/main` 與之後新建／更新的 PR。
+`#440`、`#441`、`#443`、`#444`、`#446`、`#447`、`#448`。
+
+## 2026-08-11 post-merge live recheck
+
+| PR／Issue | 決策與理由 |
+| --- | --- |
+| upstream `#450`／Issue `#449` | 採用到 watermark `8b34e3e097f4f598b883df0db11669271f83d31f`。新增 `retire-delivered`，只有在所有 `pr_refs` 已由 provider 證明 terminal 後才把 orphan run 標為 `superseded`；退休 action 僅在有 last-known-good revision 的 rate-limit degraded 情境容忍舊 authority。上游 policy、Python 3.10–3.13、build 與 smoke 全綠。 |
+| open upstream `#451` | 延後。這是 v0.1.6 release 收版 PR；檢查時 head `02f604c04ba0e4ae16f70294ba5541631e3b3748` 仍未合併，且 policy 與 Python 3.12 CI 失敗。只有 upstream 合併、release tag 可驗證且 fork compatibility matrix 通過後才採用，不 cherry-pick 未完成 release。 |
+
+下次只評估 `8b34e3e097f4f598b883df0db11669271f83d31f..upstream/main`，以及
+`#451` head／CI 狀態在上述紀錄後的變化；不要重做 `#450` 或 `#449` 的取捨。
 
 ## Issue ledger
+
+### `hamanpaul/paulsha-cortex#449`，完成
+
+由 upstream `#450` 關閉，本 fork 已採用。`retire-delivered` 不取代或放寬
+pre-delivery `abandon`；terminal PR provider evidence、WorkflowRun CAS 與 durable audit
+record 仍是退休條件。
 
 ### `hamanpaul/paulsha-cortex#442`，部分完成，保留 upstream open
 
@@ -59,7 +75,7 @@ Copilot token 佈署。沒有這些證據，不重做「從 keyring 複製 token
 ```powershell
 git fetch upstream main --tags --prune
 git rev-list --left-right --count origin/main...upstream/main
-git log --oneline b79c74aa20e7229c08b279fb0ec062751a8dbeca..upstream/main
+git log --oneline 8b34e3e097f4f598b883df0db11669271f83d31f..upstream/main
 gh pr list --repo hamanpaul/paulsha-cortex --state open --limit 50
 gh issue list --repo hamanpaul/paulsha-cortex --state open --limit 100
 ```
