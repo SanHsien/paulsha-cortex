@@ -9,10 +9,11 @@
 | 前次 review watermark | `b868760`（2026-08-09） |
 | 首輪 upstream main | `b79c74aa20e7229c08b279fb0ec062751a8dbeca` |
 | 追補 upstream main | `8b34e3e097f4f598b883df0db11669271f83d31f` |
-| upstream release | `v0.1.5`（tag `efec061fb322ad174a3312c3f5a626e680048856`） |
+| 最終 upstream main | `ea76673ab77451fed08a7ff8527f9581cfd2ac6a` |
+| upstream release | `v0.1.6`（tag object `c607e86c970500233c4efd9491678d44f8b69d56`） |
 | merge 前 origin main | `b354a42d215370ab2d95e05cd879e591ecf58342` |
 | 首輪 review 範圍 | watermark 後 104 commits、41 merged PR、0 open PR、1 open issue |
-| 本輪決策 | 採用 `upstream/main` 到 `8b34e3e`（含 `#450`）；`#451` 尚未合併且 CI 失敗，延後 |
+| 本輪決策 | 採用 `upstream/main` 到 `ea76673`（含 `#450`、`#451`）；保留 fork hardening 與 Windows adapters |
 
 ## 2026-08-11 PR review ledger
 
@@ -25,7 +26,7 @@
 | intake、planning、authority、recovery | `#387`、`#388`、`#392`、`#394`、`#398`、`#400`、`#402`、`#403`、`#405`、`#407`、`#409`、`#411`、`#412`、`#413`、`#415`、`#417`、`#419`、`#421`、`#426`、`#428`、`#430`、`#433`、`#436`、`#437`、`#440` | 採用。修正 define/brainstorm failure evidence、artifact authority、orphan rescue、atomic registry、handoff reconciliation、gate provenance 與 auto-claim stalled run。 |
 | provider、rate limit、dispatch、delivery | `#423`、`#424`、`#427`、`#429`、`#432`、`#434`、`#435`、`#441` | 採用。補 policy-derived verification、digest、instance-scoped control root、GitHub rate-limit/backoff、provider preflight、spawn admission、typed provider failure 與 executor credential normalization。 |
 | adversarial evidence | `#431` | 採用。evidence-claim workflow 強制 adversarial review，直接補強本 fork 的 artifact-backed completion 目標。 |
-| packaging／release | `#422`、`#446` | 採用程式碼、Python matrix 與 `v0.1.5` 版本狀態；本 fork 仍因 upstream 無 LICENSE 而不發布衍生 wheel／sdist。 |
+| packaging／release | `#422`、`#446`、`#451` | 採用程式碼、Python matrix 與 `v0.1.6` 版本狀態；本 fork 仍因 upstream 無 LICENSE 而不發布衍生 wheel／sdist。 |
 | monitor concurrency | `#438`、`#444`、`#448` | 採用。移除 process-global `umask` race、修 connection-thread TOCTOU；合併時將修正下沉到共用 Unix/TCP transport，保留 Windows loopback endpoint。 |
 | launcher／Issue #442 | `#447` | 部分採用並補強。保留 `cg` zero-tool review/planning 契約，但改由跨平台 typed-argv Python wrapper 傳 stdin，不重新引入 Bash。 |
 | continuation design | `#443` | 採用設計與 mid-merge detection MVP；不把設計文件當成完成宣告。 |
@@ -34,17 +35,17 @@
 `#403`、`#405`、`#407`、`#409`、`#411`、`#412`、`#413`、`#415`、`#417`、
 `#419`、`#421`、`#422`、`#423`、`#424`、`#426`、`#427`、`#428`、`#429`、
 `#430`、`#431`、`#432`、`#433`、`#434`、`#435`、`#436`、`#437`、`#438`、
-`#440`、`#441`、`#443`、`#444`、`#446`、`#447`、`#448`。
+`#440`、`#441`、`#443`、`#444`、`#446`、`#447`、`#448`、`#450`、`#451`。
 
 ## 2026-08-11 post-merge live recheck
 
 | PR／Issue | 決策與理由 |
 | --- | --- |
 | upstream `#450`／Issue `#449` | 採用到 watermark `8b34e3e097f4f598b883df0db11669271f83d31f`。新增 `retire-delivered`，只有在所有 `pr_refs` 已由 provider 證明 terminal 後才把 orphan run 標為 `superseded`；退休 action 僅在有 last-known-good revision 的 rate-limit degraded 情境容忍舊 authority。fork review 另補 malformed merged timestamp/state fail-closed 與一致 evidence size limit。上游 policy、Python 3.10–3.13、build 與 smoke 全綠。 |
-| open upstream `#451` | 延後。這是 v0.1.6 release 收版 PR；檢查時 head `02f604c04ba0e4ae16f70294ba5541631e3b3748` 仍未合併，且 policy 與 Python 3.12 CI 失敗。只有 upstream 合併、release tag 可驗證且 fork compatibility matrix 通過後才採用，不 cherry-pick 未完成 release。 |
+| upstream `#451` | 首次檢查時延後；之後 upstream 於 `ea76673ab77451fed08a7ff8527f9581cfd2ac6a` 合併，並建立可驗證的 `v0.1.6` tag。Python 3.10–3.13、build、smoke 全綠；當時 policy failure 是 tag 建立前的 R-07 時序，fork 以 tag 已存在的 final state 重新驗證後採用。 |
 
-下次只評估 `8b34e3e097f4f598b883df0db11669271f83d31f..upstream/main`，以及
-`#451` head／CI 狀態在上述紀錄後的變化；不要重做 `#450` 或 `#449` 的取捨。
+下次只評估 `ea76673ab77451fed08a7ff8527f9581cfd2ac6a..upstream/main` 與之後
+新建／更新的 PR；不要重做 `#449`、`#450` 或 `#451` 的取捨。
 
 ## Issue ledger
 
@@ -75,7 +76,7 @@ Copilot token 佈署。沒有這些證據，不重做「從 keyring 複製 token
 ```powershell
 git fetch upstream main --tags --prune
 git rev-list --left-right --count origin/main...upstream/main
-git log --oneline 8b34e3e097f4f598b883df0db11669271f83d31f..upstream/main
+git log --oneline ea76673ab77451fed08a7ff8527f9581cfd2ac6a..upstream/main
 gh pr list --repo hamanpaul/paulsha-cortex --state open --limit 50
 gh issue list --repo hamanpaul/paulsha-cortex --state open --limit 100
 ```

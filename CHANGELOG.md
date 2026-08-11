@@ -8,13 +8,30 @@
 ## [Unreleased]
 
 ### Added
-- **建立 Windows-first fork 開發與治理環境**：新增原生 PowerShell bootstrap/full gate、Windows CI、typed-argv process wrapper、loopback TCP monitor transport與不需提權的 per-user Startup service backend；Linux/systemd 保持相容，bubblewrap foreign-review sandbox 的 Linux-only 邊界與 upstream 無 LICENSE 的限制均明確記錄。
-- **Issue #442（第一部分）：新增 `cg`（copilot API／glm-5.2 via llm-share）launcher 支援**：`launcher.build_cg_argv` 依 operator 提供並 smoke 驗證的介面契約（prompt 經 stdin、`--headless --stdin`、model 預設 `glm-5.2`、effort 合法值 low/medium/high/xhigh）組出 argv，登記進 `_ARGV_BUILDERS`；cg 為 zero-tool executor，只服務 read-only 的 planner／reviewer。詳見 `changelog.d/cg-launcher-support.md`。
-- **同步 upstream v0.1.5 並處理 Issue #442 的 fork 決策**：採用 watermark `b79c74a` 前 41 張 merged PR，保留 Windows-first adapters；ship-phase cards 啟用動態 `provider:executor` auth gate，逐項決策與續作條件寫入 `docs/UPSTREAM.md`。
+- 新增 Windows-first PowerShell 開發環境、LF checkout 契約、原生完整驗證入口、fork／開發／決策文件，以及 GitHub 協作、安全掃描與依賴維護骨架。
+- Windows-first runtime：原生 process wrapper、TCP monitor transport、per-user Startup service backend、PowerShell bootstrap/full gate 與 Windows CI。
+- 同步 upstream v0.1.5 到 `b79c74a`，保留原生 Windows runtime；`cg` 經 typed-argv wrapper 傳 stdin，ship-phase cards 啟用 `provider:executor` auth gate。
+- 追補 upstream `#450` 的 `retire-delivered` orphan-run 退休流程與限流時的窄化 last-known-good authority；同步把 `#449` 完成狀態及 `#451` release 決策寫入 upstream ledger。
+
+### Changed
+- `docs/UPSTREAM.md` 記錄已檢查 PR、Issue #442 的採用／延後決策與下次 review watermark，避免重複處理。
+- Windows launcher 在載入跨平台 wrapper 時保留 operator 原有的 `PYTHONPATH`；review-only 環境仍只暴露 repo package root。
+- 同步 upstream `#451` 的 v0.1.6 release metadata 與 tag 水位；下次 review watermark 推進到 `ea76673`。
+
+### Fixed
+- 修復 Windows 上會送 signal 的 PID probe、POSIX-only imports/durability、CRLF evidence identity、hardlink immutability、cross-host absolute path/mode semantics、monitor scan race 與 registry backup cleanup。
+- 修正 upstream 合併後的 Windows-only 回歸：POSIX service 測試分流、planning fixture newline authority、Windows mode 語意、hermetic home 隔離、PowerShell PID probe decoding，以及 digest delivery command 的反斜線 argv 解析。
+- `cg` prompt 改走真正的 OS stdin pipe，不再進入 wrapper command line，避開 Windows `CreateProcess` 長度上限與 prompt 洩漏。
+- Windows bootstrap 依 `.python-version` 優先使用 uv-managed Python，並拒絕超出 package 上限的 Python 3.14。
+- 強化 `retire-delivered`：GitHub PR lifecycle 的 merged timestamp／state 組合必須一致，且首次寫入與重入共用 evidence 大小上限。
+
+## [0.1.6] - 2026-08-11
+
+### Added
+- **Issue #442（第一部分）：新增 `cg`（copilot API／glm-5.2 via llm-share）launcher 支援**：提供 zero-tool、read-only 的 planner／reviewer executor；本 fork 的 Windows-first stdin hardening 另記於 `[Unreleased]`。
 - **交付後孤兒 run 的明確退休路徑 `cortex work retire-delivered`（Gap 1）**：交付發生在 cortex 管線之外（fallback 巷道 subagent 直接做完並 merge）時，對應的 `WorkflowRun` 會卡在 `ongoing`／`verify`／`needs_human`、且其 build 階段建的 PR（`pr_refs`）早已 terminal，既有 `abandon` 的 pre-delivery 閘門使之無法退休、亦無法 ship，形成死角。新增獨立、意圖明確的退休 work-action `retire-delivered`：先透過既有 provider seam（新增 `GitHubDeliveryClient.fetch_pr_lifecycle_status`，走既有 `_api`、不自 subprocess `gh`）驗證每個 `pr_ref` 的 PR 都為 terminal（merged／closed），再落 audit evidence（`work-retire-delivered/`，schema `cortex-work-retire-delivered/v1`）並將 run 標為 `superseded`；registry 層維持純粹、不打 GitHub，退休 admission 只要求 `ongoing`＋無 active job＋`pr_refs` 非空。沿用 exact WorkflowRun CAS（`--expected-run-id`）＋bounded actor/reason，並具 idempotent 重入（已 superseded 時從 durable evidence 重讀 terminal 證明、不再打 GitHub）。**刻意不弱化既有 `abandon` 的 pre-delivery 嚴格性**。詳見 `changelog.d/orphan-run-retirement.md`。
 
 ### Fixed
-- **完成 repository-wide Windows compatibility review**：修復會在 Windows 實際送 signal 的 PID probe、`fcntl`/`getloadavg`/directory fsync POSIX 假設、CRLF/LF evidence identity、immutable hardlink cleanup、cross-host path/mode semantics、monitor transient scan removal、registry v1 backup cleanup，以及測試寫入真實使用者 runtime 的隔離問題。完整 findings 與驗證清冊見 `docs/reviews/2026-08-09-windows-first-review.md`。
 - **Issue #445：`test_server_discards_finished_connection_threads` thread-timing flaky（連線執行緒已 `stopped` 但尚未從 `_connection_threads` list 移除）**：真正成因是 `MonitorServer.serve_forever()` accept loop 內 `t.start()` 與「登記進 `_connection_threads`」順序反了的 TOCTOU race——極快完成的連線處理執行緒可能在被登記進 list *之前* 就已跑完並自行嘗試 self-remove（此時它不在 list 裡，形同無效），accept loop 隨後才把這條已死執行緒 append 進去，且無下一條連線觸發清理，殘留永久留在 list 裡，任何長度的 poll 都等不到。修法：改為先登記再 `start()`，關閉整個 race window；測試側 poll 上限同步由 1.0s 提高到 2.0s 作防禦餘裕。詳見 `changelog.d/connection-thread-flaky.md`。
 - **退休類 work-action 在 provider rate-limit 下不再硬失敗（Gap 2，#370 只保護了 resume 的延伸）**：`claim.load_work_authority` 新增 opt-in 參數 `allow_rate_limited_last_known_good`（預設 `False`，逐層透傳至 `_authority_from_canonical_row`）——僅在「canonical GitHub provider 因 rate-limit degraded **且** snapshot 仍留有 last-known-good `revision`/`last_success_at`」的窄條件下改用 last-known-good 續行，不 raise。`execute_work_action` 只對退休語境（`_RETIREMENT_ACTIONS = {abandon, retire-delivered}`）帶入此旗標，claim/start 等需要即時 authority 的語境維持嚴格 fail-closed 預設；非 rate-limit 的 degraded／缺 revision 情境即使在退休語境下仍嚴格拒絕。因退休不依賴 issue 即時開關狀態，正好在系統被限流、最需要清理 stuck run 時仍能退休。詳見 `changelog.d/orphan-run-retirement.md`。
 
