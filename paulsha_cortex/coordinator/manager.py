@@ -5943,12 +5943,123 @@ def _specialize_workflow_launcher(launcher, step):
     return launcher
 
 
-def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher_factory):
+# #369：provider capability 探測的死碼修復。修復前 `_runtime_preflight_gate`
+# 呼叫 `evaluate_dispatch_gate` 時從未傳入 `snapshot_lookup`／`provider_prober`
+# （兩者預設 None）——`_resolve_provider_freshness` 在 `snapshot_lookup is None`
+# 時直接回 STALE_SNAPSHOT，而 STALE_SNAPSHOT 不在 `_BLOCKING_OUTCOMES`（只有
+# CAPABILITY_MISSING／PROVIDER_UNAVAILABLE 會擋），所以任何 `provider:` 宣告
+# 在生產環境永遠放行，等於整條路徑是死碼。以下兩個 factory 把它接上真正的
+# 資料源：GitHub 走既有 monitor durable snapshot（唯讀，無快照時安全回退成
+# STALE_SNAPSHOT，不變更行為的保守面）；executor 走 dispatch-time 的登入態
+# 探測（`coordinator.executor_auth`），以 process-level 快取避免每次 dispatch
+# 都重新 spawn CLI 子行程（見 `_EXECUTOR_AUTH_CACHE`）。
+#
+# cards.yaml 尚未有卡片宣告 `provider:executor`（見 #369 changelog 的風險
+# 說明）：sentinel 機制已就緒且有完整測試覆蓋，但要接上前先確認 CI／各執行
+# 環境對 claude／codex／copilot CLI 的可得性，避免 dispatch 熱路徑意外 spawn
+# 子行程；`provider:github:<repo>` 純讀 monitor 快照檔，無此風險，已直接接上
+# openspec-archive／policy-commit 兩張 ship-phase 卡。
+_EXECUTOR_AUTH_CACHE: dict[str, object] = {}
+
+
+def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> object | None:
+    from paulsha_cortex.monitor.work_models import parse_timestamp
+
+    from .runtime_preflight import DEFAULT_PROVIDER_TTL_SECONDS, ProviderFreshness
+
+    try:
+        snapshot = snapshot_store.load()
+    except Exception:  # noqa: BLE001 - monitor 快照壞掉不得拖垮 dispatch
+        return None
+    if snapshot is None:
+        return None
+    provider = snapshot.providers.get(provider_id)
+    if provider is None:
+        return None
+    try:
+        observed_at = parse_timestamp(provider.last_attempt_at).timestamp()
+    except ValueError:
+        return None
+    reason = "; ".join(provider.diagnostics) if provider.diagnostics else None
+    return ProviderFreshness(
+        provider_id=provider.provider_id,
+        status=provider.status,
+        observed_at=observed_at,
+        ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
+        source="monitor-snapshot",
+        reason=reason,
+    )
+
+
+def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
+    """#369：executor 登入態的「快照」層——實際是 process-level 快取。
+
+    沒有既有的 durable executor-auth snapshot 基礎設施（GitHub 有，monitor
+    daemon 會定期掃描並落盤；executor CLI 登入態沒有），因此第一次查詢時合成
+    一筆「已過期」的紀錄，讓 `_resolve_provider_freshness` 的 stale 分支去
+    呼叫 `provider_prober` 做一次真正探測；探測結果回寫這個 cache，後續在
+    TTL 內的查詢會直接命中 `is_fresh()`、不再重新 spawn 子行程。
+    """
+
+    from .runtime_preflight import ProviderFreshness
+
+    cached = _EXECUTOR_AUTH_CACHE.get(provider_id)
+    if cached is not None:
+        return cached
+    from .executor_auth import EXECUTOR_AUTH_TTL_SECONDS
+
+    return ProviderFreshness(
+        provider_id=provider_id,
+        status="degraded",
+        observed_at=0.0,
+        ttl_seconds=EXECUTOR_AUTH_TTL_SECONDS,
+        source="cold-start",
+        reason="no prior executor auth probe",
+    )
+
+
+def _executor_auth_prober(provider_id: str) -> object | None:
+    from .executor_auth import check_executor_auth
+
+    result = check_executor_auth(provider_id)
+    _EXECUTOR_AUTH_CACHE[provider_id] = result
+    return result
+
+
+def _combined_provider_snapshot_lookup(*, snapshot_store) -> Callable[[str], object | None]:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    def _lookup(provider_id: str) -> object | None:
+        if provider_id in EXECUTOR_CANDIDATES:
+            return _executor_auth_snapshot_lookup(provider_id)
+        return _monitor_provider_snapshot_lookup(provider_id, snapshot_store=snapshot_store)
+
+    return _lookup
+
+
+def _combined_provider_prober(provider_id: str) -> object | None:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    if provider_id in EXECUTOR_CANDIDATES:
+        return _executor_auth_prober(provider_id)
+    # GitHub 目前只用 monitor snapshot，不做額外 live probe：monitor daemon
+    # 本身已定期刷新該快照，再疊一層 live probe 只是重複付網路成本
+    # （#369 範圍界定，見 changelog）。
+    return None
+
+
+def _runtime_preflight_gate(
+    run, step, *, identities: IdentityRegistry, launcher_factory, snapshot_store=None
+):
     """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
 
     回傳 None 代表這張 card 未宣告任何 capability，呼叫端照原路徑走；否則回傳
     `DispatchGateDecision`，其中 `launcher` 只在通過 preflight 的 identity 上建立
     ——被擋下的 identity 不會產生任何 model session。
+
+    `snapshot_store` 預設 None 時延後到真正需要時才建立
+    `monitor.work_snapshot.WorkSnapshotStore()`（讀既有 monitor durable
+    snapshot）；測試可注入指向 tmp_path 的 store，不觸碰真實安裝路徑。
     """
 
     from .runtime_preflight import card_runtime_requirements, evaluate_dispatch_gate
@@ -5984,12 +6095,20 @@ def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher
 
         return host_environment()
 
+    active_store = snapshot_store
+    if active_store is None:
+        from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+        active_store = WorkSnapshotStore()
+
     return evaluate_dispatch_gate(
         card=step.card,
         requirements=requirements,
         candidates=candidates,
         environment_for=_environment_for,
         launcher_factory=_launcher_for,
+        snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
+        provider_prober=_combined_provider_prober,
     )
 
 
