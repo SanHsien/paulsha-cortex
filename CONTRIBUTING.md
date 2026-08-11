@@ -19,7 +19,7 @@ pwsh -File tools/bootstrap_dev.ps1
 pwsh -File tools/dev_check.ps1 -Quick
 ```
 
-原生 Windows 不是權威 runtime；腳本透過 WSL 執行。完整說明見 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)。
+原生 Windows 11 是本 fork 的權威開發 runtime；PowerShell 腳本直接使用 repo-local `.venv`。WSL 只用於 Linux/systemd/bubblewrap 相容驗證。完整說明見 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)。
 
 ## Pull request
 

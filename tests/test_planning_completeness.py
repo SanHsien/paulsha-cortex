@@ -176,6 +176,26 @@ def test_rejected_artifacts_remain_authoritative_sources_for_missing_kind_questi
     ]
 
 
+def test_missing_kind_questions_fall_back_to_accepted_refs_when_kind_absent() -> None:
+    """issue #408（補完）：todo 錨定的 work item（small-fix combo）缺 spec/design
+    時，同 kind 完全不存在 → source_refs 過去恆為空，destinations 推導與
+    secondary source material 雙雙斷炊。fallback 到 accepted refs 後，
+    `_planning_destinations` 能從 workstream todo 路徑導出目的地。"""
+    todo_ref = "docs/superpowers/workstreams/fix-demo-v3/todo.md"
+    report = assess_planning_completeness(
+        [
+            _artifact(
+                "plan",
+                "---\nstatus: accepted\nwork_item: fix-demo-v3\n---\n## Tasks\n- [ ] 修好它。\n",
+                todo_ref,
+            )
+        ]
+    )
+    assert report.missing_kinds == ("spec", "design")
+    for question in report.default_question_pack.questions:
+        assert question.source_refs == (todo_ref,)
+
+
 def test_any_blocking_marker_triggers_brainstorm_even_when_an_alternate_artifact_is_accepted() -> None:
     report = assess_planning_completeness(
         [
@@ -476,7 +496,12 @@ def test_brainstorm_fails_closed_when_no_heterogeneous_peer_or_output_is_malform
         primary_integrator=lambda *_: {},
     )
     assert malformed.state == "needs_human"
-    assert malformed.reason == "secondary-output-malformed"
+    # Issue #397：reason 不再是壓平後的單一字面值，必須透傳底層例外型別與
+    # 訊息片段（`validate_secondary_evidence` 這裡是 ValueError: secondary
+    # evidence identity invalid），排障時才看得出真正壞在哪一段驗證。
+    assert malformed.reason is not None
+    assert malformed.reason.startswith("secondary-output-malformed:")
+    assert "ValueError" in malformed.reason
     assert malformed.gate_refs.brainstorm_peer is None
 
     valid_secondary = lambda pack, _identity: {
@@ -507,10 +532,164 @@ def test_brainstorm_fails_closed_when_no_heterogeneous_peer_or_output_is_malform
         secondary_planner=valid_secondary,
         primary_integrator=lambda *_: {},
     )
-    assert (malformed_primary.state, malformed_primary.reason) == (
-        "needs_human",
-        "primary-integration-malformed",
+    assert malformed_primary.state == "needs_human"
+    # 同上：integrator 分支同型 `except Exception` 也要透傳例外摘要。
+    assert malformed_primary.reason is not None
+    assert malformed_primary.reason.startswith("primary-integration-malformed:")
+    assert "ValueError" in malformed_primary.reason
+
+
+def test_brainstorm_reason_includes_underlying_exception_summary_for_questioner(
+    tmp_path: Path,
+) -> None:
+    """Issue #397：`question-pack-malformed` 分支同樣要透傳底層例外——過去
+    三處 `except Exception` 全部把例外壓平成單一字面值，操作者只看得到分支
+    名稱、看不到底層是 ValueError 還是別的、訊息內容是什麼，排障要另外重跑
+    加 print 才查得到。這裡直接讓 primary_questioner raise，驗證 reason 併入
+    例外型別與訊息片段（供 #393 的 planning-failure evidence／recover-planning
+    的 `_read_planning_failure_record` 直接讀出，兩者都只要求非空字串）。"""
+    report = assess_planning_completeness([_artifact("spec", ACCEPTED_SPEC)])
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy",
+                "model_id": "Gemini 3.1 Pro (High)",
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": "agy-plan-sandbox",
+            },
+        ]
     )
+    probes = {
+        ("agy", "Gemini 3.1 Pro (High)"): CapabilityProbe.ready_for(
+            "agy", "Gemini 3.1 Pro (High)", "google"
+        )
+    }
+
+    def raising_questioner(_input: object) -> object:
+        raise RuntimeError("questioner exploded")
+
+    result = run_heterogeneous_brainstorm(
+        report=report,
+        primary=("codex", "primary"),
+        registry=registry,
+        probes=probes,
+        evidence_dir=tmp_path,
+        artifact_root=tmp_path,
+        scope=SCOPE,
+        primary_questioner=raising_questioner,
+        secondary_planner=lambda *_: {},
+        primary_integrator=lambda *_: {},
+    )
+    assert result.state == "needs_human"
+    assert result.reason is not None
+    assert result.reason.startswith("question-pack-malformed:")
+    assert "RuntimeError" in result.reason
+    assert "questioner exploded" in result.reason
+
+
+def test_brainstorm_reason_includes_underlying_exception_summary_for_artifact_write(
+    tmp_path: Path,
+) -> None:
+    """Issue #408：artifact-write 分支是 #397 儀器化時漏掉的第四個裸吞
+    `except Exception`——canary v2 gen3 只看得到 `primary-artifact-write-rejected`
+    卻查不到是哪條驗證拒的。這裡讓整條 brainstorm 走到 artifact_writer，
+    驗證 reason 併入例外型別與訊息片段。"""
+    report = assess_planning_completeness([_artifact("spec", ACCEPTED_SPEC)])
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy",
+                "model_id": "Gemini 3.1 Pro (High)",
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": "agy-plan-sandbox",
+            },
+        ]
+    )
+    probes = {
+        ("agy", "Gemini 3.1 Pro (High)"): CapabilityProbe.ready_for(
+            "agy", "Gemini 3.1 Pro (High)", "google"
+        )
+    }
+
+    def questioner(_report_payload):
+        return report.default_question_pack.to_dict()
+
+    def secondary(pack_payload, identity):
+        return {
+            "schema_version": 1,
+            "question_pack_id": pack_payload["pack_id"],
+            "evidence": [
+                {
+                    "question_id": q["question_id"],
+                    "claims": ["No accepted artifact found."],
+                    "source_refs": ["docs/planning-index.md:1"],
+                }
+                for q in pack_payload["questions"]
+            ],
+        }
+
+    kind_to_body = {"design": ACCEPTED_DESIGN, "plan": ACCEPTED_PLAN}
+
+    def integrator(pack_payload, evidence_payload):
+        resolutions = []
+        artifacts = []
+        for question in pack_payload["questions"]:
+            artifact_kind = question["kind"].removeprefix("missing-")
+            artifact_ref = f"docs/{artifact_kind}.md"
+            resolutions.append(
+                {
+                    "question_id": question["question_id"],
+                    "decision": "Create and accept the missing artifact.",
+                    "artifact_kind": artifact_kind,
+                    "artifact_refs": [artifact_ref],
+                }
+            )
+            artifacts.append(
+                {"kind": artifact_kind, "path": artifact_ref, "content": kind_to_body[artifact_kind]}
+            )
+        return {
+            "schema_version": 1,
+            "question_pack_id": pack_payload["pack_id"],
+            "secondary_evidence_hash": evidence_payload["evidence_hash"],
+            "resolutions": resolutions,
+            "artifacts": artifacts,
+        }
+
+    def exploding_writer(_rows):
+        raise RuntimeError("publication transaction refused")
+
+    result = run_heterogeneous_brainstorm(
+        report=report,
+        primary=("codex", "primary"),
+        registry=registry,
+        probes=probes,
+        evidence_dir=tmp_path,
+        artifact_root=tmp_path,
+        scope=SCOPE,
+        primary_questioner=questioner,
+        secondary_planner=secondary,
+        primary_integrator=integrator,
+        artifact_writer=exploding_writer,
+    )
+    assert result.state == "needs_human"
+    assert result.reason is not None
+    assert result.reason.startswith("primary-artifact-write-rejected:")
+    assert "RuntimeError" in result.reason
+    assert "publication transaction refused" in result.reason
 
 
 def test_primary_must_write_accepted_artifacts_before_brainstorm_gate_passes(tmp_path: Path) -> None:

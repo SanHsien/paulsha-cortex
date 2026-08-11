@@ -1054,13 +1054,26 @@ identities:
             # #261：真實 wrapper 在模型結束後除了 exit sentinel 還會寫下 gate
             # ledger；fake launcher 一併模擬，否則 build／verify 的 passed 會
             # 因為「沒有獨立 gate 證據」而正確地 fail closed。
+            #
+            # #379：build phase 卡片若宣告 test_policy（tdd-red=red-required／
+            # subagent-build=focused），manager 現在要求 ledger 出現對應的
+            # pytest gate，否則因 plan 宣告的應驗 gate 缺席而 fail closed；
+            # 其餘卡片（含 worktree-isolation 與 plan/verify/review phase）
+            # 維持既有空 gate 清單。
+            build_gate_rows: list[dict[str, object]] = []
+            if phase == "build" and card == "tdd-red":
+                build_gate_rows = [
+                    {"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"}
+                ]
+            elif phase == "build" and card == "subagent-build":
+                build_gate_rows = [{"name": "pytest", "status": "passed", "exit_code": 0}]
             terminal_contract.gate_ledger_path(log_path).write_text(
                 json.dumps(
                     {
                         "schema_version": terminal_contract.GATE_LEDGER_SCHEMA_VERSION,
                         "kind": "workflow-gate-ledger",
                         "slice_id": slice_id,
-                        "gates": [],
+                        "gates": build_gate_rows,
                     }
                 ),
                 encoding="utf-8",

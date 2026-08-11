@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import hashlib
 import os
+import logging
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from paulsha_cortex.control import constants, contract
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
     manager, manager_daemon, planning_runtime, registry as registry_module, review,
-    terminal_contract, verification, work_bridge,
+    terminal_contract, verification, work_actions, work_bridge,
 )
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -24,6 +25,7 @@ from paulsha_cortex.coordinator.model_identities import (
     CapabilityProbe,
     IdentityRegistry,
 )
+from paulsha_cortex.coordinator.planning import BrainstormResult, PlanningGateRefs
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import (
     GateEvidenceRef,
@@ -36,12 +38,19 @@ from paulsha_cortex.deck.compile import compile_combo, emit
 from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
 
 
-def _gate_ledger_passed(log_path) -> None:
+def _gate_ledger_passed(log_path, *, gates: list[dict[str, object]] | None = None) -> None:
     """#261：模擬 manager wrapper 在模型行程結束後寫下的 gate ledger。
 
     真實流程中這份檔案由 `launcher` 產生的 wrapper script 呼叫
     `paulsha_cortex.coordinator.gate_ledger` 寫出，模型碰不到；沒有它的話
     build／verify 的 `passed` 會（正確地）因為缺乏獨立 gate 證據而 fail closed。
+
+    #379：預設仍是空 gate 清單（維持既有多數呼叫端模擬「operator 未宣告
+    PSC_GATE_CMD_*」的情境）；呼叫端如果在模擬一張 test_policy 非
+    none／null 的卡片（例如 tdd-red／subagent-build），必須顯式傳入
+    ``gates`` 帶上對應的 pytest 條目——否則 manager 現在會（正確地）因為
+    plan 宣告的應驗 gate 沒出現在 ledger 而 fail closed，而不是像修復前那樣
+    vacuous pass。
     """
 
     path = terminal_contract.gate_ledger_path(log_path)
@@ -52,7 +61,7 @@ def _gate_ledger_passed(log_path) -> None:
                 "schema_version": terminal_contract.GATE_LEDGER_SCHEMA_VERSION,
                 "kind": "workflow-gate-ledger",
                 "slice_id": Path(log_path).stem,
-                "gates": [],
+                "gates": gates if gates is not None else [],
             }
         ),
         encoding="utf-8",
@@ -65,6 +74,45 @@ def _manifest() -> WorkflowManifest:
     result = compile_combo(combo, cards, "production wiring", change="production-wiring")
     assert result.workflow_manifest is not None
     return result.workflow_manifest
+
+
+def _assert_planning_failure_evidence_recoverable(
+    *,
+    coordinator_root: Path,
+    persisted: WorkflowRun,
+    classification: str,
+    reason: str,
+) -> None:
+    """issue #393 回歸樁：define needs_human 靜默失敗必須留下
+    `cortex-planning-failure/v1` evidence，且該 evidence 要能被
+    `work_actions._read_planning_failure_record`／`_planning_failure_hint`
+    讀到——這正是 `recover-planning` 的前置成立條件。過去全庫只有 reader、
+    沒有任何 producer，這條斷言在修復前必然 FAIL（RuntimeError: recover-
+    planning requires planning failure evidence／`_planning_failure_hint`
+    回 None）。
+    """
+
+    evidence_dir = coordinator_root / "evidence" / "planning-recovery"
+    evidence_paths = sorted(evidence_dir.glob(f"{persisted.run_id}-*.json"))
+    assert evidence_paths, f"未見 planning-recovery evidence，目錄內容：{list(evidence_dir.glob('*'))}"
+    assert len(evidence_paths) == 1
+    evidence_path = evidence_paths[0]
+    body = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert body["schema"] == "cortex-planning-failure/v1"
+    assert body["run_id"] == persisted.run_id
+    assert body["classification"] == classification
+    assert body["reason"] == reason
+    assert isinstance(body.get("created_at"), str) and body["created_at"]
+    assert str(evidence_path) in persisted.evidence_refs
+
+    record = work_actions._read_planning_failure_record(run=persisted, run_id=persisted.run_id)
+    assert record["classification"] == classification
+    assert record["reason"] == reason
+    assert record["evidence_ref"] == str(evidence_path)
+
+    hint = work_actions._planning_failure_hint(persisted)
+    assert hint is not None
+    assert hint["classification"] == classification
 
 
 def _done_ship_run(registry: JobRegistry, root: Path) -> WorkflowRun:
@@ -220,7 +268,16 @@ def _write_planning_artifacts(root: Path, *, missing: set[str] | None = None) ->
     }
     authority: list[PlanningArtifactAuthority] = []
     for kind, body in bodies.items():
-        ref = f"docs/{kind}.md"
+        # #414：plan 的 ref 必須落在 writing-plans 卡宣告的 canonical outputs
+        # glob（`docs/superpowers/plans/*<task-slug>*.md`）內，否則
+        # deterministic pass 前的 declared-outputs 驗證會判定缺席、觸發
+        # materialize fallback，讓 `planner.outputs` 多出一筆——這裡的測試
+        # 目的是驗證「outputs 已存在」的既有正路，故 ref 需真的匹配宣告。
+        ref = (
+            "docs/superpowers/plans/production-wiring.md"
+            if kind == "plan"
+            else f"docs/{kind}.md"
+        )
         path = root / ref
         if kind not in missing:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,7 +296,9 @@ def _write_planning_artifacts(root: Path, *, missing: set[str] | None = None) ->
     return tuple(authority)
 
 
-def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path: Path) -> None:
+def test_control_queue_workflow_action_is_the_production_mutation_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
     manifest = _manifest()
@@ -251,7 +310,8 @@ def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path:
         handoff_dir=str(tmp_path / "handoff"),
     )
 
-    result = executor(build_request(req_type="workflow-action", args=_workflow_args(manifest_path, tmp_path), requested_by="operator"))
+    with caplog.at_level(logging.ERROR, logger="paulsha_cortex.coordinator.manager"):
+        result = executor(build_request(req_type="workflow-action", args=_workflow_args(manifest_path, tmp_path), requested_by="operator"))
 
     persisted = registry.get_workflow_run(result["run_id"])
     assert persisted.current_phase == "define"
@@ -259,6 +319,237 @@ def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path:
     assert result["reason"] == "planning-runtime-unavailable"
     assert not hasattr(registry, "create_workflow_run")
     assert not hasattr(registry, "update_workflow_run")
+    # #391：daemon periodic tick 觸發時沒人消費回傳值，reason 過去只活在
+    # return dict 裡就蒸發；needs_human 落地時必須同時留一筆可查的結構化 log
+    # （run_id + reason），不能只靠呼叫端讀 return 值。
+    assert any(
+        "planning-runtime-unavailable" in record.message and persisted.run_id in record.message
+        for record in caplog.records
+    )
+    # issue #393：這條 needs_human 出口過去沒有任何 producer 寫
+    # `cortex-planning-failure/v1` evidence，recover-planning 對它結構性
+    # 不可用；修復後必須留下可被 reader 消費的 evidence。
+    _assert_planning_failure_evidence_recoverable(
+        coordinator_root=tmp_path,
+        persisted=persisted,
+        classification="environment",
+        reason="planning-runtime-unavailable",
+    )
+
+
+def test_planning_runtime_initialization_failure_logs_reason_and_records_needs_human(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """issue #391：runtime_factory 本身 raise（例如 sandbox 建立失敗）時，
+    manager.apply_workflow_action 過去只把 exception 整個吞掉、reason 只塞進
+    回傳值——daemon periodic tick 觸發時沒有呼叫端讀這個回傳值，reason 蒸發，
+    只留下一個查不出原因的 needs_human facet。修復後必須落一筆含 run_id、
+    reason、底層 exception 型別與訊息的結構化 log。
+    """
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    args = _workflow_args(manifest_path, tmp_path)
+
+    def failing_runtime_factory(*, primary, worktree):
+        raise RuntimeError("sandbox worktree creation refused")
+
+    with caplog.at_level(logging.ERROR, logger="paulsha_cortex.coordinator.manager"):
+        result = manager.apply_workflow_action(
+            registry,
+            args=args,
+            runtime_factory=failing_runtime_factory,
+            coordinator_root=tmp_path,
+        )
+
+    persisted = registry.get_workflow_run(result["run_id"])
+    assert persisted.current_phase == "define"
+    assert persisted.facets == ("needs_human",)
+    assert result["reason"] == "planning-runtime-initialization-failed"
+    matching = [
+        record
+        for record in caplog.records
+        if "planning-runtime-initialization-failed" in record.message
+        and persisted.run_id in record.message
+    ]
+    assert matching, f"未見結構化 log，實際紀錄：{[r.message for r in caplog.records]}"
+    assert "RuntimeError" in matching[0].message
+    assert "sandbox worktree creation refused" in matching[0].message
+    # issue #393：runtime_factory 例外路徑同樣要留 evidence；reason 併上
+    # #392 已組好的字串與例外摘要。
+    _assert_planning_failure_evidence_recoverable(
+        coordinator_root=tmp_path,
+        persisted=persisted,
+        classification="environment",
+        reason="planning-runtime-initialization-failed: RuntimeError: sandbox worktree creation refused",
+    )
+
+
+def test_brainstorm_not_ready_logs_reason_before_needs_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """issue #391：run_heterogeneous_brainstorm 沒收斂到 ready 狀態時的
+    needs_human 分支，比照另外兩條 runtime 缺失路徑，reason 也不能只活在
+    回傳值裡——必須留一筆含 run_id／state／reason 的結構化 log。
+    """
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    args = _workflow_args(manifest_path, tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "gpt-primary",
+                "independence_domain": "openai", "capabilities": ["planning"],
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        manager,
+        "run_heterogeneous_brainstorm",
+        lambda **_: BrainstormResult(
+            state="needs_human",
+            reason="no-heterogeneous-planner",
+            secondary_domain=None,
+            gate_refs=PlanningGateRefs(),
+        ),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="paulsha_cortex.coordinator.manager"):
+        result = manager.apply_workflow_action(
+            registry,
+            args=args,
+            identity_registry=identities,
+            primary_questioner=lambda *a, **k: None,
+            secondary_planner=lambda *a, **k: None,
+            primary_integrator=lambda *a, **k: None,
+            coordinator_root=tmp_path,
+        )
+
+    persisted = registry.get_workflow_run(result["run_id"])
+    assert persisted.current_phase == "define"
+    assert persisted.facets == ("needs_human",)
+    assert result["reason"] == "no-heterogeneous-planner"
+    assert any(
+        "no-heterogeneous-planner" in record.message and persisted.run_id in record.message
+        for record in caplog.records
+    )
+    # issue #393：brainstorm 未 ready 歸類 content（非 environment）——
+    # `_resume_decision` 對 content 一律不浮現 recover-planning，
+    # 與 fail-closed 意圖一致（見 test_planning_claim_recovery 的
+    # test_resume_hides_recovery_for_content_failure）。
+    _assert_planning_failure_evidence_recoverable(
+        coordinator_root=tmp_path,
+        persisted=persisted,
+        classification="content",
+        reason="no-heterogeneous-planner",
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "primary-artifact-write-rejected: ValueError: planning artifact lacks current "
+        "planning authority: docs/superpowers/specs/fix-416-design.md",
+        "primary-artifact-write-rejected: ValueError: planning artifact current authority "
+        "drift: docs/superpowers/specs/fix-416-design.md",
+    ],
+)
+def test_planning_authority_residue_write_rejection_is_environment_classified(reason: str) -> None:
+    """issue #416（選做修法 3）：`_publish_planning_artifacts` 對「已存在但無/與
+    目前 authority 不符」的檔案一律 fail-closed（見 manager.py
+    `_publish_planning_artifacts` 的兩處 raise），正是 abandon 未回滾發佈殘留
+    撞見下一世代重新發佈同一 destinations 的死鎖地雷特徵——屬環境／狀態殘留
+    而非模型內容缺陷，`manager._is_planning_authority_residue_failure` 必須把
+    它辨識出來，好讓呼叫端可以改歸 `environment`（進而讓
+    recover-planning 可用）。"""
+
+    assert manager._is_planning_authority_residue_failure(reason) is True
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        None,
+        "no-heterogeneous-planner",
+        "question-pack-malformed: RuntimeError: questioner exploded",
+        # #416 判準刻意窄：write-rejected 前綴存在，但底層錯誤不是 authority
+        # 殘留（例如整合出的路徑逃出 governed roots），仍必須維持 content。
+        "primary-artifact-write-rejected: ValueError: planning artifact path outside "
+        "governed roots",
+    ],
+)
+def test_planning_authority_residue_classifier_stays_content_for_unrelated_reasons(
+    reason: str | None,
+) -> None:
+    """反向情境：非 authority 殘留特徵的失敗（含 write-rejected 但底層是其他
+    內容型驗證錯誤）必須維持既有 `content` 分類，不擴大 #393 的分類映射。"""
+
+    assert manager._is_planning_authority_residue_failure(reason) is False
+
+
+def test_brainstorm_authority_residue_write_rejection_records_environment_and_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue #416 端到端：`run_heterogeneous_brainstorm` 因 `_publish_planning_
+    artifacts` 的 authority fail-closed 回 `primary-artifact-write-rejected:
+    ValueError: planning artifact lacks current planning authority: ...` 時，
+    `apply_workflow_action` 必須把 evidence 落成 `environment`（而不是 #393
+    預設的 `content`），讓 `_planning_failure_hint`／`_read_planning_failure_
+    record` 顯示可 recover-planning——修法前這條分支恆為 `content`，
+    recover-planning 永遠不可用，只能改名重識別（issue 內文記載的短期實操）
+    燒一個世代繞過。
+    """
+
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    args = _workflow_args(manifest_path, tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "gpt-primary",
+                "independence_domain": "openai", "capabilities": ["planning"],
+            }
+        ]
+    )
+    residue_reason = (
+        "primary-artifact-write-rejected: ValueError: planning artifact lacks current "
+        "planning authority: docs/superpowers/specs/fix-416-design.md"
+    )
+    monkeypatch.setattr(
+        manager,
+        "run_heterogeneous_brainstorm",
+        lambda **_: BrainstormResult(
+            state="needs_human",
+            reason=residue_reason,
+            secondary_domain=None,
+            gate_refs=PlanningGateRefs(),
+        ),
+    )
+
+    result = manager.apply_workflow_action(
+        registry,
+        args=args,
+        identity_registry=identities,
+        primary_questioner=lambda *a, **k: None,
+        secondary_planner=lambda *a, **k: None,
+        primary_integrator=lambda *a, **k: None,
+        coordinator_root=tmp_path,
+    )
+
+    persisted = registry.get_workflow_run(result["run_id"])
+    assert persisted.facets == ("needs_human",)
+    assert result["reason"] == residue_reason
+    _assert_planning_failure_evidence_recoverable(
+        coordinator_root=tmp_path,
+        persisted=persisted,
+        classification="environment",
+        reason=residue_reason,
+    )
 
 
 def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(
@@ -777,6 +1068,129 @@ def test_ship_validator_failure_persists_needs_human_on_review_complete_run(
     assert stopped.current_phase == "review"
     assert stopped.facets == ("needs_human",)
     assert stopped.gate_status == "failed"
+
+
+def _rate_limited_ship_run(tmp_path: Path) -> tuple[JobRegistry, WorkflowRun]:
+    steps = tuple(
+        WorkflowStep.from_dict({**step.to_dict(), "gate_result": "passed"})
+        if step.phase != "ship"
+        else step
+        for step in _manifest().steps
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"review": 1},
+        candidate_head="a" * 40,
+        verified_head="a" * 40,
+        gate_status="running",
+    )
+    return registry, run
+
+
+def test_ship_validator_rate_limit_does_not_raise_or_require_operator(tmp_path: Path) -> None:
+    """#370: a canonical GitHub provider AuthorityValidationError classified
+    as rate-limited (REASON_PROVIDER_RATE_LIMITED_CANONICAL, raised by
+    `load_work_authority` inside a real `build_production_ship_validator`)
+    must not behave like an arbitrary ship_validator failure -- it's a known
+    transient condition that resolves itself, not something needing a human.
+    Unlike `test_ship_validator_failure_persists_needs_human_on_review_complete_run`
+    (an *unclassified* RuntimeError, which correctly still needs_human+raises),
+    this must return a soft "provider-rate-limited" result and leave needs_human
+    untouched -- so a plain periodic tick resume (no operator) naturally
+    retries once the durable backoff clears, no human required."""
+    from paulsha_cortex.coordinator.claim import (
+        REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+        AuthorityValidationError,
+    )
+
+    registry, run = _rate_limited_ship_run(tmp_path)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    calls = []
+
+    def rate_limited_validator(**kwargs):
+        calls.append(kwargs)
+        raise AuthorityValidationError(
+            "durable GitHub provider authority rate-limited",
+            reason_code=REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+            repo=run.repo,
+            work_id=run.work_id,
+            provider_id=f"github:{run.repo}",
+            field="status",
+        )
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path,
+        operator_resume=True,
+        ship_validator=rate_limited_validator,
+    )
+
+    assert len(calls) == 1
+    assert result["reason"] == "provider-rate-limited"
+    assert result["run_id"] == run.run_id
+    assert isinstance(result.get("retry_after_epoch"), float)
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in persisted.facets
+    assert persisted.current_phase == "review"
+
+    # Durable: the backoff deadline is now on disk under coordinator_root,
+    # readable independently of anything resume_workflow_run kept in memory.
+    from paulsha_cortex.coordinator import provider_backoff
+
+    active = provider_backoff.active_backoff(tmp_path, f"github:{run.repo}", now=0.0)
+    assert active is not None
+    assert active.deadline_epoch == result["retry_after_epoch"]
+
+
+def test_resume_before_backoff_deadline_short_circuits_without_calling_ship_validator(
+    tmp_path: Path,
+) -> None:
+    """#370 acceptance: "operator resume 在 deadline 前給明確限流中訊息，
+    而非立即重撞" -- a resume attempt made *before* a previously-recorded
+    backoff deadline must not invoke ship_validator (and therefore not
+    touch GitHub-derived authority) again at all."""
+    import time
+
+    from paulsha_cortex.coordinator import provider_backoff
+
+    registry, run = _rate_limited_ship_run(tmp_path)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    # Real wall-clock "now" -- resume_workflow_run's short-circuit check
+    # compares the durable deadline against `time.time()`, not a fake clock.
+    provider_backoff.record_backoff(tmp_path, f"github:{run.repo}", now=time.time())
+
+    def must_not_be_called(**_kwargs):
+        raise AssertionError("ship_validator must not be called before backoff deadline")
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path,
+        operator_resume=True,
+        ship_validator=must_not_be_called,
+    )
+
+    assert result["reason"] == "provider-rate-limited"
+    assert "retry_after_epoch" in result
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in persisted.facets
 
 
 @pytest.mark.parametrize("terminal_phase", ["merged", "done"])
@@ -1750,7 +2164,14 @@ def test_build_card_advances_candidate_only_to_exact_descendant_head(tmp_path: P
         session_name="wf-tdd-red",
         log_path=str(log),
     )
-    _gate_ledger_passed(log)
+    # #379：tdd-red 卡 test_policy=red-required，manager 現在會要求 ledger 裡
+    # 出現 pytest 這個 gate；exit_code=1（RED 如預期失敗）才是 #307 語意反轉
+    # 認可的合格證據，對稱既有 test_manager_harvest_authorizes_tdd_red_card_
+    # with_expected_red_pytest 的寫法。
+    _gate_ledger_passed(
+        log,
+        gates=[{"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"}],
+    )
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
     terminal = manager.terminalize_workflow_job(
         registry,
@@ -2047,6 +2468,202 @@ def test_brainstorm_authority_resolves_exact_manager_archive_after_active_path_m
     with pytest.raises(ValueError, match="artifact hash drift"):
         manager._validated_brainstorm_planning_authority(
             untrusted,
+            coordinator_root=coordinator_root,
+        )
+
+
+def _materialize_authority_fixture(
+    tmp_path: Path,
+    *,
+    extra_digest_matches_todo: bool = True,
+    extra_ref_matches_plan_pattern: bool = True,
+) -> tuple[SimpleNamespace, Path, str]:
+    """issue #418 樁：重現 #414 deterministic plan pass materialize 出的
+    canonical plan 檔（與 brainstorm 實際發佈的
+    `docs/superpowers/workstreams/<slug>/todo.md` 是同一份內容的
+    byte-copy，只是路徑不同，為了對齊 build 端 declared input pattern）與
+    brainstorm evidence 對帳。回傳 ``(run, coordinator_root, canonical_ref)``。
+    """
+
+    slug = "materialize-authority-repro"
+    workspace = tmp_path / "workspace"
+    coordinator_root = tmp_path / "coordinator"
+    plan_body = "---\nstatus: accepted\n---\n# Plan\n## Tasks\n- Ship.\n"
+    other_plan_body = "---\nstatus: accepted\n---\n# Plan\n## Tasks\n- Different.\n"
+    spec_body = "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n"
+    design_body = "---\nstatus: accepted\n---\n# Design\n## Decisions\nBound.\n"
+
+    todo_ref = f"docs/superpowers/workstreams/{slug}/todo.md"
+    spec_ref = f"docs/superpowers/specs/{slug}-spec.md"
+    design_ref = f"docs/superpowers/specs/{slug}-design.md"
+    canonical_ref = (
+        f"docs/superpowers/plans/{slug}-plan.md"
+        if extra_ref_matches_plan_pattern
+        else f"docs/superpowers/plans-archive/{slug}-plan.md"
+    )
+
+    def _write(ref: str, body: str) -> Path:
+        path = workspace / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    todo_path = _write(todo_ref, plan_body)
+    spec_path = _write(spec_ref, spec_body)
+    design_path = _write(design_ref, design_body)
+    canonical_path = _write(
+        canonical_ref, plan_body if extra_digest_matches_todo else other_plan_body
+    )
+
+    artifact_rows = [
+        {"kind": "plan", "ref": todo_ref, "sha256": manager._sha256_path(todo_path)},
+        {"kind": "spec", "ref": spec_ref, "sha256": manager._sha256_path(spec_path)},
+        {"kind": "design", "ref": design_ref, "sha256": manager._sha256_path(design_path)},
+    ]
+    evidence = coordinator_root / "evidence" / "planning" / "brainstorm.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "brainstorm-peer",
+                "scope": {
+                    "repo": "hamanpaul/paulsha-cortex",
+                    "work_id": slug,
+                    "source_revision": "2" * 64,
+                },
+                "artifacts": artifact_rows,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    define_step = WorkflowStep(
+        phase="define",
+        persona="planner",
+        card="brainstorming",
+        executor=None,
+        model=None,
+        domain=None,
+        inputs=(),
+        outputs=(
+            f"docs/superpowers/specs/*{slug}*-spec.md",
+            f"docs/superpowers/specs/*{slug}*-design.md",
+        ),
+        gate_result="passed",
+    )
+    plan_step = WorkflowStep(
+        phase="plan",
+        persona="planner",
+        card="writing-plans",
+        executor=None,
+        model=None,
+        domain=None,
+        inputs=(),
+        outputs=(f"docs/superpowers/plans/*{slug}*.md",),
+        gate_result="passed",
+    )
+
+    planning_authority = (
+        PlanningArtifactAuthority(
+            ref=spec_ref,
+            kind="spec",
+            work_id=slug,
+            baseline_sha256=manager._sha256_path(spec_path),
+        ),
+        PlanningArtifactAuthority(
+            ref=design_ref,
+            kind="design",
+            work_id=slug,
+            baseline_sha256=manager._sha256_path(design_path),
+        ),
+        PlanningArtifactAuthority(
+            ref=todo_ref,
+            kind="plan",
+            work_id=slug,
+            baseline_sha256=manager._sha256_path(todo_path),
+        ),
+        # #414 materialize 出的 canonical plan 副本：不在 brainstorm evidence
+        # 的 artifacts 列表中（brainstorm 只發佈了 todo_ref），但已隨
+        # deterministic plan pass 併入 `run.planning_authority`。
+        PlanningArtifactAuthority(
+            ref=canonical_ref,
+            kind="plan",
+            work_id=slug,
+            baseline_sha256=manager._sha256_path(canonical_path),
+        ),
+    )
+
+    run = SimpleNamespace(
+        repo="hamanpaul/paulsha-cortex",
+        work_id=slug,
+        workspace_root=str(workspace),
+        steps=(define_step, plan_step),
+        openspec_refs=(slug,),
+        brainstorm_required=True,
+        planning_source_revision="2" * 64,
+        planning_authority=planning_authority,
+        gate_refs=(
+            GateEvidenceRef("brainstorm", str(evidence), manager._sha256_path(evidence)),
+        ),
+    )
+    return run, coordinator_root, canonical_ref
+
+
+def test_brainstorm_authority_accepts_materialized_plan_byte_copy(tmp_path: Path) -> None:
+    """issue #418：materialized canonical plan（`docs/superpowers/plans/<slug>.md`）
+    是 brainstorm 發佈的 `todo.md` 的 byte-copy（同 digest、同 kind=plan、同
+    work_id），且 ref 落在 plan phase 宣告的 output pattern 內——這是合法副本，
+    不應被判定為 evidence omission；回傳的 authority 仍要保留這筆副本，讓
+    build worktree 能繼續透過 authority_refs fallback seed 到它。修正前
+    （單純 `set(persisted) - set(scanned)` 非空即 raise）本測試必 RED。"""
+
+    run, coordinator_root, canonical_ref = _materialize_authority_fixture(tmp_path)
+
+    authority, source_revision = manager._validated_brainstorm_planning_authority(
+        run,
+        coordinator_root=coordinator_root,
+    )
+
+    assert authority == run.planning_authority
+    assert source_revision == "2" * 64
+    assert canonical_ref in {item.ref for item in authority}
+
+
+def test_brainstorm_authority_rejects_materialized_plan_with_different_digest(
+    tmp_path: Path,
+) -> None:
+    """負向樁：canonical plan 副本內容與任何已驗證的 brainstorm kind=plan
+    entry 皆不同（非 byte-copy）——這是真正的 omission，必須維持 raise，
+    不可被 #418 的例外路徑誤放行。"""
+
+    run, coordinator_root, _canonical_ref = _materialize_authority_fixture(
+        tmp_path, extra_digest_matches_todo=False,
+    )
+
+    with pytest.raises(ValueError, match="omits persisted authority"):
+        manager._validated_brainstorm_planning_authority(
+            run,
+            coordinator_root=coordinator_root,
+        )
+
+
+def test_brainstorm_authority_rejects_persisted_ref_outside_plan_output_pattern(
+    tmp_path: Path,
+) -> None:
+    """負向樁：即使 digest 對得上，若多出的 persisted ref 不落在 plan phase
+    宣告的 output pattern 內，就不是 `_materialize_plan_card_output` 會產生
+    的路徑形狀——必須維持 raise，避免例外路徑被濫用成任意 ref 的 omission
+    漏洞。"""
+
+    run, coordinator_root, _canonical_ref = _materialize_authority_fixture(
+        tmp_path, extra_ref_matches_plan_pattern=False,
+    )
+
+    with pytest.raises(ValueError, match="omits persisted authority"):
+        manager._validated_brainstorm_planning_authority(
+            run,
             coordinator_root=coordinator_root,
         )
 
@@ -2468,7 +3085,18 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
             log_path.with_suffix(".exit").write_text("0", encoding="utf-8")
-            _gate_ledger_passed(log_path)
+            # #379：build phase 卡片若宣告 test_policy（tdd-red=red-required／
+            # subagent-build=focused），manager 現在要求 ledger 出現對應的
+            # pytest gate，否則 fail closed；其餘卡片（含 worktree-isolation
+            # 與 plan/verify/review phase）維持既有空 gate 清單。
+            build_gate_rows = None
+            if phase == "build" and card == "tdd-red":
+                build_gate_rows = [
+                    {"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"}
+                ]
+            elif phase == "build" and card == "subagent-build":
+                build_gate_rows = [{"name": "pytest", "status": "passed", "exit_code": 0}]
+            _gate_ledger_passed(log_path, gates=build_gate_rows)
             return LaunchHandle(
                 executor=str(job["executor"]), model_id=str(job["model_id"]),
                 session_name=slice_id, pid=100, log_path=str(log_path),
@@ -4504,7 +5132,14 @@ def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> 
     }
     rows = []
     for kind, body in bodies.items():
-        ref = f"docs/{kind}.md"
+        # #414：同上——plan 的 ref 需落在 writing-plans 卡宣告的 canonical
+        # outputs glob 內，否則 deterministic pass 前的驗證判定缺席，觸發
+        # materialize fallback，多出一筆 planning_authority。
+        ref = (
+            "docs/superpowers/plans/production-wiring.md"
+            if kind == "plan"
+            else f"docs/{kind}.md"
+        )
         path = tmp_path / ref
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")

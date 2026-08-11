@@ -126,6 +126,40 @@ def test_recover_mutations_map_to_existing_request_types_and_arguments(
     assert capsys.readouterr().err == ""
 
 
+def test_recover_slice_retry_review_forwards_review_identity(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # #396 item 4：`cortex recover slice` 是 slice-action 的 porcelain 入口，
+    # 需要跟 `cortex slice-action`（coordinator/cli.py）一樣可以帶
+    # --review-executor/--review-model，否則 reviewer-identity-missing 仍無法
+    # 從這個入口補。
+    argv = [
+        "recover",
+        "slice",
+        "slice-92",
+        "retry-review",
+        "--actor",
+        "operator@example",
+        "--review-executor",
+        "codex",
+        "--review-model",
+        "gpt-5.4",
+    ]
+    assert _run_cli(argv) == 3
+
+    request = _submitted_request()
+    assert request["type"] == "slice-action"
+    assert request["args"] == {
+        "slice_id": "slice-92",
+        "action": "retry-review",
+        "actor": "operator@example",
+        "review_executor": "codex",
+        "review_model": "gpt-5.4",
+    }
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.parametrize(
     "argv",
     [

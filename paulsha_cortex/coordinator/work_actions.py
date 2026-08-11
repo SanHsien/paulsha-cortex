@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -56,6 +57,8 @@ from .preflight import PreflightRequest, load_preflight_command, run_preflight
 from .work_bridge import current_sizing_snapshot, resolve_trusted_repo_root, workflow_status
 from .workflow import GateEvidenceRef
 
+
+logger = logging.getLogger(__name__)
 
 Runner = Callable[..., object]
 ShipExecutor = Callable[[dict[str, Any], object], dict[str, Any]]
@@ -1630,11 +1633,33 @@ def _claim_action(
         active = canonical_run.to_dict()
         active["reason"] = decision.reason
     elif canonical_run is not None:
-        if args.get("action") == "resume" and decision.action in {
-            "resume",
-            "needs_human",
-            "blocked",
-        }:
+        # #420：`decision.action == "resume"` 只代表 `_resume_decision` 判定
+        # `active_status == "ongoing"`（needs_human/blocked/done/
+        # needs_decomposition 都有自己的專屬分支，不會落到這裡）——即 facets
+        # 乾淨、單純還在跑。explicit `cortex work resume`（`args["action"] ==
+        # "resume"`）本就會在這裡重呼叫 `workflow_starter`，讓仍卡在 define
+        # phase（`apply_workflow_action(action="start")` 的 claim→define→plan
+        # 同步續推段被中途打斷，例如 `_load_planning_artifacts` 之類未被
+        # needs_human 分支接住的例外）的 run 有機會重跑一次。periodic
+        # auto-claim scan（`automatic=True`，`args["action"] == "auto-scan"`）
+        # 過去完全不滿足 `args.get("action") == "resume"` 這個字面比對，導致
+        # 同一個 claim_key 每輪都只落到下面 `active = canonical_run.to_dict()`
+        # 的原樣反映——`workflow_starter` 永遠不會再被呼叫。這正是 auto-claim
+        # 建立的 run 完成 define 前若被中斷，就永久卡住、explicit intake 卻能
+        # 在同一 request 內同步續推的根因（#420）。這裡加上
+        # `automatic and decision.action == "resume"` 這個等價觸發，且刻意
+        # **不**擴及 needs_human/blocked：那兩個分支仍只在明確
+        # `args["action"] == "resume"`（即人工介入）時才重試，維持 #373 的
+        # 守衛——auto-claim 不得自動清除或重試 needs_human run。
+        # `start_canonical_workflow` 對非 define phase 的既有 run 本就是原樣
+        # early return（見 work_bridge.py `_claimable_existing_runs`／
+        # `existing_run.current_phase != "define"` 短路），故對 plan/build/
+        # verify/review 等已推進的 run 重呼叫 `workflow_starter` 是安全的
+        # no-op，不會產生非預期的重派工。
+        if (
+            args.get("action") == "resume"
+            and decision.action in {"resume", "needs_human", "blocked"}
+        ) or (automatic and decision.action == "resume"):
             if workflow_starter is None:
                 raise RuntimeError("canonical workflow starter unavailable")
             canonical_run = workflow_starter(
@@ -2204,6 +2229,90 @@ def _recover_planning_record(
     return {"ref": str(target), "hash": digest}
 
 
+def _gc_one_abandoned_planning_artifact(item, *, workspace_root: Path) -> None:
+    """單一 planning artifact 的 best-effort GC；只在確定安全時才刪檔。
+
+    #416：`item`（`PlanningArtifactAuthority`）記錄 brainstorm define 成功發佈
+    這份 artifact 時的 ref／baseline_sha256。abandon 之後，只有「未被 git
+    追蹤」且「現存內容 hash 與發佈時 baseline 完全相符」才視為安全可回滾的
+    發佈殘留；任何不確定（已追蹤、hash 不符、symlink、tracking 狀態查不到）
+    一律留檔——寧可留下需要人工清的殘留，也不能誤刪 operator 內容。呼叫端
+    （`_gc_abandoned_planning_artifacts`）負責吞掉這裡拋出的例外，這裡本身
+    保持該拋就拋，讓呼叫端統一記 diagnostics。
+    """
+
+    relative = Path(item.ref)
+    if relative.is_absolute() or ".." in relative.parts:
+        # `PlanningArtifactAuthority.__post_init__` 已擋過一次，這裡是縱深防禦。
+        raise ValueError(f"planning authority ref outside workspace: {item.ref}")
+    resolved_root = workspace_root.resolve()
+    path = (resolved_root / relative).resolve()
+    try:
+        path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"planning authority ref escapes workspace: {item.ref}") from exc
+    if path.is_symlink() or not path.is_file():
+        # 已不存在（可能已被清過或本來就沒發佈成功）、或不是一般檔案——
+        # 兩者都不是本 GC 的安全操作範圍，視為 no-op。
+        return
+    tracked = subprocess.run(
+        ["git", "-C", str(resolved_root), "ls-files", "--error-unmatch", "--", str(relative)],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if tracked.returncode == 0:
+        logger.info(
+            "planning-artifact-gc-skip-tracked ref=%s reason=git-tracked", item.ref,
+        )
+        return  # git 已追蹤：不是「未提交的發佈殘留」，交給 git 正常流程管理。
+    if tracked.returncode != 1:
+        raise RuntimeError(
+            f"planning artifact git tracking state unavailable: {item.ref}: "
+            f"{tracked.stderr.strip()[:200]}"
+        )
+    actual_hash = verification.sha256_bytes(path.read_bytes())
+    if actual_hash != item.baseline_sha256:
+        logger.warning(
+            "planning-artifact-gc-skip-hash-drift ref=%s expected=%s actual=%s",
+            item.ref, item.baseline_sha256, actual_hash,
+        )
+        return  # operator 手動改過：不可信任 baseline 已過期，留檔待人工判斷。
+    path.unlink()
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    logger.info("planning-artifact-gc-removed ref=%s", item.ref)
+
+
+def _gc_abandoned_planning_artifacts(run) -> None:
+    """abandon 終態化之後，盡力回收已發佈未提交的 planning artifacts。
+
+    #416 根因：`_PlanningPublicationTransaction` 的 rollback 只在 define 流程
+    內部失敗時觸發；一旦成功 commit（`run.planning_authority` 落地、journal
+    刪除），run 若隨後被 abandon，沒人知道要回滾這些已發佈檔案。下一世代重新
+    claim 後 brainstorm 對同一 destinations 再發佈時，`_publish_planning_
+    artifacts` 對「檔案已存在但無對應 authority」一律 fail-closed 拒收，殘留檔
+    變成死鎖地雷。
+
+    GC 的安全邊界由 `_gc_one_abandoned_planning_artifact` 逐項把關（未追蹤 +
+    hash 相符才刪）；這裡只負責逐項呼叫、吞掉任何例外——GC 是 abandon 的附帶
+    效果，不得讓 abandon 本身因為 GC 失敗而失敗，失敗只記 diagnostics。
+    """
+
+    workspace_root = Path(run.workspace_root)
+    for item in run.planning_authority:
+        try:
+            _gc_one_abandoned_planning_artifact(item, workspace_root=workspace_root)
+        except Exception as exc:  # noqa: BLE001 - best-effort：GC 不得讓 abandon 失敗
+            logger.warning(
+                "planning-artifact-gc-failed run_id=%s ref=%s error=%s: %s",
+                run.run_id, item.ref, type(exc).__name__, str(exc)[:200],
+            )
+
+
 def _superseded_abandon_body(
     run,
     *,
@@ -2347,6 +2456,10 @@ def _abandon_action(
             run.run_id,
             evidence_ref=record["ref"],
         )
+        # #416：重入分支同樣要嘗試 GC——覆蓋「第一次 GC 之後、下一次 abandon
+        # 呼叫之前殘留仍未清乾淨」的窗口；已清過的項目在這裡自然是 no-op
+        # （`_gc_one_abandoned_planning_artifact` 對已不存在的檔案直接略過）。
+        _gc_abandoned_planning_artifacts(updated)
         return {
             "action": "abandoned",
             "reason": reason,
@@ -2364,7 +2477,21 @@ def _abandon_action(
         f"{authority.repo}#{number}" for number in authority.mapped_issues
     )
     if run.issue_refs != expected_issues or run.openspec_refs != authority.mapped_openspec:
-        raise RuntimeError("abandon WorkflowRun refs differ from current WorkAuthority")
+        # #410（孤兒救援，建議 2 的窄放行）：work item 改名／重識別後，舊識別的
+        # authority 會失去 issue/openspec 映射（例如 tombstone row 只剩 path 錨點、
+        # 或 collision 使 correlation 不再把 issue 分派給本 work_id），此時 run 的
+        # refs 與 authority 恆不相等，孤兒 run 永遠不可 abandon——與 v3 相撞的
+        # 認領也永遠無法釋放。僅在「authority 完全失去 issue 與 openspec 映射、
+        # 而 run 仍留有 refs」這個孤兒簽名下放行；一般 abandon（authority 映射
+        # 完整）維持嚴格相等。expected_run_id／actor／reason 的強制項與上方的
+        # 單一 ongoing 檢查不變，abandon evidence 照常落盤留稽核。
+        orphan_rescue = (
+            not authority.mapped_issues
+            and not authority.mapped_openspec
+            and bool(run.issue_refs or run.openspec_refs)
+        )
+        if not orphan_rescue:
+            raise RuntimeError("abandon WorkflowRun refs differ from current WorkAuthority")
     body = {
         "schema": "cortex-work-abandon/v1",
         "repo": authority.repo,
@@ -2404,6 +2531,10 @@ def _abandon_action(
         run.run_id,
         evidence_ref=record["ref"],
     )
+    # #416：run 終態化為 superseded 之後，盡力回收已發佈未提交的 planning
+    # artifacts——放在狀態轉換之後，確保只有 abandon 真的成立時才動檔案；
+    # GC 本身 best-effort、不 raise，失敗不得讓已經成功的 abandon 跟著失敗。
+    _gc_abandoned_planning_artifacts(updated)
     return {
         "action": "abandoned",
         "reason": reason,

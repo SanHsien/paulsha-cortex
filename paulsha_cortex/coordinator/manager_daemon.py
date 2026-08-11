@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,12 +20,13 @@ from typing import Any, Callable
 from paulsha_cortex.config import paths
 from paulsha_cortex.lib import file_lock
 from ..control import constants, contract
-from . import autonomy, manager, planning_runtime
+from . import autonomy, backoff, manager, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .dispatcher import Dispatcher
 from .model_identities import load_model_identities
 from .registry import JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
+from .spawn_admission import DEFAULT_MIN_INTERVAL_SECONDS, SpawnAdmissionLimiter, build_default_limiter
 from .work_actions import safe_exception_summary
 from paulsha_cortex.lib.path_safety import redact_absolute_paths
 
@@ -43,14 +45,13 @@ MANAGER_CMD_MARKER = "paulsha_cortex.coordinator.manager_daemon"
 
 # Periodic-tick failure resilience (issue #249): a persistently failing tick
 # must never retry every poll cycle -- that turns a 5-minute schedule into a
-# hot loop. Consecutive failures back off the next attempt exponentially
-# (``tick_interval * BASE**min(failures, MAX_EXPONENT)``); once
-# TICK_CIRCUIT_BREAKER_THRESHOLD consecutive failures accrue, periodic ticks
-# pause entirely for TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS before one more
-# attempt is made. Request-queue processing (including a manual "tick"
-# request, the operator's rescue channel) is never gated by any of this.
-TICK_BACKOFF_MULTIPLIER_BASE = 2.0
-TICK_BACKOFF_MAX_EXPONENT = 4  # caps backoff at tick_interval * 2**4 = 16x
+# hot loop. Consecutive failures back off the next attempt exponentially via
+# `backoff.tick_backoff_seconds` (``tick_interval * BASE**min(failures,
+# MAX_EXPONENT)``, see backoff.py); once TICK_CIRCUIT_BREAKER_THRESHOLD
+# consecutive failures accrue, periodic ticks pause entirely for
+# TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS before one more attempt is made.
+# Request-queue processing (including a manual "tick" request, the
+# operator's rescue channel) is never gated by any of this.
 TICK_CIRCUIT_BREAKER_THRESHOLD = 6  # consecutive failures before ticks pause
 TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0  # cool-down before one retry
 
@@ -203,18 +204,15 @@ def _repo_from_manifest(payload: dict[str, Any]) -> str | None:
     )
 
 
-def _tick_backoff_seconds(base_interval: float, consecutive_failures: int) -> float:
-    """Exponential backoff interval for the next periodic-tick retry.
-
-    Doubles per consecutive failure, capped at ``TICK_BACKOFF_MAX_EXPONENT``
-    doublings, so a persistently failing tick backs off instead of retrying
-    on every poll cycle. ``consecutive_failures <= 0`` (no prior failure)
-    returns the unmodified ``base_interval``, preserving today's cadence.
-    """
-    if consecutive_failures <= 0:
-        return base_interval
-    exponent = min(consecutive_failures, TICK_BACKOFF_MAX_EXPONENT)
-    return base_interval * (TICK_BACKOFF_MULTIPLIER_BASE**exponent)
+# #370: the exponential curve itself now lives in `backoff.py` (pure, no
+# internal deps) so `provider_backoff.py`'s durable GitHub rate-limit
+# backoff can reuse it without a circular import back into this module.
+# Re-exported under the original names -- callers/tests/docs referencing
+# `manager_daemon._tick_backoff_seconds` / `TICK_BACKOFF_MAX_EXPONENT` /
+# `TICK_BACKOFF_MULTIPLIER_BASE` keep working unchanged.
+_tick_backoff_seconds = backoff.tick_backoff_seconds
+TICK_BACKOFF_MAX_EXPONENT = backoff.BACKOFF_MAX_EXPONENT
+TICK_BACKOFF_MULTIPLIER_BASE = backoff.BACKOFF_MULTIPLIER_BASE
 
 
 def _safe_tick_error_summary(exc: Exception) -> dict[str, str]:
@@ -463,6 +461,7 @@ def build_request_executor(
     workflow_ship_validator=None,
     work_action_fn: Callable[..., dict[str, Any]] | None = None,
     stage_evidence_validator: Callable[[dict[str, str]], bool] | None = None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
@@ -779,6 +778,7 @@ def build_request_executor(
                 git_runner=getattr(dispatcher, "_git_runner", None),
                 identity_registry=builder_identity_registry,
                 launcher_factory=builder_launcher_factory,
+                spawn_admission=spawn_admission,
             )
             job = dispatched[0]
             if registry is None:
@@ -807,9 +807,19 @@ def build_request_executor(
             model=requested_model,
         )
         if request_type == "fanout":
+            # issue #383：手動 `cortex fanout` 過去直接把全部 metas 餵給
+            # dispatch_ready_fn，完全沒有 run_tick() 那層 in-flight active／
+            # already_terminal 過濾——同一 snapshot 下兩條路徑對同一批 slice
+            # 給出不同答案。這裡改呼叫與 run_tick() 共用的 dispatch_gate_scan()，
+            # 消除分歧：仍會排除 in-flight job／與 registry 現況一致的終局
+            # manifest，但已復原（registry state=="pending"）的 slice 不再被
+            # 殘留 manifest 誤擋。
+            fanout_metas, _already_terminal, _needs_human = manager.dispatch_gate_scan(
+                metas, handoff_dir=request_handoff_dir, registry=getattr(dispatcher, "_registry", None)
+            )
             jobs = _call_with_supported_kwargs(
                 dispatch_ready_fn,
-                metas,
+                fanout_metas,
                 predicate,
                 dispatcher,
                 persona=persona,
@@ -818,6 +828,7 @@ def build_request_executor(
                 git_runner=getattr(dispatcher, "_git_runner", None),
                 identity_registry=builder_identity_registry,
                 launcher_factory=builder_launcher_factory,
+                spawn_admission=spawn_admission,
             )
             return {
                 "dispatch_skipped": False,
@@ -837,6 +848,7 @@ def build_request_executor(
             "reaper": reaper,
             "identity_registry": builder_identity_registry,
             "launcher_factory": builder_launcher_factory,
+            "spawn_admission": spawn_admission,
         }
         if requested_review_executor is not None or requested_review_model is not None:
             run_tick_kwargs.update(
@@ -875,7 +887,14 @@ def build_periodic_tick_runner(
     auto_claim_fn: Callable[[], list[dict[str, Any]]] | None = None,
     workflow_identity_registry=None,
     workflow_ship_validator=None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> Callable[[], dict[str, Any]]:
+    """#381：``spawn_admission``（若提供）在同一個 runner 的整個生命週期內只解析
+    一次，讓 workflow resume 迴圈與其後的 run_tick（fanout）在同一輪、甚至跨輪
+    tick 之間，對同一 provider 共用同一個節流時間軸——而不是各自建一個互不知情
+    的 limiter。未提供時原樣傳 ``None`` 往下遞交給 resume/run_tick 各自的
+    no-op 預設（見 spawn_admission.resolve_limiter），行為與未接線前完全相同。
+    """
     predicate = lambda slice_id: autonomy.default_is_satisfied(
         slice_id,
         handoff_dir=handoff_dir,
@@ -917,7 +936,17 @@ def build_periodic_tick_runner(
                 else paths.coordinator_root().resolve()
             )
             for workflow in registry.list_workflow_runs():
-                if workflow.status != "ongoing" or "blocked" in workflow.facets:
+                if (
+                    workflow.status != "ongoing"
+                    or "blocked" in workflow.facets
+                    # #373 縱深防禦：manager.resume_workflow_run 自身已對
+                    # needs_human 做 early-return（operator_resume 預設
+                    # False），這裡的迴圈守衛跟它對齊，不把已經 needs_human
+                    # 的 run 送進去白跑一趟——尤其是同一 tick 內剛被
+                    # authority-restart reset 剝除過 needs_human 又再度標記
+                    # needs_human 的 run，不必每個 tick 都重新嘗試一次。
+                    or "needs_human" in workflow.facets
+                ):
                     continue
                 if workflow.current_phase not in {"plan", "build", "verify", "review"}:
                     continue
@@ -934,13 +963,18 @@ def build_periodic_tick_runner(
                             registry=registry,
                             coordinator_root=coordinator_root,
                         )
-                    manager.resume_workflow_run(
+                    # #381：透過 _call_with_supported_kwargs 遞交 spawn_admission——
+                    # 舊版（尚未認得這個參數的）injected fake 仍相容，不會因為新增
+                    # 這個可選 kwarg 而 TypeError。
+                    _call_with_supported_kwargs(
+                        manager.resume_workflow_run,
                         dispatcher,
                         run_id=workflow.run_id,
                         identities=identities,
                         launcher_factory=workflow_launcher_factory,
                         coordinator_root=coordinator_root,
                         ship_validator=active_ship_validator,
+                        spawn_admission=spawn_admission,
                     )
                 except Exception as exc:
                     _log_error(
@@ -999,6 +1033,7 @@ def build_periodic_tick_runner(
                 allow_unsafe=default_allow_unsafe,
                 model=identity.model_id,
             ),
+            "spawn_admission": spawn_admission,
         }
         if default_review_executor is not None or default_review_model is not None:
             run_tick_kwargs.update(
@@ -1045,6 +1080,7 @@ def run_loop(
     default_review_model: str | None = None,
     reaper: Callable[[], dict[str, Any]] | None = None,
     recent_done_window_seconds: float | None = RECENT_DONE_WINDOW_SECONDS,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> bool:
     runtime_pid = os.getpid() if pid is None else pid
     held_lock = acquire_lock(pid=runtime_pid, pid_alive=pid_alive, now_fn=now_fn)
@@ -1089,6 +1125,11 @@ def run_loop(
                     "default_review_model": default_review_model,
                 }
             )
+        # #381：只在明確提供時才帶入這個 kwarg（比照 default_model 的既有慣例）——
+        # 保留 build_request_executor 未升級前就已存在的注入測試相容（strict
+        # keyword-only fake 沒有 spawn_admission 這個參數）。
+        if spawn_admission is not None:
+            executor_kwargs["spawn_admission"] = spawn_admission
         executor = build_request_executor(**executor_kwargs)
     provider = status_provider or build_runtime_status_provider(
         registry=ensure_registry(),
@@ -1119,6 +1160,11 @@ def run_loop(
                     "default_review_model": default_review_model,
                 }
             )
+        # #381：同一個 spawn_admission instance 同時餵給 executor（手動
+        # dispatch/fanout/tick 請求）與 periodic runner（自動 tick 的 workflow
+        # resume + fanout）——兩條 lane 才會對同一個 provider 共用節流時間軸。
+        if spawn_admission is not None:
+            periodic_kwargs["spawn_admission"] = spawn_admission
         periodic_runner = build_periodic_tick_runner(**periodic_kwargs)
 
     constants.requests_dir().mkdir(parents=True, exist_ok=True)
@@ -1311,13 +1357,15 @@ def _pid_alive(pid: int) -> bool:
                 [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=5,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return result.returncode == 0 and MANAGER_CMD_MARKER in result.stdout
+        return result.returncode == 0 and MANAGER_CMD_MARKER in (result.stdout or "")
 
     try:
         os.kill(pid, 0)
@@ -1349,12 +1397,26 @@ def _install_signal_handlers() -> None:
 # _reset_log_error_dedup_state() -- called at the top of run_loop -- so a
 # fresh daemon process (or a fresh test invocation of run_loop) never
 # inherits suppression counters from a previous run.
-_LOG_ERROR_DEDUP_STATE: dict[str, Any] = {"signature": None, "repeat_count": 0}
+#
+# issue #374：早期實作是「單槽」——整個 dedup state 只存一筆
+# signature+count，一輪 tick 交錯出現多個不同 signature（實測每輪 14 個，
+# 來自 #373 的 14 個受害 run）時，下一筆一旦 signature 不同就把槽位整個
+# 重置，導致 ``signature != state["signature"]`` 恆真、每筆都印、抑制摘要
+# 永遠不會觸發——#249 想解決的洪水問題在多 signature 交錯下形同虛設。
+# 改為「多槽 LRU」：以 signature 為 key，各自獨立計數與抑制；
+# ``OrderedDict`` 提供 O(1) 的 move-to-end／popitem(last=False)，
+# 用來實作有界容量下「淘汰最久未用者」的 LRU 語意，避免
+# signature 含 source_revision（#373 的迴圈會改寫它）時無界成長。
+_LOG_ERROR_DEDUP_STATE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+# LRU 容量上限：#373 情境下實測每輪最多交錯 14 個並行 signature，64 留有
+# 充裕餘裕，同時避免長時間運行的 daemon 因 signature 種類持續增生
+# （例如 source_revision 不斷變動）而讓 dedup state 無界成長。
+LOG_ERROR_DEDUP_MAX_SLOTS = 64
 
 
 def _reset_log_error_dedup_state() -> None:
-    _LOG_ERROR_DEDUP_STATE["signature"] = None
-    _LOG_ERROR_DEDUP_STATE["repeat_count"] = 0
+    _LOG_ERROR_DEDUP_STATE.clear()
 
 
 def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None:
@@ -1371,6 +1433,14 @@ def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None
     LOG_ERROR_SUMMARY_INTERVAL occurrences, so a persistently failing tick
     can no longer flood the log the way it did in #249 -- while still
     leaving evidence that the failure is ongoing.
+
+    Multi-slot LRU (#374): suppression state is keyed per signature (up to
+    ``LOG_ERROR_DEDUP_MAX_SLOTS`` concurrently-tracked signatures), so
+    interleaved errors of different signatures each get their own
+    independent count/suppression instead of resetting a single shared
+    slot on every mismatch. Slots beyond the cap are evicted least-recently
+    -used first; an evicted signature is treated as first-seen again on its
+    next occurrence.
     """
     timestamp = contract.utcnow()
     signature = f"{type(exc).__name__}: {exc}"
@@ -1378,16 +1448,21 @@ def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None
         details = " ".join(f"{key}={value}" for key, value in context.items() if value is not None)
         if details:
             signature = f"{signature} ({details})"
-    state = _LOG_ERROR_DEDUP_STATE
-    if state["signature"] != signature:
-        state["signature"] = signature
-        state["repeat_count"] = 0
+
+    slot = _LOG_ERROR_DEDUP_STATE.get(signature)
+    if slot is None:
+        # 首見（或先前被 LRU 淘汰）：獨立開一個新槽，一律印出完整行。
+        if len(_LOG_ERROR_DEDUP_STATE) >= LOG_ERROR_DEDUP_MAX_SLOTS:
+            _LOG_ERROR_DEDUP_STATE.popitem(last=False)  # 淘汰最久未用的 slot
+        _LOG_ERROR_DEDUP_STATE[signature] = {"repeat_count": 0}
         print(f"{timestamp} manager_daemon error: {signature}", file=sys.stderr)
         return
-    state["repeat_count"] += 1
-    if state["repeat_count"] % LOG_ERROR_SUMMARY_INTERVAL == 0:
+
+    _LOG_ERROR_DEDUP_STATE.move_to_end(signature)  # 標記為最近使用，維持 LRU 順序
+    slot["repeat_count"] += 1
+    if slot["repeat_count"] % LOG_ERROR_SUMMARY_INTERVAL == 0:
         print(
-            f"{timestamp} manager_daemon error (repeated {state['repeat_count']}x since "
+            f"{timestamp} manager_daemon error (repeated {slot['repeat_count']}x since "
             f"first occurrence, most recent at {timestamp}): {signature}",
             file=sys.stderr,
         )
@@ -1414,8 +1489,29 @@ def main(argv: list[str] | None = None) -> int:
             "預設 86400（24 小時），亦可用 PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS 覆寫。"
         ),
     )
+    parser.add_argument(
+        "--spawn-min-interval-seconds",
+        type=float,
+        default=None,
+        help=(
+            "issue #381：per-provider spawn admission 的最小啟動間隔（秒）——"
+            "同一 provider（executor CLI，例如 copilot 啟動時連續探測 GitHub "
+            "/user）背靠背 spawn 時插入的最小間隔，不同 provider 互不阻塞。"
+            f"未指定時讀 PSC_SPAWN_MIN_INTERVAL_SECONDS，皆未設則用內建預設 "
+            f"{DEFAULT_MIN_INTERVAL_SECONDS} 秒；設為 0 停用節流。"
+        ),
+    )
     args = parser.parse_args(argv)
     _install_signal_handlers()
+
+    # #381：fanout（dispatch/fanout/tick 請求 ＋ periodic tick 的 run_tick）
+    # 與 workflow lane（periodic tick 的 resume 迴圈）在這裡拿到同一個
+    # SpawnAdmissionLimiter instance，往下分別注入 build_request_executor 與
+    # build_periodic_tick_runner，兩條 lane 才會對同一個 provider quota
+    # 共用節流時間軸，而不是各自為政。
+    spawn_admission_limiter = build_default_limiter(
+        min_interval_seconds=args.spawn_min_interval_seconds,
+    )
 
     started = run_loop(
         poll_interval=args.poll_interval,
@@ -1429,6 +1525,7 @@ def main(argv: list[str] | None = None) -> int:
         default_review_executor=args.review_executor,
         default_review_model=args.review_model,
         recent_done_window_seconds=args.recent_done_window_seconds,
+        spawn_admission=spawn_admission_limiter,
     )
     return 0 if started else 1
 

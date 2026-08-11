@@ -7,11 +7,12 @@ import tempfile
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.lib.durability import fsync_directory as _fsync_directory
 from . import verification
+from .claim import claim_key_for_authority_digest
 from .usage_extractors import extract_usage
 from .workflow import (
     GateEvidenceRef,
@@ -59,14 +60,48 @@ SLICE_STATE_TRANSITIONS = {
     "verified": frozenset({"verified", "completed", "needs_human"}),
     "completed": frozenset({"completed"}),
     "needs_human": frozenset({"needs_human", "pending", "building", "reviewing", "verified", "failed", "completed"}),
-    "failed": frozenset({"failed", "pending", "needs_human"}),
+    # "building" 併入 failed 的合法離開路徑（#382）：repin_slice() 刻意保留
+    # slice state（同 needs_human 的既有行為，見
+    # test_repin_slice_preserves_needs_human_until_explicit_retry_transition），
+    # 只重置 gate_state；retry-build 的實際派工路徑
+    # （autonomy.dispatch_ready -> _mark_slice_building）緊接著會把 state 從
+    # repin 前的原值直接轉成 "building"。needs_human 早就允許這條直接跳轉，
+    # failed 原本沒有，導致 repin 成功後下一步 _mark_slice_building 仍會
+    # raise，retry-build 整條路徑還是走不完。
+    "failed": frozenset({"failed", "pending", "needs_human", "building"}),
 }
 GATE_STATE_TRANSITIONS = {
     "pending": frozenset({"pending", "passed", "failed", "needs_human"}),
     "passed": frozenset({"passed"}),
-    "failed": frozenset({"failed", "needs_human"}),
+    # "failed" -> "pending" 對齊 SLICE_STATE_TRANSITIONS["failed"]（同樣允許
+    # failed -> pending）：兩張表原本不對稱是 #382 死鎖根因之一——slice state
+    # 可以復原、gate_state 卻永久卡死，讓 repin_slice()／retry-build 對
+    # failed/failed slice 保證失敗。
+    "failed": frozenset({"failed", "needs_human", "pending"}),
     "needs_human": frozenset({"needs_human", "pending", "passed", "failed"}),
 }
+
+# repin_slice() 接受重派的 slice state 集合。"failed" 併入此集合（#382）：
+# SLICE_STATE_TRANSITIONS 早就允許 failed -> pending，但 repin_slice() 自己
+# 這道硬編閘門沒跟上，導致宣告的 retry-build 對 failed slice 保證被拒。
+# 仍然刻意排除進行中／終局狀態（building/dispatched/running/exited/
+# reviewing/verified/completed）——repin 不該蓋過一個 active 中的 job。
+REPINNABLE_SLICE_STATES = frozenset({"pending", "needs_human", "failed"})
+
+
+def slice_repin_eligible(slice_row: dict[str, Any]) -> bool:
+    """判斷 `repin_slice()` 目前是否會接受這個 slice 的 `(state, gate_state)`。
+
+    `repin_slice()` 與 `manager.allowed_slice_actions()` 共用同一套判準
+    （同一份 REPINNABLE_SLICE_STATES／GATE_STATE_TRANSITIONS），確保
+    `allowed_slice_actions()` 宣告的 `retry-build` 一定是 `repin_slice()`
+    真的會接受的動作，不會宣告一個保證失敗的操作（#382）。
+    """
+    if str(slice_row.get("state")) not in REPINNABLE_SLICE_STATES:
+        return False
+    gate_state = str(slice_row.get("gate_state"))
+    return "pending" in GATE_STATE_TRANSITIONS.get(gate_state, frozenset())
+
 
 # StageExecutionKey 涵蓋的內容定址欄位（#214）：repo/work_id/card/phase/executor/
 # model/base_sha/candidate_sha/frozen_input_hashes/action/test_policy 任一改變都必須
@@ -473,7 +508,7 @@ class JobRegistry:
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
-            "usage_reason", "started_at", "exited_at",
+            "workflow_test_policy", "usage_reason", "started_at", "exited_at",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
@@ -516,6 +551,24 @@ class JobRegistry:
         ):
             raise ValueError(
                 f"coordinator 狀態檔 workflow_evidence 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        # #384：executor 失敗的 typed 分類（provider_outcome.py）。舊狀態檔沒有
+        # 這個欄位（None）；有的話必須是固定四鍵形狀，鍵值型別比照
+        # ProviderFailureClassification.to_dict()。
+        provider_outcome = job.get("provider_outcome")
+        if provider_outcome is not None and (
+            not isinstance(provider_outcome, dict)
+            or set(provider_outcome) != {"outcome", "authority", "reason", "retryable"}
+            or not isinstance(provider_outcome.get("outcome"), str)
+            or not provider_outcome["outcome"]
+            or not isinstance(provider_outcome.get("authority"), str)
+            or not provider_outcome["authority"]
+            or not isinstance(provider_outcome.get("reason"), str)
+            or not provider_outcome["reason"]
+            or not isinstance(provider_outcome.get("retryable"), bool)
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 provider_outcome 格式錯誤（fail-closed）: {self._state_path}"
             )
         for field in ("workflow_inputs", "workflow_outputs"):
             value = job.get(field)
@@ -733,6 +786,7 @@ class JobRegistry:
         workflow_output_baseline: tuple[dict[str, str], ...] = (),
         workflow_builder_job_id: str | None = None,
         workflow_stage_execution_key: str | None = None,
+        workflow_test_policy: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -781,7 +835,14 @@ class JobRegistry:
             "workflow_output_baseline": [dict(row) for row in workflow_output_baseline],
             "workflow_builder_job_id": workflow_builder_job_id,
             "workflow_stage_execution_key": workflow_stage_execution_key,
+            # #379：派工當下 pin 住的驗收判準快照（deck 卡片的 test_policy），
+            # harvest 時與 registry 現有 WorkflowRun.steps 的現值比對，drift 一律
+            # fail closed（見 manager._workflow_acceptance_definition_drifted）。
+            "workflow_test_policy": workflow_test_policy,
             "workflow_evidence": None,
+            # #384：executor 失敗的 typed 分類（見 provider_outcome.py），只在
+            # `update_headless_result` 收到失敗結果且能分類時才會被寫入。
+            "provider_outcome": None,
             "usage": None,
             "usage_raw": None,
             "usage_reason": None,
@@ -944,11 +1005,17 @@ class JobRegistry:
         *,
         status: str,
         exit_code: int,
+        provider_outcome: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in TERMINAL_JOB_STATUSES:
             raise ValueError(
                 f"headless 完成結果 status 須為 'exited' 或 'failed'，收到: {status!r}"
             )
+        if provider_outcome is not None and (
+            not isinstance(provider_outcome, Mapping)
+            or set(provider_outcome) != {"outcome", "authority", "reason", "retryable"}
+        ):
+            raise ValueError("provider_outcome 格式錯誤（fail-closed）")
         job = self._find_job(job_id)
         _validate_transition(
             field="job status",
@@ -959,6 +1026,10 @@ class JobRegistry:
         job["status"] = status
         job["exit_code"] = exit_code
         job["exited_at"] = _now_iso()
+        # #384：executor 失敗的 typed 分類（見 provider_outcome.py）。只在呼叫端
+        # 傳入時才寫入——`status == "exited"` 或呼叫端未提供分類（例如 launch
+        # 本身失敗、根本沒有 executor 輸出可分類）時保持 None，不偽造分類。
+        job["provider_outcome"] = dict(provider_outcome) if provider_outcome is not None else None
         # #325：usage 抽取是盡力而為的附加資訊，任何失敗都不得影響上面已判定
         # 好的 status/exit_code/exited_at——extract_usage 本身已 fail-soft，
         # 這裡再包一層防禦性雙保險。
@@ -1039,9 +1110,10 @@ class JobRegistry:
         dispatch_base: str | None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
-        if str(slice_row["state"]) not in {"pending", "needs_human"}:
+        if str(slice_row["state"]) not in REPINNABLE_SLICE_STATES:
             raise ValueError(
-                f"非法 slice state repin: {slice_row['state']!r}（只允許 pending/needs_human 重派）"
+                f"非法 slice state repin: {slice_row['state']!r}"
+                "（只允許 pending/needs_human/failed 重派）"
             )
         _validate_transition(
             field="gate_state",
@@ -1092,6 +1164,28 @@ class JobRegistry:
         verification_hash: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+
+        # Phase 1 — validate every provided field against the live row
+        # *without* mutating anything. #382: the previous validate-then-write
+        # ordering was interleaved per field, so a later field (e.g.
+        # gate_state) failing validation could raise *after* an earlier field
+        # (e.g. state) had already been written into the live `slice_row`
+        # object. That partial write was never persisted (the raise happens
+        # before `_persist()`), but it also never got corrected — the next
+        # *unrelated* `_persist()` call (from any other job/slice mutation)
+        # would flush the tainted in-memory row to disk. Validating
+        # everything up front means a rejected call cannot leave any trace,
+        # in memory or on disk.
+        new_current_evidence_refs = None
+        if current_evidence_refs is not None:
+            if not _is_ref_list(current_evidence_refs):
+                raise ValueError("current_evidence_refs 必須為字串陣列")
+            new_current_evidence_refs = _copy_ref_list(current_evidence_refs)
+        new_current_evaluation_refs = None
+        if current_evaluation_refs is not None:
+            if not _is_ref_list(current_evaluation_refs):
+                raise ValueError("current_evaluation_refs 必須為字串陣列")
+            new_current_evaluation_refs = _copy_ref_list(current_evaluation_refs)
         if state is not None:
             if state not in VALID_SLICE_STATES:
                 raise ValueError(f"非法 slice state: {state!r}")
@@ -1101,7 +1195,6 @@ class JobRegistry:
                 new=state,
                 allowed=SLICE_STATE_TRANSITIONS,
             )
-            slice_row["state"] = state
         if gate_state is not None:
             if gate_state not in VALID_GATE_STATES:
                 raise ValueError(f"非法 gate_state: {gate_state!r}")
@@ -1111,20 +1204,23 @@ class JobRegistry:
                 new=gate_state,
                 allowed=GATE_STATE_TRANSITIONS,
             )
-            slice_row["gate_state"] = gate_state
-        if current_evidence_refs is not None:
-            if not _is_ref_list(current_evidence_refs):
-                raise ValueError("current_evidence_refs 必須為字串陣列")
-            slice_row["current_evidence_refs"] = _copy_ref_list(current_evidence_refs)
-        if current_evaluation_refs is not None:
-            if not _is_ref_list(current_evaluation_refs):
-                raise ValueError("current_evaluation_refs 必須為字串陣列")
-            slice_row["current_evaluation_refs"] = _copy_ref_list(current_evaluation_refs)
         if builder_job_id is not None:
             self._validate_existing_job_ref("builder_job_id", builder_job_id)
-            slice_row["builder_job_id"] = builder_job_id
         if reviewer_job_id is not None:
             self._validate_existing_job_ref("reviewer_job_id", reviewer_job_id)
+
+        # Phase 2 — everything validated; apply every field together.
+        if state is not None:
+            slice_row["state"] = state
+        if gate_state is not None:
+            slice_row["gate_state"] = gate_state
+        if new_current_evidence_refs is not None:
+            slice_row["current_evidence_refs"] = new_current_evidence_refs
+        if new_current_evaluation_refs is not None:
+            slice_row["current_evaluation_refs"] = new_current_evaluation_refs
+        if builder_job_id is not None:
+            slice_row["builder_job_id"] = builder_job_id
+        if reviewer_job_id is not None:
             slice_row["reviewer_job_id"] = reviewer_job_id
         if candidate is not None:
             slice_row["candidate"] = candidate
@@ -1154,6 +1250,22 @@ class JobRegistry:
         result: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+
+        # Phase 1 — validate every provided field before mutating anything
+        # (#382, same rationale as update_slice above): a rejected multi-field
+        # transition must never leave a half-applied write sitting in the
+        # live `slice_row`, or an unrelated later `_persist()` call flushes
+        # the tainted row to disk.
+        new_evidence_refs = None
+        if evidence_refs is not None:
+            if not _is_ref_list(evidence_refs):
+                raise ValueError("evidence_refs 必須為字串陣列")
+            new_evidence_refs = _copy_ref_list(evidence_refs)
+        new_evaluation_refs = None
+        if evaluation_refs is not None:
+            if not _is_ref_list(evaluation_refs):
+                raise ValueError("evaluation_refs 必須為字串陣列")
+            new_evaluation_refs = _copy_ref_list(evaluation_refs)
         if state is not None:
             if state not in VALID_SLICE_STATES:
                 raise ValueError(f"非法 slice state: {state!r}")
@@ -1163,7 +1275,6 @@ class JobRegistry:
                 new=state,
                 allowed=SLICE_STATE_TRANSITIONS,
             )
-            slice_row["state"] = state
         if gate_state is not None:
             if gate_state not in VALID_GATE_STATES:
                 raise ValueError(f"非法 gate_state: {gate_state!r}")
@@ -1173,22 +1284,22 @@ class JobRegistry:
                 new=gate_state,
                 allowed=GATE_STATE_TRANSITIONS,
             )
+
+        # Phase 2 — everything validated; apply every field together, then
+        # persist exactly once.
+        if state is not None:
+            slice_row["state"] = state
+        if gate_state is not None:
             slice_row["gate_state"] = gate_state
-        if evidence_refs is not None:
-            if not _is_ref_list(evidence_refs):
-                raise ValueError("evidence_refs 必須為字串陣列")
-            refs = _copy_ref_list(evidence_refs)
-            slice_row["current_evidence_refs"] = refs
+        if new_evidence_refs is not None:
+            slice_row["current_evidence_refs"] = new_evidence_refs
             slice_row["evidence_history"].append(
-                {"action": action, "actor": actor, "refs": refs, "at": _now_iso()}
+                {"action": action, "actor": actor, "refs": new_evidence_refs, "at": _now_iso()}
             )
-        if evaluation_refs is not None:
-            if not _is_ref_list(evaluation_refs):
-                raise ValueError("evaluation_refs 必須為字串陣列")
-            refs = _copy_ref_list(evaluation_refs)
-            slice_row["current_evaluation_refs"] = refs
+        if new_evaluation_refs is not None:
+            slice_row["current_evaluation_refs"] = new_evaluation_refs
             slice_row["evaluation_history"].append(
-                {"action": action, "actor": actor, "refs": refs, "at": _now_iso()}
+                {"action": action, "actor": actor, "refs": new_evaluation_refs, "at": _now_iso()}
             )
         if candidate is not None:
             slice_row["candidate"] = candidate
@@ -1922,6 +2033,17 @@ class JobRegistry:
         review gate——比照 `_manager_reset_workflow_after_archive` 的『只清 verify/
         review』模式，build phase 已產出的 Candidate 維持不變，不是
         `_manager_reset_workflow_for_retry_build` 那種整個 build phase 級重置。
+
+        #373：`claim_key` 必須跟著 `authority_digest` 同步重算，否則
+        `work_actions._claim_action` 的觸發條件
+        （`canonical_run.claim_key != _expected_claim_key(authority)`）在 reset
+        之後仍然為真——同一個未再變動的 authority digest 會讓每一次 automatic
+        scan（每個 daemon tick）都重新判定為「authority 已變更」，重跑本函式：
+        剝除 needs_human、attempts["verify"] 無界累加，並讓
+        `manager.resume_workflow_run` 在同一 tick 內撞上已改寫的
+        `source_revision` 造成 workflow job binding mismatch，形成永久重觸發
+        迴圈。`claim_key` 同步後，下一次 automatic scan 只要 authority 沒有
+        再變，觸發條件即為假，reset 只在 authority 真的前進時才會再次發生。
         """
 
         index = self._find_workflow_run_index(run_id)
@@ -1957,6 +2079,11 @@ class JobRegistry:
                 "verify": current.attempts.get("verify", 0) + 1,
             },
             gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            # #373 根治：claim_key 必須與 authority_digest 同步重算（見上方
+            # docstring），否則觸發條件永久為真，形成每 tick 重新 reset 的迴圈。
+            claim_key=claim_key_for_authority_digest(
+                repo=current.repo, work_id=current.work_id, authority_digest=authority_digest
+            ),
             source_revision=authority_digest,
             verified_head=None,
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),

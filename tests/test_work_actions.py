@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -20,7 +21,7 @@ from paulsha_cortex.coordinator.github_delivery import (
 )
 from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
 from paulsha_cortex.coordinator.registry import JobRegistry
-from paulsha_cortex.coordinator.workflow import GateEvidenceRef
+from paulsha_cortex.coordinator.workflow import GateEvidenceRef, PlanningArtifactAuthority
 
 
 HEAD = "a" * 40
@@ -207,6 +208,116 @@ def test_resume_existing_needs_human_reenters_canonical_starter(tmp_path: Path) 
     assert calls == [(claim_key, None)]
     assert result["result"]["run"]["current_phase"] == "plan"
     assert result["result"]["run"]["facets"] == []
+
+
+def test_periodic_auto_claim_scan_retries_run_stuck_at_define(tmp_path: Path) -> None:
+    """issue #420 RED→GREEN：auto-claim 建立的 run 若在 `apply_workflow_action
+    (action="start")` 的 claim→define→plan 同步續推段中途被中斷（例如
+    `_load_planning_artifacts` 一類、未被任何 needs_human 分支接住的例外），
+    會停在 `current_phase="define"`、facets 乾淨、`brainstorm_required`
+    仍是預設 False——`decide_auto_claim` 對這個 authority 之後每輪都只會判定
+    `_resume_decision` 的 `action="resume"`（因為 `active_status=="ongoing"`）。
+
+    修復前：`_claim_action` 的既有-run 分支只在 `args["action"] == "resume"`
+    （即人工經 `cortex work resume` 觸發）才重呼叫 `workflow_starter`；
+    periodic auto-claim scan 固定帶 `args={"action": "auto-scan"}`，永遠不滿足
+    這個字面比對，導致 `workflow_starter` 永遠不會再被呼叫、run 永久卡在
+    define——這正是 explicit intake 在同一 request 內能同步跑 define→plan→
+    build、而 auto-claim 建的 run 卻無人接手續推的根因。
+
+    修復後：`automatic=True`（auto-claim scan 的呼叫方式）且
+    `decision.action == "resume"` 時也觸發同樣的重試，讓下一輪 periodic tick
+    的 auto-claim scan 能把這個 run 續推到 plan（甚至更後面）。
+    """
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    # reason=None -> facets=()，模擬「define 已建立、但續推被中斷」的乾淨卡住
+    # 狀態，不是 needs_human。
+    stuck = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, claim_key, None)
+    assert stuck.current_phase == "define"
+    assert stuck.facets == ()
+    assert stuck.brainstorm_required is False
+
+    calls: list[tuple[str, str | None]] = []
+
+    def retrying_starter(bound_authority, bound_claim_key, reason):
+        calls.append((bound_claim_key, reason))
+        # 模擬 start_canonical_workflow 重跑一次 define 續推段這次成功，
+        # 推進到 plan（比照 apply_workflow_action 的 report.complete 分支）。
+        return registry._manager_update_workflow_run(
+            stuck.run_id,
+            current_phase="plan",
+            attempts={**stuck.attempts, "plan": 1},
+            brainstorm_required=False,
+            facets=(),
+        )
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        runner=lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"labels": [{"name": "cortex:auto-on-going"}]}),
+            stderr="",
+        ),
+        workflow_registry=registry,
+        workflow_starter=retrying_starter,
+    )
+
+    assert calls == [(claim_key, None)]
+    assert result[0]["action"] == "resume"
+    assert result[0]["run"]["run_id"] == stuck.run_id
+    assert result[0]["run"]["current_phase"] == "plan"
+    assert registry.get_workflow_run(stuck.run_id).current_phase == "plan"
+
+
+def test_periodic_auto_claim_scan_does_not_retry_needs_human_run(tmp_path: Path) -> None:
+    """#420 修復的邊界：只有 `decision.action == "resume"`（active_status ==
+    "ongoing"，facets 乾淨）才在 auto-claim scan 觸發重試。needs_human run
+    的 `decision.action == "needs_human"`，不受影響——維持 #373 的守衛：
+    auto-claim 不得自動清除或重試 needs_human run，仍須等人工
+    `cortex work resume` 接手。
+    """
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    stuck = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, claim_key, "planning-runtime-unavailable")
+    assert stuck.facets == ("needs_human",)
+
+    def forbidden_starter(*args, **kwargs):
+        raise AssertionError(
+            "auto-claim scan must not re-invoke workflow_starter for a "
+            "needs_human run"
+        )
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        runner=lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"labels": [{"name": "cortex:auto-on-going"}]}),
+            stderr="",
+        ),
+        workflow_registry=registry,
+        workflow_starter=forbidden_starter,
+    )
+
+    assert result[0]["action"] == "needs_human"
+    assert registry.get_workflow_run(stuck.run_id).current_phase == "define"
+    assert registry.get_workflow_run(stuck.run_id).facets == ("needs_human",)
 
 
 def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
@@ -618,6 +729,219 @@ def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
             state_path=state,
             workflow_registry=registry,
         )
+
+
+def test_abandon_orphan_rescue_allows_refs_drift_when_authority_lost_all_mappings(
+    tmp_path: Path,
+) -> None:
+    """issue #410（孤兒救援窄放行）：work item 改名／重識別後，舊識別的
+    authority 失去 issue 與 openspec 映射（tombstone row 只剩 path 錨點），
+    run 的 refs 與 authority 恆不相等——嚴格相等守衛使孤兒 run 永遠不可
+    abandon。僅在「authority 兩類映射皆空、run 仍留 refs」的孤兒簽名下放行；
+    authority 映射非空但內容不同（真正的 refs 漂移）仍必須 fail-closed。"""
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    args = {
+        "action": "abandon",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "issue 410 孤兒救援：改名後清理舊識別的 ongoing run。",
+    }
+
+    # 真正的 refs 漂移（authority 仍有映射、只是內容不同）必須維持 fail-closed。
+    drifted = _snapshot(
+        tmp_path / "snapshot-drifted.json",
+        issues=(13,),
+        source_revisions=("issue:13@open", "openspec:demo@1"),
+    )
+    with pytest.raises(RuntimeError, match="refs differ"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=drifted,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+    # 孤兒簽名：authority 失去全部 issue／openspec 映射（僅剩 todo 錨點）。
+    orphaned = _snapshot(
+        tmp_path / "snapshot-orphan.json",
+        issues=(),
+        changes=(),
+        prs=(),
+        source_revisions=("todo:docs/todo.md@1",),
+    )
+    result = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=orphaned,
+        state_path=state,
+        workflow_registry=registry,
+    )
+    assert result["result"]["action"] == "abandoned"
+    rescued = registry.get_workflow_run(run_id)
+    assert rescued.status == "superseded"
+
+
+def _start_run_with_planning_authority(
+    tmp_path: Path,
+    *,
+    registry: JobRegistry,
+    ref: str,
+    content: bytes,
+    kind: str = "spec",
+) -> tuple[str, Path]:
+    """啟動一個 run，並把 `ref` 綁定為它的 planning_authority——模擬 brainstorm
+    define 已成功發佈該檔案到 workspace_root（未 git 提交）。回傳 (run_id,
+    絕對路徑)。"""
+
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    workspace_root = Path(run.workspace_root)
+    target = workspace_root / ref
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    registry._manager_update_workflow_run(
+        run_id,
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=kind,
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            ),
+        ),
+    )
+    return run_id, target
+
+
+def _abandon_args(run_id: str) -> dict:
+    return {
+        "action": "abandon",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "issue 416：清掉未提交 planning artifact 殘留的回歸測試。",
+    }
+
+
+def test_abandon_gc_removes_untracked_planning_artifact_matching_baseline_hash(
+    tmp_path: Path,
+) -> None:
+    """issue #416：run 被 abandon 前，brainstorm define 已把 spec/design 發佈到
+    workspace_root（未 git 提交）。abandon 之前沒人回滾這些殘留——下一世代
+    重新 claim、brainstorm 再對同一 destinations 發佈時，`_publish_planning_
+    artifacts` 對「檔案已存在但無對應 authority」一律 fail-closed 拒收
+    （`lacks current planning authority`），殘留檔變成死鎖地雷。
+
+    這裡驗證 abandon 之後，未追蹤且 hash 與發佈時 baseline 相符的殘留檔會被
+    回滾刪除——RED（修法前）：`_abandon_action` 完全不知道 planning_authority
+    的存在，檔案在 abandon 之後依然原封不動留著。
+    """
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    ref = "docs/superpowers/specs/fix-416-spec.md"
+    content = b"# Fix 416 Spec\n\n## Requirements\n\ndemo\n"
+    run_id, target = _start_run_with_planning_authority(
+        tmp_path, registry=registry, ref=ref, content=content,
+    )
+    assert target.is_file()
+
+    work_actions.execute_work_action(
+        args=_abandon_args(run_id),
+        requested_by="operator",
+        snapshot_path=tmp_path / "snapshot.json",
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    abandoned = registry.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert not target.exists(), (
+        "abandon 之後未追蹤、hash 相符的殘留 planning artifact 必須被回滾刪除"
+        "（issue #416：否則下一世代 brainstorm 重新發佈同一路徑時會被 authority"
+        " 檢查必拒）"
+    )
+
+
+def test_abandon_gc_preserves_planning_artifact_with_hash_drift(tmp_path: Path) -> None:
+    """operator 手動改過殘留檔（現存內容與發佈時 baseline_sha256 不符）時，GC
+    必須留檔並且不得誤刪——不可信的 drift 交給人工判斷，不能悄悄清掉。"""
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    ref = "docs/superpowers/specs/fix-416-drift-spec.md"
+    original = b"# Fix 416 Spec\n\n## Requirements\n\noriginal\n"
+    run_id, target = _start_run_with_planning_authority(
+        tmp_path, registry=registry, ref=ref, content=original,
+    )
+    target.write_bytes(b"# Fix 416 Spec\n\n## Requirements\n\noperator edited this\n")
+
+    work_actions.execute_work_action(
+        args=_abandon_args(run_id),
+        requested_by="operator",
+        snapshot_path=tmp_path / "snapshot.json",
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    abandoned = registry.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert target.is_file(), "hash 不符（operator 手改）的殘留檔必須保留，不可誤刪"
+    assert b"operator edited this" in target.read_bytes()
+
+
+def test_abandon_gc_preserves_git_tracked_planning_artifact(tmp_path: Path) -> None:
+    """已被 git 追蹤的檔案（例如 operator 刻意 commit 過）不屬於「未提交殘留」
+    範圍，GC 必須完全不碰它——只清未追蹤的發佈殘留。"""
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    ref = "docs/superpowers/specs/fix-416-tracked-spec.md"
+    content = b"# Fix 416 Spec\n\n## Requirements\n\ntracked\n"
+    run_id, target = _start_run_with_planning_authority(
+        tmp_path, registry=registry, ref=ref, content=content,
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", ref], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.email=t@example.com", "-c", "user.name=t",
+         "commit", "-q", "-m", "commit the planning artifact"],
+        check=True,
+    )
+
+    work_actions.execute_work_action(
+        args=_abandon_args(run_id),
+        requested_by="operator",
+        snapshot_path=tmp_path / "snapshot.json",
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    abandoned = registry.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert target.is_file(), "git 已追蹤的檔案必須保留，GC 只清未追蹤的發佈殘留"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows hardlinks share the read-only attribute")

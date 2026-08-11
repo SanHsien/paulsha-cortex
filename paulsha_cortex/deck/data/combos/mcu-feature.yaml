@@ -1,6 +1,12 @@
 combo:
   id: mcu-feature
   task_type: mcu-feature
+  # issue #378：mcu-feature 是本 repo 現有的 evidence-claim 類 combo
+  # （mcu-hw-evidence 產出「硬體證據」）。adversarial-review 直接落在核心層
+  # （combo.cards / combo.gate_spine），不透過 band_triggered 加掛層——此 combo
+  # 本無 band 概念，evidence-claim 類 slice 不論 band 評估結果都要對抗式檢視
+  # rigged setup，不能像 feature-oneshot 的 band_triggered 加掛層那樣被
+  # Green band 跳過。
   cards:
     - ref: mcu-hw-evidence
     - ref: writing-plans
@@ -8,8 +14,12 @@ combo:
     - ref: tdd-red
     - ref: subagent-build
     - ref: code-review
+    - ref: adversarial-review
+      depends_on: [code-review]
     - ref: receiving-code-review
     - ref: verification
   gate_spine:
     - after: mcu-hw-evidence
       exists: ["docs/superpowers/specs/*<task-slug>*-hw-evidence.md"]
+    - after: adversarial-review
+      exists: ["reports/review/*<task-slug>*-adversarial.md"]

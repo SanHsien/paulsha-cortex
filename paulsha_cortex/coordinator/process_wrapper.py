@@ -10,8 +10,9 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import sys
 from pathlib import Path
-from typing import Sequence
+from typing import BinaryIO, Sequence
 from uuid import uuid4
 
 from paulsha_cortex.lib.durability import fsync_directory
@@ -33,12 +34,18 @@ def _write_exit_sentinel(path: Path, exit_code: int) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    stdin: BinaryIO | None = None,
+) -> int:
     parser = argparse.ArgumentParser(prog="paulsha-cortex-process-wrapper")
     parser.add_argument("--sentinel", required=True)
     parser.add_argument("--ledger", required=True)
     parser.add_argument("--worktree", required=True)
     parser.add_argument("--run-gates", action="store_true")
+    parser.add_argument("--forward-stdin", action="store_true")
+    parser.add_argument("--discard-child-stderr", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(list(argv) if argv is not None else None)
     command = list(args.command)
@@ -48,7 +55,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("missing child command")
 
     try:
-        completed = subprocess.run(command, cwd=args.worktree, check=False)
+        completed = subprocess.run(
+            command,
+            cwd=args.worktree,
+            check=False,
+            input=((stdin or sys.stdin.buffer).read() if args.forward_stdin else None),
+            stderr=(subprocess.DEVNULL if args.discard_child_stderr else None),
+        )
         exit_code = int(completed.returncode)
     except OSError:
         exit_code = 127

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from paulsha_cortex.coordinator import manager_daemon
+from paulsha_cortex.coordinator.executor_auth import classify_cli_output
 from paulsha_cortex.deploy import installer
 
 from . import COMMANDS, PorcelainCommand, register
@@ -161,8 +162,20 @@ def _executor_status(name: str) -> tuple[bool, str, str | None]:
     if result.returncode == 0:
         return True, success_detail, None
     if name == "copilot":
-        combined = (result.stdout + result.stderr).lower()
-        if any(token in combined for token in ("login", "authenticate", "authorization", "device code")):
+        # #369：rate limit 判定必須先於 login 判定——GitHub 的限流訊息常常
+        # 同時帶有 "authenticate"／"login" 字樣（例如「請重新授權以取得更高
+        # 額度」），若對輸出做字串匹配時 login 判定排在前面，限流會被誤判成
+        # 「尚未登入」。分類邏輯與 coordinator.executor_auth 共用一份，避免
+        # 兩處各自實作、各自漂移。
+        combined = result.stdout + result.stderr
+        status, _ = classify_cli_output(result.returncode, combined)
+        if status == "rate_limited":
+            return (
+                False,
+                "copilot 觸發流量限制（rate limit），暫時無法確認登入態。",
+                "請稍後重試 `cortex bootstrap`；若限流解除後仍然失敗，才需要執行 `copilot login`。",
+            )
+        if status == "logged_out":
             return False, "copilot 已安裝，但尚未登入。", login_fix
         return (
             False,

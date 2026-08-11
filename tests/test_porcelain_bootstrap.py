@@ -309,6 +309,77 @@ def test_bootstrap_batch_wrapper_rejects_cmd_metacharacters(
         bootstrap._run(["unsafe", "safe&whoami"])
 
 
+def test_bootstrap_copilot_rate_limit_output_not_misclassified_as_logged_out(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#369：copilot 的登入態判定過去對輸出做字串匹配（"login"／"authenticate"／
+    "device code"）。GitHub 的限流訊息常常同時帶有這些字樣（例如「請重新
+    authenticate 以取得更高額度」），導致限流被誤判成「尚未登入」，進而錯誤
+    建議 `copilot login`——真正該做的是稍後重試，而不是重新登入。
+
+    修復前這個測試會 FAIL：exit code 雖然一樣是 4（preflight 仍然失敗），
+    但訊息會落入 "copilot 已安裝，但尚未登入" 分支並建議 `copilot login`，
+    因為輸出裡同時含有 "rate limit" 與 "authenticate"／"login" 字樣。
+    """
+
+    _reset_porcelain_modules()
+    _write_symlink_tool(bootstrap_runtime["bin_dir"], "bash", "bash")
+    _write_symlink_tool(bootstrap_runtime["bin_dir"], "git", "git")
+    if os.name == "nt":
+        (bootstrap_runtime["bin_dir"] / "copilot.cmd").write_text(
+            "\n".join(
+                (
+                    "@echo off",
+                    'if "%~1"=="-p" (',
+                    "  echo Error: You have exceeded a secondary rate limit. "
+                    "To authenticate again, run copilot /login. 1>&2",
+                    "  exit /b 1",
+                    ")",
+                    'if "%~1"=="login" exit /b 0',
+                    "exit /b 0",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+    else:
+        _write_stub(
+            bootstrap_runtime["bin_dir"],
+            "copilot",
+            "\n".join(
+                (
+                    'if [[ "${1:-}" == "-p" ]]; then',
+                    '  echo "Error: You have exceeded a secondary rate limit. '
+                    'To authenticate again, run copilot /login." >&2',
+                    "  exit 1",
+                    "fi",
+                    'if [[ "${1:-}" == "login" ]]; then',
+                    "  exit 0",
+                    "fi",
+                    "exit 0",
+                    "",
+                )
+            ),
+        )
+    monkeypatch.setenv("PATH", str(bootstrap_runtime["bin_dir"]))
+    monkeypatch.setenv("PSC_MANAGER_EXECUTOR", "copilot")
+    monkeypatch.chdir(bootstrap_runtime["repo_root"])
+
+    assert _run_cli(["bootstrap"]) == 4
+
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    # 必須指出是流量限制，而不是登入態問題。
+    assert "rate limit" in combined
+    # 不得誤判成「已安裝，但尚未登入」——這是修復前的實際措辭，修復後這句
+    # 具體文字不該再出現（fix 建議裡允許附帶提及 `copilot login` 作為「限流
+    # 解除後仍失敗才需要」的次要選項，但不能是主要判定）。
+    assert "已安裝，但尚未登入" not in combined
+    assert "請先執行 `copilot login`" not in combined
+
+
 def test_bootstrap_preflight_reports_actionable_repo_fix(
     bootstrap_runtime: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,

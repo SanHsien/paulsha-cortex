@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
+from paulsha_cortex.coordinator.verification import validate_verification_contract
 from paulsha_cortex.deck.compile import (
     CompileResult,
     DeckCompileError,
@@ -616,3 +618,103 @@ def test_emit_force_file_mode_consistent(tmp_path):
     emit(result, out, force=True)
     mode = (out / result.slices[0].filename).stat().st_mode & 0o777
     assert mode == (0o666 if os.name == "nt" else 0o644)
+    assert mode == (0o666 if os.name == "nt" else 0o644)
+
+
+# --- issue #380: verification skeleton 不得寫死 pytest，改由 .project-policy.yml 的
+# preflight.steps 導出；偵測不到時填 fail-closed placeholder，不可留空 ---
+
+
+def _verification_of(result) -> dict:
+    return yaml.safe_load(result.slices[0].content.split("---\n")[1])["verification"]
+
+
+def _policy_check(verification: dict) -> dict:
+    return next(
+        check for check in verification["checks"] if check.get("kind") == "command" and check.get("name") == "policy"
+    )
+
+
+def test_verification_skeleton_derives_argv_from_project_policy_preflight_steps(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path / "deck")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".project-policy.yml").write_text(
+        """\
+policy_profile: flat
+policy_version: 1.0.15
+preflight:
+  steps:
+    - name: openspec
+      kind: validation
+      argv: ["python3", "-m", "policy_check", "--repo", "."]
+      timeout_seconds: 45
+    - name: tests
+      kind: tests
+      argv: ["python3", "-m", "pytest", "tests/", "-q"]
+      timeout_seconds: 900
+""",
+        encoding="utf-8",
+    )
+    result = compile_combo(
+        combo, cards, "demo task", change="demo", allow_external=True, repo_root=repo_root
+    )
+    verification = _verification_of(result)
+    policy_check = _policy_check(verification)
+    assert policy_check["argv"] == ["python3", "-m", "policy_check", "--repo", "."]
+    assert policy_check["timeout_seconds"] == 45
+    assert verification["tests"][0]["argv"] == ["python3", "-m", "pytest", "tests/", "-q"]
+    assert verification["tests"][0]["timeout_seconds"] == 900
+    assert verification["full_suite"]["argv"] == ["python3", "-m", "pytest", "tests/", "-q"]
+    assert verification["full_suite"]["timeout_seconds"] == 900
+    # 契約仍合法且滿足 auto_dispatch 前提（name=policy 保留、persona-scope 恰一筆）
+    validate_verification_contract(verification, repo_root=repo_root, auto_dispatch=True)
+
+
+def test_verification_skeleton_placeholder_when_no_project_policy_file(tmp_path, capsys):
+    cards, combo = _feature_oneshot(tmp_path / "deck")
+    repo_root = tmp_path / "bare-repo"
+    repo_root.mkdir()
+    result = compile_combo(
+        combo, cards, "demo task", change="demo", allow_external=True, repo_root=repo_root
+    )
+    verification = _verification_of(result)
+    policy_check = _policy_check(verification)
+    # name 必須維持 "policy"（verification.py 的 auto_dispatch policy_command_count 前提）
+    assert policy_check["name"] == "policy"
+
+    # fail-closed：placeholder argv 若被誤執行必須非零退出，不可靜默通過
+    proc = subprocess.run(policy_check["argv"], capture_output=True)
+    assert proc.returncode != 0
+    tests_entry = verification["tests"][0]
+    proc_tests = subprocess.run(tests_entry["argv"], capture_output=True)
+    assert proc_tests.returncode != 0
+    full_suite_proc = subprocess.run(verification["full_suite"]["argv"], capture_output=True)
+    assert full_suite_proc.returncode != 0
+
+    # 契約仍合法（不可留空）
+    validate_verification_contract(verification, repo_root=repo_root, auto_dispatch=True)
+
+    err = capsys.readouterr().err
+    assert "policy" in err.lower() or "驗證" in err
+    assert "WARNING" in err or "警告" in err
+
+
+def test_verification_skeleton_placeholder_when_preflight_steps_missing_kind(tmp_path, capsys):
+    cards, combo = _feature_oneshot(tmp_path / "deck")
+    repo_root = tmp_path / "repo-no-preflight"
+    repo_root.mkdir()
+    (repo_root / ".project-policy.yml").write_text(
+        "policy_profile: flat\npolicy_version: 1.0.15\n",
+        encoding="utf-8",
+    )
+    result = compile_combo(
+        combo, cards, "demo task", change="demo", allow_external=True, repo_root=repo_root
+    )
+    verification = _verification_of(result)
+    policy_check = _policy_check(verification)
+    assert policy_check["name"] == "policy"
+    proc = subprocess.run(policy_check["argv"], capture_output=True)
+    assert proc.returncode != 0
+    validate_verification_contract(verification, repo_root=repo_root, auto_dispatch=True)
+    assert "WARNING" in capsys.readouterr().err

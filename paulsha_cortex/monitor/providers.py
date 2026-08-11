@@ -17,6 +17,7 @@ from urllib.parse import quote
 import yaml
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
 
 from .work_models import ProviderSnapshot, WorkSource
 
@@ -707,11 +708,14 @@ class GitHubWorkProvider:
             return self._failure(attempted_at, "github provider I/O failure")
         if completed.returncode != 0:
             message = completed.stderr.decode(errors="replace") if isinstance(completed.stderr, bytes) else completed.stderr
-            lowered = (message or "").lower()
-            if "401" in lowered or "bad credentials" in lowered or "auth" in lowered:
-                diagnostic = "github authentication failed"
-            elif "rate limit" in lowered or "403" in lowered:
+            # #370: rate limit must be checked *before* auth -- GitHub's own
+            # secondary/abuse-detection rate limit messages mention "OAuth"
+            # and invite re-authenticating, so an auth-first check
+            # misclassifies a retryable rate limit as a dead credential.
+            if is_rate_limit_signal(message):
                 diagnostic = "github rate limit exceeded"
+            elif is_auth_signal(message):
+                diagnostic = "github authentication failed"
             else:
                 diagnostic = "github API request failed"
             return self._failure(attempted_at, diagnostic)

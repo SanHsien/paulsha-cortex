@@ -1,6 +1,6 @@
 # paulsha-cortex 現行決策
 
-最後修訂：2026-08-09
+最後修訂：2026-08-11
 
 本檔只保留仍影響本 fork 維護與實作的取捨。操作步驟見 [`DEVELOPMENT.md`](DEVELOPMENT.md)，來源與同步方法見 [`FORK.md`](FORK.md)，版本歷史見 [`CHANGELOG.md`](../CHANGELOG.md)。
 
@@ -9,6 +9,7 @@
 - `origin` 指向 `SanHsien/paulsha-cortex`，`upstream` 指向 `hamanpaul/paulsha-cortex`。
 - 目前不改產品名稱、不重寫歷史、不離開 fork network；先保留低成本追蹤 upstream 的能力。
 - 初始評估水位為 upstream `b868760`／v0.1.4。每次同步只從這個水位之後評估，並更新本節。
+- 最新已評估水位為 upstream `b79c74a`／v0.1.5；逐 PR 決策與下次起點見 [`UPSTREAM.md`](UPSTREAM.md)。
 
 ## 2. 定位為 research/development fork
 
@@ -34,3 +35,9 @@
 - `tools/dev_check.ps1`／`.sh` 是一致入口，不取代 `CLAUDE.md` 的 changelog、PR-context policy check 與 Candidate evidence 規則。
 - 每次只接受同一 Candidate 的一次權威 full gate；失敗後只重跑受影響的 focused test，再做一次完整收尾。
 - WSL `/mnt/c` 的慢速不是測試失敗；但 timeout 或 skipped checks 必須如實記錄，不能包裝成通過。
+
+## 6. Issue #442 採 ship-phase executor auth canary
+
+- `cg` 維持 zero-tool，只能用於 read-only planning／review；Windows 由 typed-argv Python wrapper 經 stdin 傳 prompt，不退回 Bash wrapper。
+- `provider:executor` 只先啟用於 `openspec-archive`／`policy-commit`。在 GitHub side effect 前檢查登入態、可用時依既有 identity 順序 reroute，全部不可用才進 `needs_human`。
+- 不自動從 `gh` keyring 抽取 Copilot token，也不把 token 寫入 repository。只有 deployment runtime env 已安全提供 `COPILOT_GITHUB_TOKEN`／`GH_TOKEN`／`GITHUB_TOKEN` 時才使用；自動 secret-store 整合需另案具備 rotation、ACL、redaction 與 restart 證據。

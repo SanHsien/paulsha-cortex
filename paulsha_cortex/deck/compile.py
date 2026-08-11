@@ -12,6 +12,7 @@ from typing import Mapping, Sequence
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator.workflow import WorkflowManifest, WorkflowStep
 from paulsha_cortex.lib.durability import fsync_directory
+from paulsha_cortex.project_policy import ProjectPolicyError, resolve_project_policy
 
 from .schema import BAND_LEVELS, BandTriggeredSpine, Card, Combo, ComboEntry
 
@@ -62,7 +63,97 @@ def _warning_default_target_branch(task_slug: str, change: str | None) -> None:
     )
 
 
-def _verification_skeleton() -> dict[str, object]:
+_DEFAULT_POLICY_CHECK_TIMEOUT_SECONDS = 30
+_DEFAULT_TESTS_TIMEOUT_SECONDS = 60
+
+
+def _preflight_steps(repo_root: Path) -> list[dict[str, object]]:
+    """讀 `.project-policy.yml` 的 `preflight.steps`（issue #380：verification 骨架不得
+    寫死 pytest，須以此為導出來源）。任何解析問題都視為「偵測不到」，交給呼叫端走
+    fail-closed placeholder，不在 compile 期整個炸掉。"""
+    try:
+        resolution = resolve_project_policy(repo_root)
+    except ProjectPolicyError:
+        return []
+    payload = resolution.payload
+    if not isinstance(payload, dict):
+        return []
+    preflight = payload.get("preflight")
+    if not isinstance(preflight, dict):
+        return []
+    steps = preflight.get("steps")
+    if not isinstance(steps, list):
+        return []
+    return [step for step in steps if isinstance(step, dict)]
+
+
+def _first_step_of_kind(steps: Sequence[dict[str, object]], kind: str) -> dict[str, object] | None:
+    for step in steps:
+        if step.get("kind") == kind:
+            return step
+    return None
+
+
+def _step_argv(step: dict[str, object] | None) -> list[str] | None:
+    if step is None:
+        return None
+    argv = step.get("argv")
+    if not isinstance(argv, list) or not argv:
+        return None
+    if not all(isinstance(item, str) and item.strip() for item in argv):
+        return None
+    return list(argv)
+
+
+def _step_timeout(step: dict[str, object] | None, default: int) -> int | float:
+    if step is not None:
+        timeout = step.get("timeout_seconds")
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+            return timeout
+    return default
+
+
+def _placeholder_argv(reason: str) -> list[str]:
+    """Fail-closed 佔位 argv（issue #380）：偵測不到 policy steps 時不可留空，也不可
+    悄悄套用某個猜測指令——必須是「誤執行就非零退出」的明確佔位，翻 dispatch: auto
+    前一定會被擋下，逼 operator 手動補上真正的驗證指令。"""
+    return ["python3", "-c", "import sys; sys.exit(" + json.dumps(reason, ensure_ascii=False) + ")"]
+
+
+def _warn_policy_undetected(kind: str, *, purpose: str) -> None:
+    print(
+        f"deck compile: [WARNING] 未偵測到 .project-policy.yml 的 preflight.steps(kind: {kind})，"
+        f"verification.{purpose} 已改填 fail-closed placeholder；翻 dispatch: auto 前必須手動改成"
+        "真正的驗證指令（見 issue #380）",
+        file=sys.stderr,
+    )
+
+
+def _verification_skeleton(repo_root: Path) -> dict[str, object]:
+    steps = _preflight_steps(repo_root)
+    validation_step = _first_step_of_kind(steps, "validation")
+    tests_step = _first_step_of_kind(steps, "tests")
+
+    policy_argv = _step_argv(validation_step)
+    if policy_argv is None:
+        policy_argv = _placeholder_argv(
+            "cortex deck compile: 未偵測到 .project-policy.yml preflight.steps(kind: validation)，"
+            "此 policy check 為 fail-closed placeholder，翻 dispatch: auto 前請手動改成真正的 policy "
+            "驗證指令（例如 python3 -m policy_check --repo .）"
+        )
+        _warn_policy_undetected("validation", purpose="checks[name=policy].argv")
+    policy_timeout = _step_timeout(validation_step, _DEFAULT_POLICY_CHECK_TIMEOUT_SECONDS)
+
+    tests_argv = _step_argv(tests_step)
+    if tests_argv is None:
+        tests_argv = _placeholder_argv(
+            "cortex deck compile: 未偵測到 .project-policy.yml preflight.steps(kind: tests)，"
+            "此 tests/full_suite 為 fail-closed placeholder，翻 dispatch: auto 前請手動改成真正的"
+            "測試指令"
+        )
+        _warn_policy_undetected("tests", purpose="tests/full_suite.argv")
+    tests_timeout = _step_timeout(tests_step, _DEFAULT_TESTS_TIMEOUT_SECONDS)
+
     return {
         "docs_class": "code",
         "required_artifacts": [],
@@ -71,22 +162,22 @@ def _verification_skeleton() -> dict[str, object]:
             {
                 "kind": "command",
                 "name": "policy",
-                "argv": ["python3", "-m", "pytest", "-q"],
+                "argv": policy_argv,
                 "cwd": ".",
-                "timeout_seconds": 30,
+                "timeout_seconds": policy_timeout,
             },
         ],
         "tests": [
             {
-                "argv": ["python3", "-m", "pytest", "-q"],
+                "argv": tests_argv,
                 "cwd": ".",
-                "timeout_seconds": 60,
+                "timeout_seconds": tests_timeout,
             },
         ],
         "full_suite": {
-            "argv": ["python3", "-m", "pytest", "-q"],
+            "argv": tests_argv,
             "cwd": ".",
-            "timeout_seconds": 60,
+            "timeout_seconds": tests_timeout,
             "baseline": "no-regression",
         },
     }
@@ -506,7 +597,9 @@ def compile_combo(
     allow_external: bool = False,
     plan_ref: str | None = None,
     band: str | None = None,
+    repo_root: str | Path | None = None,
 ) -> CompileResult:
+    effective_repo_root = Path(repo_root) if repo_root is not None else paths.repo_root()
     slug = slugify_task(task)
     if change is not None:
         change = _validate_change_name(change)
@@ -544,7 +637,12 @@ def compile_combo(
     verify_commands = core_gate_commands + band_gate_commands
     previous_slice_id: str | None = None
 
-    for slice_id, members in _group_slices(entries, cards, slug):
+    slice_groups = _group_slices(entries, cards, slug)
+    # 只在真的要 emit 至少一份 slice 時才讀 .project-policy.yml；同一次 compile 對所有
+    # slice 共用同一份骨架（單次讀檔、單次 warning，不因 slice 數量而重複列印）。
+    verification_skeleton = _verification_skeleton(effective_repo_root) if slice_groups else None
+
+    for slice_id, members in slice_groups:
         deps: list[str] = []
         for member in members:
             for dep_ref in explicit_deps.get(member.id, ()):
@@ -572,7 +670,7 @@ def compile_combo(
                 plan_ref,
                 deps,
                 target_branch,
-                _verification_skeleton(),
+                verification_skeleton,
             )
             + "\n"
             + f"# {slice_id}\n\n"

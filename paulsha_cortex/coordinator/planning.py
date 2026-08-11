@@ -241,8 +241,21 @@ def _build_default_question_pack(
     assessments: tuple[ArtifactAssessment, ...], missing_kinds: tuple[str, ...]
 ) -> QuestionPack:
     questions: list[PlanningQuestion] = []
+    # #408（補完）：missing-{kind} 問題的 source_refs 過去只取「同 kind 的
+    # assessments refs」。同 kind 有草稿（rejected/draft）時這是對的——重寫要
+    # 以草稿為本（見 test_rejected_artifacts_remain_authoritative_sources_...）；
+    # 但 todo 錨定的 work item（如 small-fix combo）該 kind 完全不存在，
+    # source_refs 恆為空 tuple，造成兩個下游斷點：
+    # (a) `_planning_destinations` 的 openspec／workstream 錨點推導拿不到任何
+    #     路徑 → destinations 空 → integrator 發明路徑必被 governed-roots 拒；
+    # (b) `_planning_source_material` 無檔可讀 → secondary planner 兩手空空。
+    # 故補 fallback：同 kind refs 為空時退到全部 accepted artifacts 的 refs
+    # ——既有權威素材正是「建立 accepted {kind} 需要什麼權威內容」的來源。
+    accepted_refs = tuple(
+        assessment.artifact.ref for assessment in assessments if assessment.accepted
+    )
     for kind in missing_kinds:
-        source_refs = tuple(
+        same_kind_refs = tuple(
             assessment.artifact.ref
             for assessment in assessments
             if assessment.artifact.kind == kind
@@ -251,7 +264,7 @@ def _build_default_question_pack(
             _make_question(
                 f"missing-{kind}",
                 f"What authoritative content is required to create an accepted {kind}?",
-                source_refs,
+                same_kind_refs or accepted_refs,
             )
         )
     for assessment in assessments:
@@ -1088,17 +1101,31 @@ def run_heterogeneous_brainstorm(
             "default_question_pack": report.default_question_pack.to_dict(),
         }
         pack = validate_question_pack(primary_questioner(questioner_input), report=report)
-    except Exception:
-        return BrainstormResult("needs_human", "question-pack-malformed", None, empty_refs, None)
+    except Exception as exc:
+        # issue #397：這三處 `except Exception` 過去把底層例外整段壓平成單一
+        # 字面值 reason，操作者只看得到分支名稱、看不到底層是哪種例外、訊息
+        # 內容是什麼——排障要另外重跑加 print 才查得到（曾經雙重誤導：真正
+        # 原因是 planning launcher 把 operator worktree 判成被汙染而
+        # ValueError，卻只顯示成籠統的「question-pack-malformed」）。這裡併入
+        # 例外型別與訊息前 160 字，供 #393 的 planning-failure evidence 與
+        # recover-planning 的 `_read_planning_failure_record` 直接讀出；兩者
+        # 都只要求 reason 為非空字串，加長不影響既有契約。
+        return BrainstormResult(
+            "needs_human",
+            f"question-pack-malformed: {type(exc).__name__}: {str(exc)[:160]}",
+            None,
+            empty_refs,
+            None,
+        )
     try:
         secondary = validate_secondary_evidence(
             secondary_planner(pack.to_dict(), selection.identity),
             question_pack=pack,
         )
-    except Exception:
+    except Exception as exc:
         return BrainstormResult(
             "needs_human",
-            "secondary-output-malformed",
+            f"secondary-output-malformed: {type(exc).__name__}: {str(exc)[:160]}",
             selection.identity.independence_domain,
             empty_refs,
             None,
@@ -1112,10 +1139,10 @@ def run_heterogeneous_brainstorm(
             question_pack=pack,
             secondary_evidence_hash=evidence_hash,
         )
-    except Exception:
+    except Exception as exc:
         return BrainstormResult(
             "needs_human",
-            "primary-integration-malformed",
+            f"primary-integration-malformed: {type(exc).__name__}: {str(exc)[:160]}",
             selection.identity.independence_domain,
             empty_refs,
             None,
@@ -1126,10 +1153,13 @@ def run_heterogeneous_brainstorm(
             if not integration.get("artifacts"):
                 raise ValueError("structured artifact content missing")
             rollback_publication = artifact_writer(integration.get("artifacts", []))
-        except Exception:
+        except Exception as exc:
+            # #408：這是 #397 儀器化時漏掉的第四個裸吞分支——artifact write 的
+            # 實際拒絕原因（哪條驗證、哪個路徑）必須透傳進 reason，與其餘三個
+            # 分支的例外摘要格式一致。
             return BrainstormResult(
                 "needs_human",
-                "primary-artifact-write-rejected",
+                f"primary-artifact-write-rejected: {type(exc).__name__}: {str(exc)[:160]}",
                 selection.identity.independence_domain,
                 empty_refs,
                 None,

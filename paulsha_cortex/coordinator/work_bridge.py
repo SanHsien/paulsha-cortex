@@ -367,6 +367,19 @@ def start_canonical_workflow(
         if model_chain_override is not None
         else (existing_run.model_chain_override if existing_run is not None else None)
     )
+    # #390：combo 比照上面 model_chain_override 的凍結語意——resume 等後續動作
+    # 依 contract.py 的 fail-closed 設計不會轉發 combo（見 manager.apply_work_action
+    # 的 work_action_combo_override 只在 start/intake 有效），這裡若沒收到明確
+    # override 就沿用既有 run（仍在 define phase 的重試路徑）已持久化的 combo，
+    # 避免重新對 mapped_issue_titles 跑 select_combo 選出不同 combo、
+    # 導致 default_workflow_manifest 產生不同 bytes、被 _write_manifest 的
+    # byte 比對判為 conflict（canonical workflow manifest conflicts with
+    # persisted claim）。
+    effective_combo_override = (
+        combo_override
+        if combo_override is not None
+        else (existing_run.combo if existing_run is not None else None)
+    )
     stale_owners = _other_owner_ongoing_runs(registry, authority)
     if stale_owners:
         blocking = ", ".join(sorted({run.work_id for run in stale_owners}))
@@ -379,18 +392,22 @@ def start_canonical_workflow(
     cards = load_cards(DEFAULT_CARDS_PATH)
     combo_catalog = _combo_catalog(cards)
     taxonomy = load_task_types(combos=combo_catalog)
-    # combo_override 的存在性／合法性驗證單一交給 select_combo（deck/selector.py
-    # R3：經 load_combo 驗證，taxonomy 反查找不到 task_type 時保留 None，legacy
-    # combo 如 mcu-feature 不會被誤判 unknown）；此處不再重覆一份驗證邏輯。
+    # combo_override（或凍結沿用的 effective_combo_override）的存在性／合法性
+    # 驗證單一交給 select_combo（deck/selector.py R3：經 load_combo 驗證，
+    # taxonomy 反查找不到 task_type 時保留 None，legacy combo 如 mcu-feature
+    # 不會被誤判 unknown）；此處不再重覆一份驗證邏輯。凍結沿用時直接餵
+    # override，走的是 select_combo 既有的 explicit-override 分支——
+    # ComboSelection.source 因此如實標記為 explicit-override，不需另開
+    # schema 不認得的新 source 字面值。
     try:
         combo_selection = select_combo(
             mapped_issue_titles(authority),
             taxonomy=taxonomy,
-            override=combo_override,
+            override=effective_combo_override,
         )
     except ComboSelectionError as exc:
-        if combo_override is not None:
-            raise RuntimeError(f"combo override unavailable: {combo_override}") from exc
+        if effective_combo_override is not None:
+            raise RuntimeError(f"combo override unavailable: {effective_combo_override}") from exc
         raise
     manifest = default_workflow_manifest(
         authority.work_id,

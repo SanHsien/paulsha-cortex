@@ -138,7 +138,15 @@ def _write_managed_env(
     """更新 managed keys（PY / PSC_REPO_ROOT），就地保留其餘 operator 手動行與註解。
 
     每次 install 只覆寫本函式管理的鍵；既有的 PSC_MANAGER_SPECS_DIR、
-    PSC_WORKTREE_ROOT、PSC_CONTROL_ROOT 等 operator 設定不得被清掉。
+    PSC_WORKTREE_ROOT、PSC_COORDINATOR_ROOT、PSC_SPECS_ROOT 等未進 managed
+    dict 的 operator 設定不受影響（本函式只走 `key in remaining` 分支才會動它）。
+
+    `preserve_existing` 是給「managed dict 裡的鍵，但仍想尊重既有值」用的例外；
+    **不要**把任何依 PSC_AGENTS_ROOT／instance 推導出來的路徑放進來（PY /
+    PSC_REPO_ROOT / PSC_REPO_IDENTITY / PSC_AGENTS_ROOT / PSC_PROJECT_CONFIG_ROOT /
+    PSC_CONTROL_ROOT 皆屬此類）——那種值一旦被舊值鎖住，`cortex install service`
+    重裝就永遠修不好一個早期殘留的錯誤路徑（issue #371 的根因；#375 引入
+    PSC_CONTROL_ROOT 時複驗明確警告過不得重蹈覆轍）。
     """
     if env_file.is_symlink():
         raise ValueError("runtime bootstrap env 不可為 symlink")
@@ -307,6 +315,14 @@ def install_service_result(
         "PSC_MONITOR_STATE_ROOT": str(agents_root / "monitor"),
         "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
         "PSC_MANAGER_INTERVAL_SECONDS": str(interval),
+        # #375：control plane（manager.lock／requests／done／status.json）沒有
+        # instance 成分時，兩個 instance 若共用同一個 PSC_AGENTS_ROOT（installer
+        # 目前預設就是如此：agents_root 預設為 $HOME/.agents，與 instance 名稱
+        # 無關）會搶同一把 manager.lock——第二個 instance 的 daemon 啟動即退出，
+        # 靜默 adopt 對方 pid，work item 永遠不會被處理。比照 PSC_RUN_ROOT 的
+        # `run/<instance>` 模式讓它天生 per-instance。
+        "PSC_CONTROL_ROOT": str(agents_root / "control" / instance),
+        "PSC_MANAGER_INTERVAL_SECONDS": str(interval),
     }
     executor_override = os.environ.get("PSC_MANAGER_EXECUTOR", "").strip()
     if executor_override:
@@ -316,12 +332,18 @@ def install_service_result(
     _write_managed_env(
         env_file,
         managed_env,
+        # PSC_PROJECT_CONFIG_ROOT 與 PSC_CONTROL_ROOT 刻意不在這裡：兩者都是純粹
+        # 依 PSC_AGENTS_ROOT／instance 推導的 managed path，放進 preserve_existing
+        # 等於允許一個早期殘留的錯誤值被永久鎖死、重裝也修不好（#371 的根因；
+        # #375 加入 PSC_CONTROL_ROOT 時複驗明確警告過不得重蹈覆轍）。
+        # PSC_MANAGER_SPECS_DIR／PSC_COORDINATOR_ROOT／PSC_SPECS_ROOT 目前仍不在
+        # managed_env 之列（維持 operator 域，見 issue #375 comment 的評估與
+        # test_install_leaves_specs_and_coordinator_roots_as_operator_domain）。
         preserve_existing=frozenset(
             {
                 "PSC_INSTANCE",
                 "PSC_RUN_ROOT",
                 "PSC_MONITOR_STATE_ROOT",
-                "PSC_PROJECT_CONFIG_ROOT",
             }
         ),
     )

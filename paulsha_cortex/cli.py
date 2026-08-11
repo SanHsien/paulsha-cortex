@@ -29,6 +29,7 @@ setup and workflow commands:
   list             列出統一 Work Item read model
   work show        顯示單一 Work Item 與可解釋關聯
   doctor           檢查 gh、preflight、model identity、agy 與 service paths
+  control lock-path 印出 manager.lock 契約路徑（shell wrapper／daemon 同源，整合用途）
   relay-hook       執行封裝內 relay hook（整合用途）
 
 coordinator commands:
@@ -48,13 +49,14 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|gc|link|unlink|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|abandon|auto|review-attest|ship> ...
+usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|abandon|auto|review-attest|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
   gc        proposal-first 回收殘留 build worktree 與已 merge local branch（唯讀 registry）
   link      由 Manager 寫入 confirmed association
   unlink    由 Manager 寫入 exclusion
+  intake    「拿到一個 issue/task 就進件」的單一入口，等價於（必要時）link 後接 start
   start     手動 claim 並建立 WorkflowRun（可用 --combo 明示 override）
   resume    恢復 needs_human／blocked workflow
   retry-build  以 exact Candidate CAS 重開最後一個 builder card
@@ -69,6 +71,13 @@ work item commands:
   ship      執行 fail-closed delivery state machine
 
 `cortex stat --combo-selections` 可彙總自動選牌／override／bypass 的來源與 task_type。
+
+claim 前置條件（intake／start 共用）：work item 必須先進到 lifecycle `todo`
+狀態才會產生可 claim 的 `start` next_action。只 link 一個 GitHub issue（`topic`
+狀態）不足夠——還需要一個 active 的 Todo 來源（workstream `todo.md` 的 path
+link、accepted superpowers spec/plan，或 active OpenSpec change）。純 issue-only
+work item 對 intake/start 呼叫 fail-closed 時，錯誤訊息會標示 work item 目前
+所在的 lifecycle state 與缺少的 Todo 來源；詳見 docs/unified-work-lifecycle.md。
 
 run 'cortex work show --help' or coordinator mutation help for arguments.
 """
@@ -151,6 +160,10 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
         from paulsha_cortex.doctor import main as doctor_main
 
         return int(doctor_main(args[1:]) or 0)
+    if args[0] == "control":
+        from paulsha_cortex.control.cli import main as control_main
+
+        return int(control_main(args[1:]) or 0)
     porcelain_commands = _load_porcelain_commands()
     porcelain_command = porcelain_commands.get(args[0])
     if porcelain_command is not None:

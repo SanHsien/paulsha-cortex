@@ -24,6 +24,13 @@
 
 ## 建議樣板（emit 時可直接對齊）
 
+`deck compile` 自 #380 起會從目標 repo 的 `.project-policy.yml`（`preflight.steps`，
+typed：`kind: validation` / `kind: tests` + `argv` + `timeout_seconds`）自動導出下列
+`checks[name=policy]` 與 `tests`/`full_suite` 的 `argv`／`timeout_seconds`；偵測不到對應
+step 時（無 `.project-policy.yml`，或有檔但缺該 kind）會改填 fail-closed placeholder（誤
+執行會非零退出）並在 compile 輸出印醒目 warning——這種情況務必在翻 `dispatch: auto`
+前手動改成下方樣板等級的真實指令，不可原樣放行。
+
 ```yaml
 target_branch: feature/101
 verification:
@@ -33,15 +40,15 @@ verification:
     - kind: persona-scope
     - kind: command
       name: policy
-      argv: [python3, -m, pytest, -q]
+      argv: [python3, -m, policy_check, --repo, .]
       cwd: .
       timeout_seconds: 30
   tests:
-    - argv: [python3, -m, pytest, -q]
+    - argv: [python3, -m, pytest, tests/, -q]
       cwd: .
       timeout_seconds: 60
   full_suite:
-    argv: [python3, -m, pytest, -q]
+    argv: [python3, -m, pytest, tests/, -q]
     cwd: .
     timeout_seconds: 60
     baseline: no-regression

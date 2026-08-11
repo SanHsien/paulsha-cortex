@@ -15,6 +15,8 @@ from typing import Callable, Mapping, Sequence
 from urllib.parse import quote
 from unittest.mock import patch
 
+from .github_rate_limit import is_rate_limit_signal
+
 DOCTOR_SCHEMA = "cortex-doctor/v1"
 AUTO_LABEL = "cortex:auto-on-going"
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -79,6 +81,38 @@ def _process(
     if not isinstance(returncode, int):
         return 1, ""
     return returncode, stdout if isinstance(stdout, str) else ""
+
+
+def _gh_auth_probe(runner: Runner) -> ProbeResult:
+    """#370: ``gh auth status`` exits non-zero on rate limit *and* on a
+    genuinely invalid credential -- exit code alone can't tell them apart,
+    and misreporting a rate limit as "authentication failed" sends
+    operators chasing a token that isn't actually broken (see #370's
+    runtime evidence: a secondary rate limit was misdiagnosed this way).
+    Classifies stderr/stdout the same way as the Monitor GitHub provider
+    (`monitor/providers.py`) and canonical authority classification
+    (`coordinator/claim.py`) so all three agree. Never echoes the raw
+    command output into the probe detail -- only a fixed, secret-free
+    string (see ``test_doctor_does_not_echo_credentials_from_failed_command``).
+    """
+    try:
+        raw = runner(["gh", "auth", "status"], shell=False, capture_output=True, text=True, timeout=45)
+    except Exception:
+        return ProbeResult("gh-auth", "fail", "authentication failed", True)
+    returncode = getattr(raw, "returncode", None)
+    if returncode == 0:
+        return ProbeResult("gh-auth", "pass", "authenticated", True)
+    stderr = getattr(raw, "stderr", "")
+    stdout = getattr(raw, "stdout", "")
+    message = "\n".join(value for value in (stderr, stdout) if isinstance(value, str))
+    if is_rate_limit_signal(message):
+        return ProbeResult(
+            "gh-auth",
+            "warn",
+            "GitHub rate limit exceeded -- wait for the window to reset before treating this as a credential failure",
+            False,
+        )
+    return ProbeResult("gh-auth", "fail", "authentication failed", True)
 
 
 def _valid_repo(value: str | None) -> bool:
@@ -557,6 +591,67 @@ def _repo_identity_probe(effective: Mapping[str, str]) -> ProbeResult:
     return ProbeResult("repo-identity", "pass", "PSC_REPO_ROOT matches recorded PSC_REPO_IDENTITY stamp", False)
 
 
+# #371／#375：managed_env 的 `preserve_existing` 曾把 PSC_PROJECT_CONFIG_ROOT
+# 鎖成一個早期殘留的錯誤值，`cortex install service` 重裝也修不好；
+# PSC_CONTROL_ROOT 是 #375 新收進 managed_env 的鍵，同一種 bug class 可能重演。
+# installer 端已修好（兩者都改成每次 install 一律以目前 PSC_AGENTS_ROOT／
+# instance 重新推導），但已經部署、尚未重跑 install service 的既有安裝仍可能
+# 卡著舊值。這個 probe 是獨立於 install 之外的潛伏期偵測：不需要重裝就能看見
+# 目前 effective 值是否已經跟目前的推導值分岔。
+_MANAGED_PATH_DRIFT_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("PSC_PROJECT_CONFIG_ROOT", ("config", "paulsha")),
+    ("PSC_CONTROL_ROOT", ("control",)),
+)
+
+
+def _managed_path_drift_probe(
+    effective: Mapping[str, str], *, agents_root: Path, instance: str
+) -> ProbeResult:
+    drifted: list[str] = []
+    missing: list[str] = []
+    for key, relative in _MANAGED_PATH_DRIFT_TARGETS:
+        # PSC_CONTROL_ROOT 是 instance-scoped（`control/<instance>`），其餘目前
+        # 仍是 agents_root 底下的固定子目錄——與 installer.py 的 managed_env
+        # 推導公式保持一致。
+        derived = (
+            agents_root.joinpath(*relative, instance)
+            if key == "PSC_CONTROL_ROOT"
+            else agents_root.joinpath(*relative)
+        )
+        raw = effective.get(key, "").strip()
+        if not raw:
+            # 鍵完全缺席＝installer 這個版本以前從未寫過它（例如 #375 之前的舊
+            # PSC_CONTROL_ROOT），屬預期過渡態，不視為主動 drift。
+            missing.append(key)
+            continue
+        actual = Path(raw).expanduser()
+        if actual != derived:
+            drifted.append(f"{key}: effective={actual} derived={derived}")
+    if drifted:
+        return ProbeResult(
+            "managed-path-drift",
+            "fail",
+            "managed path drift detected (rerun `cortex install service` to repair): "
+            + "; ".join(drifted),
+            True,
+        )
+    if missing:
+        return ProbeResult(
+            "managed-path-drift",
+            "warn",
+            "managed path(s) not yet written by installer (legacy install predates this "
+            "key becoming instance-scoped managed state; rerun `cortex install service` "
+            "to adopt): " + ", ".join(missing),
+            False,
+        )
+    return ProbeResult(
+        "managed-path-drift",
+        "pass",
+        "managed paths match current PSC_AGENTS_ROOT-derived values",
+        False,
+    )
+
+
 def _service_paths_probe(*, home: Path, instance: str, live: bool) -> ProbeResult:
     result, _effective = _service_environment_probe(
         home=home,
@@ -728,6 +823,7 @@ def run_doctor(
         ),
         service_probe,
         _repo_identity_probe(effective),
+        _managed_path_drift_probe(effective, agents_root=agents_root, instance=instance),
         state_probe,
         socket_probe,
     ]
@@ -750,10 +846,7 @@ def run_doctor(
             )
         )
     else:
-        auth_code, _ = _process(runner, ["gh", "auth", "status"])
-        probes.append(
-            ProbeResult("gh-auth", "pass" if auth_code == 0 else "fail", "authenticated" if auth_code == 0 else "authentication failed", True)
-        )
+        probes.append(_gh_auth_probe(runner))
         repo_code, repo_stdout = _process(
             runner,
             ["gh", "api", "--include", f"repos/{repo}"],
