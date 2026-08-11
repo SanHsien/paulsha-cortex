@@ -143,6 +143,10 @@ cards:
     # #369：ship phase 落地變更需要 GitHub 可達（issue/PR 狀態核對、archive
     # 與 remote 一致性）；provider snapshot degraded 時擋在 dispatch 前，避免
     # 耗費一整個 session 後才因連線問題失敗。
+    # #442：小範圍試啟用 `provider:executor` 動態 sentinel（#369 建立、已測但
+    # 一直無卡宣告）——dispatch 前對「該 identity candidate 實際使用的 executor」
+    # 做登入態探測（coordinator.executor_auth），限流／登出擋在 spawn 之前。
+    # 先只在 ship-phase 兩張卡觀測，其餘卡待觀測無誤再擴大。
     runtime_capabilities:
       - "provider:github:hamanpaul/paulsha-cortex"
       - "provider:executor"
@@ -159,6 +163,8 @@ cards:
     persona_binding: manager
     # #369：conventional commit 落地後緊接著就是 push／PR 流程，同樣需要
     # GitHub 可達；宣告與 openspec-archive 相同的 provider 需求。
+    # #442：與 openspec-archive 一致，試啟用 `provider:executor` 登入態閘門
+    # （範圍與擴大條件見 openspec-archive 的說明）。
     runtime_capabilities:
       - "provider:github:hamanpaul/paulsha-cortex"
       - "provider:executor"
