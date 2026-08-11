@@ -15,9 +15,21 @@ stop_legacy_manager_timer() {
   systemctl --user disable "${instance}-manager.timer" >/dev/null 2>&1 || true
 }
 
+# #375：lock 路徑不得由 shell 自己硬寫一套解析規則——曾經固定回退到
+# $HOME/.agents/control，與 Python daemon（control/constants.py →
+# config/runtime.py 的完整 PSC_AGENTS_ROOT 解析鏈）各自為政；兩個 instance 的
+# PSC_AGENTS_ROOT 不同時，wrapper 判斷的 lock 路徑就會跟 daemon 實際使用的分岔，
+# 第二個 instance 啟動失敗時 wrapper 反而認養到另一個 instance 的 pid。改成呼叫
+# 與 daemon 同源的 `cortex control lock-path` 契約；結果快取到
+# _psc_manager_lock_path，避免 wait_for_manager_shutdown 的輪詢迴圈（最多 100 次、
+# 每次間隔 0.05s）反覆 spawn python 拖慢 shutdown 偵測。
+_psc_manager_lock_path=""
+
 manager_lock_path() {
-  local control_root="${PSC_CONTROL_ROOT:-$HOME/.agents/control}"
-  printf '%s\n' "$control_root/manager.lock"
+  if [[ -z "$_psc_manager_lock_path" ]]; then
+    _psc_manager_lock_path="$("$PY" -m paulsha_cortex.cli control lock-path)"
+  fi
+  printf '%s\n' "$_psc_manager_lock_path"
 }
 
 is_live_manager_pid() {
@@ -122,6 +134,15 @@ start_manager_loop() {
   fi
   mkdir -p "$HOME/.agents/log"
   local manager_log="$HOME/.agents/log/manager.log"
+  # #375 評估後的取捨：PSC_MANAGER_SPECS_DIR（連同 PSC_COORDINATOR_ROOT／
+  # PSC_SPECS_ROOT）目前仍刻意留在 operator 域，installer 不會幫它們 instance-
+  # scope。這行的 `$HOME/.agents/specs` 預設同樣不會跟著 PSC_AGENTS_ROOT 走，
+  # 是比 lock 路徑更直接的一個 isolation 破口（agents_root 已各自隔離的兩個
+  # instance，沒設定 PSC_MANAGER_SPECS_DIR 時仍會共掃同一份 specs 目錄）。
+  # 沒有跟著這次一併修的原因：coordinator_root 是 jobs.json／delivery-journal
+  # 等大量既有呼叫點的共用 state root，改動面遠大於本次 CONTROL_ROOT／
+  # PROJECT_CONFIG_ROOT 的範圍，需要獨立評估／測試，見
+  # test_install_leaves_specs_and_coordinator_roots_as_operator_domain 的說明。
   (
     "$PY" -m paulsha_cortex.coordinator.manager_daemon \
       --specs-dir "${PSC_MANAGER_SPECS_DIR:-$HOME/.agents/specs}"

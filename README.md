@@ -590,9 +590,9 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 | 介面 | 預設路徑 | 環境變數 |
 | --- | --- | --- |
 | preflight command (delivery) | 無預設（delivery 時必填） | `PSC_PREFLIGHT_CMD` |
-| control root | `~/.agents/control` | `PSC_CONTROL_ROOT` |
-| coordinator root | `~/.agents/coordinator` | `PSC_COORDINATOR_ROOT` |
-| specs root | `~/.agents/specs` | `PSC_SPECS_ROOT` |
+| control root | 依 `PSC_INSTANCE` 讀 installer env；未安裝時為 `~/.agents/control`（未 instance 化，見下方說明） | `PSC_CONTROL_ROOT` |
+| coordinator root | `~/.agents/coordinator`（未 instance 化，operator 域，見下方說明） | `PSC_COORDINATOR_ROOT` |
+| specs root | `~/.agents/specs`（未 instance 化，operator 域，見下方說明） | `PSC_SPECS_ROOT` |
 | run root | 依 `PSC_INSTANCE`（預設`cortex`）讀installer env；未安裝時為`~/.agents/run/<instance>` | `PSC_RUN_ROOT`（最高優先） |
 | monitor state root | `~/.agents/monitor` | `PSC_MONITOR_STATE_ROOT` |
 | config root | `~/.config/paulshaclaw` | `PSC_CONFIG_ROOT` |
@@ -601,6 +601,8 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 | worktree root | `<repo>-worktrees` sibling | `PSC_WORKTREE_ROOT` |
 
 Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 branch，並始終以 run repository 作為 `ScriptWorktreeCreator` 的 git來源，以確保 builder worktree 在對應 repo 池內建立。
+
+`cortex install service` 會把 `PSC_CONTROL_ROOT` 寫成 `<agents_root>/control/<instance>`（比照 `PSC_RUN_ROOT` 的 `run/<instance>` 模式），讓 `manager.lock` 天生 per-instance；`service-manager.sh` 透過 `cortex control lock-path`（與 daemon 同一套 `config/runtime.py` 解析鏈）取得 lock 路徑，不再自行硬寫預設值（issue #375）。`PSC_PROJECT_CONFIG_ROOT` 與 `PSC_CONTROL_ROOT` 皆屬 installer 的 managed path：每次 `cortex install service` 都會依目前 `PSC_AGENTS_ROOT`／instance 重新推導並覆寫，不會被既有值鎖住（issue #371）；`cortex doctor` 的 `managed-path-drift` probe 可在尚未重跑 install 前就偵測到殘留的舊值。`PSC_MANAGER_SPECS_DIR`／`PSC_COORDINATOR_ROOT`／`PSC_SPECS_ROOT` 目前仍未 instance 化、也不在 installer 的 managed_env 之列（evaluate 後決定留待後續 follow-up；多 instance 共用同一 `PSC_AGENTS_ROOT` 時這三者會共用同一份 specs/coordinator 狀態）。
 
 `PSC_PREFLIGHT_CMD` 必須為 typed argv，不可使用 shell wrapper。delivery preflight 常見設定範例：
 

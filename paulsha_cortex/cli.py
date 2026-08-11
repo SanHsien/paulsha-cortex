@@ -29,6 +29,7 @@ setup and workflow commands:
   list             列出統一 Work Item read model
   work show        顯示單一 Work Item 與可解釋關聯
   doctor           檢查 gh、preflight、model identity、agy 與 service paths
+  control lock-path 印出 manager.lock 契約路徑（shell wrapper／daemon 同源，整合用途）
   relay-hook       執行封裝內 relay hook（整合用途）
 
 coordinator commands:
@@ -151,6 +152,10 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
         from paulsha_cortex.doctor import main as doctor_main
 
         return int(doctor_main(args[1:]) or 0)
+    if args[0] == "control":
+        from paulsha_cortex.control.cli import main as control_main
+
+        return int(control_main(args[1:]) or 0)
     porcelain_commands = _load_porcelain_commands()
     porcelain_command = porcelain_commands.get(args[0])
     if porcelain_command is not None:
