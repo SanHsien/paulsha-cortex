@@ -545,6 +545,96 @@ class Stage9ServerTests(unittest.TestCase):
         mode = stat.S_IMODE(self.socket_path.stat().st_mode)
         self.assertEqual(mode, 0o600)
 
+    def test_serve_forever_does_not_touch_process_umask(self) -> None:
+        """Regression for #439: `serve_forever()` must rely solely on the
+        explicit `os.chmod(0o600)` for socket permissions, not a
+        `os.umask()` flip/restore dance around `bind()`. `os.umask()` is
+        process-global (not thread-local); flipping it — even briefly —
+        exposes every other thread in the process to a window where a
+        concurrent `mkdir(parents=True)` can inherit an overly restrictive
+        mode (see `test_concurrent_mkdir_keeps_execute_bit_during_serve_forever_bind`
+        below and issue #425). Asserting `os.umask` is never called is the
+        direct, non-timing-sensitive proof that the race class is gone.
+        """
+        other_socket_path = self.tmp / "no-umask-call.sock"
+        server = MonitorServer(store=self.store, socket_path=other_socket_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with mock.patch(
+            "paulsha_cortex.monitor.server.os.umask",
+            side_effect=AssertionError(
+                "serve_forever() must not call os.umask() (issue #439)"
+            ),
+        ):
+            thread.start()
+            try:
+                deadline = time.time() + 2.0
+                while time.time() < deadline and not other_socket_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(
+                    other_socket_path.exists(),
+                    msg="server socket did not bind in time",
+                )
+            finally:
+                server.stop()
+                thread.join(timeout=2.0)
+
+    def test_concurrent_mkdir_keeps_execute_bit_during_serve_forever_bind(self) -> None:
+        """Regression for #439/#425: while `serve_forever()` is inside its
+        `bind()` call, a *different* thread's `mkdir(parents=True)` must not
+        be affected by any process-wide umask tightening.
+
+        The real race window used to be the duration of one `bind()`
+        syscall — a handful of microseconds, too narrow to hit
+        deterministically in a test. To observe it reliably, this test
+        interposes a short sleep inside `socket.socket.bind` (test-only;
+        production code is untouched) so the server thread is provably
+        parked *inside* `bind()` while the main thread does a concurrent
+        `mkdir(parents=True)` elsewhere. Before the #439 fix this would flake
+        onto mode `0o600` (no execute bit) whenever the mkdir landed inside
+        the old `os.umask(0o177)` window; after the fix `serve_forever()`
+        never touches the umask, so the new directory always keeps the
+        ambient umask's execute bit.
+        """
+        real_bind = socket.socket.bind
+        bind_entered = threading.Event()
+        release_bind = threading.Event()
+
+        def _slow_bind(sock_self: socket.socket, address: str) -> None:
+            bind_entered.set()
+            release_bind.wait(timeout=2.0)
+            return real_bind(sock_self, address)
+
+        other_socket_path = self.tmp / "umask-race.sock"
+        server = MonitorServer(store=self.store, socket_path=other_socket_path)
+        new_dir = self.tmp / "concurrent-race" / "nested" / "leaf"
+        try:
+            with mock.patch.object(socket.socket, "bind", _slow_bind):
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(
+                        bind_entered.wait(timeout=2.0),
+                        msg="serve_forever never reached bind()",
+                    )
+                    # Server thread is now parked inside bind(). If
+                    # serve_forever still flipped the process umask around
+                    # bind() the way it did before #439, this is exactly the
+                    # window in which it would be tightened.
+                    new_dir.mkdir(parents=True)
+                finally:
+                    release_bind.set()
+                    thread.join(timeout=2.0)
+        finally:
+            server.stop()
+        mode = stat.S_IMODE(new_dir.stat().st_mode)
+        self.assertTrue(
+            mode & stat.S_IXUSR,
+            msg=(
+                "concurrent mkdir(parents=True) lost its execute bit during "
+                f"serve_forever's bind() window (mode={oct(mode)})"
+            ),
+        )
+
     def test_server_rejects_unknown_request_kind(self) -> None:
         sock = self._connect()
         _socket_send_request(sock, {"kind": "definitely_not_a_real_kind"})

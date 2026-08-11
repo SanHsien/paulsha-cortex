@@ -157,12 +157,14 @@ class MonitorServer:
         try:
             with _SOCKET_PATH_LOCK:
                 self._prepare_socket_path()
-                previous_umask = os.umask(0o177)
-                try:
-                    listener.bind(str(self._socket_path))
-                    bound = True
-                finally:
-                    os.umask(previous_umask)
+                # `os.chmod(0o600)` below sets the socket's final permission
+                # explicitly, so no umask tightening is needed around
+                # `bind()`. `os.umask()` is process-global (not
+                # thread-local) — flipping it here would race any other
+                # thread's concurrent `mkdir(parents=True)` into inheriting
+                # an overly restrictive mode (see issue #439 / #425).
+                listener.bind(str(self._socket_path))
+                bound = True
                 os.chmod(str(self._socket_path), 0o600)
                 listener.listen(16)
                 listener.settimeout(ACCEPT_TIMEOUT_SECONDS)
