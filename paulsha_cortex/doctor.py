@@ -251,7 +251,14 @@ def _review_sandbox_probe(
     runner: Runner = subprocess.run,
     live: bool = False,
 ) -> ProbeResult:
-    """Validate the executable Claude sandbox surface when it can review."""
+    """Validate the executable Claude sandbox surface when it can review.
+
+    #452 B／#456 R6：packaged roster 登錄的 claude review 是**候選宣告**，登錄
+    不隱含本機可用。只有 host-local overlay 明示宣告 claude review 時，本 probe
+    才以 fail gate 把關（operator 宣稱本機可跑，缺件是真錯誤——與 #452 前行為
+    逐項相同）；候選宣告僅來自 packaged 時，同樣的檢查照跑但降級為 warn／非
+    required，不得因 roster 落地讓原本健康的部署 doctor 轉紅。
+    """
 
     config_root = Path(
         env.get("PSC_PROJECT_CONFIG_ROOT", str(agents_root / "config" / "paulsha"))
@@ -264,14 +271,32 @@ def _review_sandbox_probe(
         return ProbeResult(
             "review-sandbox", "fail", "review identity registry unavailable", True
         )
-    required = any(
+    declared = any(
         identity.executor == "claude" and "review" in identity.capabilities
         for identity in registry.identities
     )
-    if not required:
+    if not declared:
         return ProbeResult(
             "review-sandbox", "warn", "no Claude review identity configured", False
         )
+    result = _review_sandbox_checks(env, runner=runner, live=live)
+    if result.status == "fail" and not _custom_overlay_declares_claude_review(config_root):
+        return ProbeResult(
+            "review-sandbox",
+            "warn",
+            f"{result.detail} (packaged claude review identity is a candidate "
+            "declaration; registry listing does not imply local availability, #456 R6)",
+            False,
+        )
+    return result
+
+
+def _review_sandbox_checks(
+    env: Mapping[str, str],
+    *,
+    runner: Runner,
+    live: bool,
+) -> ProbeResult:
     search_path = env.get("PATH")
     executables = {
         name: shutil.which(name, path=search_path)
@@ -386,6 +411,24 @@ def _review_sandbox_probe(
             )
     return ProbeResult(
         "review-sandbox", "pass", "Claude native Bash sandbox runtime ready", True
+    )
+
+
+def _custom_overlay_declares_claude_review(config_root: Path) -> bool:
+    """host-local overlay（非 packaged 候選 roster）是否明示宣告 claude review。"""
+
+    custom = config_root / "model-identities.yaml"
+    if not custom.is_file():
+        return False
+    try:
+        from .coordinator.model_identities import _load_model_identity_file
+
+        overlay = _load_model_identity_file(custom)
+    except (ImportError, ValueError):
+        return False
+    return any(
+        identity.executor == "claude" and "review" in identity.capabilities
+        for identity in overlay.identities
     )
 
 

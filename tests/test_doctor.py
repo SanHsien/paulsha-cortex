@@ -295,7 +295,9 @@ def test_review_sandbox_probe_requires_dependencies_only_for_claude_reviewer(
         "schema_version: 2\n"
         "identities:\n"
         "  - executor: claude\n"
-        "    model_id: sonnet\n"
+        # model_id 刻意避開 packaged roster 的 claude/sonnet（#452 B），
+        # 否則 overlay 覆蓋同鍵身分會觸發 shadow fail-closed。
+        "    model_id: sonnet-reviewer\n"
         "    independence_domain: anthropic\n"
         "    capabilities: [review]\n",
         encoding="utf-8",
@@ -328,7 +330,9 @@ def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
         "schema_version: 2\n"
         "identities:\n"
         "  - executor: claude\n"
-        "    model_id: sonnet\n"
+        # model_id 刻意避開 packaged roster 的 claude/sonnet（#452 B），
+        # 否則 overlay 覆蓋同鍵身分會觸發 shadow fail-closed。
+        "    model_id: sonnet-reviewer\n"
         "    independence_domain: anthropic\n"
         "    capabilities: [review]\n",
         encoding="utf-8",
@@ -395,7 +399,9 @@ def test_review_sandbox_probe_rejects_unsupported_claude_version(
         "schema_version: 2\n"
         "identities:\n"
         "  - executor: claude\n"
-        "    model_id: sonnet\n"
+        # model_id 刻意避開 packaged roster 的 claude/sonnet（#452 B），
+        # 否則 overlay 覆蓋同鍵身分會觸發 shadow fail-closed。
+        "    model_id: sonnet-reviewer\n"
         "    independence_domain: anthropic\n"
         "    capabilities: [review]\n",
         encoding="utf-8",
@@ -424,7 +430,9 @@ def test_review_sandbox_probe_rejects_degraded_unix_socket_filter(
         "schema_version: 2\n"
         "identities:\n"
         "  - executor: claude\n"
-        "    model_id: sonnet\n"
+        # model_id 刻意避開 packaged roster 的 claude/sonnet（#452 B），
+        # 否則 overlay 覆蓋同鍵身分會觸發 shadow fail-closed。
+        "    model_id: sonnet-reviewer\n"
         "    independence_domain: anthropic\n"
         "    capabilities: [review]\n",
         encoding="utf-8",

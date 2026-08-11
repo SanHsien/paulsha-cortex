@@ -23,7 +23,7 @@ INSPECT_SCHEMA = "cortex-porcelain/inspect/v1"
 def register_commands() -> None:
     if "inspect" in COMMANDS:
         return
-    register(PorcelainCommand(name="inspect", help="唯讀檢查 status/job/ready/work/doctor/service", run=main))
+    register(PorcelainCommand(name="inspect", help="唯讀檢查 status/job/ready/work/doctor/service/models", run=main))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,6 +54,11 @@ def _build_parser() -> argparse.ArgumentParser:
     service = sub.add_parser("service", help="檢查 service runtime 與 unit exec path")
     service.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
     service.add_argument("--json", action="store_true", help="輸出 cortex-porcelain/inspect/v1 JSON")
+
+    models = sub.add_parser(
+        "models", help="顯示每個 model identity × persona 的能力封套值與 provenance 來源"
+    )
+    models.add_argument("--json", action="store_true", help="輸出 cortex-porcelain/inspect/v1 JSON")
     return parser
 
 
@@ -275,6 +280,40 @@ def _run_service(*, instance: str, json_output: bool) -> int:
     return 0
 
 
+def _run_models(*, json_output: bool) -> int:
+    """#452 驗收 1：顯示每身分封套值、來源（measured/default）與評測出處。"""
+
+    from paulsha_cortex.coordinator.model_identities import load_model_identities
+    from paulsha_cortex.coordinator.model_profile import envelope_display_rows
+
+    rows = envelope_display_rows(load_model_identities())
+    if json_output:
+        _json_dump(_inspect_envelope("models", models=rows))
+        return 0
+    for row in rows:
+        envelope = row["envelope"]
+        source = row["source"]
+        ceiling = envelope.get("invariant_ceiling")
+        sys.stdout.write(
+            f"{row['executor']}/{row['model_id']}\t{row['persona']}\t"
+            f"accepts_bands={envelope.get('accepts_bands')}({source.get('accepts_bands')})\t"
+            f"invariant_ceiling={'∅(bypass)' if ceiling is None else ceiling}"
+            f"({source.get('invariant_ceiling')})\t"
+            f"consistency_scope=({source.get('consistency_scope')})\t"
+            f"acceptance_modes=({source.get('acceptance_modes')})\n"
+        )
+        provenance = row.get("provenance")
+        if provenance and provenance.get("fingerprint"):
+            fingerprint = provenance["fingerprint"]
+            sys.stdout.write(
+                f"  provenance: deck={fingerprint.get('deck_id')} "
+                f"sha256={str(fingerprint.get('deck_content_sha256'))[:12]}… "
+                f"patchmud={fingerprint.get('patchmud_version')} "
+                f"profiled_at={provenance.get('profiled_at')}\n"
+            )
+    return 0
+
+
 def main(argv: Sequence[str]) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv))
@@ -296,6 +335,8 @@ def main(argv: Sequence[str]) -> int:
             )
         if args.command == "service":
             return _run_service(instance=args.instance, json_output=args.json)
+        if args.command == "models":
+            return _run_models(json_output=args.json)
     except ValueError as exc:
         print(f"錯誤: {exc}", file=sys.stderr)
         return 1

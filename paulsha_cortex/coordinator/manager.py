@@ -6090,7 +6090,46 @@ def _identity_candidates_for_persona(persona: str, identities: IdentityRegistry,
     return candidates
 
 
-def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> list:
+def _measured_profile_partition(
+    persona: str, sizing_band, candidates: list
+) -> tuple[list, list[tuple[object, str]]]:
+    """#452 C：measured 側寫的解析優先序與 capable() 判準 1 過濾。
+
+    - 帶該 persona 實測側寫（accepts_bands source=measured）的身分排前
+      （解析優先序：override > measured 側寫 > registry/預設；同層維持既有
+      registry 順序，stable partition 不重排）。
+    - 實測 accepts_bands 排除本 run 的 sizing_band 的身分被剔除，理由隨
+      excluded 回傳給呼叫端（#209 R1：全滅時進 fail-closed 錯誤訊息，部分
+      剔除時由呼叫端落 manager log，兩者皆可觀測）。band 未知（planning 尚未
+      產出）或封套來自預設（#453 零過濾不變量）時一律不過濾。
+    """
+
+    from .model_identities import ENVELOPE_SOURCE_MEASURED, project_envelope
+
+    measured: list = []
+    defaults: list = []
+    excluded: list[tuple[object, str]] = []
+    for identity in candidates:
+        projection = project_envelope(identity, persona)
+        if projection.source.get("accepts_bands") != ENVELOPE_SOURCE_MEASURED:
+            defaults.append(identity)
+            continue
+        bands = tuple(projection.envelope["accepts_bands"])
+        if sizing_band is not None and sizing_band not in bands:
+            excluded.append(
+                (
+                    identity,
+                    f"measured accepts_bands={list(bands)} 排除 sizing_band={sizing_band}",
+                )
+            )
+            continue
+        measured.append(identity)
+    return measured + defaults, excluded
+
+
+def _workflow_identity_candidates_for_persona(
+    run, persona: str, identities: IdentityRegistry
+) -> list:
     """依既有規則產生合格 identity 清單，順序即優先序。
 
     #262：re-route 需要「次佳但合法」的候選，因此把原本只回傳 candidates[0]
@@ -6100,6 +6139,7 @@ def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> li
     #205：run-scoped 覆寫先於共享 registry 選擇被檢查；命中時回傳**單元素**
     清單，使 #262 的 preflight re-route 不會把 operator 明確指定的 identity
     換成別的——覆寫的意義就是「用這一個」，被 re-route 掉等同靜默失效。
+    #452 C：覆寫優先序高於 measured 側寫，measured band 過濾不套用在覆寫上。
     """
 
     builder_domains = {
@@ -6112,9 +6152,9 @@ def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> li
     # 覆寫仍須通過與共享路徑相同的 capability／independence domain 約束，違反
     # 時 fail closed 並列出可用 candidates，MUST NOT 靜默退回共享預設。
     override = getattr(run, "model_chain_override", None)
-    persona_override = override.get(step.persona) if isinstance(override, dict) else None
+    persona_override = override.get(persona) if isinstance(override, dict) else None
     if persona_override is not None:
-        eligible = _identity_candidates_for_persona(step.persona, identities, builder_domains)
+        eligible = _identity_candidates_for_persona(persona, identities, builder_domains)
         executor = persona_override.get("executor")
         model_id = persona_override.get("model_id")
         identity = identities.get(executor, model_id)
@@ -6122,27 +6162,73 @@ def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> li
         if identity is None:
             raise ValueError(
                 "model chain override 指定的 identity 不存在於 registry: "
-                f"{step.persona}={executor}/{model_id}（可用 candidates: {available}）"
+                f"{persona}={executor}/{model_id}（可用 candidates: {available}）"
             )
         if identity not in eligible:
-            if step.persona == "reviewer" and identity.independence_domain in builder_domains:
+            if persona == "reviewer" and identity.independence_domain in builder_domains:
                 reason = "independence_domain 與 builder 相同"
             else:
-                capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(step.persona, "build")
+                capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona, "build")
                 reason = f"不具備 {capability} capability"
             raise ValueError(
                 "model chain override 指定的 identity 不符既有約束: "
-                f"{step.persona}={executor}/{model_id}（{reason}；可用 candidates: {available}）"
+                f"{persona}={executor}/{model_id}（{reason}；可用 candidates: {available}）"
             )
         return [identity]
-    candidates = _identity_candidates_for_persona(step.persona, identities, builder_domains)
-    if step.persona == "builder" and run.primary_domain is not None:
+    candidates = _identity_candidates_for_persona(persona, identities, builder_domains)
+    if persona == "builder" and run.primary_domain is not None:
+        # #452 對抗審查修正：primary_domain 是「同 domain 優先」的**排序偏好**，
+        # 不是合法性限制（見 _identity_candidates_for_persona docstring）。舊實
+        # 作「preferred 非空即整組收窄」在 packaged roster 只有 agy 時無害，但
+        # roster 擴充 build 候選（#456 R3）後，僅為候選宣告的 packaged 身分會把
+        # host overlay 的可跑 builder 整個擠出候選清單，#262 preflight re-route
+        # 因此失去 fallback——packaged 登錄不隱含本機可用（比照 doctor #456 R6
+        # 的候選宣告語意）。改為 preferred 排前、其餘保留在後：首選不變，
+        # fallback 不丟。
         preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
         if preferred:
-            candidates = preferred
+            rest = [
+                item for item in candidates if item.independence_domain != run.primary_domain
+            ]
+            candidates = preferred + rest
     if not candidates:
-        raise ValueError(f"no configured identity for workflow persona: {step.persona}")
+        raise ValueError(f"no configured identity for workflow persona: {persona}")
+    # #452 C：measured 側寫優先＋band 過濾（三段 persona 之外的 catch-all
+    # persona 沒有封套語意，維持原清單）。
+    from .model_identities import DEFAULT_ENVELOPE
+
+    if persona in DEFAULT_ENVELOPE:
+        ordered, excluded = _measured_profile_partition(
+            persona, getattr(run, "sizing_band", None), candidates
+        )
+        if excluded and ordered:
+            # #452 對抗審查修正（#209 R1）：部分剔除（仍有存活候選）時排除理由
+            # 也要可觀測——落 manager log，不再靜默丟棄；全滅時走下方
+            # fail-closed 錯誤訊息。
+            logger.info(
+                "workflow run=%s persona=%s measured 側寫剔除候選：%s（存活候選 %d）",
+                getattr(run, "run_id", None),
+                persona,
+                "; ".join(
+                    f"{identity.executor}/{identity.model_id}: {reason}"
+                    for identity, reason in excluded
+                ),
+                len(ordered),
+            )
+        if not ordered:
+            detail = "; ".join(
+                f"{identity.executor}/{identity.model_id}: {reason}"
+                for identity, reason in excluded
+            )
+            raise ValueError(
+                f"no capable identity for workflow persona: {persona}（{detail}）"
+            )
+        candidates = ordered
     return candidates
+
+
+def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> list:
+    return _workflow_identity_candidates_for_persona(run, step.persona, identities)
 
 
 def _select_workflow_identity(run, step, identities: IdentityRegistry):
@@ -6197,11 +6283,13 @@ def _specialize_workflow_launcher(launcher, step):
 # 探測（`coordinator.executor_auth`），以 process-level 快取避免每次 dispatch
 # 都重新 spawn CLI 子行程（見 `_EXECUTOR_AUTH_CACHE`）。
 #
-# cards.yaml 尚未有卡片宣告 `provider:executor`（見 #369 changelog 的風險
-# 說明）：sentinel 機制已就緒且有完整測試覆蓋，但要接上前先確認 CI／各執行
-# 環境對 claude／codex／copilot CLI 的可得性，避免 dispatch 熱路徑意外 spawn
-# 子行程；`provider:github:<repo>` 純讀 monitor 快照檔，無此風險，已直接接上
-# openspec-archive／policy-commit 兩張 ship-phase 卡。
+# #442：`provider:executor` sentinel 已（小範圍）接上 cards——openspec-archive
+# ／policy-commit 兩張 ship-phase 卡宣告了它（與 #369 先行接上的
+# `provider:github:<repo>` 併存），啟用前已在部署環境驗證 claude／codex／
+# copilot CLI 皆在場且登入態探測可用（見 #442 PR 的驗證紀錄）。其餘卡仍
+# 維持 hold：待 ship-phase 觀測無誤後再擴大，避免 dispatch 熱路徑對更多
+# combo 意外 spawn 探測子行程。探測成本由 `_EXECUTOR_AUTH_CACHE`（process-
+# level、TTL 900s）與 ProbeBudget 上限共同約束。
 _EXECUTOR_AUTH_CACHE: dict[str, object] = {}
 
 
@@ -6357,10 +6445,28 @@ def _runtime_preflight_gate(
 
 def _record_resolved_model_chain(registry, run, step, identity) -> None:
     """#205 R4/D5：把本次 dispatch 實際解析到的 executor/model/domain 與來源
-    （run-scoped override vs 共享 registry）寫入 run，供事後稽核。純 provenance
-    寫入，逐段覆蓋合併既有紀錄，不影響既有 workflow 語意或推進邏輯。"""
+    寫入 run，供事後稽核。純 provenance 寫入，逐段覆蓋合併既有紀錄，不影響
+    既有 workflow 語意或推進邏輯。
+
+    #452 C：source 記錄實際解析依據——run-scoped 覆寫記 ``override``；身分帶
+    該 persona 的實測側寫記 ``patchmud-profile``；查表投影落在保守預設記
+    ``default-envelope``（``registry`` 保留為 #452 前既有紀錄的 legacy 值）。
+    """
     override = getattr(run, "model_chain_override", None)
-    source = "override" if isinstance(override, dict) and step.persona in override else "registry"
+    if isinstance(override, dict) and step.persona in override:
+        source = "override"
+    else:
+        from .model_identities import (
+            DEFAULT_ENVELOPE,
+            ENVELOPE_SOURCE_MEASURED,
+            project_envelope,
+        )
+
+        source = "default-envelope"
+        if step.persona in DEFAULT_ENVELOPE:
+            projection = project_envelope(identity, step.persona)
+            if ENVELOPE_SOURCE_MEASURED in projection.source.values():
+                source = "patchmud-profile"
     resolved = dict(getattr(run, "resolved_model_chain", None) or {})
     resolved[step.persona] = {
         "executor": identity.executor,
@@ -6698,8 +6804,30 @@ def _plan_frontmatter_artifact_classes(text: str) -> frozenset[str] | None:
     return frozenset(item.strip() for item in classes)
 
 
+def _plan_review_envelope_lookup(run, identities: IdentityRegistry):
+    """#452 C：`planning._plan_review_envelope` 的 envelope_lookup provider。
+
+    投影對象是「本 run 將解析到的 builder 身分」（#205 覆寫優先，與 dispatch
+    同一條解析路徑）。#453 R5／#454 R5：投影所需兩鍵任一來源為 default 即回
+    ``None``——v1 映射不量測這兩欄，現況恆回 None，seam 證據字節與
+    ``envelope_lookup=None`` 逐位元相同；實測值落地後自動開始真值過濾。
+    """
+
+    def _lookup():
+        try:
+            candidates = _workflow_identity_candidates_for_persona(run, "builder", identities)
+        except ValueError:
+            return None
+        from .model_identities import plan_review_envelope_projection
+
+        return plan_review_envelope_projection(candidates[0], persona="builder")
+
+    return _lookup
+
+
 def _evaluate_yellow_plan_review(
     artifacts: tuple[PlanningArtifact, ...] | None,
+    envelope_lookup=None,
 ):
     """#208 收口 wiring 2：Yellow band 推進 build 前的機械 plan review 判定。
 
@@ -6707,6 +6835,9 @@ def _evaluate_yellow_plan_review(
     fail-soft 回傳 ``None``——呼叫端據此維持現行為（正常推進），不得讓既有
     測試變紅。``applicable_contract_rules`` 固定餵 ``ACCEPTANCE_SURFACE_RULES``
     全集，理由同 ``work_bridge.current_sizing_snapshot``。
+
+    ``envelope_lookup``（#452 C）由呼叫端以 :func:`_plan_review_envelope_lookup`
+    注入；預設 ``None`` 維持 #209 未接線時的既有 bypass 語意。
     """
 
     if artifacts is None:
@@ -6722,7 +6853,7 @@ def _evaluate_yellow_plan_review(
             plan_artifact=plan_artifact,
             acceptance_surfaces=acceptance_surfaces,
             applicable_contract_rules=ACCEPTANCE_SURFACE_RULES,
-            envelope_lookup=None,
+            envelope_lookup=envelope_lookup,
         )
     except ValueError:
         return None
@@ -6849,7 +6980,10 @@ def _dispatch_workflow_card(
                 # （#212 的判定機制，這裡只接線）。Green／Red／None band 不呼叫
                 # gate（Red 已在上面攔下；Green/None 維持現行為，#223 已定案的
                 # fail-soft 慣例）。
-                gate_outcome = _evaluate_yellow_plan_review(artifacts)
+                gate_outcome = _evaluate_yellow_plan_review(
+                    artifacts,
+                    envelope_lookup=_plan_review_envelope_lookup(run, identities),
+                )
                 if gate_outcome is not None and not gate_outcome.ready:
                     if gate_outcome.terminal:
                         updated = registry._manager_update_workflow_run(

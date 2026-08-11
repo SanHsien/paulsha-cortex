@@ -140,25 +140,11 @@ def _mkdir_resilient(path: Path, *, attempts: int = 25, delay: float = 0.02) -> 
     """`path.mkdir(parents=True, exist_ok=True)`, retried past a transient
     `PermissionError` (issue #425).
 
-    This suite starts several `MonitorServer` instances per test, and
-    `MonitorServer.serve_forever()` briefly flips the *process-wide* umask
-    around its Unix-socket `bind()` call (see
-    `paulsha_cortex/monitor/server.py`). `os.umask()` is not thread-local —
-    it is one value shared by every thread in the process — so if this
-    thread's `mkdir(parents=True)` happens to create a new ancestor
-    directory during that window, the ancestor can inherit an overly
-    restrictive mode (e.g. `0o600`, no execute/traverse bit). Any later
-    `mkdir`/`stat` underneath that ancestor then raises `PermissionError`;
-    in CI this has shown up as `pathlib` raising `PermissionError` from
-    `Path.mkdir` / `Path.is_dir` while building a fresh
-    `docs/superpowers/workstreams/<stage>` tree, flaky only on Python 3.13
-    where the narrower timing of the rewritten pathlib internals makes the
-    (pre-existing, version-independent) race more likely to be observed.
-
-    The race window is a handful of microseconds — the duration of one
-    `bind()` call — so a short bounded retry lets the owning thread restore
-    the umask and clears the flake without masking a genuine, persistent
-    permission problem, which keeps failing past `attempts` and still
+    The retry was introduced for issue #425, when a process-wide umask race
+    could temporarily make an ancestor untraversable. The server no longer
+    changes umask (issue #439), but keeping a short bounded retry remains a
+    useful guard against transient filesystem permission/contention errors.
+    A genuine persistent permission problem still fails past `attempts` and
     raises here.
     """
     last_error: PermissionError | None = None
@@ -240,7 +226,7 @@ class MkdirResilientTests(unittest.TestCase):
 
     def test_retries_past_transient_permission_error_on_ancestor(self) -> None:
         """A directory that briefly loses its execute bit (simulating the
-        MonitorServer umask race) must not fail `_mkdir_resilient` — it
+        historical MonitorServer umask race) must not fail `_mkdir_resilient` — it
         should retry until the ancestor becomes traversable again, then
         create the target."""
         blocker = self.tmp / "blocker"
@@ -512,14 +498,13 @@ class Stage9ServerTests(unittest.TestCase):
             target=self.server.serve_forever, daemon=True
         )
         self.server_thread.start()
-        # wait for socket to appear
-        for _ in range(50):
-            if self.socket_path.exists():
-                break
-            time.sleep(0.02)
+        # The path appears at bind(), before the Unix transport applies 0o600.
+        # Readiness is published only after bind/chmod/listen completes.
         self.assertTrue(
-            self.socket_path.exists(), msg="server socket did not bind in time"
+            self.server.wait_until_ready(timeout=2.0),
+            msg="server did not reach ready state in time",
         )
+        self.assertTrue(self.socket_path.exists(), msg="server socket is missing")
         self.addCleanup(self._cleanup)
 
     def _cleanup(self) -> None:

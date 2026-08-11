@@ -1,0 +1,608 @@
+"""#452 A/D：patchmud 一次性評測巷道（`cortex model profile` 的核心邏輯）。
+
+選配、不在熱路徑：偵測不到 ``patchmud`` 可執行檔即印明確 skip 訊息並回 0。
+只透過 CLI 邊界互動（``patchmud run``／``patchmud report``），本模組 MUST NOT
+``import patchmud``。評測結果經 :func:`envelope_mapping.map_report_to_envelope`
+換算後只產 diff 預覽；**經明確 ``--apply`` 才寫 registry**（#454 R3 人工複核閘），
+且空 ``accepts_bands``（below-green-floor）絕不落 registry。
+
+寫入目標是 packaged registry 檔（repo 內 ``data/model-identities.yaml``，operator
+看 git diff 後自行 commit）——不可寫 custom overlay：``load_model_identities``
+對 custom 覆蓋 packaged 同鍵身分會 raise shadow error。
+
+一次性語意（#452 D）：評測指紋 ``(executor, model_id, persona, deck_id,
+deck content_sha256, patchmud version)`` 存 ``profile_provenance.fingerprint``；
+指紋未變→``already-profiled`` skip；``--force`` 重評。熱路徑（claim／dispatch／
+resume／tick 的派工判定）永不同步觸發本模組。
+"""
+
+from __future__ import annotations
+
+import difflib
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
+
+from .._yaml import YAMLError, safe_load
+from .envelope_mapping import EnvelopeMappingError, map_report_to_envelope
+from .model_identities import (
+    ENVELOPE_FIELDS,
+    IdentityRegistry,
+    _load_model_identity_file,
+    _packaged_registry_path,
+    project_envelope,
+)
+
+PROFILE_SCHEMA = "cortex-model-profile/v1"
+
+#: cortex 身分 → patchmud model 別名。誠實約束（#452 票面）：patchmud 目前
+#: 只有 anthropic adapter（別名 sonnet/haiku/opus/fable）；roster 內只有
+#: claude/sonnet 可被驅動，copilot/codex/agy/cg 一律 per-identity skip
+#: （adapter-unavailable）維持 default，禁止假造可跑。
+PATCHMUD_MODEL_ALIASES: Mapping[tuple[str, str], str] = {
+    ("claude", "sonnet"): "sonnet",
+}
+
+#: deck 可量測的 persona 維度：pilot-v1 只量 builder（#456 R7 分期註記；
+#: planner／reviewer 題庫待 paulsha-patchmud#13）。未知 deck 保守視為僅 builder。
+DECK_MEASURED_PERSONAS: Mapping[str, tuple[str, ...]] = {
+    "pilot-v1": ("builder",),
+}
+_DEFAULT_MEASURED_PERSONAS = ("builder",)
+
+#: persona → 所需 capability（與 manager._MODEL_CHAIN_CAPABILITY_BY_PERSONA 對齊）。
+_PERSONA_CAPABILITY = {
+    "planner": "planning",
+    "builder": "build",
+    "reviewer": "review",
+}
+
+DEFAULT_DECK_ID = "pilot-v1"
+DEFAULT_LOADOUT = "P0T0R0"
+
+_RATE_LIMIT_RE = re.compile(r"\b429\b|rate.?limit", re.IGNORECASE)
+_MAX_ENCOUNTER_ATTEMPTS = 3
+_PLAIN_SCALAR_RE = re.compile(r"[A-Za-z][A-Za-z0-9._+:/@#-]*")
+
+ProcessRunner = Callable[..., object]
+
+
+def default_patchmud_root() -> Path:
+    """本機約定路徑（issue #452 §A）：$HOME/prj_pri/paulsha-patchmud。"""
+
+    return Path(os.environ.get("PSC_PATCHMUD_ROOT", str(Path.home() / "prj_pri" / "paulsha-patchmud")))
+
+
+def _has_python_shebang(path: Path) -> bool:
+    try:
+        first_line = path.read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, UnicodeDecodeError, IndexError):
+        return False
+    return first_line.startswith("#!") and "python" in first_line.lower()
+
+
+def _discover_patchmud_bin(
+    explicit: str | None,
+    *,
+    platform: str = os.name,
+    search_path: str | None = None,
+) -> str | None:
+    if explicit:
+        return explicit
+    path_value = search_path if search_path is not None else os.environ.get("PATH", "")
+    discovered = (
+        shutil.which("patchmud")
+        if search_path is None
+        else shutil.which("patchmud", path=path_value)
+    )
+    if discovered is not None or platform != "nt":
+        return discovered
+    # PATHEXT-based discovery ignores extensionless files on Windows. Accept
+    # only a literal Python shebang script; arbitrary extensionless files stay
+    # non-executable and fail closed.
+    for entry in path_value.split(os.pathsep):
+        if not entry:
+            continue
+        candidate = Path(entry) / "patchmud"
+        if candidate.is_file() and _has_python_shebang(candidate):
+            return str(candidate)
+    return None
+
+
+def _patchmud_command(patchmud_bin: str | Path, *, platform: str = os.name) -> list[str]:
+    """Return an argv prefix that can launch a patchmud entry point.
+
+    Native Windows cannot execute an extensionless Python shebang script.
+    Console-script ``.exe`` shims and ``.cmd`` wrappers remain direct; an
+    explicit ``.py`` file or Python shebang uses this interpreter.
+    """
+
+    executable = str(patchmud_bin)
+    if platform != "nt":
+        return [executable]
+    path = Path(executable)
+    if path.suffix.lower() == ".py":
+        return [sys.executable, executable]
+    if path.suffix:
+        return [executable]
+    if _has_python_shebang(path):
+        return [sys.executable, executable]
+    return [executable]
+
+
+@dataclass(frozen=True)
+class ProfileOptions:
+    apply: bool = False
+    force: bool = False
+    deck_id: str = DEFAULT_DECK_ID
+    loadout: str = DEFAULT_LOADOUT
+    patchmud_bin: str | None = None
+    patchmud_root: Path | None = None
+    registry_file: Path | None = None
+    identity_filter: tuple[str, ...] = field(default_factory=tuple)
+
+
+def deck_content_sha256(deck_dir: Path) -> str:
+    """deck 目錄的 deterministic content hash（排序後逐檔 path+bytes）。"""
+
+    digest = hashlib.sha256()
+    for path in sorted(p for p in deck_dir.rglob("*") if p.is_file()):
+        digest.update(path.relative_to(deck_dir).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _encounter_dirs(deck_dir: Path) -> list[Path]:
+    return sorted(p for p in deck_dir.iterdir() if p.is_dir())
+
+
+def _emit_scalar(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if _PLAIN_SCALAR_RE.fullmatch(text) and text not in {"true", "false", "null"}:
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _emit_mapping(lines: list[str], payload: Mapping[str, object], indent: int) -> None:
+    pad = " " * indent
+    for key, value in payload.items():
+        if isinstance(value, Mapping):
+            lines.append(f"{pad}{key}:")
+            _emit_mapping(lines, value, indent + 2)
+        elif isinstance(value, (list, tuple)):
+            inner = ", ".join(_emit_scalar(item) for item in value)
+            lines.append(f"{pad}{key}: [{inner}]")
+        else:
+            lines.append(f"{pad}{key}: {_emit_scalar(value)}")
+
+
+_REGISTRY_HEADER = """\
+# #452 B／#456 R3：候選身分 roster（capabilities 為候選宣告，benchmark 前）。
+# 封套欄位「沒寫＝預設、有寫＝實測」（#453 R4：registry 永不寫入預設值）；
+# 實測值由 `cortex model profile` 產 diff、經人工複核 --apply 後落地。
+# 列序即候選優先序：agy 維持首位，保住既有 planner 熱路徑選擇不變。
+"""
+
+
+def render_registry_file(rows: Sequence[Mapping[str, object]], *, schema_version: int = 3) -> str:
+    lines: list[str] = [_REGISTRY_HEADER.rstrip("\n"), f"schema_version: {schema_version}", "identities:"]
+    key_order = (
+        "executor",
+        "model_id",
+        "independence_domain",
+        "capabilities",
+        "live_probe",
+        *ENVELOPE_FIELDS,
+        "profile_provenance",
+    )
+    for row in rows:
+        first = True
+        for key in key_order:
+            if key not in row or row[key] is None:
+                continue
+            value = row[key]
+            prefix = "  - " if first else "    "
+            first = False
+            if isinstance(value, Mapping):
+                lines.append(f"{prefix}{key}:")
+                _emit_mapping(lines, value, 6)
+            elif isinstance(value, (list, tuple)):
+                inner = ", ".join(_emit_scalar(item) for item in value)
+                lines.append(f"{prefix}{key}: [{inner}]")
+            else:
+                lines.append(f"{prefix}{key}: {_emit_scalar(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def write_registry_file(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    """先寫暫存檔並以 loader round-trip 驗證，通過才原子取代（fail-closed）。"""
+
+    text = render_registry_file(rows)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        _load_model_identity_file(tmp)
+    except ValueError:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, path)
+
+
+def _fingerprint(
+    *, executor: str, model_id: str, persona: str, deck_id: str,
+    deck_sha: str, patchmud_version: str,
+) -> dict[str, str]:
+    return {
+        "executor": executor,
+        "model_id": model_id,
+        "persona": persona,
+        "deck_id": deck_id,
+        "deck_content_sha256": deck_sha,
+        "patchmud_version": patchmud_version,
+    }
+
+
+def _existing_fingerprint(identity, persona: str) -> Mapping[str, object] | None:
+    provenance = getattr(identity, "profile_provenance", None)
+    if not isinstance(provenance, Mapping):
+        return None
+    fingerprint = provenance.get("fingerprint")
+    if not isinstance(fingerprint, Mapping):
+        return None
+    if str(fingerprint.get("persona", "")).strip() != persona:
+        return None
+    return fingerprint
+
+
+def _run_process(runner: ProcessRunner, argv: list[str]) -> tuple[int, str]:
+    try:
+        raw = runner(argv, shell=False, capture_output=True, text=True)
+    except Exception as exc:  # noqa: BLE001 - 選配巷道 fail-soft，不拖垮呼叫端
+        return 1, f"{type(exc).__name__}: {exc}"
+    returncode = getattr(raw, "returncode", None)
+    stdout = getattr(raw, "stdout", "") or ""
+    stderr = getattr(raw, "stderr", "") or ""
+    if not isinstance(returncode, int):
+        return 1, "malformed process result"
+    return returncode, f"{stdout}\n{stderr}"
+
+
+def _run_encounter_with_backoff(
+    runner: ProcessRunner,
+    argv: list[str],
+    *,
+    sleep: Callable[[float], None],
+) -> tuple[bool, str]:
+    """單一 encounter 執行；429/rate-limit 訊號指數退避重試（#455 §4.2）。"""
+
+    output = ""
+    for attempt in range(_MAX_ENCOUNTER_ATTEMPTS):
+        code, output = _run_process(runner, argv)
+        if code == 0:
+            return True, output
+        if not _RATE_LIMIT_RE.search(output):
+            return False, output
+        if attempt + 1 < _MAX_ENCOUNTER_ATTEMPTS:
+            sleep(float(2 ** (attempt + 1)))
+    return False, output
+
+
+def _profile_cells(registry: IdentityRegistry, measured_personas: tuple[str, ...]):
+    """列出 (identity, persona) 目標格：capability 對應 persona × deck 可量測維度。"""
+
+    for identity in registry.identities:
+        for persona in ("planner", "builder", "reviewer"):
+            if _PERSONA_CAPABILITY[persona] not in identity.capabilities:
+                continue
+            yield identity, persona, persona in measured_personas
+
+
+def run_model_profile(
+    options: ProfileOptions,
+    *,
+    runner: ProcessRunner = subprocess.run,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] | None = None,
+    platform: str = os.name,
+) -> dict[str, object]:
+    """執行 profile 巷道，回傳結構化結果（porcelain 層負責呈現）。
+
+    回傳 dict：``schema``／``skip_reason``（patchmud 不在場時）／``patchmud``
+    （bin、version、deck 指紋）／``cells``（逐格 status+reason+diff）／
+    ``applied``／``registry_file``。
+    """
+
+    result: dict[str, object] = {
+        "schema": PROFILE_SCHEMA,
+        "skip_reason": None,
+        "patchmud": None,
+        "cells": [],
+        "applied": False,
+    }
+    registry_file = options.registry_file or _packaged_registry_path()
+    result["registry_file"] = str(registry_file)
+
+    patchmud_bin = _discover_patchmud_bin(options.patchmud_bin, platform=platform)
+    if patchmud_bin is None:
+        result["skip_reason"] = "patchmud-not-found"
+        return result
+    patchmud_root = options.patchmud_root or default_patchmud_root()
+    version_file = Path(patchmud_root) / "VERSION"
+    try:
+        patchmud_version = version_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        patchmud_version = ""
+    if not patchmud_version:
+        result["skip_reason"] = "patchmud-version-unresolvable"
+        return result
+    deck_dir = Path(patchmud_root) / "decks" / options.deck_id
+    if not deck_dir.is_dir():
+        raise ValueError(f"deck 目錄不存在：{deck_dir}")
+    encounters = _encounter_dirs(deck_dir)
+    if not encounters:
+        raise ValueError(f"deck 目錄無任何 encounter：{deck_dir}")
+    deck_sha = deck_content_sha256(deck_dir)
+    measured_personas = DECK_MEASURED_PERSONAS.get(options.deck_id, _DEFAULT_MEASURED_PERSONAS)
+    deck_info = {
+        "deck_id": options.deck_id,
+        "content_sha256": deck_sha,
+        "encounter_count": len(encounters),
+        "measured_personas": list(measured_personas),
+    }
+    result["patchmud"] = {
+        "bin": str(patchmud_bin),
+        "version": patchmud_version,
+        "root": str(patchmud_root),
+        "deck": dict(deck_info),
+    }
+    patchmud_command = _patchmud_command(patchmud_bin, platform=platform)
+
+    registry = _load_model_identity_file(Path(registry_file))
+    # #452 對抗審查修正：--identity 打錯字時不得靜默產出零 cells 讓操作者誤信
+    # 「全部已評測完」——查無對應身分即明確報錯（porcelain 層以 exit 2 呈現）；
+    # `/` 與 `:` 兩種拼法都接受（與 build_capability_lookup 的解析一致）。
+    identity_filter: tuple[str, ...] = ()
+    if options.identity_filter:
+        known_labels = {
+            f"{identity.executor}/{identity.model_id}" for identity in registry.identities
+        }
+        normalized: list[str] = []
+        unknown: list[str] = []
+        for raw in options.identity_filter:
+            text = str(raw).strip()
+            label = text if "/" in text else text.replace(":", "/", 1)
+            if label not in known_labels:
+                unknown.append(text)
+            normalized.append(label)
+        if unknown:
+            raise ValueError(
+                "--identity 查無對應身分："
+                + ", ".join(unknown)
+                + "（registry 內可用："
+                + ", ".join(sorted(known_labels))
+                + "；接受 executor/model_id 或 executor:model_id 拼法）"
+            )
+        identity_filter = tuple(normalized)
+    rows = [identity.to_dict() for identity in registry.identities]
+    row_index = {
+        (str(row["executor"]), str(row["model_id"])): position
+        for position, row in enumerate(rows)
+    }
+    current_text = render_registry_file(rows)
+    cells: list[dict[str, object]] = []
+    applied_any = False
+    timestamp = (now() if now is not None else datetime.now(timezone.utc)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    for identity, persona, persona_measurable in _profile_cells(registry, measured_personas):
+        label = f"{identity.executor}/{identity.model_id}"
+        if identity_filter and label not in identity_filter:
+            continue
+        cell: dict[str, object] = {
+            "executor": identity.executor,
+            "model_id": identity.model_id,
+            "persona": persona,
+        }
+        cells.append(cell)
+        if not persona_measurable:
+            # deck 量不到這個 persona 維度（pilot-v1 只量 builder）：誠實維持
+            # default，不假跑（#454 R1 persona-dimension-unmeasured）。
+            cell["status"] = "skipped"
+            cell["reason"] = "persona-dimension-unmeasured"
+            continue
+        existing = _existing_fingerprint(identity, persona)
+        fingerprint = _fingerprint(
+            executor=identity.executor,
+            model_id=identity.model_id,
+            persona=persona,
+            deck_id=options.deck_id,
+            deck_sha=deck_sha,
+            patchmud_version=patchmud_version,
+        )
+        if existing is not None and dict(existing) == fingerprint and not options.force:
+            cell["status"] = "already-profiled"
+            cell["reason"] = "fingerprint-unchanged"
+            continue
+        alias = PATCHMUD_MODEL_ALIASES.get((identity.executor, identity.model_id))
+        if alias is None:
+            # 誠實約束：patchmud 僅 anthropic adapter，其餘 executor 不可驅動。
+            cell["status"] = "skipped"
+            cell["reason"] = "adapter-unavailable"
+            cell["detail"] = (
+                "patchmud 僅 anthropic adapter（sonnet/haiku/opus/fable）；"
+                "本身分維持 default 封套"
+            )
+            continue
+
+        runs_root = Path(tempfile.mkdtemp(prefix="cortex-model-profile-runs-"))
+        report_root = Path(tempfile.mkdtemp(prefix="cortex-model-profile-report-"))
+        failures: list[str] = []
+        for encounter_dir in encounters:
+            ok, output = _run_encounter_with_backoff(
+                runner,
+                [
+                    *patchmud_command,
+                    "run",
+                    str(encounter_dir),
+                    "--model",
+                    alias,
+                    "--loadout",
+                    options.loadout,
+                    "--runs-root",
+                    str(runs_root),
+                    "--run-id",
+                    f"profile-{identity.executor}-{identity.model_id}-{encounter_dir.name}",
+                ],
+                sleep=sleep,
+            )
+            if not ok:
+                failures.append(f"{encounter_dir.name}: {output.strip()[:200]}")
+        if failures:
+            # 先掛上逐關失敗明細：report 若因 run 全滅而失敗，操作者才看得到
+            # 根因（實跑 e2e 驗證發現的可觀測性缺口——429 全滅時只剩 report
+            # glob 錯誤，看不出是限流）。
+            cell["encounter_failures"] = failures
+        report_code, report_output = _run_process(
+            runner,
+            [
+                *patchmud_command,
+                "report",
+                "--runs",
+                str(runs_root / "*"),
+                "--out",
+                str(report_root),
+            ],
+        )
+        if report_code != 0:
+            cell["status"] = "failed"
+            cell["reason"] = "report-failed"
+            cell["detail"] = report_output.strip()[:400]
+            continue
+        report_path = report_root / "report.yaml"
+        try:
+            report = safe_load(report_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, YAMLError) as exc:
+            cell["status"] = "failed"
+            cell["reason"] = "report-unreadable"
+            cell["detail"] = f"{type(exc).__name__}: {exc}"
+            continue
+        try:
+            mapping = map_report_to_envelope(
+                report,
+                executor=identity.executor,
+                model_id=identity.model_id,
+                persona=persona,
+                deck=deck_info,
+                patchmud_version=patchmud_version,
+                report_model=alias,
+                report_loadout=options.loadout,
+            )
+        except EnvelopeMappingError as exc:
+            cell["status"] = "failed"
+            cell["reason"] = "mapping-rejected"
+            cell["detail"] = str(exc)
+            continue
+        provenance = mapping["provenance"]
+        cell["observation"] = dict(provenance["observation"])
+        cell["mapping_reasons"] = dict(provenance["reasons"])
+        if not provenance["registry_writable"]:
+            # 空的實測 accepts_bands（below-green-floor）或全 default 結果不得
+            # 落 registry（#454 R3；#209 R2「非空」契約）——人工裁決除名或維持。
+            cell["status"] = "not-writable"
+            cell["reason"] = str(provenance["reasons"].get("accepts_bands"))
+            continue
+
+        proposed_rows = [dict(row) for row in rows]
+        target = proposed_rows[row_index[(identity.executor, identity.model_id)]]
+        for field_name in ENVELOPE_FIELDS:
+            if provenance["source"].get(field_name) == "measured":
+                value = mapping["envelope"][field_name]
+                target[field_name] = list(value) if isinstance(value, (list, tuple)) else value
+            else:
+                target.pop(field_name, None)
+        target["profile_provenance"] = {
+            "fingerprint": dict(provenance["fingerprint"]),
+            "source": dict(provenance["source"]),
+            "reasons": dict(provenance["reasons"]),
+            "observation": dict(provenance["observation"]),
+            "profiled_at": timestamp,
+        }
+        proposed_text = render_registry_file(proposed_rows)
+        diff = "".join(
+            difflib.unified_diff(
+                current_text.splitlines(keepends=True),
+                proposed_text.splitlines(keepends=True),
+                fromfile=str(registry_file),
+                tofile=f"{registry_file}（proposed）",
+            )
+        )
+        cell["diff"] = diff
+        cell["envelope"] = {
+            key: (list(value) if isinstance(value, (list, tuple)) else value)
+            for key, value in mapping["envelope"].items()
+        }
+        if options.apply:
+            write_registry_file(Path(registry_file), proposed_rows)
+            rows = proposed_rows
+            current_text = proposed_text
+            applied_any = True
+            cell["status"] = "applied"
+        else:
+            cell["status"] = "proposed"
+        cell["reason"] = str(provenance["reasons"].get("accepts_bands"))
+
+    result["cells"] = cells
+    result["applied"] = applied_any
+    return result
+
+
+def envelope_display_rows(registry: IdentityRegistry) -> list[dict[str, object]]:
+    """`cortex inspect models` 的顯示資料：每身分 × persona 的封套投影＋來源。"""
+
+    display: list[dict[str, object]] = []
+    for identity in registry.identities:
+        for persona in ("planner", "builder", "reviewer"):
+            if _PERSONA_CAPABILITY[persona] not in identity.capabilities:
+                continue
+            projection = project_envelope(identity, persona)
+            provenance_summary: dict[str, object] | None = None
+            if projection.provenance is not None:
+                fingerprint = projection.provenance.get("fingerprint")
+                provenance_summary = {
+                    "fingerprint": dict(fingerprint) if isinstance(fingerprint, Mapping) else None,
+                    "profiled_at": projection.provenance.get("profiled_at"),
+                }
+            display.append(
+                {
+                    "executor": identity.executor,
+                    "model_id": identity.model_id,
+                    "independence_domain": identity.independence_domain,
+                    "persona": persona,
+                    "envelope": {
+                        key: (list(value) if isinstance(value, (list, tuple)) else value)
+                        for key, value in projection.envelope.items()
+                    },
+                    "source": dict(projection.source),
+                    "provenance": provenance_summary,
+                }
+            )
+    return display
