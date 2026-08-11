@@ -922,7 +922,17 @@ def build_periodic_tick_runner(
                 else paths.coordinator_root().resolve()
             )
             for workflow in registry.list_workflow_runs():
-                if workflow.status != "ongoing" or "blocked" in workflow.facets:
+                if (
+                    workflow.status != "ongoing"
+                    or "blocked" in workflow.facets
+                    # #373 縱深防禦：manager.resume_workflow_run 自身已對
+                    # needs_human 做 early-return（operator_resume 預設
+                    # False），這裡的迴圈守衛跟它對齊，不把已經 needs_human
+                    # 的 run 送進去白跑一趟——尤其是同一 tick 內剛被
+                    # authority-restart reset 剝除過 needs_human 又再度標記
+                    # needs_human 的 run，不必每個 tick 都重新嘗試一次。
+                    or "needs_human" in workflow.facets
+                ):
                     continue
                 if workflow.current_phase not in {"plan", "build", "verify", "review"}:
                     continue

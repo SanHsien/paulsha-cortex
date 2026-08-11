@@ -566,6 +566,130 @@ def test_authority_restart_does_not_invalidate_build_phase_run(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
+# #373：authority restart 必須同步更新 claim_key，否則
+# work_actions._claim_action 的 mismatch 觸發條件（canonical_run.claim_key !=
+# _expected_claim_key(authority)）永久為真——每次 automatic scan 都重新觸發
+# reset，剝除 needs_human、改寫 source_revision、attempts["verify"] 無界累加，
+# 進而讓 manager.resume_workflow_run 撞上 workflow job binding mismatch，形成
+# 永久重觸發迴圈。
+# ---------------------------------------------------------------------------
+
+
+def test_authority_restart_reset_syncs_claim_key_to_new_authority(tmp_path: Path) -> None:
+    """#373 根因（最小重現）：_manager_reset_workflow_for_authority_restart 只
+    改寫 source_revision，從未同步 claim_key。"""
+
+    old_authority, _ = _authority(tmp_path, source_revisions=["issue:12@open", "openspec:demo@1"])
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    old_claim_key = work_actions._expected_claim_key(old_authority)
+    steps = _base_steps(verify_result="passed", review_result="passed")
+    run = _make_run(
+        registry,
+        authority=old_authority,
+        claim_key=old_claim_key,
+        current_phase="review",
+        steps=steps,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        facets=(),
+    )
+    new_snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=["issue:12@updated", "openspec:demo@1"],
+    )
+    new_authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=new_snapshot
+    )
+    new_digest = work_actions.work_authority_digest(new_authority)
+    expected_new_claim_key = work_actions._expected_claim_key(new_authority)
+    assert expected_new_claim_key != old_claim_key
+
+    updated = registry._manager_reset_workflow_for_authority_restart(
+        run.run_id, authority_digest=new_digest
+    )
+
+    assert updated.source_revision == new_digest
+    # 根因斷言：reset 後 claim_key 必須跟著更新到新 authority 對應的 expected
+    # key，否則下一次 automatic scan 的 mismatch 判定永遠為真。
+    assert updated.claim_key == expected_new_claim_key
+
+
+def test_repeated_automatic_scan_on_unchanged_authority_does_not_retrigger_restart(
+    tmp_path: Path,
+) -> None:
+    """#373 迴圈重現：同一 authority digest 下，重複的 automatic scan（模擬多次
+    daemon tick）不得每次都重新觸發 authority-restart reset——否則 needs_human
+    facet 每 tick 被剝除、attempts["verify"] 無界累加、workflow job binding
+    mismatch 永久重複（見 issue #373 2026-08-10 comment 的完整迴圈）。"""
+
+    old_authority, _ = _authority(tmp_path, source_revisions=["issue:12@open", "openspec:demo@1"])
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    old_claim_key = work_actions._expected_claim_key(old_authority)
+    steps = _base_steps(verify_result="passed", review_result="passed")
+    run = _make_run(
+        registry,
+        authority=old_authority,
+        claim_key=old_claim_key,
+        current_phase="review",
+        steps=steps,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        facets=(),
+    )
+    new_snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=["issue:12@updated", "openspec:demo@1"],
+    )
+    new_authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=new_snapshot
+    )
+
+    # Tick 1：authority 真的變了（issue 內容更新），第一次 restart 合法觸發。
+    tick1 = work_actions._claim_action(
+        args={"action": "auto-scan"},
+        authority=new_authority,
+        now_epoch=200,
+        state_path=tmp_path / "runs.json",
+        automatic=True,
+        auto_label=True,
+        workflow_registry=registry,
+    )
+    assert tick1["action"] == "resume"
+    assert tick1["run"]["retry_classification"] == "authority_restart"
+    after_tick1 = registry.get_workflow_run(run.run_id)
+    attempts_after_tick1 = after_tick1.attempts.get("verify", 0)
+    assert attempts_after_tick1 >= 1
+    assert after_tick1.claim_key == work_actions._expected_claim_key(new_authority)
+
+    # 模擬 manager.py `_job_for_workflow_card` 撞上 workflow job binding
+    # mismatch 後，manager_daemon.py 的 except handler 把 needs_human 寫回
+    # （見 manager_daemon.py 的 resume 迴圈 except 分支）。
+    registry._manager_update_workflow_run(
+        run.run_id, facets=("needs_human",), gate_status="running"
+    )
+
+    # Tick 2～4：authority 完全沒再變（模擬後續多次 daemon tick，snapshot 沒
+    # 有新變更）。根治後：claim_key 已與 tick1 的新 authority 同步，mismatch
+    # 判定不再為真——不再重新觸發 restart，needs_human 不被無限剝除，
+    # attempts 不再無界累加。
+    for _ in range(3):
+        tick_result = work_actions._claim_action(
+            args={"action": "auto-scan"},
+            authority=new_authority,
+            now_epoch=200,
+            state_path=tmp_path / "runs.json",
+            automatic=True,
+            auto_label=True,
+            workflow_registry=registry,
+        )
+        current = registry.get_workflow_run(run.run_id)
+        assert tick_result["action"] == "needs_human"
+        assert "needs_human" in current.facets
+        assert current.attempts.get("verify", 0) == attempts_after_tick1
+        assert current.claim_key == work_actions._expected_claim_key(new_authority)
+
+
+# ---------------------------------------------------------------------------
 # 追加：retry_classification 在 WorkflowRun 上的 provenance 語意（供
 # work_bridge._completion_draft 讀取寫入 CompletionRecord，maintainer 追加
 # 派工 1）——一般 phase 推進（_manager_update_workflow_run）保持既有值不變，
