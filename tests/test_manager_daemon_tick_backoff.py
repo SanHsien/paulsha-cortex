@@ -256,6 +256,78 @@ def test_log_error_deduplicates_repeated_signature_with_periodic_summary(capsys)
     assert "a totally different problem" in stderr_tail
 
 
+def test_log_error_deduplicates_interleaved_signatures_independently(capsys):
+    """issue #374：單槽去重被多筆錯誤輪替瓦解的回歸測試。
+
+    daemon 每輪 tick 會交錯產生多個不同 signature（實測每輪 14 個，來自
+    #373 的 14 個受害 run）。修復前的單槽實作只存一筆 signature+count，
+    一旦下一筆 signature 不同就整槽重置——於是 ``state["signature"] !=
+    signature`` 恆真，每筆都印、抑制摘要永遠不會觸發（#249 的抑制路徑
+    形同虛設）。本測試以 3 個 signature 各送 200 筆、輪流交錯（呼叫序為
+    sig1, sig2, sig3, sig1, sig2, sig3, ...），驗證每個 signature 各自
+    獨立計數、各自的週期摘要都要出現，且交錯的不同 signature 不得互相
+    重置對方的計數。
+
+    在修復前（單槽）此測試必為 RED：交錯情境下抑制數＝0，
+    ``len(sig1_lines) == 200``（等同 total_calls，完全沒有被抑制）。
+    """
+    manager_daemon._reset_log_error_dedup_state()
+    signatures = [
+        ValueError("interleaved failure alpha"),
+        ValueError("interleaved failure beta"),
+        ValueError("interleaved failure gamma"),
+    ]
+    calls_per_signature = 200
+    total_calls = calls_per_signature * len(signatures)
+
+    for _ in range(calls_per_signature):
+        for exc in signatures:
+            manager_daemon._log_error(exc)
+
+    output_lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+
+    # 核心斷言：交錯不得瓦解抑制——印出行數必須遠少於送入筆數。
+    assert len(output_lines) < total_calls
+
+    interval = manager_daemon.LOG_ERROR_SUMMARY_INTERVAL
+    expected_lines_per_signature = 1 + (calls_per_signature - 1) // interval
+    for exc in signatures:
+        marker = str(exc)
+        sig_lines = [line for line in output_lines if marker in line]
+        # 每個 signature 各自的抑制節奏都要符合既有單一 signature 語意
+        # （首筆必印＋每 interval 筆一次摘要），交錯不改變這個節奏。
+        assert len(sig_lines) == expected_lines_per_signature, (
+            f"{marker!r} 印出 {len(sig_lines)} 行，預期 {expected_lines_per_signature} 行"
+        )
+        assert marker in sig_lines[0]
+        assert any("repeated" in line for line in sig_lines[1:])
+
+
+def test_log_error_dedup_lru_eviction_evicts_oldest_slot(capsys):
+    """LRU 容量上限：signature 數超過 ``LOG_ERROR_DEDUP_MAX_SLOTS`` 時，
+    最久未使用的 slot 必須被淘汰；被淘汰的 signature 再次出現時視為
+    首見（重新印出完整行，而非被抑制）。這是 signature 含
+    ``source_revision``（#373 的迴圈會改寫它）情境下避免記憶體無界
+    成長的必要防線。"""
+    manager_daemon._reset_log_error_dedup_state()
+    max_slots = manager_daemon.LOG_ERROR_DEDUP_MAX_SLOTS
+
+    first_signature_exc = ValueError("eviction-candidate-0")
+    manager_daemon._log_error(first_signature_exc)
+    capsys.readouterr()  # 清空第一筆的輸出，只關注後續行為
+
+    # 灌入 max_slots 個「全新」signature，把最早的那個擠出 LRU。
+    for index in range(1, max_slots + 1):
+        manager_daemon._log_error(ValueError(f"eviction-filler-{index}"))
+    capsys.readouterr()
+
+    # 原本第一個 signature 已被淘汰，理應被視為「首見」而非抑制重複。
+    manager_daemon._log_error(first_signature_exc)
+    stderr_tail = capsys.readouterr().err
+    assert "eviction-candidate-0" in stderr_tail
+    assert "repeated" not in stderr_tail
+
+
 def test_safe_tick_error_summary_redacts_paths_and_caps_length(tmp_path: Path):
     """受測路徑一律由 tmp_path 動態組出——測試檔本身不得出現使用者絕對路徑的
     結構字面值（``/home/<name>/``），否則會反過來觸發 R-21 secret scan。
