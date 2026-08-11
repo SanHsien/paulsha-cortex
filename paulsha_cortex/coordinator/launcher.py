@@ -685,6 +685,16 @@ class SubprocessLauncher:
         self._commit_required = commit_required
         self._review_terminal_kind = review_terminal_kind
 
+    @property
+    def executor(self) -> str:
+        """公開 executor CLI 家族（copilot/claude/codex/agy）。
+
+        #381：spawn admission limiter 需要在啟動前依 provider 分桶節流；
+        沒有 per-slice identity 可查時，這是唯一能從已注入的 launcher
+        自報「實際會是哪個 provider」的管道（見 spawn_admission.resolve_provider）。
+        """
+        return self._executor
+
     def as_read_only(self) -> "SubprocessLauncher":
         """Return an equivalent launcher with the executor's strict planning contract."""
 

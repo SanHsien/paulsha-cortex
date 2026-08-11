@@ -24,6 +24,7 @@ from .dispatcher import Dispatcher
 from .model_identities import load_model_identities
 from .registry import JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
+from .spawn_admission import DEFAULT_MIN_INTERVAL_SECONDS, SpawnAdmissionLimiter, build_default_limiter
 from .work_actions import safe_exception_summary
 
 DEFAULT_TICK_INTERVAL = 300.0
@@ -464,6 +465,7 @@ def build_request_executor(
     workflow_ship_validator=None,
     work_action_fn: Callable[..., dict[str, Any]] | None = None,
     stage_evidence_validator: Callable[[dict[str, str]], bool] | None = None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
@@ -780,6 +782,7 @@ def build_request_executor(
                 git_runner=getattr(dispatcher, "_git_runner", None),
                 identity_registry=builder_identity_registry,
                 launcher_factory=builder_launcher_factory,
+                spawn_admission=spawn_admission,
             )
             job = dispatched[0]
             if registry is None:
@@ -829,6 +832,7 @@ def build_request_executor(
                 git_runner=getattr(dispatcher, "_git_runner", None),
                 identity_registry=builder_identity_registry,
                 launcher_factory=builder_launcher_factory,
+                spawn_admission=spawn_admission,
             )
             return {
                 "dispatch_skipped": False,
@@ -848,6 +852,7 @@ def build_request_executor(
             "reaper": reaper,
             "identity_registry": builder_identity_registry,
             "launcher_factory": builder_launcher_factory,
+            "spawn_admission": spawn_admission,
         }
         if requested_review_executor is not None or requested_review_model is not None:
             run_tick_kwargs.update(
@@ -886,7 +891,14 @@ def build_periodic_tick_runner(
     auto_claim_fn: Callable[[], list[dict[str, Any]]] | None = None,
     workflow_identity_registry=None,
     workflow_ship_validator=None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> Callable[[], dict[str, Any]]:
+    """#381：``spawn_admission``（若提供）在同一個 runner 的整個生命週期內只解析
+    一次，讓 workflow resume 迴圈與其後的 run_tick（fanout）在同一輪、甚至跨輪
+    tick 之間，對同一 provider 共用同一個節流時間軸——而不是各自建一個互不知情
+    的 limiter。未提供時原樣傳 ``None`` 往下遞交給 resume/run_tick 各自的
+    no-op 預設（見 spawn_admission.resolve_limiter），行為與未接線前完全相同。
+    """
     predicate = lambda slice_id: autonomy.default_is_satisfied(
         slice_id,
         handoff_dir=handoff_dir,
@@ -955,13 +967,18 @@ def build_periodic_tick_runner(
                             registry=registry,
                             coordinator_root=coordinator_root,
                         )
-                    manager.resume_workflow_run(
+                    # #381：透過 _call_with_supported_kwargs 遞交 spawn_admission——
+                    # 舊版（尚未認得這個參數的）injected fake 仍相容，不會因為新增
+                    # 這個可選 kwarg 而 TypeError。
+                    _call_with_supported_kwargs(
+                        manager.resume_workflow_run,
                         dispatcher,
                         run_id=workflow.run_id,
                         identities=identities,
                         launcher_factory=workflow_launcher_factory,
                         coordinator_root=coordinator_root,
                         ship_validator=active_ship_validator,
+                        spawn_admission=spawn_admission,
                     )
                 except Exception as exc:
                     _log_error(
@@ -1020,6 +1037,7 @@ def build_periodic_tick_runner(
                 allow_unsafe=default_allow_unsafe,
                 model=identity.model_id,
             ),
+            "spawn_admission": spawn_admission,
         }
         if default_review_executor is not None or default_review_model is not None:
             run_tick_kwargs.update(
@@ -1066,6 +1084,7 @@ def run_loop(
     default_review_model: str | None = None,
     reaper: Callable[[], dict[str, Any]] | None = None,
     recent_done_window_seconds: float | None = RECENT_DONE_WINDOW_SECONDS,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> bool:
     runtime_pid = os.getpid() if pid is None else pid
     held_lock = acquire_lock(pid=runtime_pid, pid_alive=pid_alive, now_fn=now_fn)
@@ -1110,6 +1129,11 @@ def run_loop(
                     "default_review_model": default_review_model,
                 }
             )
+        # #381：只在明確提供時才帶入這個 kwarg（比照 default_model 的既有慣例）——
+        # 保留 build_request_executor 未升級前就已存在的注入測試相容（strict
+        # keyword-only fake 沒有 spawn_admission 這個參數）。
+        if spawn_admission is not None:
+            executor_kwargs["spawn_admission"] = spawn_admission
         executor = build_request_executor(**executor_kwargs)
     provider = status_provider or build_runtime_status_provider(
         registry=ensure_registry(),
@@ -1140,6 +1164,11 @@ def run_loop(
                     "default_review_model": default_review_model,
                 }
             )
+        # #381：同一個 spawn_admission instance 同時餵給 executor（手動
+        # dispatch/fanout/tick 請求）與 periodic runner（自動 tick 的 workflow
+        # resume + fanout）——兩條 lane 才會對同一個 provider 共用節流時間軸。
+        if spawn_admission is not None:
+            periodic_kwargs["spawn_admission"] = spawn_admission
         periodic_runner = build_periodic_tick_runner(**periodic_kwargs)
 
     constants.requests_dir().mkdir(parents=True, exist_ok=True)
@@ -1442,8 +1471,29 @@ def main(argv: list[str] | None = None) -> int:
             "預設 86400（24 小時），亦可用 PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS 覆寫。"
         ),
     )
+    parser.add_argument(
+        "--spawn-min-interval-seconds",
+        type=float,
+        default=None,
+        help=(
+            "issue #381：per-provider spawn admission 的最小啟動間隔（秒）——"
+            "同一 provider（executor CLI，例如 copilot 啟動時連續探測 GitHub "
+            "/user）背靠背 spawn 時插入的最小間隔，不同 provider 互不阻塞。"
+            f"未指定時讀 PSC_SPAWN_MIN_INTERVAL_SECONDS，皆未設則用內建預設 "
+            f"{DEFAULT_MIN_INTERVAL_SECONDS} 秒；設為 0 停用節流。"
+        ),
+    )
     args = parser.parse_args(argv)
     _install_signal_handlers()
+
+    # #381：fanout（dispatch/fanout/tick 請求 ＋ periodic tick 的 run_tick）
+    # 與 workflow lane（periodic tick 的 resume 迴圈）在這裡拿到同一個
+    # SpawnAdmissionLimiter instance，往下分別注入 build_request_executor 與
+    # build_periodic_tick_runner，兩條 lane 才會對同一個 provider quota
+    # 共用節流時間軸，而不是各自為政。
+    spawn_admission_limiter = build_default_limiter(
+        min_interval_seconds=args.spawn_min_interval_seconds,
+    )
 
     started = run_loop(
         poll_interval=args.poll_interval,
@@ -1457,6 +1507,7 @@ def main(argv: list[str] | None = None) -> int:
         default_review_executor=args.review_executor,
         default_review_model=args.review_model,
         recent_done_window_seconds=args.recent_done_window_seconds,
+        spawn_admission=spawn_admission_limiter,
     )
     return 0 if started else 1
 

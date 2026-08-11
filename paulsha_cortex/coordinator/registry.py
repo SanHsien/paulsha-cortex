@@ -506,7 +506,7 @@ class JobRegistry:
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
-            "usage_reason", "started_at", "exited_at",
+            "workflow_test_policy", "usage_reason", "started_at", "exited_at",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
@@ -784,6 +784,7 @@ class JobRegistry:
         workflow_output_baseline: tuple[dict[str, str], ...] = (),
         workflow_builder_job_id: str | None = None,
         workflow_stage_execution_key: str | None = None,
+        workflow_test_policy: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -832,6 +833,10 @@ class JobRegistry:
             "workflow_output_baseline": [dict(row) for row in workflow_output_baseline],
             "workflow_builder_job_id": workflow_builder_job_id,
             "workflow_stage_execution_key": workflow_stage_execution_key,
+            # #379：派工當下 pin 住的驗收判準快照（deck 卡片的 test_policy），
+            # harvest 時與 registry 現有 WorkflowRun.steps 的現值比對，drift 一律
+            # fail closed（見 manager._workflow_acceptance_definition_drifted）。
+            "workflow_test_policy": workflow_test_policy,
             "workflow_evidence": None,
             # #384：executor 失敗的 typed 分類（見 provider_outcome.py），只在
             # `update_headless_result` 收到失敗結果且能分類時才會被寫入。

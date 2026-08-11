@@ -24,7 +24,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 
 # canonical envelope 的版本。舊形狀（1）不即刻失效，走 legacy 相容路徑。
@@ -578,6 +578,7 @@ def authorize_terminal(
     ledger_path: str | Path,
     require_ledger: bool = False,
     test_policy: str | None = None,
+    expected_gate_names: Iterable[str] = frozenset(),
 ) -> TerminalAuthorization:
     """採信 terminal 狀態；``passed`` 必須由 manager 獨立產生的 gate ledger 授權（R2）。
 
@@ -593,6 +594,17 @@ def authorize_terminal(
     影響「terminal 自稱 passed 是否與 ledger 矛盾」這條判斷；模型自述的
     ``gate_evidence`` 仍對照未反轉的原始 ledger 事實，維持誠實性檢查不被稀釋。
     其他 ``test_policy``（含 ``None``）不受影響，一般卡的 fail-closed 行為不變。
+
+    #379：``expected_gate_names`` 是由呼叫端從 spec/plan（例如 deck 卡片的
+    ``test_policy``）機械導出的「這個 phase 應驗的 gate 名稱集合」，與 gate
+    名稱是否存在於 ``PSC_GATE_CMD_*`` 宣告出的 ledger 完全獨立。過去 gate 集合
+    唯一來源是 operator 的 ``PSC_GATE_CMD_*`` 宣告；若 operator 漏宣告 plan 要求
+    的 gate，ledger 對那個 gate 而言永遠是「不存在」，而 #308 對空/局部 ledger
+    的既有處理不會發現這個落差——builder 自報的超集因此無人驗證。這裡在既有
+    D3 矛盾偵測之後、#308 的空 ledger 早退之前插入一道獨立檢查：只要
+    ``expected_gate_names`` 有任何名稱不在 ledger 實際跑過的 gate 集合內，一律
+    fail closed，不論 ledger 是完全空還是部份宣告。預設空集合維持所有既有呼叫
+    端（未傳入本參數）的行為不變。
     """
 
     if envelope.status != "passed":
@@ -647,11 +659,30 @@ def authorize_terminal(
                 detail=str(actual.get("detail") or ""),
             )
 
+    # #379：spec/plan 導出的應驗 gate 若沒出現在 ledger 實際跑過的集合裡，代表
+    # operator 的 PSC_GATE_CMD_* 宣告漏掉了 plan 要求的 gate——這是「builder 自報
+    # 的超集無人驗」的真缺口，必須在 #308 的空 ledger 早退之前攔下，且不論 ledger
+    # 是完全空還是只宣告了部份 gate 都一視同仁。放在 D3 矛盾偵測之後：ledger 裡
+    # 已存在但失敗的 gate 優先以更具體的 GateContradictionError 呈現。
+    missing_expected = sorted(frozenset(expected_gate_names) - set(outcomes))
+    if missing_expected:
+        raise TerminalContractError(
+            "terminal 宣稱 passed，但 spec/plan 宣告應驗的 gate 未出現在 manager 的 "
+            f"gate ledger：{missing_expected}；operator 的 PSC_GATE_CMD_* 宣告未涵蓋這些 "
+            "gate，沒有任何獨立證據可以背書 passed",
+            reason="gate-ledger-missing-expected-gate",
+            validation_path="$.gate_evidence",
+            errors=(
+                {"missing_gates": missing_expected, "ledger_gates": sorted(outcomes)},
+            ),
+        )
+
     # 模型自述的 gate 宣告必須與 ledger 一致：宣稱跑了 ledger 沒有的 gate，或宣稱
     # 的結果與 ledger 不符，都是 R2 定義的矛盾（前者代表自述不可信，後者已被上面
     # 的迴圈攔下，這裡補上「宣稱 failed 卻整體 passed」這類不一致）。
     #
-    # #308：operator 顯式零 gate（ledger 存在但 gates 為空）時跳過此對照——此設定
+    # #308：operator 顯式零 gate（ledger 存在但 gates 為空）且 spec/plan 也沒有
+    # 任何應驗 gate（上面的 missing_expected 檢查已放行）時跳過此對照——此設定
     # 依 #261 文件本就沒有 R2 保護，空 ledger 下沒有可對照的獨立證據層；模型自述
     # 不構成授權，對照它只會讓授權結果隨模型是否填寫 gate_evidence 而隨機化
     # （gpt-5.4 會把 shell 指令如 `pwd` 填進 gate_evidence）。ledger 非空時維持
