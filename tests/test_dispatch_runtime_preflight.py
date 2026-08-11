@@ -86,6 +86,28 @@ class _CountingLauncherFactory:
         return object()
 
 
+def _fresh_executor_auth_cache(*executors: str) -> dict[str, ProviderFreshness]:
+    """#442：預填 manager 的 process-level executor auth 快取為「剛探測過、ok」。
+
+    manager wiring 測試若不預填，`provider:executor` 宣告會讓
+    `_combined_provider_prober` 真的 spawn CLI 子行程——測試必須維持 hermetic。
+    """
+
+    import time as _time
+
+    now = _time.time()
+    return {
+        executor: ProviderFreshness(
+            provider_id=executor,
+            status="ok",
+            observed_at=now,
+            ttl_seconds=900.0,
+            source="live-probe",
+        )
+        for executor in executors
+    }
+
+
 _BUILDER = ModelIdentity(
     executor="claude",
     model_id="opus-5",
@@ -599,10 +621,17 @@ def test_card_contract_declares_capabilities_in_shipped_deck():
     # #369：ship phase 的兩張卡宣告了 provider 需求——這是修復死碼路徑後第一批
     # 真正的輸入，否則接線了也不會被觸發（cards.yaml 修復前只有 module:pytest
     # 宣告，從無 provider: 宣告）。
+    # #442：同兩張卡再宣告 `provider:executor` 動態 sentinel——小範圍試啟用
+    # dispatch 前的 executor 登入態閘門（其餘卡待 ship-phase 觀測無誤再擴大）。
+    from paulsha_cortex.coordinator.runtime_preflight import PROVIDER_EXECUTOR_SENTINEL
+
     for card_id in ("openspec-archive", "policy-commit"):
         requirements = card_runtime_requirements(card_id, cards=cards)
         assert (
             RuntimeCapability("provider", "github:hamanpaul/paulsha-cortex") in requirements
+        ), card_id
+        assert (
+            RuntimeCapability("provider", PROVIDER_EXECUTOR_SENTINEL) in requirements
         ), card_id
 
     # 未宣告的 card 是 no-op，行為與 #262 之前相同。
@@ -776,7 +805,9 @@ def test_provider_executor_sentinel_passes_when_resolved_executor_is_ok(tmp_path
     assert factory.model_invocations == 1
 
 
-def test_manager_wiring_blocks_dispatch_on_fresh_degraded_provider_snapshot(tmp_path):
+def test_manager_wiring_blocks_dispatch_on_fresh_degraded_provider_snapshot(
+    tmp_path, monkeypatch
+):
     """#369 RED→GREEN 的核心斷言：manager._runtime_preflight_gate 過去從未把
     snapshot_lookup／provider_prober 傳給 evaluate_dispatch_gate（兩者預設
     None），因此 provider capability 探測在生產環境是死碼——即使 monitor
@@ -794,6 +825,13 @@ def test_manager_wiring_blocks_dispatch_on_fresh_degraded_provider_snapshot(tmp_
     from paulsha_cortex.coordinator.model_identities import IdentityRegistry
     from paulsha_cortex.monitor.work_models import ProviderSnapshot
     from paulsha_cortex.monitor.work_snapshot import WorkSnapshot, WorkSnapshotStore
+
+    # #442：policy-commit 現在同時宣告 `provider:executor`；預填 process-level
+    # 快取為 fresh ok，讓本測試聚焦 github provider 的 degraded 硬擋語意，
+    # 且不 spawn 任何真實 CLI 探測子行程。
+    monkeypatch.setattr(
+        manager, "_EXECUTOR_AUTH_CACHE", _fresh_executor_auth_cache("claude", "codex")
+    )
 
     provider_id = "github:hamanpaul/paulsha-cortex"
     # 用「現在」當 last_attempt_at，確保相對於 gate 實際呼叫時的 wall clock
@@ -857,7 +895,7 @@ def test_manager_wiring_blocks_dispatch_on_fresh_degraded_provider_snapshot(tmp_
     assert f"providers unavailable: {provider_id}" in (decision.reason or "")
 
 
-def test_manager_wiring_dispatches_when_provider_snapshot_absent(tmp_path):
+def test_manager_wiring_dispatches_when_provider_snapshot_absent(tmp_path, monkeypatch):
     """對照組：monitor 完全沒有這個 provider 的快照時（例如 daemon 剛啟動、
     尚未跑過第一輪掃描）不得硬擋——回退成 STALE_SNAPSHOT，non-blocking，行為
     與 #369 修復前對「無 snapshot」情境的保守面一致，只是現在死碼真的活了。
@@ -866,6 +904,11 @@ def test_manager_wiring_dispatches_when_provider_snapshot_absent(tmp_path):
     from paulsha_cortex.coordinator import manager
     from paulsha_cortex.coordinator.model_identities import IdentityRegistry
     from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+    # #442：同上——預填 executor auth 快取，維持 hermetic。
+    monkeypatch.setattr(
+        manager, "_EXECUTOR_AUTH_CACHE", _fresh_executor_auth_cache("claude", "codex")
+    )
 
     class _FakeStep:
         card = "policy-commit"
@@ -900,6 +943,166 @@ def test_manager_wiring_dispatches_when_provider_snapshot_absent(tmp_path):
     assert decision is not None
     assert decision.action == "dispatch"
     assert decision.result.outcome is PreflightOutcome.STALE_SNAPSHOT
+
+
+def test_manager_wiring_probes_executor_auth_via_fake_runner(tmp_path, monkeypatch):
+    """#442 啟用 regression：ship-phase 卡宣告 `provider:executor` 後，manager
+    的 dispatch gate 真的走 executor_auth 探測路徑——冷啟動（process 快取空）
+    時以正確 argv 對候選 identity 的 executor 探測一次、結果回寫快取。runner
+    為注入的 fake，全程不 spawn 實體 CLI。
+    """
+
+    import functools
+    import subprocess as _subprocess
+
+    from paulsha_cortex.coordinator import executor_auth, manager
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+    calls: list[tuple[str, ...]] = []
+
+    def _fake_runner(argv, *, timeout):
+        calls.append(tuple(argv))
+        return _subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(manager, "_EXECUTOR_AUTH_CACHE", {})
+    monkeypatch.setattr(
+        executor_auth,
+        "check_executor_auth",
+        functools.partial(executor_auth.check_executor_auth, runner=_fake_runner),
+    )
+
+    class _FakeStep:
+        card = "policy-commit"  # #442 起宣告 provider:executor（與 provider:github 併存）
+        persona = "manager"
+        phase = "ship"
+        commit_policy = None
+
+    class _FakeRun:
+        steps = ()
+        primary_domain = None
+
+    class _Launcher:
+        def __init__(self, identity):
+            self._identity = identity
+
+        def executor_environment(self):
+            return _host_env(tmp_path, name=f"{self._identity.executor}-sandbox")
+
+        def launch(self, **kwargs):  # pragma: no cover
+            raise AssertionError("測試不預期真的 launch")
+
+    registry = IdentityRegistry(schema_version=2, identities=(_BUILDER, _ALT_BUILDER))
+    empty_store = WorkSnapshotStore(path=tmp_path / "absent-snapshot.json")
+    decision = manager._runtime_preflight_gate(
+        _FakeRun(),
+        _FakeStep(),
+        identities=registry,
+        launcher_factory=_Launcher,
+        snapshot_store=empty_store,
+    )
+
+    assert decision is not None
+    assert decision.action == "dispatch"
+    # 首位 candidate（claude）探測 ok 即放行：sentinel 解析成該 candidate 實際
+    # 的 executor，argv 正是 executor_auth 對 claude 定義的登入態指令，且只
+    # 探測一次（codex 不需被打擾）。
+    assert calls == [("claude", "auth", "status")]
+    cached = manager._EXECUTOR_AUTH_CACHE.get("claude")
+    assert cached is not None and cached.status == "ok"
+    outcomes = {
+        finding.capability.token: finding.outcome
+        for finding in decision.result.findings
+    }
+    # github provider 無 monitor 快照 → STALE_SNAPSHOT（non-blocking）；
+    # executor 登入態探測則真的跑了並回報 OK。
+    assert outcomes["provider:executor"] is PreflightOutcome.OK
+    assert (
+        outcomes["provider:github:hamanpaul/paulsha-cortex"]
+        is PreflightOutcome.STALE_SNAPSHOT
+    )
+
+
+def test_manager_wiring_reroutes_when_executor_rate_limited(tmp_path, monkeypatch):
+    """#442：首位 candidate 的 executor 探測回報限流（degraded）時，gate 依
+    既有 candidate 順序 re-route 到下一位（codex），而非直接 needs_human——
+    「限流／登出擋在 model session spawn 之前」正是本閘門啟用的目的。
+    """
+
+    import functools
+    import subprocess as _subprocess
+
+    from paulsha_cortex.coordinator import executor_auth, manager
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+    calls: list[tuple[str, ...]] = []
+
+    def _fake_runner(argv, *, timeout):
+        calls.append(tuple(argv))
+        if argv[0] == "claude":
+            # 比照 #369 實際案例：限流訊息同時帶 authenticate 字樣，分類必須
+            # 是 rate_limited 而非 logged_out（executor_auth 的判定順序）。
+            return _subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout="",
+                stderr="API rate limit exceeded; please re-authenticate for higher quota",
+            )
+        return _subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(manager, "_EXECUTOR_AUTH_CACHE", {})
+    monkeypatch.setattr(
+        executor_auth,
+        "check_executor_auth",
+        functools.partial(executor_auth.check_executor_auth, runner=_fake_runner),
+    )
+
+    class _FakeStep:
+        card = "policy-commit"
+        persona = "manager"
+        phase = "ship"
+        commit_policy = None
+
+    class _FakeRun:
+        steps = ()
+        primary_domain = None
+
+    class _Launcher:
+        def __init__(self, identity):
+            self._identity = identity
+
+        def executor_environment(self):
+            return _host_env(tmp_path, name=f"{self._identity.executor}-sandbox")
+
+        def launch(self, **kwargs):  # pragma: no cover
+            raise AssertionError("測試不預期真的 launch")
+
+    registry = IdentityRegistry(schema_version=2, identities=(_BUILDER, _ALT_BUILDER))
+    empty_store = WorkSnapshotStore(path=tmp_path / "absent-snapshot.json")
+    decision = manager._runtime_preflight_gate(
+        _FakeRun(),
+        _FakeStep(),
+        identities=registry,
+        launcher_factory=_Launcher,
+        snapshot_store=empty_store,
+    )
+
+    assert decision is not None
+    assert decision.action == "reroute"
+    assert decision.identity is _ALT_BUILDER
+    assert calls == [("claude", "auth", "status"), ("codex", "doctor", "--json")]
+    # 被擋下的 claude 以 PROVIDER_UNAVAILABLE 記錄於 attempts，freshness 指名
+    # 解析後的 executor（claude）與限流原因——sentinel 字面值不外洩。
+    first = decision.attempts[0]
+    assert first.blocking
+    finding = next(
+        item for item in first.findings if item.capability.token == "provider:executor"
+    )
+    assert finding.outcome is PreflightOutcome.PROVIDER_UNAVAILABLE
+    assert finding.freshness is not None
+    assert finding.freshness.provider_id == "claude"
+    assert "rate limit" in (finding.freshness.reason or "")
 
 
 def test_launcher_reports_same_environment_as_real_job():
