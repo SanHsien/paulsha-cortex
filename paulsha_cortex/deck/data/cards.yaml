@@ -140,6 +140,10 @@ cards:
     requires: ["openspec/changes/<change>/tasks.md"]
     produces: ["openspec/changes/archive/*<change>*"]
     persona_binding: manager
+    # #369：ship phase 落地變更需要 GitHub 可達（issue/PR 狀態核對、archive
+    # 與 remote 一致性）；provider snapshot degraded 時擋在 dispatch 前，避免
+    # 耗費一整個 session 後才因連線問題失敗。
+    runtime_capabilities: ["provider:github:hamanpaul/paulsha-cortex"]
 
   - id: policy-commit
     kind: skill
@@ -151,6 +155,9 @@ cards:
     requires: []
     produces: []          # 證據 = conventional commit 本身（不機驗檔案）
     persona_binding: manager
+    # #369：conventional commit 落地後緊接著就是 push／PR 流程，同樣需要
+    # GitHub 可達；宣告與 openspec-archive 相同的 provider 需求。
+    runtime_capabilities: ["provider:github:hamanpaul/paulsha-cortex"]
 
   - id: adversarial-review
     kind: skill
