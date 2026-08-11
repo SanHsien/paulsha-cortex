@@ -187,6 +187,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_slice_action.add_argument("slice_id")
     p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"])
     p_slice_action.add_argument("--actor", required=True)
+    # #396 item 4：retry-review／retry-verify 落 needs_human(reviewer-identity-missing)
+    # 時，先前只能靠 tick/complete 的 request 級參數補 foreign reviewer identity——
+    # slice-action 本身沒有對應旗標可帶。比照 complete/tick 既有的 identity
+    # override 機制（apply_slice_action／manager_daemon 早已接受這兩個 kwarg，
+    # 見 manager.py:1303-1304、manager_daemon.py:482-483，缺口純粹在 CLI 表層）。
+    p_slice_action.add_argument(
+        "--review-executor", choices=sorted(_ARGV_BUILDERS), default=None,
+        help="foreign reviewer executor",
+    )
+    p_slice_action.add_argument("--review-model", default=None, help="foreign reviewer model ID")
 
     p_work = sub.add_parser("work", help="透過 manager daemon 執行 work lifecycle mutation")
     p_work.add_argument(
@@ -370,9 +380,14 @@ def main(
         )
 
     if args.cmd == "slice-action":
+        slice_action_args = {"slice_id": args.slice_id, "action": args.action, "actor": args.actor}
+        if args.review_executor is not None:
+            slice_action_args["review_executor"] = args.review_executor
+        if args.review_model is not None:
+            slice_action_args["review_model"] = args.review_model
         return _submit_mutation_request(
             "slice-action",
-            {"slice_id": args.slice_id, "action": args.action, "actor": args.actor},
+            slice_action_args,
             read_status_fn=read_status_fn,
             submit_request_fn=submit_request_fn,
             poll_done_fn=poll_done_fn,

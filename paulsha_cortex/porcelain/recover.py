@@ -43,6 +43,15 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"),
     )
     slice_cmd.add_argument("--actor", required=True)
+    # #396 item 4：`cortex recover slice` 與 `cortex slice-action`
+    # （coordinator/cli.py）同樣送出 slice-action request，需要一致的 foreign
+    # reviewer identity override，否則 retry-review 落 needs_human
+    # (reviewer-identity-missing) 時這個入口也補不了。不在此處重複
+    # `_ARGV_BUILDERS` 的 choices 驗證（避免額外耦合 coordinator.launcher 的
+    # 內部符號）；不合法的 executor 名稱交給 daemon 端既有驗證 fail-closed
+    # （與本檔既有的 --kind／--combo 等欄位一致，皆未在 argparse 層重複列舉）。
+    slice_cmd.add_argument("--review-executor", default=None, help="foreign reviewer executor")
+    slice_cmd.add_argument("--review-model", default=None, help="foreign reviewer model ID")
     _add_tracking_options(slice_cmd)
 
     work = sub.add_parser("work", help="復原 work lifecycle")
@@ -76,11 +85,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _slice_args(args: argparse.Namespace) -> dict[str, Any]:
-    return {
+    payload = {
         "slice_id": args.slice_id,
         "action": args.action,
         "actor": args.actor,
     }
+    for name in ("review_executor", "review_model"):
+        value = getattr(args, name)
+        if value is not None:
+            payload[name] = value
+    return payload
 
 
 def _work_args(args: argparse.Namespace) -> dict[str, Any]:
