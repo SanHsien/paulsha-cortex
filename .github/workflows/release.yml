@@ -20,6 +20,16 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Verify tag matches VERSION
+        run: |
+          tag_ref="${GITHUB_REF#refs/tags/v}"
+          version_file="$(cat VERSION | tr -d '[:space:]')"
+          if [ "$tag_ref" != "$version_file" ]; then
+            echo "::error::tag v$tag_ref does not match VERSION file ($version_file)"
+            exit 1
+          fi
+          echo "tag v$tag_ref matches VERSION ($version_file)"
+
       - name: Build distributions
         run: |
           python -m pip install --upgrade pip build twine

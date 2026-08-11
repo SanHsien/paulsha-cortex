@@ -601,6 +601,101 @@ def test_github_permission_probe_fails_without_token_scope_proof(tmp_path: Path,
     assert "not proven" in permission.detail
 
 
+# --- #370：gh-auth probe 必須區分 rate limit（暫時性）與真憑證失效 ----------
+
+
+def test_gh_auth_probe_reports_rate_limit_as_warn_not_authentication_failed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """`gh auth status` 撞到 rate limit 時 exit code 也是非零，但這不是
+    憑證失效——doctor 誤報 authentication failed 會誤導排障方向（見 #370
+    的 runtime 證據：secondary rate limit 被當成 token invalid 排查）。"""
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._request_runtime_monitor",
+        lambda socket_path, payload: {
+            "ok": True,
+            "data": {"schema": "cortex-work/v1", "items": [], "sequence": 0},
+        },
+    )
+
+    def runner(argv, **kwargs):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return Result(
+                returncode=1,
+                stderr=(
+                    "You have exceeded a secondary rate limit for the OAuth "
+                    "App associated with this personal access token."
+                ),
+            )
+        if "repos/acme/demo" in argv:
+            return Result(
+                raw=(
+                    "HTTP/2 200 OK\r\nX-OAuth-Scopes: repo\r\n\r\n"
+                    '{"private":true,"permissions":{"push":true}}'
+                )
+            )
+        return Result({"name": "cortex:auto-on-going"})
+
+    report = run_doctor(
+        probe_live=True,
+        repo="acme/demo",
+        env=env,
+        home=home,
+        runner=runner,
+        agy_probe=lambda: (True, "ready"),
+    )
+    gh_auth = next(item for item in report.probes if item.name == "gh-auth")
+    assert gh_auth.status == "warn"
+    assert "authentication failed" not in gh_auth.detail
+    assert "rate limit" in gh_auth.detail.lower()
+    # A rate-limit warn on a required-in-spirit probe must not itself flip
+    # the whole report to not-ok (other probes still gate that).
+    assert report.ok
+
+
+def test_gh_auth_probe_still_reports_real_credential_failure_as_fail(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+
+    def runner(argv, **kwargs):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return Result(returncode=1, stderr="The token in ~/.config/gh/hosts.yml is invalid.")
+        if "repos/acme/demo" in argv:
+            return Result(returncode=1)
+        return Result(returncode=1)
+
+    report = run_doctor(
+        probe_live=True,
+        repo="acme/demo",
+        env=env,
+        home=home,
+        runner=runner,
+        agy_probe=lambda: (False, "unavailable"),
+    )
+    gh_auth = next(item for item in report.probes if item.name == "gh-auth")
+    assert gh_auth.status == "fail"
+    assert gh_auth.detail == "authentication failed"
+    assert not report.ok
+
+
 def test_service_probe_rejects_unit_that_does_not_load_bootstrap_env(tmp_path: Path) -> None:
     from paulsha_cortex.doctor import _service_paths_probe
 
@@ -701,6 +796,148 @@ def test_run_doctor_reports_repo_identity_drift_as_overall_failure(
     repo_identity = next(p for p in report.probes if p.name == "repo-identity")
     assert repo_identity.status == "fail"
     assert repo_identity.required is True
+
+
+# --- #371／#375：managed-path drift probe（潛伏期偵測） -----------------------
+#
+# preserve_existing 曾把 PSC_PROJECT_CONFIG_ROOT 鎖死成一個早期殘留的錯誤值，
+# `cortex install service` 重裝也修不好（#371）；PSC_CONTROL_ROOT 是 #375 新收進
+# managed_env 的鍵，同一種 bug class 也可能發生。installer 修好之後，這個 probe
+# 是給「還沒重跑 install service 的既有安裝」用的獨立診斷：只要 env 檔裡的值
+# 跟目前 PSC_AGENTS_ROOT／instance 會推導出的值對不上，就回報 drift。
+
+
+def test_managed_path_drift_probe_passes_when_values_match_derivation(tmp_path: Path) -> None:
+    from paulsha_cortex.doctor import _managed_path_drift_probe
+
+    agents_root = tmp_path / "agents"
+    effective = {
+        "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
+        "PSC_CONTROL_ROOT": str(agents_root / "control" / "cortex"),
+    }
+
+    result = _managed_path_drift_probe(effective, agents_root=agents_root, instance="cortex")
+
+    assert result.status == "pass"
+    assert result.required is False
+
+
+def test_managed_path_drift_probe_warns_when_control_root_absent_legacy_env(
+    tmp_path: Path,
+) -> None:
+    """#375 修復前的舊安裝：env 只有 PSC_PROJECT_CONFIG_ROOT，PSC_CONTROL_ROOT
+    整個沒被 installer 寫過，屬預期過渡態，不得把 doctor 拖成 fail。"""
+    from paulsha_cortex.doctor import _managed_path_drift_probe
+
+    agents_root = tmp_path / "agents"
+    effective = {"PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha")}
+
+    result = _managed_path_drift_probe(effective, agents_root=agents_root, instance="cortex")
+
+    assert result.status == "warn"
+    assert result.required is False
+    assert "PSC_CONTROL_ROOT" in result.detail
+
+
+def test_managed_path_drift_probe_fails_when_project_config_root_diverges(
+    tmp_path: Path,
+) -> None:
+    """issue #371 的精確重現：PSC_PROJECT_CONFIG_ROOT 已存在，但值不是目前
+    agents_root 會推導出的值——這正是 preserve_existing 鎖死掉的那個錯誤值。"""
+    from paulsha_cortex.doctor import _managed_path_drift_probe
+
+    agents_root = tmp_path / "agents" / "instances" / "hippo-open-issues"
+    stale_shared_root = tmp_path / "agents" / "config" / "paulsha"
+    effective = {
+        "PSC_PROJECT_CONFIG_ROOT": str(stale_shared_root),
+        "PSC_CONTROL_ROOT": str(agents_root / "control" / "hippo"),
+    }
+
+    result = _managed_path_drift_probe(effective, agents_root=agents_root, instance="hippo")
+
+    assert result.status == "fail"
+    assert result.required is True
+    assert "PSC_PROJECT_CONFIG_ROOT" in result.detail
+    assert str(stale_shared_root) in result.detail
+    assert str(agents_root / "config" / "paulsha") in result.detail
+    assert "cortex install service" in result.detail
+
+
+def test_managed_path_drift_probe_fails_when_control_root_diverges(tmp_path: Path) -> None:
+    from paulsha_cortex.doctor import _managed_path_drift_probe
+
+    agents_root = tmp_path / "agents"
+    effective = {
+        "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
+        "PSC_CONTROL_ROOT": str(tmp_path / "shared-control"),
+    }
+
+    result = _managed_path_drift_probe(effective, agents_root=agents_root, instance="cortex")
+
+    assert result.status == "fail"
+    assert result.required is True
+    assert "PSC_CONTROL_ROOT" in result.detail
+
+
+def test_run_doctor_includes_managed_path_drift_probe_and_stays_ok_when_matching(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """happy path（`_layout()` 目前寫的 PSC_PROJECT_CONFIG_ROOT 是正確推導值、
+    PSC_CONTROL_ROOT 尚未寫入即為 legacy warn）不得讓整體 doctor 變 fail。"""
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+
+    report = run_doctor(probe_live=False, instance="cortex", env=env, home=home)
+
+    assert report.ok
+    drift = next(p for p in report.probes if p.name == "managed-path-drift")
+    assert drift.status == "warn"
+
+
+def test_run_doctor_reports_managed_path_drift_as_overall_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+    env_file = home / ".agents" / "core" / "runtime" / "cortex-manager.env"
+    stale_shared_root = home / ".agents" / "config" / "paulsha"
+    isolated_agents_root = home / ".agents" / "instances" / "hippo-open-issues"
+    content = env_file.read_text(encoding="utf-8")
+    content = content.replace(
+        f"PSC_AGENTS_ROOT={home / '.agents'}\n",
+        f"PSC_AGENTS_ROOT={isolated_agents_root}\n",
+    )
+    content = content.replace(
+        f"PSC_PROJECT_CONFIG_ROOT={home / '.agents' / 'config' / 'paulsha'}\n",
+        f"PSC_PROJECT_CONFIG_ROOT={stale_shared_root}\n",
+    )
+    env_file.write_text(content, encoding="utf-8")
+    (isolated_agents_root / "config" / "paulsha").mkdir(parents=True, exist_ok=True)
+    (isolated_agents_root / "config" / "paulsha" / "model-identities.yaml").write_text(
+        "schema_version: 1\nidentities: []\n", encoding="utf-8"
+    )
+
+    report = run_doctor(probe_live=False, instance="cortex", env=env, home=home)
+
+    assert report.ok is False
+    drift = next(p for p in report.probes if p.name == "managed-path-drift")
+    assert drift.status == "fail"
+    assert drift.required is True
+    assert "PSC_PROJECT_CONFIG_ROOT" in drift.detail
 
 
 def test_doctor_cli_json_and_help(monkeypatch, capsys) -> None:

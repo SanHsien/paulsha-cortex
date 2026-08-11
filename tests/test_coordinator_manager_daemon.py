@@ -13,7 +13,13 @@ from types import SimpleNamespace
 import pytest
 
 from paulsha_cortex.control import constants, contract
-from paulsha_cortex.coordinator import autonomy as coordinator_autonomy, completion, manager_daemon, verification
+from paulsha_cortex.coordinator import (
+    autonomy as coordinator_autonomy,
+    completion,
+    manager,
+    manager_daemon,
+    verification,
+)
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 
@@ -1428,6 +1434,100 @@ def test_allow_unsafe_fanout_over_one_ready_slice_writes_error_done(monkeypatch,
     assert "--allow-unsafe" in done["error"]
 
 
+def test_fanout_and_run_tick_filter_same_snapshot_identically(monkeypatch, tmp_path):
+    # issue #383：手動 `cortex fanout`（daemon type="fanout"）過去直接把全部 metas
+    # 餵給 dispatch_ready_fn，完全沒有 run_tick() 的 in-flight active／
+    # already_terminal 過濾——同一份 registry/handoff snapshot，兩條路徑對同一批
+    # slice 給出不同答案。這裡用同一個 snapshot 分別跑兩條路徑（monkeypatch
+    # dispatch_ready 只記錄實際被餵進去的 slice_id 集合，不真的派工），驗證兩者
+    # 現在一致：in-flight（slice-active）與「manifest 跟 registry 現況一致」
+    # （slice-blocked，仍是 needs_human）皆被排除；「registry 已顯示復原」
+    # （slice-recovered，state=pending）不再被殘留 manifest 誤擋；全新 slice
+    # （slice-ready）照常放行。
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path))
+
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+
+    reg = JobRegistry(state_path=tmp_path / "jobs.json")
+    reg.create_job(
+        task="slice-active", persona="builder", branch="feature/slice-active",
+        pane="", worktree=str(tmp_path / "wt" / "a"),
+    )
+    reg.create_slice(
+        slice_id="slice-blocked", spec_path="s.md", spec_hash="0" * 64,
+        plan_path="p.md", plan_hash="0" * 64, target_branch="main",
+        builder_job_id=None, reviewer_job_id=None, candidate=None,
+    )
+    reg.update_slice("slice-blocked", state="needs_human", gate_state="needs_human")
+    (handoff_dir / "slice-blocked.json").write_text(
+        json.dumps({"slice_id": "slice-blocked", "job_id": "old", "gate_status": "needs_human", "gate_reason": "x"}),
+        encoding="utf-8",
+    )
+    reg.create_slice(
+        slice_id="slice-recovered", spec_path="s2.md", spec_hash="0" * 64,
+        plan_path="p2.md", plan_hash="0" * 64, target_branch="main",
+        builder_job_id=None, reviewer_job_id=None, candidate=None,
+    )
+    reg.update_slice("slice-recovered", state="pending", gate_state="pending")
+    (handoff_dir / "slice-recovered.json").write_text(
+        json.dumps({"slice_id": "slice-recovered", "job_id": "old2", "gate_status": "failed", "gate_reason": "y"}),
+        encoding="utf-8",
+    )
+    # slice-ready：全新、無殘留 manifest、registry 無 slice row。
+
+    metas = [
+        {"slice_id": "slice-active", "dispatch": "auto", "plan": "a.md", "depends_on": []},
+        {"slice_id": "slice-blocked", "dispatch": "auto", "plan": "b.md", "depends_on": []},
+        {"slice_id": "slice-recovered", "dispatch": "auto", "plan": "c.md", "depends_on": []},
+        {"slice_id": "slice-ready", "dispatch": "auto", "plan": "d.md", "depends_on": []},
+    ]
+
+    class _PollingDispatcher:
+        def __init__(self, registry) -> None:
+            self._registry = registry
+
+        def poll_headless_done(self, job_id: str) -> dict:
+            return self._registry.get_job(job_id)  # 維持原狀（模擬仍在跑）
+
+    dispatcher = _PollingDispatcher(reg)
+
+    captured_run_tick: list[set[str]] = []
+
+    def _spy_run_tick_dispatch_ready(fed_metas, *_args, **_kwargs):
+        captured_run_tick.append({m["slice_id"] for m in fed_metas})
+        return []
+
+    monkeypatch.setattr(coordinator_autonomy, "dispatch_ready", _spy_run_tick_dispatch_ready)
+
+    manager.run_tick(
+        dispatcher, metas=metas, launcher=object(), is_satisfied=lambda _sid: True,
+        handoff_dir=str(handoff_dir), clock=lambda: "T0",
+    )
+
+    captured_fanout: list[set[str]] = []
+
+    def _spy_fanout_dispatch_ready(fed_metas, *_args, **_kwargs):
+        captured_fanout.append({m["slice_id"] for m in fed_metas})
+        return []
+
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        launcher=object(),
+        workflow_identity_registry=IdentityRegistry.from_rows([]),
+        scan_specs_fn=lambda _specs_dir: metas,
+        dispatch_ready_fn=_spy_fanout_dispatch_ready,
+    )
+    request_executor(contract.build_request(req_type="fanout", args={}, requested_by="cockpit"))
+
+    expected = {"slice-recovered", "slice-ready"}
+    assert captured_run_tick == [expected]
+    assert captured_fanout == [expected]
+
+
 def test_dispatch_unknown_slice(monkeypatch, tmp_path):
     done, launcher, _, _ = _run_dispatch_request(
         monkeypatch,
@@ -1612,6 +1712,62 @@ def test_slice_action_request_runs_manager_action(monkeypatch, tmp_path):
     assert captured["slice_id"] == "slice-a"
     assert captured["action"] == "retry-build"
     assert captured["actor"] == "operator"
+
+
+def test_slice_action_request_forwards_review_identity(monkeypatch, tmp_path):
+    # #396 item 4：retry-review 落 needs_human(reviewer-identity-missing) 時，
+    # slice-action 需要能補 foreign reviewer identity。manager_daemon 這一層
+    # 早已讀 args.get("review_executor"/"review_model")（見
+    # build_request_executor 對 "slice-action" 分支），缺口純粹在 CLI 表層沒有
+    # 對應旗標；這個測試證明 CLI 補上旗標後，端到端（request args → daemon →
+    # apply_slice_action kwargs）確實會把 identity 帶到底。
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = "20260703T090013Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    _write_request(
+        req_id,
+        type="slice-action",
+        args={
+            "slice_id": "slice-a",
+            "action": "retry-review",
+            "actor": "operator",
+            "review_executor": "codex",
+            "review_model": "gpt-5.4",
+        },
+    )
+    registry = FakeRegistry()
+    dispatcher = FakeDispatcher(registry, worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"))
+    captured: dict[str, object] = {}
+
+    def fake_apply(dispatcher_arg, **kwargs):
+        captured["dispatcher"] = dispatcher_arg
+        captured.update(kwargs)
+        return {"slice_id": kwargs["slice_id"], "action": kwargs["action"], "result": "ok"}
+
+    monkeypatch.setattr(manager_daemon.manager, "apply_slice_action", fake_apply)
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=RecordingLauncher(),
+    )
+
+    manager_daemon.run_loop(
+        request_executor=request_executor,
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=300.0,
+        now_fn=lambda: "2026-07-03T09:05:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _: None,
+        pid=1,
+        max_rounds=1,
+    )
+
+    done = contract.read_json(constants.done_dir() / f"{req_id}.json")
+    assert done["status"] == "ok"
+    assert captured["review_executor"] == "codex"
+    assert captured["review_model"] == "gpt-5.4"
 
 
 def test_work_action_request_has_one_manager_owned_execution_path(tmp_path):
@@ -2169,6 +2325,18 @@ def test_pid_alive_requires_manager_cmdline(tmp_path) -> None:
         for proc in (foreign, manager_process):
             proc.terminate()
             proc.wait(timeout=10)
+
+
+def test_windows_pid_probe_fails_closed_when_powershell_stdout_is_missing(monkeypatch) -> None:
+    monkeypatch.setattr(manager_daemon.os, "name", "nt")
+    monkeypatch.setattr(manager_daemon.shutil, "which", lambda _name: "pwsh")
+    monkeypatch.setattr(
+        manager_daemon.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout=None, stderr=None),
+    )
+
+    assert manager_daemon._pid_alive(123) is False
 
 
 def test_acquire_lock_uses_cross_platform_kernel_lock() -> None:

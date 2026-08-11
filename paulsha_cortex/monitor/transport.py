@@ -62,11 +62,9 @@ def bind_monitor_listener(path: str | Path, *, backlog: int = 16) -> socket.sock
     if uses_unix_socket():
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            previous_umask = os.umask(0o177)
-            try:
-                listener.bind(str(endpoint))
-            finally:
-                os.umask(previous_umask)
+            # chmod below establishes the final socket mode. Avoid os.umask()
+            # here because it is process-global and races concurrent mkdir().
+            listener.bind(str(endpoint))
             os.chmod(endpoint, 0o600)
             listener.listen(backlog)
             return listener

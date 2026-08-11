@@ -11,6 +11,7 @@ import os
 import shutil
 import stat
 import sys
+import time
 
 import pytest
 
@@ -596,6 +597,16 @@ def test_card_contract_declares_capabilities_in_shipped_deck():
         requirements = card_runtime_requirements(card_id, cards=cards)
         assert RuntimeCapability("module", "pytest") in requirements, card_id
 
+    # #369：ship phase 的兩張卡宣告了 provider 需求——這是修復死碼路徑後第一批
+    # 真正的輸入，否則接線了也不會被觸發（cards.yaml 修復前只有 module:pytest
+    # 宣告，從無 provider: 宣告）。
+    for card_id in ("openspec-archive", "policy-commit"):
+        requirements = card_runtime_requirements(card_id, cards=cards)
+        assert (
+            RuntimeCapability("provider", "github:hamanpaul/paulsha-cortex") in requirements
+        ), card_id
+        assert RuntimeCapability("provider", "executor") in requirements, card_id
+
     # 未宣告的 card 是 no-op，行為與 #262 之前相同。
     assert card_runtime_requirements("workflow-claim", cards=cards) == ()
     assert card_runtime_requirements("no-such-card", cards=cards) == ()
@@ -694,6 +705,223 @@ def test_manager_gate_blocks_dispatch_before_model_session(tmp_path):
         )
         is None
     )
+
+
+# ------------------------------------------------------------------------ #369
+
+
+def test_provider_executor_sentinel_resolves_dynamically_per_candidate(tmp_path):
+    """#369：`provider:executor` 是動態 sentinel，preflight 逐一嘗試 identity
+    candidate 時把它解析成該 candidate 實際使用的 executor，而非寫死的字面值
+    ——builder／manager persona 的 identity 本就會在 claude／codex 之間輪替
+    （見 manager._identity_candidates_for_persona），寫死會驗錯 executor。
+    """
+
+    now = 2000.0
+    seen: list[str] = []
+
+    def _snapshot(provider_id: str) -> ProviderFreshness:
+        seen.append(provider_id)
+        return ProviderFreshness(
+            provider_id=provider_id,
+            status="degraded",
+            observed_at=now - 10.0,
+            ttl_seconds=900.0,
+            source="snapshot",
+            reason="not logged in",
+        )
+
+    decision = evaluate_dispatch_gate(
+        card="c",
+        requirements=(RuntimeCapability("provider", "executor"),),
+        candidates=(_BUILDER, _ALT_BUILDER),
+        environment_for=lambda identity: _host_env(tmp_path, name=f"{identity.executor}-env"),
+        snapshot_lookup=_snapshot,
+        now=now,
+    )
+
+    assert decision.action == "needs_human"
+    # sentinel 從未原樣傳給 snapshot_lookup——兩個 candidate 各自被以「自己的
+    # executor」查詢（claude 對應 _BUILDER，codex 對應 _ALT_BUILDER）。
+    assert seen == ["claude", "codex"]
+    assert "executor" not in seen
+
+
+def test_provider_executor_sentinel_passes_when_resolved_executor_is_ok(tmp_path):
+    """對照組：解析出的 executor 新鮮度為 ok 時放行，證明 sentinel 確實接上
+    真正的判定邏輯，而不是一律擋下。"""
+
+    now = 3000.0
+
+    def _snapshot(provider_id: str) -> ProviderFreshness:
+        return ProviderFreshness(
+            provider_id=provider_id,
+            status="ok",
+            observed_at=now - 5.0,
+            ttl_seconds=900.0,
+            source="snapshot",
+        )
+
+    factory = _CountingLauncherFactory()
+    decision = evaluate_dispatch_gate(
+        card="c",
+        requirements=(RuntimeCapability("provider", "executor"),),
+        candidates=(_BUILDER,),
+        environment_for=lambda identity: _host_env(tmp_path),
+        launcher_factory=factory,
+        snapshot_lookup=_snapshot,
+        now=now,
+    )
+
+    assert decision.action == "dispatch"
+    assert decision.result.outcome is PreflightOutcome.OK
+    assert factory.model_invocations == 1
+
+
+def test_manager_wiring_blocks_dispatch_on_fresh_degraded_provider_snapshot(tmp_path, monkeypatch):
+    """#369 RED→GREEN 的核心斷言：manager._runtime_preflight_gate 過去從未把
+    snapshot_lookup／provider_prober 傳給 evaluate_dispatch_gate（兩者預設
+    None），因此 provider capability 探測在生產環境是死碼——即使 monitor
+    snapshot 顯示某個 provider degraded，dispatch 仍會放行（#369 root cause）。
+
+    修復前這個測試會 FAIL：`decision.action == "dispatch"` 而非
+    `"needs_human"`，因為 `_runtime_preflight_gate` 沒有接上任何 snapshot 來源
+    ——`evaluate_dispatch_gate` 收到的 `snapshot_lookup=None` 讓
+    `_resolve_provider_freshness` 直接判 STALE_SNAPSHOT（non-blocking）。
+    """
+
+    from datetime import datetime, timezone
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+    from paulsha_cortex.monitor.work_models import ProviderSnapshot
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshot, WorkSnapshotStore
+
+    provider_id = "github:hamanpaul/paulsha-cortex"
+    # 用「現在」當 last_attempt_at，確保相對於 gate 實際呼叫時的 wall clock
+    # 一定落在 TTL(900s) 內——測試斷言的是「fresh degraded 必須硬擋」，不是
+    # stale 的次要分支。
+    fresh_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    store = WorkSnapshotStore(path=tmp_path / "work-items.snapshot.json")
+    store.write(
+        WorkSnapshot(
+            sequence=1,
+            written_at=fresh_now,
+            providers={
+                provider_id: ProviderSnapshot(
+                    provider_id=provider_id,
+                    status="degraded",
+                    last_attempt_at=fresh_now,
+                    last_success_at=None,
+                    revision=None,
+                    diagnostics=("github rate limit exceeded",),
+                    sources=(),
+                )
+            },
+            work_items=(),
+            source_owners={},
+            exclusions=(),
+        )
+    )
+
+    class _FakeStep:
+        card = "policy-commit"  # 出貨契約宣告 provider:github:hamanpaul/paulsha-cortex
+        persona = "manager"
+        phase = "ship"
+        commit_policy = None
+
+    class _FakeRun:
+        steps = ()
+        primary_domain = None
+
+    class _Launcher:
+        def __init__(self, identity):
+            self._identity = identity
+
+        def executor_environment(self):
+            return _host_env(tmp_path, name=f"{self._identity.executor}-sandbox")
+
+        def launch(self, **kwargs):  # pragma: no cover - 被呼叫即測試失敗
+            raise AssertionError("provider degraded 時不得建立 model session")
+
+    registry = IdentityRegistry(schema_version=2, identities=(_BUILDER, _ALT_BUILDER))
+    monkeypatch.setattr(
+        manager,
+        "_executor_auth_snapshot_lookup",
+        lambda executor_id: ProviderFreshness(
+            provider_id=executor_id,
+            status="ok",
+            observed_at=time.time() - 1.0,
+            source="test",
+        ),
+    )
+    decision = manager._runtime_preflight_gate(
+        _FakeRun(),
+        _FakeStep(),
+        identities=registry,
+        launcher_factory=_Launcher,
+        snapshot_store=store,
+    )
+
+    assert decision is not None
+    assert decision.action == "needs_human"
+    assert decision.result.outcome is PreflightOutcome.PROVIDER_UNAVAILABLE
+    assert f"providers unavailable: {provider_id}" in (decision.reason or "")
+
+
+def test_manager_wiring_dispatches_when_provider_snapshot_absent(tmp_path, monkeypatch):
+    """對照組：monitor 完全沒有這個 provider 的快照時（例如 daemon 剛啟動、
+    尚未跑過第一輪掃描）不得硬擋——回退成 STALE_SNAPSHOT，non-blocking，行為
+    與 #369 修復前對「無 snapshot」情境的保守面一致，只是現在死碼真的活了。
+    """
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+    class _FakeStep:
+        card = "policy-commit"
+        persona = "manager"
+        phase = "ship"
+        commit_policy = None
+
+    class _FakeRun:
+        steps = ()
+        primary_domain = None
+
+    class _Launcher:
+        def __init__(self, identity):
+            self._identity = identity
+
+        def executor_environment(self):
+            return _host_env(tmp_path, name=f"{self._identity.executor}-sandbox")
+
+        def launch(self, **kwargs):  # pragma: no cover
+            raise AssertionError("測試不預期真的 launch")
+
+    registry = IdentityRegistry(schema_version=2, identities=(_BUILDER, _ALT_BUILDER))
+    empty_store = WorkSnapshotStore(path=tmp_path / "absent-snapshot.json")
+    monkeypatch.setattr(
+        manager,
+        "_executor_auth_snapshot_lookup",
+        lambda provider_id: ProviderFreshness(
+            provider_id=provider_id,
+            status="ok",
+            observed_at=time.time() - 1.0,
+            source="test",
+        ),
+    )
+    decision = manager._runtime_preflight_gate(
+        _FakeRun(),
+        _FakeStep(),
+        identities=registry,
+        launcher_factory=_Launcher,
+        snapshot_store=empty_store,
+    )
+
+    assert decision is not None
+    assert decision.action == "dispatch", decision.attempts
+    assert decision.result.outcome is PreflightOutcome.STALE_SNAPSHOT
 
 
 def test_launcher_reports_same_environment_as_real_job():

@@ -136,10 +136,47 @@ def _require_phase3(test: unittest.TestCase) -> None:
         )
 
 
+def _mkdir_resilient(path: Path, *, attempts: int = 25, delay: float = 0.02) -> None:
+    """`path.mkdir(parents=True, exist_ok=True)`, retried past a transient
+    `PermissionError` (issue #425).
+
+    This suite starts several `MonitorServer` instances per test, and
+    `MonitorServer.serve_forever()` briefly flips the *process-wide* umask
+    around its Unix-socket `bind()` call (see
+    `paulsha_cortex/monitor/server.py`). `os.umask()` is not thread-local —
+    it is one value shared by every thread in the process — so if this
+    thread's `mkdir(parents=True)` happens to create a new ancestor
+    directory during that window, the ancestor can inherit an overly
+    restrictive mode (e.g. `0o600`, no execute/traverse bit). Any later
+    `mkdir`/`stat` underneath that ancestor then raises `PermissionError`;
+    in CI this has shown up as `pathlib` raising `PermissionError` from
+    `Path.mkdir` / `Path.is_dir` while building a fresh
+    `docs/superpowers/workstreams/<stage>` tree, flaky only on Python 3.13
+    where the narrower timing of the rewritten pathlib internals makes the
+    (pre-existing, version-independent) race more likely to be observed.
+
+    The race window is a handful of microseconds — the duration of one
+    `bind()` call — so a short bounded retry lets the owning thread restore
+    the umask and clears the flake without masking a genuine, persistent
+    permission problem, which keeps failing past `attempts` and still
+    raises here.
+    """
+    last_error: PermissionError | None = None
+    for _ in range(attempts):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return
+        except PermissionError as error:
+            last_error = error
+            time.sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
 def _make_workspace(root: Path, project_name: str, todo_body: str) -> Path:
     proj = root / project_name
     ws = proj / "docs" / "superpowers" / "workstreams" / "stage1-demo"
-    ws.mkdir(parents=True, exist_ok=True)
+    _mkdir_resilient(ws)
     (proj / ".project-policy.yml").write_text("policy_profile: stage-driven\n")
     (ws / "todo.md").write_text(textwrap.dedent(todo_body))
     return proj
@@ -179,6 +216,88 @@ def _socket_send_request(sock: socket.socket, request: dict) -> None:
     sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
 
 
+# --- mkdir resilience (issue #425 regression) ---------------------------
+
+
+class MkdirResilientTests(unittest.TestCase):
+    """`_mkdir_resilient` must ride out a transient PermissionError on an
+    ancestor directory instead of propagating it (issue #425)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="stage9-mkdir-resilient-"))
+
+    def tearDown(self) -> None:
+        import shutil
+
+        # Best-effort: if a test forgot to restore permissions, do it here so
+        # cleanup itself cannot raise and mask the real test outcome.
+        for entry in self.tmp.rglob("*"):
+            try:
+                entry.chmod(0o700)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_retries_past_transient_permission_error_on_ancestor(self) -> None:
+        """A directory that briefly loses its execute bit (simulating the
+        MonitorServer umask race) must not fail `_mkdir_resilient` — it
+        should retry until the ancestor becomes traversable again, then
+        create the target."""
+        blocker = self.tmp / "blocker"
+        blocker.mkdir()
+        blocker.chmod(0o600)  # no execute bit: children become untraversable
+
+        def _unblock() -> None:
+            time.sleep(0.05)
+            blocker.chmod(0o755)
+
+        unblocker = threading.Thread(target=_unblock, daemon=True)
+        unblocker.start()
+        try:
+            target = blocker / "projRace" / "docs" / "superpowers" / "workstreams" / "stage1-demo"
+            _mkdir_resilient(target)
+            self.assertTrue(target.is_dir())
+        finally:
+            unblocker.join(timeout=2.0)
+            blocker.chmod(0o755)
+
+    @unittest.skipIf(os.name == "nt", "Windows chmod cannot remove directory traversal")
+    def test_raises_after_exhausting_attempts_on_persistent_permission_error(self) -> None:
+        """A *persistent* permission problem (never restored) must still
+        surface as a `PermissionError` — the retry is bounded, not a
+        silent swallow."""
+        blocker = self.tmp / "blocker-persistent"
+        blocker.mkdir()
+        blocker.chmod(0o600)
+        try:
+            with self.assertRaises(PermissionError):
+                _mkdir_resilient(blocker / "child", attempts=3, delay=0.01)
+        finally:
+            blocker.chmod(0o755)
+
+    def test_make_workspace_survives_ancestor_permission_race(self) -> None:
+        """End-to-end: `_make_workspace` (the exact call site from the CI
+        traceback in #425) must succeed even while its root is transiently
+        non-traversable."""
+        blocker = self.tmp / "ws"
+        blocker.mkdir()
+        blocker.chmod(0o600)
+
+        def _unblock() -> None:
+            time.sleep(0.05)
+            blocker.chmod(0o755)
+
+        unblocker = threading.Thread(target=_unblock, daemon=True)
+        unblocker.start()
+        try:
+            proj = _make_workspace(blocker, "projRace", DEFAULT_TODO)
+            todo = proj / "docs" / "superpowers" / "workstreams" / "stage1-demo" / "todo.md"
+            self.assertTrue(todo.exists())
+        finally:
+            unblocker.join(timeout=2.0)
+            blocker.chmod(0o755)
+
+
 # --- B-store / SnapshotStore --------------------------------------------
 
 
@@ -202,7 +321,7 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         )
 
     def test_store_load_returns_initial_snapshot_with_no_events(self) -> None:
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         cfg = self._build_config()
 
@@ -215,7 +334,7 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         self.assertIn("projA", ids)
 
     def test_store_refresh_emits_event_when_project_state_changes(self) -> None:
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         proj = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         cfg = self._build_config()
 
@@ -235,7 +354,7 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(evt.project_id, "projA")
 
     def test_store_refresh_emits_no_event_when_state_unchanged(self) -> None:
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         cfg = self._build_config()
         store = SnapshotStore(config=cfg)
@@ -245,7 +364,7 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(events, ())
 
     def test_store_refresh_removes_deleted_project_from_snapshot(self) -> None:
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         doomed = _make_workspace(self.tmp / "ws", "projB", DEFAULT_TODO)
         cfg = self._build_config()
@@ -266,7 +385,7 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(events[0].project_id, "projB")
 
     def test_store_refresh_project_reclassifies_tracked_to_hidden_legacy(self) -> None:
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         proj = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         cfg = MonitorConfig(
             workspaces=(WorkspaceConfig(path=self.tmp / "ws", name="ws"),),
@@ -286,14 +405,14 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         self.assertIsNone(store.get("projA"))
 
     def test_store_refresh_emits_event_when_only_source_signals_change(self) -> None:
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         proj = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         cfg = self._build_config()
         store = SnapshotStore(config=cfg)
         store.load()
 
         archive_root = proj / "openspec" / "changes" / "archive"
-        archive_root.mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(archive_root)
 
         events = store.refresh_projects(("projA",))
         self.assertEqual(len(events), 1)
@@ -301,7 +420,7 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         self.assertFalse(events[0].removed)
 
     def test_store_assigns_monotonic_sequence_to_events(self) -> None:
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         proj = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         cfg = self._build_config()
         store = SnapshotStore(config=cfg)
@@ -322,8 +441,8 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
     def test_store_preserves_duplicate_project_basenames(self) -> None:
         west_root = self.tmp / "west"
         east_root = self.tmp / "east"
-        west_root.mkdir(parents=True, exist_ok=True)
-        east_root.mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(west_root)
+        _mkdir_resilient(east_root)
         _make_workspace(west_root, "same", DEFAULT_TODO)
         _make_workspace(east_root, "same", DEFAULT_TODO)
         cfg = MonitorConfig(
@@ -378,7 +497,7 @@ class Stage9ServerTests(unittest.TestCase):
     def setUp(self) -> None:
         _require_phase3(self)
         self.tmp = Path(tempfile.mkdtemp(prefix="stage9-server-"))
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         _make_workspace(self.tmp / "ws", "projB", DEFAULT_TODO)
         self.cfg = MonitorConfig(
@@ -479,6 +598,96 @@ class Stage9ServerTests(unittest.TestCase):
         mode = stat.S_IMODE(self.socket_path.stat().st_mode)
         self.assertEqual(mode, 0o600)
 
+    def test_serve_forever_does_not_touch_process_umask(self) -> None:
+        """Regression for #439: `serve_forever()` must rely solely on the
+        explicit `os.chmod(0o600)` for socket permissions, not a
+        `os.umask()` flip/restore dance around `bind()`. `os.umask()` is
+        process-global (not thread-local); flipping it — even briefly —
+        exposes every other thread in the process to a window where a
+        concurrent `mkdir(parents=True)` can inherit an overly restrictive
+        mode (see `test_concurrent_mkdir_keeps_execute_bit_during_serve_forever_bind`
+        below and issue #425). Asserting `os.umask` is never called is the
+        direct, non-timing-sensitive proof that the race class is gone.
+        """
+        other_socket_path = self.tmp / "no-umask-call.sock"
+        server = MonitorServer(store=self.store, socket_path=other_socket_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with mock.patch(
+            "paulsha_cortex.monitor.server.os.umask",
+            side_effect=AssertionError(
+                "serve_forever() must not call os.umask() (issue #439)"
+            ),
+        ):
+            thread.start()
+            try:
+                deadline = time.time() + 2.0
+                while time.time() < deadline and not other_socket_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(
+                    other_socket_path.exists(),
+                    msg="server socket did not bind in time",
+                )
+            finally:
+                server.stop()
+                thread.join(timeout=2.0)
+
+    def test_concurrent_mkdir_keeps_execute_bit_during_serve_forever_bind(self) -> None:
+        """Regression for #439/#425: while `serve_forever()` is inside its
+        `bind()` call, a *different* thread's `mkdir(parents=True)` must not
+        be affected by any process-wide umask tightening.
+
+        The real race window used to be the duration of one `bind()`
+        syscall — a handful of microseconds, too narrow to hit
+        deterministically in a test. To observe it reliably, this test
+        interposes a short sleep inside `socket.socket.bind` (test-only;
+        production code is untouched) so the server thread is provably
+        parked *inside* `bind()` while the main thread does a concurrent
+        `mkdir(parents=True)` elsewhere. Before the #439 fix this would flake
+        onto mode `0o600` (no execute bit) whenever the mkdir landed inside
+        the old `os.umask(0o177)` window; after the fix `serve_forever()`
+        never touches the umask, so the new directory always keeps the
+        ambient umask's execute bit.
+        """
+        real_bind = socket.socket.bind
+        bind_entered = threading.Event()
+        release_bind = threading.Event()
+
+        def _slow_bind(sock_self: socket.socket, address: str) -> None:
+            bind_entered.set()
+            release_bind.wait(timeout=2.0)
+            return real_bind(sock_self, address)
+
+        other_socket_path = self.tmp / "umask-race.sock"
+        server = MonitorServer(store=self.store, socket_path=other_socket_path)
+        new_dir = self.tmp / "concurrent-race" / "nested" / "leaf"
+        try:
+            with mock.patch.object(socket.socket, "bind", _slow_bind):
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(
+                        bind_entered.wait(timeout=2.0),
+                        msg="serve_forever never reached bind()",
+                    )
+                    # Server thread is now parked inside bind(). If
+                    # serve_forever still flipped the process umask around
+                    # bind() the way it did before #439, this is exactly the
+                    # window in which it would be tightened.
+                    new_dir.mkdir(parents=True)
+                finally:
+                    release_bind.set()
+                    thread.join(timeout=2.0)
+        finally:
+            server.stop()
+        mode = stat.S_IMODE(new_dir.stat().st_mode)
+        self.assertTrue(
+            mode & stat.S_IXUSR,
+            msg=(
+                "concurrent mkdir(parents=True) lost its execute bit during "
+                f"serve_forever's bind() window (mode={oct(mode)})"
+            ),
+        )
+
     def test_server_rejects_unknown_request_kind(self) -> None:
         sock = self._connect()
         _socket_send_request(sock, {"kind": "definitely_not_a_real_kind"})
@@ -515,13 +724,19 @@ class Stage9ServerTests(unittest.TestCase):
             _socket_send_request(sock, {"kind": "list_projects"})
             _socket_recv_line(sock)
             sock.close()
-        deadline = time.time() + 1.0
+        # 1.0s -> 2.0s (matches the other generous polls in this file, e.g.
+        # the deadlines above): the accept loop now registers each handler
+        # thread in `_connection_threads` *before* starting it (issue #445),
+        # so discard is no longer lazy/racy and this bound only needs to
+        # absorb ordinary CPU-scheduling delay under a loaded CI runner, not
+        # a permanently-orphaned dead-thread entry.
+        deadline = time.time() + 2.0
         while time.time() < deadline and self.server._connection_threads:
             time.sleep(0.02)
         self.assertEqual(self.server._connection_threads, [])
 
     def test_server_rejects_live_socket_instead_of_stealing_it(self) -> None:
-        (self.tmp / "ws2").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws2")
         _make_workspace(self.tmp / "ws2", "projZ", DEFAULT_TODO)
         other_cfg = MonitorConfig(
             workspaces=(WorkspaceConfig(path=self.tmp / "ws2", name="ws2"),),
@@ -630,12 +845,12 @@ class Stage9ServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         _require_phase3(self)
         self.tmp = Path(tempfile.mkdtemp(prefix="stage9-svc-"))
-        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.tmp / "ws")
         self.project_dir = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
-        (self.project_dir / ".git" / "refs" / "heads").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.project_dir / ".git" / "refs" / "heads")
         (self.project_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         (self.project_dir / ".git" / "refs" / "heads" / "main").write_text("deadbeef\n")
-        (self.project_dir / "node_modules" / "pkg").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.project_dir / "node_modules" / "pkg")
         (self.project_dir / "node_modules" / "pkg" / "index.js").write_text("module.exports = 1;\n")
         self.run_dir = self.tmp / "run"
         self.socket_path = self.run_dir / "project-monitor.sock"
@@ -795,7 +1010,7 @@ class Stage9ServiceTests(unittest.TestCase):
         self.assertFalse(any(key in self.service._watched_paths for key in expected))
 
         self.project_dir = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
-        (self.project_dir / ".git" / "refs" / "heads").mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(self.project_dir / ".git" / "refs" / "heads")
         (self.project_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         (self.project_dir / ".git" / "refs" / "heads" / "main").write_text("deadbeef\n")
         self.stub_watcher.trigger(self.project_dir)
@@ -916,7 +1131,7 @@ class Stage9WatchdogIntegrationTests(unittest.TestCase):
 
     def test_watchdog_file_watcher_fires_on_file_rename_destination(self) -> None:
         git_dir = self.tmp / ".git"
-        git_dir.mkdir(parents=True, exist_ok=True)
+        _mkdir_resilient(git_dir)
         head_path = git_dir / "HEAD"
         head_path.write_text("ref: refs/heads/main\n")
         received: list[Path] = []

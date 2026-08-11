@@ -32,6 +32,7 @@ __all__ = [
     "card_runtime_requirements",
     "ExecutorEnvironment",
     "PreflightOutcome",
+    "PROVIDER_EXECUTOR_SENTINEL",
     "ProbeBudget",
     "ProviderFreshness",
     "RuntimeCapability",
@@ -50,6 +51,15 @@ DEFAULT_PROVIDER_TTL_SECONDS = 900.0
 
 # 單次 capability 探測的 timeout（R4：探測必須有界）。
 DEFAULT_PROBE_TIMEOUT_SECONDS = 10.0
+
+# #369：provider capability 的動態 sentinel。card 宣告 `provider:executor` 時
+# （而非寫死的 `provider:<literal>`），preflight 逐一嘗試 identity candidate
+# 時把它解析成「這次嘗試的 identity 實際使用的 executor」，而不是固定字串。
+# builder／manager persona 的 identity 本就會在 claude／codex 之間輪替
+# （見 manager._identity_candidates_for_persona）；若卡片寫死某個 executor
+# 名稱，換候選時就會驗錯 executor。sentinel 讓同一張卡對不同 candidate
+# 各自驗證其真正會用到的 executor 登入態。
+PROVIDER_EXECUTOR_SENTINEL = "executor"
 
 # bridge 宣告名稱到「可用性如何判定」的資料表。bridge 依賴可能是一個
 # executable（socat／script），也可能是 interpreter 內的 module（pty／fcntl）。
@@ -552,8 +562,15 @@ def run_runtime_preflight(
             outcome = PreflightOutcome.OK if ok else PreflightOutcome.CAPABILITY_MISSING
             findings.append(CapabilityFinding(capability, outcome, reason))
         else:  # provider —— kind 白名單已由 RuntimeCapability 保證
+            provider_id = capability.name
+            if provider_id == PROVIDER_EXECUTOR_SENTINEL:
+                # #369：解析成這次嘗試的 identity 實際會用的 executor，而非
+                # sentinel 字面值本身——sentinel 只在 card 宣告時出現。
+                resolved_executor = getattr(identity, "executor", None)
+                if resolved_executor:
+                    provider_id = resolved_executor
             outcome, reason, freshness = _resolve_provider_freshness(
-                capability.name,
+                provider_id,
                 snapshot_lookup=snapshot_lookup,
                 provider_prober=provider_prober,
                 budget=budget,

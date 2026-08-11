@@ -57,6 +57,16 @@ def test_work_help_lists_gc_subcommand() -> None:
     assert "回收" in umbrella_cli._WORK_HELP
 
 
+def test_work_help_lists_intake_and_claim_precondition() -> None:
+    # #389：`cortex work intake` 先前完全缺席於 umbrella `_WORK_HELP`（雖然
+    # 實際呼叫會透傳給 coordinator CLI 執行），且 claim 的 lifecycle 前置
+    # 條件（只 link issue 不足以變成可 claim，需要 active Todo 來源）未曾
+    # 記載在任何 CLI help 裡。
+    assert "intake" in umbrella_cli._WORK_HELP
+    assert "todo" in umbrella_cli._WORK_HELP
+    assert "Todo 來源" in umbrella_cli._WORK_HELP
+
+
 def test_unified_lifecycle_docs_use_typed_repo_scoped_work_mutations() -> None:
     docs = (Path(__file__).parents[1] / "docs" / "unified-work-lifecycle.md").read_text(
         encoding="utf-8"

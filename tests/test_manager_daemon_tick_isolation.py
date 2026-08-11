@@ -103,6 +103,70 @@ def test_periodic_tick_survives_auto_claim_failure_and_still_resumes_and_ticks(
     assert str(tmp_path) not in result["auto_claim_error"]
 
 
+def _needs_human_workflow() -> SimpleNamespace:
+    return SimpleNamespace(
+        run_id="run-nh",
+        work_id="demo",
+        repo="acme/demo",
+        status="ongoing",
+        facets=("needs_human",),
+        current_phase="verify",
+        # 非 "claim:v1:" 前綴，短路掉 build_production_ship_validator 分支。
+        claim_key="claim:legacy:demo",
+        source_revision="",
+    )
+
+
+def test_periodic_tick_skips_needs_human_workflow_without_calling_resume(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#373 縱深防禦：resume 迴圈的守衛（manager_daemon.py）跳過條件目前只看
+    ``"blocked" in facets``，沒看 ``needs_human``。這在 authority-restart 迴圈
+    裡是關鍵一環——同一 tick 內 auto-claim scan 剛剝除 needs_human，resume 迴圈
+    緊接著就會把這個 run 送進 ``resume_workflow_run``，即使它自己最終會因為
+    needs_human 而 early-return（operator_resume 預設 False），也不該讓已經
+    處於 needs_human 的 run 白跑一趟——縱深防禦，跟 resume_workflow_run 自身的
+    early-return 契約對齊。"""
+
+    workflow = _needs_human_workflow()
+    registry = SimpleNamespace(
+        _state_path=str(tmp_path / "jobs.json"),
+        list_workflow_runs=lambda: [workflow],
+    )
+    dispatcher = SimpleNamespace(_registry=registry, _git_runner=lambda args: "")
+
+    resume_calls: list[str] = []
+
+    def fake_resume_workflow_run(dispatcher_arg, **kwargs):
+        resume_calls.append(kwargs["run_id"])
+
+    monkeypatch.setattr(manager_daemon.manager, "resume_workflow_run", fake_resume_workflow_run)
+
+    def fake_run_tick(dispatcher_arg, **kwargs):
+        return {
+            "dispatch_skipped": False,
+            "dispatched": [],
+            "completed": [],
+            "errors": [],
+            "reaped": None,
+        }
+
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=object(),
+        run_tick_fn=fake_run_tick,
+        scan_specs_fn=lambda specs_dir: [],
+        auto_claim_fn=lambda: [],
+        workflow_identity_registry=object(),
+    )
+
+    runner()
+
+    assert resume_calls == []
+
+
 def test_periodic_tick_regression_no_failure_matches_existing_behavior(
     monkeypatch, tmp_path: Path
 ) -> None:

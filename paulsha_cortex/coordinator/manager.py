@@ -4,16 +4,19 @@ import base64
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Protocol
+from uuid import uuid4
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.lib.durability import fsync_directory
@@ -27,12 +30,16 @@ from ..persona import gate, handoff
 from . import autonomy
 from . import completion
 from . import planning_runtime
+from . import provider_backoff
+from . import provider_outcome
 from . import seams
 from . import review as foreign_review
 from . import terminal_contract
 from . import verification
+from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
+from .registry import slice_repin_eligible
 from ..config.paths import worktree_root_for
-from .claim import decomposition_route
+from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
 from .model_identities import (
     AGY_DOMAIN,
     AGY_LIVE_PROBE,
@@ -58,6 +65,8 @@ from .workflow import (
     WorkflowManifest,
     validate_workflow_phase_transition,
 )
+
+logger = logging.getLogger(__name__)
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
@@ -147,6 +156,44 @@ def _existing_manifest_job_id(path: Path) -> str | None:
         return None
     job_id = payload.get("job_id")
     return job_id if isinstance(job_id, str) else None
+
+
+def _supersede_handoff_manifest(
+    *,
+    handoff_dir: str,
+    slice_id: str,
+    action: str,
+    actor: str,
+    clock: Callable[[], str] = _utcnow,
+) -> None:
+    """操作者復原動作（recover-pre-candidate／abandon）後，替殘留 handoff manifest
+    補上 superseded 稽核標記（issue #383）。
+
+    `run_tick()`/`dispatch_gate_scan()` 的 fanout 放行判定改成與 registry 現況
+    對帳（`_manifest_still_blocks_fanout`），本函式失敗與否都不影響「復原後
+    下一輪 tick 能不能重派」這個驗收條件——這裡純粹補稽核可見性，讓直接檢視
+    manifest 檔的人（非只看 tick 行為）也能看出這份終局紀錄已經過期，而不是
+    誤以為它仍是這個 slice 的最新狀態。
+
+    不刪檔（保留稽核紀錄）；只在既有 payload 補 `superseded_at`/`superseded_by`/
+    `superseded_reason` 三欄後覆寫回同一路徑。manifest 不存在（尚未跑過任何
+    job）／壞檔／symlink／已標記過，皆 best-effort no-op——復原是主動作，
+    manifest 標記是次要動作，不得讓次要動作的失敗連帶讓復原本身 raise。
+    """
+    manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+    if manifest_path.is_symlink():
+        return
+    payload = _read_manifest_payload(manifest_path)
+    if payload is None or payload.get("superseded_at") is not None:
+        return
+    payload = dict(payload)
+    payload["superseded_at"] = clock()
+    payload["superseded_by"] = actor
+    payload["superseded_reason"] = action
+    try:
+        handoff.write_manifest(manifest_path, payload)
+    except OSError:
+        pass
 
 
 def _is_workflow_lane_job(job: dict) -> bool:
@@ -449,7 +496,16 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
     )
     state = slice_row.get("state")
     if state == "failed":
-        return ["retry-build", "recover-pre-candidate", "abandon"] if not valid_candidate else ["retry-build", "abandon"]
+        # retry-build 底層即 registry.repin_slice()。只有在 repin_slice()
+        # 真的會接受目前 (state, gate_state) 組合時才宣告 retry-build——
+        # slice_repin_eligible() 與 repin_slice() 共用同一張表／同一判準
+        # （registry.REPINNABLE_SLICE_STATES / GATE_STATE_TRANSITIONS），
+        # 讓「宣告的動作」與「mutation 端實際接受的動作」保持一致，不再宣告
+        # 一個保證失敗的 retry-build（#382）。
+        actions = ["recover-pre-candidate", "abandon"] if not valid_candidate else ["abandon"]
+        if slice_repin_eligible(slice_row):
+            actions = ["retry-build"] + actions
+        return actions
     if state != "needs_human":
         return []
     if not valid_candidate:
@@ -567,6 +623,14 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
                 latest_action = latest.get("action")
                 if isinstance(latest_action, str) and latest_action:
                     reason = latest_action
+    # #384：manifest 上的 typed provider failure 分類（None 除非本輪終局是
+    # build-phase failure 且分類得到結果，見上面 write_manifest 的呼叫端）。
+    # 投影出來讓 `cortex inspect status` 不必自己解析 `reason` 字串。
+    manifest_provider_outcome = (
+        manifest.get("provider_outcome") if isinstance(manifest, dict) else None
+    )
+    if provider_outcome.ProviderFailureClassification.from_dict(manifest_provider_outcome) is None:
+        manifest_provider_outcome = None
     authority = manifest.get("work_authority") if isinstance(manifest, dict) else None
     authority_repo = authority.get("repo") if isinstance(authority, dict) else None
     repo = _status_repo(
@@ -585,6 +649,7 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
         "reviewer_job_id": reviewer_job_id,
         "reviewer_job_state": reviewer_job_state,
         "reason": reason,
+        "provider_outcome": manifest_provider_outcome,
         "repo": repo,
         "candidate": slice_row.get("candidate"),
         "target_remote": slice_row.get("target_remote"),
@@ -1278,6 +1343,13 @@ def apply_slice_action(
             consumed_at=consumed_at,
             result="ok",
         )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-abandon",
+            actor=actor,
+            clock=clock,
+        )
         latest = registry.get_slice(slice_id)
         return {
             "slice_id": slice_id,
@@ -1350,6 +1422,13 @@ def apply_slice_action(
             gate_state="pending",
             builder_job_id=None,
             candidate=None,
+        )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-recover-pre-candidate",
+            actor=actor,
+            clock=clock,
         )
         latest = registry.get_slice(slice_id)
         return {
@@ -1696,6 +1775,11 @@ def complete_tick(
             completion_record = None
             gate_status = "failed" if status == "failed" else "needs_human"
             gate_reason = None
+            # #384：build-phase failure 的 typed 分類，供下面 manifest 寫入時
+            # 投影給 `cortex inspect status` 讀（見 slice_status_entry）。只有
+            # `elif status == "failed":` 分支會賦值；其餘終局（passed／
+            # needs_human 但非 builder failure）維持 None。
+            slice_provider_outcome_payload: dict[str, object] | None = None
 
             if job.get("kind") == "review":
                 try:
@@ -1753,7 +1837,21 @@ def complete_tick(
                             pass
                 elif status == "failed":
                     gate_status = "failed"
-                    gate_reason = "builder-failed"
+                    # #384：不再一律壓平成 "builder-failed"——`job` 已在
+                    # `Dispatcher._finalize_headless` 分類過（見
+                    # provider_outcome.py），有分類時把 outcome 併進 gate_reason，
+                    # 供 operator／`cortex inspect status` 直接看出是 auth／
+                    # rate_limited／transient／content／quota 哪一種，不必回頭
+                    # 翻 log。slice lane 沒有 workflow lane 的 `run.attempts`
+                    # 可持久化 retry 計數，故本 lane 只做分類與可觀測性，不做
+                    # bounded auto-retry（沿用既有 operator `retry-build` 手動
+                    # 復原路徑）。
+                    classification = provider_outcome.classification_from_job(job)
+                    if classification is not None:
+                        gate_reason = f"builder-failed-{classification.outcome.value}"
+                        slice_provider_outcome_payload = classification.to_dict()
+                    else:
+                        gate_reason = "builder-failed"
                     if slice_row is not None:
                         try:
                             registry.update_slice(slice_id, state="failed", gate_state="failed")
@@ -1910,6 +2008,10 @@ def complete_tick(
                         else None
                     ),
                     "completed_at": clock(),
+                    # #384：typed provider failure 分類（None 除非本輪終局是
+                    # build-phase failure 且分類得到結果）。`slice_status_entry`
+                    # 讀回這個欄位投影給 `cortex inspect status`。
+                    "provider_outcome": slice_provider_outcome_payload,
                 },
             )
             if not publish_evidence and gate_reason in {
@@ -1952,6 +2054,91 @@ def complete_tick(
     return summary
 
 
+def _manifest_still_blocks_fanout(registry, slice_id: str) -> bool:
+    """判斷殘留 handoff 終局 manifest 是否仍該擋本輪 fanout（issue #383 提案 2）。
+
+    manifest 只反映「某個 job 曾經跑到終局」，不代表「這個 slice 現在仍該被
+    跳過」——`apply_slice_action` 的 `recover-pre-candidate`／`abandon` 等復原
+    動作會把 registry state 撥回 `"pending"`（可重派），但沒有義務刪除舊
+    manifest（保留稽核紀錄）。此處與 registry 現況對帳，而不是只看 handoff
+    目錄有沒有檔案：
+
+    - registry 查無此 slice（從未建過 slice row，例如純 handoff-only 情境）
+      → 無法確認已復原，保守照舊擋。
+    - `state == "pending"` → 已被復原到可重派狀態，manifest 過期，不擋。
+    - 其餘狀態（needs_human/failed/building/verified/completed 等）→ 與
+      manifest 描述的終局一致，照舊擋。
+    """
+    if registry is None:
+        return True
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return True
+    return str(slice_row.get("state")) != "pending"
+
+
+def dispatch_gate_scan(
+    metas: list[dict],
+    *,
+    handoff_dir: str,
+    registry,
+) -> tuple[list[dict], dict[str, dict], list[dict]]:
+    """算出本輪允許進 `dispatch_ready()`/`ready_units()` 就緒判定的 meta 子集。
+
+    `run_tick()` 與 `manager_daemon.py` 的 `request_type == "fanout"` 分支皆呼叫
+    本函式，消除兩條路徑各自維護一份過濾邏輯導致的分歧（issue #383 複驗指出
+    「fanout 路徑不只沒 already_terminal 過濾、連 in-flight active 過濾也沒
+    有」）。兩層過濾疊加：
+
+    1. in-flight 過濾：registry 中仍 dispatched/running 的 job 對應 slice 本趟
+       不重派（同一 slice 一 job 不變量，review F-A）。
+    2. handoff 終局過濾：已有 handoff 終局紀錄（needs_human/failed/passed/
+       verified 皆算）的 slice 預設不重派（issue #339 冪等）——但終局是否仍
+       該擋，改與 registry 現況對帳而非只看檔案存不存在（`_manifest_still_blocks_fanout`，
+       issue #383 提案 2），避免復原後的 slice 被殘留 manifest 永久靜默跳過。
+
+    回 `(fanout_metas, already_terminal, needs_human)`：
+    - `fanout_metas`：真正該餵給 `dispatch_ready()` 的子集。
+    - `already_terminal`：slice_id -> manifest payload，供呼叫端組 needs_human
+      清單用途——不論是否阻擋 fanout 皆收，維持既有回報語意（不受本次對帳
+      影響，複驗要求 needs_human 回傳語意不變）。
+    - `needs_human`：manifest `gate_status == "needs_human"` 的清單（維持既有
+      語意；即使已復原也照列，這是操作者可見的歷史軌跡，不是「靜默」問題）。
+    """
+    already_terminal: dict[str, dict] = {}
+    needs_human: list = []
+    blocking: set[str] = set()
+    for meta in metas:
+        slice_id = meta.get("slice_id") if isinstance(meta, dict) else None
+        if not isinstance(slice_id, str) or not slice_id:
+            continue
+        manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        already_terminal[slice_id] = payload
+        if payload.get("gate_status") == "needs_human":
+            needs_human.append(
+                {
+                    "slice_id": slice_id,
+                    "gate_reason": payload.get("gate_reason"),
+                    "handoff_path": str(manifest_path),
+                }
+            )
+        if _manifest_still_blocks_fanout(registry, slice_id):
+            blocking.add(slice_id)
+
+    active: set[str] = set()
+    if registry is not None:
+        active = {j.get("task") for j in registry.list_jobs() if j.get("status") in IN_FLIGHT_STATUSES}
+    fanout_metas = [m for m in metas if m.get("slice_id") not in active and m.get("slice_id") not in blocking]
+    return fanout_metas, already_terminal, needs_human
+
+
 def run_tick(
     dispatcher,
     *,
@@ -1973,6 +2160,7 @@ def run_tick(
     review_model: str | None = None,
     identity_registry=None,
     launcher_factory=None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict:
     """跑完整 manager tick：fanout（dispatch_ready）→ complete_tick →（可選）收尾 janitor。
 
@@ -2010,47 +2198,19 @@ def run_tick(
     # 不論 dispatch_skipped 與否都要掃描——這段刻意放在 idle 判斷之前、兩分支共用，
     # 因為「idle gate 擋不擋新工作」跟「有沒有 job 卡在 needs_human 待人工」是兩件事，
     # 高負載（not-idle）時操作者更需要看到 needs_human 清單，不能被 idle-skip 短路成空清單。
-    already_terminal: dict[str, dict] = {}
-    needs_human: list = []
-    for meta in metas:
-        slice_id = meta.get("slice_id") if isinstance(meta, dict) else None
-        if not isinstance(slice_id, str) or not slice_id:
-            continue
-        manifest_path = Path(handoff_dir) / f"{slice_id}.json"
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        already_terminal[slice_id] = payload
-        if payload.get("gate_status") == "needs_human":
-            needs_human.append(
-                {
-                    "slice_id": slice_id,
-                    "gate_reason": payload.get("gate_reason"),
-                    "handoff_path": str(manifest_path),
-                }
-            )
+    # fanout_metas 已與 registry 現況對帳（dispatch_gate_scan，issue #383 提案 2）：
+    # 復原動作（recover-pre-candidate 等）把 slice 撥回 pending 後，殘留的舊終局
+    # manifest 不再讓它被永久跳過。
+    registry = getattr(dispatcher, "_registry", None)
+    fanout_metas, already_terminal, needs_human = dispatch_gate_scan(
+        metas, handoff_dir=handoff_dir, registry=registry
+    )
     # idle gate 只擋「派工側（新工作，會啟 agent，昂貴）」；完成側（poll→manifest，便宜的
     # 回收/記帳）一律跑，否則高負載時 job 完成/失敗狀態與下游釋放會被埋住（review F-C）。
     if require_idle and not idle.is_idle(max_load=max_load, probe=idle_probe):
         dispatch_skipped: str | bool = "not-idle"
     else:
         dispatch_skipped = False
-        # 冪等：跳過 registry 中已有 dispatched/running job 的 slice，避免 oneshot+timer
-        # 反覆對同一 slice 重派（review F-A：一 slice 一 job 不變量）。
-        registry = getattr(dispatcher, "_registry", None)
-        active = (
-            {j.get("task") for j in registry.list_jobs() if j.get("status") in IN_FLIGHT_STATUSES}
-            if registry is not None
-            else set()
-        )
-        fanout_metas = [
-            m
-            for m in metas
-            if m.get("slice_id") not in active and m.get("slice_id") not in already_terminal
-        ]
         try:
             dispatched = autonomy.dispatch_ready(
                 fanout_metas,
@@ -2062,6 +2222,7 @@ def run_tick(
                 handoff_dir=handoff_dir,
                 identity_registry=identity_registry,
                 launcher_factory=launcher_factory,
+                spawn_admission=spawn_admission,
             )
         except autonomy.DispatchReadyError as exc:
             dispatched = list(exc.jobs)
@@ -2220,6 +2381,121 @@ def _load_run_planning_artifacts(run) -> tuple[PlanningArtifact, ...] | None:
     return tuple(artifacts)
 
 
+# --- #414：deterministic pass plan 卡前的 declared-outputs 驗證 -------------
+#
+# 根因（生產實測 run workflow-e18785ac）：`assess_planning_completeness` 只看
+# kind 覆蓋率——workstream todo（kind=plan、accepted）就足以讓 planning 判定
+# complete，manager 因此把 plan 卡（如 writing-plans-light）deterministic
+# pass，卻從未檢查卡片自己宣告的 `produces` glob（如
+# `docs/superpowers/plans/*<task-slug>*.md`）是否真的命中檔案——todo 的
+# ref 通常不落在該 pattern 內。下一棒 build 卡宣告同一 pattern 為
+# declared input，`_workflow_input_snapshot`（見上方 `_safe_input_matches`
+# 用法）找不到檔案便直接 raise，整個 run 卡死在 needs_human。
+#
+# 這裡補上與 build 端對稱的檢查：deterministic pass 之前，用同一套
+# `_safe_input_matches` glob 語意驗證 outputs 是否已存在；缺席時嘗試把
+# 已 accepted 的 kind=plan 內容 materialize 到卡片宣告的 canonical 路徑
+# （`_materialize_plan_card_output`）。plan 卡目前沒有「planning_complete
+# 為真時仍會走正常派工」的路徑（見 `_dispatch_workflow_card` 讀碼：一旦
+# `planning_complete` 為真，本函式只會 needs_decomposition／needs_human／
+# plan-review 重試／deterministic pass 四選一，從不落到下面建立真實 job
+# 的路徑），materialize 因此是唯一可行的最小修法；不可 materialize 時
+# （宣告了非單一 output pattern、或找不到已 accepted 的 kind=plan 內容）
+# fail-closed：不跳過、不動 registry，交由下一輪 dispatch 重新判定。
+def _plan_card_declared_outputs_present(root: Path, patterns: tuple[str, ...]) -> bool:
+    """驗證 plan 卡宣告的 outputs glob patterns 是否皆已在 ``root``
+    （run.workspace_root）命中至少一個實檔。空 patterns 視為已滿足。"""
+    return all(_safe_input_matches(root, pattern) for pattern in patterns)
+
+
+def _plan_card_canonical_output_path(pattern: str) -> str:
+    """把單一 `*`-only 萬用字元 output glob pattern 收斂為 canonical 具體
+    路徑（移除 `*`）。非此形狀（含 `?`／`[...]`，或移除萬用字元後路徑不
+    合法）一律 raise，交由呼叫端視為不可 materialize。"""
+    if "*" not in pattern or "?" in pattern or "[" in pattern:
+        raise ValueError(f"plan output pattern 不支援 materialize：{pattern!r}")
+    canonical = pattern.replace("*", "")
+    relative = Path(canonical)
+    if (
+        not canonical
+        or canonical.endswith("/")
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or relative.as_posix() != canonical
+    ):
+        raise ValueError(f"plan output pattern materialize 路徑不合法：{pattern!r}")
+    return canonical
+
+
+def _materialize_plan_card_output(
+    *,
+    run,
+    step,
+    artifacts: tuple[PlanningArtifact, ...],
+    workspace_root: Path,
+):
+    """把已 accepted 的 kind=plan 規劃內容原樣 materialize 到 ``step`` 宣告
+    的（唯一）output pattern 之 canonical 路徑，透過既有 planning
+    publication 機制（`_PlanningPublicationTransaction.publish`）做
+    CAS-safe 的 atomic 寫入。成功時回傳
+    ``(更新後的 artifacts, 新的 PlanningArtifactAuthority, transaction)``——
+    呼叫端需把 authority 併入 ``run.planning_authority`` 一併提交（build
+    worktree 是獨立 git worktree，declared input 檢查缺席時要靠
+    authority 記錄從 workspace_root seed 進去，見 `_workflow_input_snapshot`
+    的 authority_refs fallback），並在後續 registry 提交失敗時呼叫
+    ``transaction.rollback()``。不可 materialize 時回傳 ``None``（不寫檔、
+    不動 registry）。
+
+    ``journal_root=None``：此次寫入與呼叫端的 registry 提交在同一次
+    dispatch 呼叫內完成，不借用 brainstorm 那份跨 run 的
+    crash-recoverable journal（避免與其 `reconcile()` 語意〔預期
+    kind=evidence 的 brainstorm gate ref〕互相干擾）；殘餘風險是寫入成功
+    後、registry 提交前這極窄的視窗內若 manager 崩潰，materialize 出的
+    檔案會變成未登記的孤兒——下一輪 dispatch 會重新判定 outputs 是否存在
+    並可能需要人工介入，但不劣於修復前 100% 必炸的現狀。
+    """
+    if len(step.outputs) != 1:
+        return None
+    try:
+        canonical_relative = _plan_card_canonical_output_path(step.outputs[0])
+    except ValueError:
+        return None
+    accepted_plan = next(
+        (
+            assessment.artifact
+            for assessment in assess_planning_completeness(artifacts).assessments
+            if assessment.artifact.kind == "plan" and assessment.accepted
+        ),
+        None,
+    )
+    if accepted_plan is None:
+        return None
+    destination = workspace_root / canonical_relative
+    if destination.is_symlink():
+        return None
+    cursor = workspace_root
+    for part in Path(canonical_relative).parent.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return None
+    content = accepted_plan.text.encode("utf-8")
+    transaction = _PlanningPublicationTransaction(
+        root=workspace_root, run_id=run.run_id, journal_root=None,
+    )
+    try:
+        transaction.publish(destination, content, baseline_hash=None, mode=0o644, kind="artifact")
+    except ValueError:
+        return None
+    materialized = PlanningArtifact(kind="plan", ref=canonical_relative, text=accepted_plan.text)
+    authority = PlanningArtifactAuthority(
+        ref=canonical_relative,
+        kind="plan",
+        work_id=run.work_id,
+        baseline_sha256=hashlib.sha256(content).hexdigest(),
+    )
+    return artifacts + (materialized,), authority, transaction
+
+
 def _manager_archive_applied(run) -> bool:
     archives = [
         step
@@ -2346,6 +2622,20 @@ def _validated_brainstorm_planning_authority(
         if step.persona == "planner" and step.phase in {"define", "plan"}
         for pattern in step.outputs
     )
+    # #418：plan 卡 deterministic pass materialize 出的 canonical plan 檔
+    # （`_materialize_plan_card_output`）與 brainstorm 實際發佈的 plan
+    # artifact（例如 workstreams/<slug>/todo.md）路徑不同、卻是同一份內容
+    # 的 byte-copy，僅為滿足 build 端 declared input pattern
+    # （`docs/superpowers/plans/*<slug>*.md`）而落地。下面單獨算出 plan
+    # phase 宣告的 output patterns，用來把這種合法副本從「omission」判定
+    # 中排除——與 `declared_patterns`（含 define phase）分開，避免誤放行
+    # 不相干的 define 階段路徑。
+    plan_output_patterns = tuple(
+        pattern
+        for step in run.steps
+        if step.persona == "planner" and step.phase == "plan"
+        for pattern in step.outputs
+    )
     persisted = {item.ref: item for item in run.planning_authority}
     scanned: dict[str, PlanningArtifactAuthority] = {}
     workspace = Path(run.workspace_root).resolve()
@@ -2410,8 +2700,36 @@ def _validated_brainstorm_planning_authority(
             baseline_sha256=digest,
         )
 
-    if set(persisted) - set(scanned):
-        raise ValueError("workflow brainstorm evidence omits persisted authority")
+    missing = set(persisted) - set(scanned)
+    if missing:
+        # #418：materialized plan 副本本身不在 brainstorm evidence 的
+        # artifacts 列表裡（它是 plan 卡 deterministic pass 之後才產生
+        # 的），因此天生落在 `persisted - scanned` 差集中。逐一檢查是否
+        # 為「合法副本」：kind=plan、work_id 對得上這個 run、內容
+        # （baseline_sha256）與某個已通過 brainstorm 驗證的 kind=plan
+        # entry 完全一致（byte-copy）、且 ref 落在 plan phase 宣告的
+        # output pattern 內（即 build 端會讀的那個 canonical 路徑）。四條
+        # 全符合才視為合法副本、不計入 omission；其餘（真正的 omission）
+        # 維持 raise，fail-closed 語意不變。
+        scanned_plan_digests = {
+            entry.baseline_sha256 for entry in scanned.values() if entry.kind == "plan"
+        }
+        unresolved = {
+            ref
+            for ref in missing
+            if not (
+                persisted[ref].kind == "plan"
+                and persisted[ref].work_id == run.work_id
+                and persisted[ref].baseline_sha256 in scanned_plan_digests
+                and any(fnmatch.fnmatch(ref, pattern) for pattern in plan_output_patterns)
+            )
+        }
+        if unresolved:
+            raise ValueError("workflow brainstorm evidence omits persisted authority")
+    # `ordered` 起始自 `run.planning_authority`（即 `persisted` 的來源），
+    # 因此上面被判定為合法副本的 materialized plan entry 原樣留在回傳值
+    # 裡——它必須繼續存在，好讓 build worktree 透過 `_workflow_input_snapshot`
+    # 的 authority_refs fallback seed 到這份 canonical plan 檔。
     ordered = list(run.planning_authority)
     ordered.extend(scanned[ref] for ref in scanned if ref not in persisted)
     return tuple(ordered), evidence_source_revision
@@ -2441,6 +2759,20 @@ def _audit_phase_steps(
             inputs=step.inputs,
             outputs=outputs if step.phase == phase and (card_id is None or step.card == card_id) else step.outputs,
             gate_result=gate_result if step.phase == phase and (card_id is None or step.card == card_id) else step.gate_result,
+            # #379 複驗發現：此函式過去重建每個 step 時漏傳
+            # skill_ref/action/commit_policy/test_policy，導致 WorkflowStep 的
+            # dataclass 預設值（None）覆寫掉「完全不在本次 (phase, card_id)
+            # 範圍內」的其他 step 的既有值——包含尚未輪到的 build phase 卡片。
+            # 實務上，run 通常在 claim phase 就先 advance 過一次，因此 build
+            # phase 卡片的 test_policy 在真正被拿來跑之前就已經被抹成 None，
+            # #307 的 red-required 語意反轉、以及 #379 由 test_policy 導出
+            # 應驗 gate 名稱的機制都會因此變成 dead code。這四個欄位本就只
+            # 該由 deck compile 決定、run 存續期間不變，故一律原樣帶過，不
+            # 受 (phase, card_id) 命中與否影響。
+            skill_ref=step.skill_ref,
+            action=step.action,
+            commit_policy=step.commit_policy,
+            test_policy=step.test_policy,
         )
         for step in steps
     )
@@ -2670,6 +3002,85 @@ def _schema_retry_attempt_key(card_id: str) -> str:
     return f"schema-mismatch:{card_id}"
 
 
+def _provider_retry_attempt_key(card_id: str) -> str:
+    """#384：provider 失敗（rate_limited／transient）bounded retry 計數在
+    ``run.attempts`` 上的鍵。比照 :func:`_schema_retry_attempt_key` 的樣板——
+    同一份 ``run.attempts`` 字典上以字首區分兩種完全不同性質的重試（schema
+    mismatch 是模型輸出形狀問題；provider 失敗是 executor/服務層問題），
+    互不影響、各自的 needs_human 原因也分開回報。
+    """
+
+    return f"provider-retry:{card_id}"
+
+
+def _provider_failure_reroute(
+    run,
+    step,
+    identities: IdentityRegistry,
+    *,
+    failed_job: Mapping[str, object],
+    classification: "provider_outcome.ProviderFailureClassification",
+):
+    """#384：provider 失敗時，在既有 candidate 順序上 re-route，不放寬
+    independence domain（forward-looking 約束：禁 policy-shopping，例如
+    Codex builder 失敗後不得 re-route 成也用 Codex 的 reviewer）。
+
+    複用 :func:`runtime_preflight.evaluate_dispatch_gate`（#369 已把 provider
+    snapshot 接進生產的同一套機制）：把「剛剛觀察到的這次失敗」餵成一筆
+    僅本次呼叫可見、in-memory 的 provider snapshot，讓 gate 依
+    :func:`_workflow_identity_candidates`（既有 domain-filtered 順序，完全未
+    改動）跳過剛失敗的 identity、選下一個候選。刻意不觸碰
+    ``_EXECUTOR_AUTH_CACHE`` 或任何 durable snapshot——這只是這一次 retry
+    決策的暫時性輸入，不影響其他 dispatch 熱路徑（`provider_prober=None`：
+    不觸發任何真實 CLI 探測子行程）。
+
+    只剩失敗的那個 identity 本身合格時，`evaluate_dispatch_gate` 必然又選回
+    它——這不是 bug，是唯一合法選擇（沒有domain-合法的替代候選可換）。
+    """
+
+    from .runtime_preflight import (
+        DEFAULT_PROVIDER_TTL_SECONDS,
+        PROVIDER_EXECUTOR_SENTINEL,
+        ProviderFreshness,
+        RuntimeCapability,
+        evaluate_dispatch_gate,
+        host_environment,
+    )
+
+    candidates = _workflow_identity_candidates(run, step, identities)
+    failed_executor = failed_job.get("executor")
+    observed_at = time.time()
+
+    def _snapshot_lookup(provider_id: str) -> ProviderFreshness | None:
+        if provider_id != failed_executor:
+            # 其餘候選：無快照 -> STALE_SNAPSHOT（non-blocking，直接放行，
+            # 不多探測、不 spawn 任何子行程）。
+            return None
+        return ProviderFreshness(
+            provider_id=provider_id,
+            status="degraded",
+            observed_at=observed_at,
+            ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
+            source="provider-failure-observed",
+            reason=f"{classification.outcome.value}: {classification.reason}",
+        )
+
+    # `_workflow_identity_candidates` 在無合格候選時已 raise ValueError——與
+    # `_select_workflow_identity` 完全相同的既有錯誤行為，這裡刻意不吞掉它
+    # （沒有候選是設定錯誤，不是「這次 retry 剛好找不到人可換」）。
+    decision = evaluate_dispatch_gate(
+        card=step.card,
+        requirements=(RuntimeCapability(kind="provider", name=PROVIDER_EXECUTOR_SENTINEL),),
+        candidates=candidates,
+        environment_for=lambda _identity: host_environment(),
+        snapshot_lookup=_snapshot_lookup,
+        provider_prober=None,
+    )
+    if decision.action == "needs_human":
+        return None
+    return decision.identity
+
+
 def _canonicalize_card_terminal(raw: Mapping[str, object]) -> dict[str, object]:
     """#261 D1：把 canonical envelope 投影成既有 card 驗證路徑吃得下的形狀。
 
@@ -2751,6 +3162,49 @@ def _workflow_step_test_policy(registry, job: Mapping[str, object]) -> str | Non
     return None
 
 
+def _expected_gate_names_for_test_policy(test_policy: str | None) -> frozenset[str]:
+    """#379：從 plan 的驗收條件（deck compile 依 combo/cards.yaml 綁在每個 build
+    phase 卡片上的 ``test_policy``）機械導出這個 phase 應驗的 gate 名稱集合。
+
+    ``test_policy`` 目前是 workflow lane 裡唯一由 spec/plan（而非 operator 的
+    ``PSC_GATE_CMD_*`` env）決定的驗收訊號：``None``／``"none"`` 代表卡片本就
+    不要求測試（例如 worktree-isolation 這類不動 candidate 程式碼的卡），維持
+    既有 #308 的合法空 ledger 放行語意；其餘合法值（``"red-required"``／
+    ``"focused"``／``"full"``）皆代表這張卡的正確產出需要跑測試，對應 ledger
+    裡 :data:`terminal_contract.RED_REQUIRED_TEST_GATE_NAME`（"pytest"）這個
+    gate 名稱——與 #307 red-required 反轉引用的是同一個名稱來源，不另立一套。
+    """
+
+    if test_policy in (None, "none"):
+        return frozenset()
+    return frozenset({terminal_contract.RED_REQUIRED_TEST_GATE_NAME})
+
+
+def _workflow_acceptance_definition_drifted(
+    job: Mapping[str, object], *, fresh_test_policy: str | None
+) -> bool:
+    """#379：驗收判準（test_policy）pinned-input drift 偵測，比照既有
+    ``_pinned_input_mismatches``／``_review_inputs_drifted`` 的「派工當下 pin
+    一份快照、harvest 時與現況比對」模式。
+
+    ``job["workflow_test_policy"]`` 是 :func:`_dispatch_workflow_card` 派工當下
+    寫入的快照（見該函式對 ``registry.create_job`` 的呼叫）；``fresh_test_policy``
+    是 harvest 當下重新從 registry 現有 ``WorkflowRun.steps`` 讀到的值。兩者不
+    一致代表這張卡的驗收判準在派工之後被動過——無論肇因是 operator／其他行程
+    的合法變更，還是任何讓 builder 自報得以「改判準讓自報成真」的路徑，都必須
+    fail closed，不得沿用新值靜默通過。
+
+    ``job`` 沒有 ``workflow_test_policy`` 欄位（例如非經
+    :func:`_dispatch_workflow_card` 真正派工路徑建立的 legacy／測試 job）時視為
+    「未 pin」，不受本檢查約束——維持既有行為，不因為新增這道保護而誤殺舊資料。
+    """
+
+    pinned = job.get("workflow_test_policy")
+    if pinned is None:
+        return False
+    return pinned != fresh_test_policy
+
+
 def _assert_terminal_gate_consistency(
     raw: Mapping[str, object],
     *,
@@ -2772,6 +3226,14 @@ def _assert_terminal_gate_consistency(
     ``test_policy=red-required``（tdd-red）卡對測試 gate 的語意反轉在
     :func:`terminal_contract.authorize_terminal` 生效；未提供或解析不到時
     ``test_policy`` 視為 ``None``，行為與反轉前完全相同。
+
+    #379：同一份 ``test_policy`` 另外餵給 :func:`_expected_gate_names_for_test_policy`
+    導出這個 phase 應驗的 gate 名稱集合，交給 ``authorize_terminal`` 的
+    ``expected_gate_names`` 參數把 #308 的空/局部 ledger 早退收斂成「只有 plan
+    本就沒有應驗 gate 時才放行」。派工當下 pin 進 job 的 ``workflow_test_policy``
+    與這裡重新解析出的現值不一致時（:func:`_workflow_acceptance_definition_drifted`），
+    在呼叫 ``authorize_terminal`` 之前就先 fail closed，不讓「判準本身被動過」
+    偽裝成一次乾淨的 gate 驗證。
     """
 
     try:
@@ -2783,11 +3245,27 @@ def _assert_terminal_gate_consistency(
     log_path = job.get("log_path")
     if not isinstance(log_path, str) or not log_path:
         return
+    test_policy = _workflow_step_test_policy(registry, job)
+    if _workflow_acceptance_definition_drifted(job, fresh_test_policy=test_policy):
+        raise terminal_contract.TerminalContractError(
+            "workflow card 的驗收判準（test_policy）自派工後已變動："
+            f"pinned={job.get('workflow_test_policy')!r}，現值={test_policy!r}；"
+            "不得沿用新值讓 builder 自報靜默通過",
+            reason="workflow-acceptance-definition-drift",
+            validation_path="$.gate_evidence",
+            errors=(
+                {
+                    "pinned_test_policy": job.get("workflow_test_policy"),
+                    "current_test_policy": test_policy,
+                },
+            ),
+        )
     terminal_contract.authorize_terminal(
         envelope,
         ledger_path=terminal_contract.gate_ledger_path(log_path),
         require_ledger=job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES,
-        test_policy=_workflow_step_test_policy(registry, job),
+        test_policy=test_policy,
+        expected_gate_names=_expected_gate_names_for_test_policy(test_policy),
     )
 
 
@@ -5464,6 +5942,36 @@ class _PlanningPublicationTransaction:
                 raise PlanningPublicationDrift("planning uncommitted rollback drift") from exc
 
 
+# #416：`_publish_planning_artifacts` 對「檔案已存在但無/與目前 authority
+# 不符」一律 fail-closed（見下方兩處 raise），這正是 abandon 未回滾已發佈
+# 殘留檔（`work_actions._gc_abandoned_planning_artifacts` 修復前的缺口）撞見
+# 下一世代重新發佈同一 destinations 時的典型死鎖地雷特徵——屬環境／狀態
+# 殘留，不是模型內容缺陷。這兩個訊息子字串必須與下方兩個 raise 的字面文字
+# 完全一致，`_is_planning_authority_residue_failure` 才能正確辨識。
+_PLANNING_AUTHORITY_RESIDUE_MARKERS = (
+    "planning artifact lacks current planning authority",
+    "planning artifact current authority drift",
+)
+
+
+def _is_planning_authority_residue_failure(reason: str | None) -> bool:
+    """判斷 brainstorm not-ready 的 reason 是否為 #416 的 authority 殘留死鎖。
+
+    只窄判斷 `run_heterogeneous_brainstorm` 對 `artifact_writer` 例外包出的
+    `primary-artifact-write-rejected: ...` 前綴、且訊息命中
+    `_PLANNING_AUTHORITY_RESIDUE_MARKERS` 兩個明確子字串之一。
+    `_publish_planning_artifacts` 其餘的內容型驗證錯誤（schema 不合法、路徑
+    逃出 governed roots、artifact 未通過驗收……）刻意不在此範圍內，維持
+    #393 既有的 `content` 分類與 fail-closed 意圖，不擴大分類映射。
+    """
+
+    return (
+        reason is not None
+        and reason.startswith("primary-artifact-write-rejected:")
+        and any(marker in reason for marker in _PLANNING_AUTHORITY_RESIDUE_MARKERS)
+    )
+
+
 def _publish_planning_artifacts(
     root_value: str,
     rows: object,
@@ -5678,12 +6186,123 @@ def _specialize_workflow_launcher(launcher, step):
     return launcher
 
 
-def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher_factory):
+# #369：provider capability 探測的死碼修復。修復前 `_runtime_preflight_gate`
+# 呼叫 `evaluate_dispatch_gate` 時從未傳入 `snapshot_lookup`／`provider_prober`
+# （兩者預設 None）——`_resolve_provider_freshness` 在 `snapshot_lookup is None`
+# 時直接回 STALE_SNAPSHOT，而 STALE_SNAPSHOT 不在 `_BLOCKING_OUTCOMES`（只有
+# CAPABILITY_MISSING／PROVIDER_UNAVAILABLE 會擋），所以任何 `provider:` 宣告
+# 在生產環境永遠放行，等於整條路徑是死碼。以下兩個 factory 把它接上真正的
+# 資料源：GitHub 走既有 monitor durable snapshot（唯讀，無快照時安全回退成
+# STALE_SNAPSHOT，不變更行為的保守面）；executor 走 dispatch-time 的登入態
+# 探測（`coordinator.executor_auth`），以 process-level 快取避免每次 dispatch
+# 都重新 spawn CLI 子行程（見 `_EXECUTOR_AUTH_CACHE`）。
+#
+# cards.yaml 尚未有卡片宣告 `provider:executor`（見 #369 changelog 的風險
+# 說明）：sentinel 機制已就緒且有完整測試覆蓋，但要接上前先確認 CI／各執行
+# 環境對 claude／codex／copilot CLI 的可得性，避免 dispatch 熱路徑意外 spawn
+# 子行程；`provider:github:<repo>` 純讀 monitor 快照檔，無此風險，已直接接上
+# openspec-archive／policy-commit 兩張 ship-phase 卡。
+_EXECUTOR_AUTH_CACHE: dict[str, object] = {}
+
+
+def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> object | None:
+    from paulsha_cortex.monitor.work_models import parse_timestamp
+
+    from .runtime_preflight import DEFAULT_PROVIDER_TTL_SECONDS, ProviderFreshness
+
+    try:
+        snapshot = snapshot_store.load()
+    except Exception:  # noqa: BLE001 - monitor 快照壞掉不得拖垮 dispatch
+        return None
+    if snapshot is None:
+        return None
+    provider = snapshot.providers.get(provider_id)
+    if provider is None:
+        return None
+    try:
+        observed_at = parse_timestamp(provider.last_attempt_at).timestamp()
+    except ValueError:
+        return None
+    reason = "; ".join(provider.diagnostics) if provider.diagnostics else None
+    return ProviderFreshness(
+        provider_id=provider.provider_id,
+        status=provider.status,
+        observed_at=observed_at,
+        ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
+        source="monitor-snapshot",
+        reason=reason,
+    )
+
+
+def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
+    """#369：executor 登入態的「快照」層——實際是 process-level 快取。
+
+    沒有既有的 durable executor-auth snapshot 基礎設施（GitHub 有，monitor
+    daemon 會定期掃描並落盤；executor CLI 登入態沒有），因此第一次查詢時合成
+    一筆「已過期」的紀錄，讓 `_resolve_provider_freshness` 的 stale 分支去
+    呼叫 `provider_prober` 做一次真正探測；探測結果回寫這個 cache，後續在
+    TTL 內的查詢會直接命中 `is_fresh()`、不再重新 spawn 子行程。
+    """
+
+    from .runtime_preflight import ProviderFreshness
+
+    cached = _EXECUTOR_AUTH_CACHE.get(provider_id)
+    if cached is not None:
+        return cached
+    from .executor_auth import EXECUTOR_AUTH_TTL_SECONDS
+
+    return ProviderFreshness(
+        provider_id=provider_id,
+        status="degraded",
+        observed_at=0.0,
+        ttl_seconds=EXECUTOR_AUTH_TTL_SECONDS,
+        source="cold-start",
+        reason="no prior executor auth probe",
+    )
+
+
+def _executor_auth_prober(provider_id: str) -> object | None:
+    from .executor_auth import check_executor_auth
+
+    result = check_executor_auth(provider_id)
+    _EXECUTOR_AUTH_CACHE[provider_id] = result
+    return result
+
+
+def _combined_provider_snapshot_lookup(*, snapshot_store) -> Callable[[str], object | None]:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    def _lookup(provider_id: str) -> object | None:
+        if provider_id in EXECUTOR_CANDIDATES:
+            return _executor_auth_snapshot_lookup(provider_id)
+        return _monitor_provider_snapshot_lookup(provider_id, snapshot_store=snapshot_store)
+
+    return _lookup
+
+
+def _combined_provider_prober(provider_id: str) -> object | None:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    if provider_id in EXECUTOR_CANDIDATES:
+        return _executor_auth_prober(provider_id)
+    # GitHub 目前只用 monitor snapshot，不做額外 live probe：monitor daemon
+    # 本身已定期刷新該快照，再疊一層 live probe 只是重複付網路成本
+    # （#369 範圍界定，見 changelog）。
+    return None
+
+
+def _runtime_preflight_gate(
+    run, step, *, identities: IdentityRegistry, launcher_factory, snapshot_store=None
+):
     """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
 
     回傳 None 代表這張 card 未宣告任何 capability，呼叫端照原路徑走；否則回傳
     `DispatchGateDecision`，其中 `launcher` 只在通過 preflight 的 identity 上建立
     ——被擋下的 identity 不會產生任何 model session。
+
+    `snapshot_store` 預設 None 時延後到真正需要時才建立
+    `monitor.work_snapshot.WorkSnapshotStore()`（讀既有 monitor durable
+    snapshot）；測試可注入指向 tmp_path 的 store，不觸碰真實安裝路徑。
     """
 
     from .runtime_preflight import card_runtime_requirements, evaluate_dispatch_gate
@@ -5719,12 +6338,20 @@ def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher
 
         return host_environment()
 
+    active_store = snapshot_store
+    if active_store is None:
+        from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+        active_store = WorkSnapshotStore()
+
     return evaluate_dispatch_gate(
         card=step.card,
         requirements=requirements,
         candidates=candidates,
         environment_for=_environment_for,
         launcher_factory=_launcher_for,
+        snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
+        provider_prober=_combined_provider_prober,
     )
 
 
@@ -6111,7 +6738,13 @@ def _dispatch_workflow_card(
     retry_failed: bool = False,
     operator_recovery_job_id: str | None = None,
     force_new_build: bool = False,
+    forced_identity: object | None = None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object] | None:
+    """#381：workflow lane 的實際 spawn 點。spawn_admission 未注入時解析為
+    零間隔 no-op（見 spawn_admission.resolve_limiter）——只有 resume_workflow_run
+    /manager_daemon periodic tick 顯式注入同一個 instance 時，兩條 lane 才會
+    對同一 provider 共用節流時間軸。"""
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
         raise RuntimeError("workflow dispatch requires dispatcher registry")
@@ -6240,6 +6873,26 @@ def _dispatch_workflow_card(
                     plan_review_passed_now = True
                 # gate_outcome is None：輸入不可得（fail-soft），落到下面正常推進，
                 # 維持現行為，不掛 plan_review_passed。
+            # #414：deterministic pass 這張 plan 卡之前，先驗證卡片宣告的
+            # outputs glob 是否已在 workspace_root 命中實檔——不對稱地只驗
+            # build 端 declared input、卻放過 plan 端 declared output，正是
+            # 生產事故（run workflow-e18785ac）的根因。缺席時嘗試
+            # materialize；不可 materialize 時 fail-closed 不跳過（詳見
+            # `_materialize_plan_card_output` docstring）。
+            workspace_root = Path(run.workspace_root).resolve()
+            new_authority: PlanningArtifactAuthority | None = None
+            publication: _PlanningPublicationTransaction | None = None
+            if not _plan_card_declared_outputs_present(workspace_root, step.outputs):
+                materialize_result = _materialize_plan_card_output(
+                    run=run, step=step, artifacts=artifacts, workspace_root=workspace_root,
+                )
+                if materialize_result is None:
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "reason": "plan-outputs-missing",
+                    }
+                artifacts, new_authority, publication = materialize_result
             next_phase = run.current_phase
             attempts = run.attempts
             if is_last_pending:
@@ -6248,30 +6901,49 @@ def _dispatch_workflow_card(
                     **run.attempts,
                     next_phase: run.attempts.get(next_phase, 0) + 1,
                 }
-            registry._manager_update_workflow_run(
-                run.run_id,
-                current_phase=next_phase,
-                steps=_audit_phase_steps(
-                    run.steps,
-                    phase=run.current_phase,
-                    executor="cortex-manager",
-                    model="deterministic",
-                    domain="cortex",
-                    outputs=tuple(artifact.ref for artifact in artifacts),
-                    card_id=step.card,
-                ),
-                attempts=attempts,
-                **({"plan_review_passed": True} if plan_review_passed_now else {}),
-            )
+            try:
+                registry._manager_update_workflow_run(
+                    run.run_id,
+                    current_phase=next_phase,
+                    steps=_audit_phase_steps(
+                        run.steps,
+                        phase=run.current_phase,
+                        executor="cortex-manager",
+                        model="deterministic",
+                        domain="cortex",
+                        outputs=tuple(artifact.ref for artifact in artifacts),
+                        card_id=step.card,
+                    ),
+                    attempts=attempts,
+                    **({"plan_review_passed": True} if plan_review_passed_now else {}),
+                    **(
+                        {"planning_authority": run.planning_authority + (new_authority,)}
+                        if new_authority is not None
+                        else {}
+                    ),
+                )
+            except BaseException:
+                if publication is not None:
+                    publication.rollback()
+                raise
             return None
     # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
     # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
     # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
-    gate = _runtime_preflight_gate(
-        run,
-        step,
-        identities=identities,
-        launcher_factory=launcher_factory,
+    # #384：`forced_identity` 提供時（provider 失敗 bounded retry 的 re-route
+    # 決策，見 `resume_workflow_run`／`_provider_failure_reroute`）代表呼叫端
+    # 已經跑過一次針對「剛剛觀察到的失敗」的 evaluate_dispatch_gate 決策，這裡
+    # 不再重跑一次通用 preflight（重跑不會產生更好的答案，只是多付一次探測
+    # 成本）。
+    gate = (
+        None
+        if forced_identity is not None
+        else _runtime_preflight_gate(
+            run,
+            step,
+            identities=identities,
+            launcher_factory=launcher_factory,
+        )
     )
     if gate is not None and gate.action == "needs_human":
         updated = registry._manager_update_workflow_run(
@@ -6290,6 +6962,12 @@ def _dispatch_workflow_card(
         launcher = gate.launcher
         if launcher is None:
             raise ValueError("workflow launcher unavailable")
+    elif forced_identity is not None:
+        identity = forced_identity
+        launcher = launcher_factory(identity)
+        if launcher is None:
+            raise ValueError("workflow launcher unavailable")
+        launcher = _specialize_workflow_launcher(launcher, step)
     else:
         identity = _select_workflow_identity(run, step, identities)
         launcher = launcher_factory(identity)
@@ -6524,6 +7202,10 @@ def _dispatch_workflow_card(
             workflow_sandbox_hash=sandbox_hash,
             workflow_output_baseline=output_baseline,
             workflow_builder_job_id=builder_job_id if step.persona == "reviewer" else None,
+            # #379：派工當下 pin 住這張卡的驗收判準（test_policy），供 harvest 時
+            # 與 registry 現有 WorkflowRun.steps 的現值比對出 drift（見
+            # manager._workflow_acceptance_definition_drifted）。
+            workflow_test_policy=step.test_policy,
         )
     except BaseException:
         if planner_sandbox is not None:
@@ -6532,6 +7214,8 @@ def _dispatch_workflow_card(
             shutil.rmtree(reviewer_sandbox, ignore_errors=True)
         raise
     try:
+        # #381：真正 spawn 前才 admit，不佔住這張卡接下來的整個執行期。
+        resolve_limiter(spawn_admission).admit(resolve_provider(identity=identity, launcher=launcher))
         handle = launcher.launch(
             slice_id=str(job["job_id"]),
             prompt=_workflow_job_prompt(
@@ -6582,6 +7266,8 @@ def dispatch_workflow_card(
     coordinator_root: str | Path,
     retry_failed: bool = False,
     force_new_build: bool = False,
+    forced_identity: object | None = None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object] | None:
     """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
 
@@ -6593,6 +7279,8 @@ def dispatch_workflow_card(
         coordinator_root=coordinator_root,
         retry_failed=retry_failed,
         force_new_build=force_new_build,
+        forced_identity=forced_identity,
+        spawn_admission=spawn_admission,
     )
 
 
@@ -6644,6 +7332,36 @@ def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path
     )
 
 
+def _provider_rate_limit_result(
+    exc: BaseException, *, run_id: str, current_phase: str, coordinator_root: str | Path
+) -> dict[str, object] | None:
+    """#370: translate a canonical-authority rate-limit failure into a soft,
+    non-raising resume result instead of the generic needs_human+re-raise
+    path used for every other ship_validator/authority failure.
+
+    Returns ``None`` (meaning: "not this case, handle it the old way") for
+    every exception except an :class:`AuthorityValidationError` carrying
+    :data:`REASON_PROVIDER_RATE_LIMITED_CANONICAL` -- a real authority
+    defect (malformed row, missing provider, genuine auth failure upstream,
+    ...) still needs_human+raises exactly as before.
+
+    Records a durable backoff deadline (survives daemon restart -- see
+    ``provider_backoff.py``) so the *next* resume attempt, operator-driven
+    or periodic-tick, can short-circuit before the window has passed
+    instead of re-hitting the same rate limit immediately.
+    """
+    if not (isinstance(exc, AuthorityValidationError) and exc.reason_code == REASON_PROVIDER_RATE_LIMITED_CANONICAL):
+        return None
+    provider_id = exc.provider_id or "github"
+    backoff = provider_backoff.record_backoff(coordinator_root, provider_id, now=time.time())
+    return {
+        "run_id": run_id,
+        "current_phase": current_phase,
+        "reason": "provider-rate-limited",
+        "retry_after_epoch": backoff.deadline_epoch,
+    }
+
+
 def resume_workflow_run(
     dispatcher,
     *,
@@ -6653,11 +7371,35 @@ def resume_workflow_run(
     coordinator_root: str | Path,
     ship_validator: Callable[..., object] | None = None,
     operator_resume: bool = False,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object]:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
+    if ship_validator is not None:
+        # #370: a prior resume already recorded a durable rate-limit
+        # backoff for this run's GitHub provider (see
+        # `_provider_rate_limit_result` below) -- short-circuit *before*
+        # doing any work, so an operator retrying early (or a periodic
+        # tick landing before the window clears) gets an explicit "still
+        # rate limited, retry after <time>" instead of walking the whole
+        # resume flow only to hit ship_validator and the same wall again.
+        # Gated on `ship_validator is not None` because that's the only
+        # thing in this function that can ever touch GitHub provider
+        # authority; canonical claim:v1 runs are wired with one uniformly
+        # regardless of phase, so this deliberately pauses all phases for
+        # a rate-limited repo, not just the review->ship transition.
+        active = provider_backoff.active_backoff(
+            coordinator_root, f"github:{run.repo}", now=time.time()
+        )
+        if active is not None:
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "provider-rate-limited",
+                "retry_after_epoch": active.deadline_epoch,
+            }
     pre_resume_gate_status = run.gate_status
     retry_failed = False
     recovery_job_id: str | None = None
@@ -6792,6 +7534,7 @@ def resume_workflow_run(
                     coordinator_root=coordinator_root,
                     retry_failed=retry,
                     operator_recovery_job_id=retry_recovery_job_id,
+                    spawn_admission=spawn_admission,
                 )
             return dispatch_workflow_card(
                 dispatcher,
@@ -6800,6 +7543,7 @@ def resume_workflow_run(
                 launcher_factory=launcher_factory,
                 coordinator_root=coordinator_root,
                 retry_failed=retry,
+                spawn_admission=spawn_admission,
             )
         except Exception:
             current = registry.get_workflow_run(bound_run.run_id)
@@ -6835,7 +7579,15 @@ def resume_workflow_run(
                     coordinator_root=coordinator_root,
                     trusted_terminal=True,
                 )
-            except Exception:
+            except Exception as exc:
+                rate_limited = _provider_rate_limit_result(
+                    exc,
+                    run_id=run.run_id,
+                    current_phase=run.current_phase,
+                    coordinator_root=coordinator_root,
+                )
+                if rate_limited is not None:
+                    return rate_limited
                 current = registry.get_workflow_run(run.run_id)
                 registry._manager_update_workflow_run(
                     run.run_id,
@@ -6850,15 +7602,26 @@ def resume_workflow_run(
                     "current_phase": run.current_phase,
                     "reason": "ship-validator-unavailable",
                 }
-            return apply_workflow_action(
-                registry,
-                args={"action": "refresh-completion", "run_id": run.run_id},
-                identity_registry=identities,
-                ship_validator=ship_validator,
-                git_runner=getattr(dispatcher, "_git_runner", None),
-                coordinator_root=coordinator_root,
-                trusted_terminal=True,
-            )
+            try:
+                return apply_workflow_action(
+                    registry,
+                    args={"action": "refresh-completion", "run_id": run.run_id},
+                    identity_registry=identities,
+                    ship_validator=ship_validator,
+                    git_runner=getattr(dispatcher, "_git_runner", None),
+                    coordinator_root=coordinator_root,
+                    trusted_terminal=True,
+                )
+            except Exception as exc:
+                rate_limited = _provider_rate_limit_result(
+                    exc,
+                    run_id=run.run_id,
+                    current_phase=run.current_phase,
+                    coordinator_root=coordinator_root,
+                )
+                if rate_limited is not None:
+                    return rate_limited
+                raise
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
     jobs = [
         job
@@ -6892,6 +7655,7 @@ def resume_workflow_run(
         return {"run_id": run.run_id, "current_phase": run.current_phase, "job_id": job["job_id"], "reason": "in-flight"}
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         failure_reason = "job-failed"
+        sandbox_ok = True
         try:
             _discard_reviewer_sandbox(
                 job,
@@ -6900,18 +7664,70 @@ def resume_workflow_run(
             )
         except ValueError:
             failure_reason = "reviewer-candidate-drift"
-        updated = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), gate_status="running"
-        )
+            sandbox_ok = False
         # #260 R6：失敗回報附帶唯讀 terminal 診斷（observed HEAD／job id／失敗
         # 原因），沿用 #261 的 `_terminal_parse_diagnostics`；診斷與授權分離，
         # 不得因此授予任何 candidate authority。
         diagnostics = _terminal_parse_diagnostics(job)
+        # #384：不再一律壓平成 "job-failed"。`job` 已在
+        # `Dispatcher._finalize_headless` 分類過（provider_outcome.py）；沙箱
+        # drift 時（sandbox_ok is False）刻意不看分類、不重試——candidate 已被
+        # reviewer 動過，跟 provider 是哪一種失敗無關，必須 fail closed。
+        classification = (
+            provider_outcome.classification_from_job(job) if sandbox_ok else None
+        )
+        status_fields: dict[str, object] = {}
+        if classification is not None:
+            status_fields["provider_outcome"] = classification.outcome.value
+            status_fields["provider_outcome_authority"] = classification.authority.value
+            failure_reason = f"job-failed-{classification.outcome.value}"
+        if sandbox_ok and classification is not None and classification.retryable:
+            retry_key = _provider_retry_attempt_key(step.card)
+            attempts = dict(run.attempts)
+            seen = attempts.get(retry_key, 0)
+            status_fields["provider_retry_count"] = seen
+            status_fields["provider_retry_limit"] = terminal_contract.MAX_PROVIDER_RETRIES
+            if seen < terminal_contract.MAX_PROVIDER_RETRIES:
+                rerouted_identity = _provider_failure_reroute(
+                    run, step, identities, failed_job=job, classification=classification,
+                )
+                replacement = dispatch_workflow_card(
+                    dispatcher,
+                    run=run,
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                    retry_failed=True,
+                    forced_identity=rerouted_identity,
+                )
+                if replacement is None:
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "reason": "not-dispatchable",
+                    }
+                current = registry.get_workflow_run(run.run_id)
+                attempts = dict(current.attempts)
+                attempts[retry_key] = seen + 1
+                registry._manager_update_workflow_run(run.run_id, attempts=attempts)
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "job_id": replacement["job_id"],
+                    "reason": "provider-failure-retry",
+                    **{**status_fields, "provider_retry_count": seen + 1},
+                    "terminal_diagnostics": diagnostics.as_dict(),
+                }
+            failure_reason = "provider-retry-exhausted"
+        updated = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), gate_status="running"
+        )
         return {
             "run_id": run.run_id,
             "current_phase": updated.current_phase,
             "job_id": job["job_id"],
             "reason": failure_reason,
+            **status_fields,
             "terminal_diagnostics": diagnostics.as_dict(),
         }
     if _malformed_workflow_card_terminal(job):
@@ -7008,7 +7824,15 @@ def resume_workflow_run(
             coordinator_root=coordinator_root,
             trusted_terminal=True,
         )
-    except Exception:
+    except Exception as exc:
+        rate_limited = _provider_rate_limit_result(
+            exc,
+            run_id=run.run_id,
+            current_phase=run.current_phase,
+            coordinator_root=coordinator_root,
+        )
+        if rate_limited is not None:
+            return rate_limited
         current = registry.get_workflow_run(run.run_id)
         registry._manager_update_workflow_run(
             run.run_id,
@@ -7023,6 +7847,92 @@ def resume_workflow_run(
     if next_job is not None:
         result["job_id"] = next_job["job_id"]
     return result
+
+
+def _write_planning_failure_evidence(
+    *,
+    coordinator_root: Path,
+    run_id: str,
+    classification: str,
+    reason: str,
+) -> str:
+    """#393：define needs_human 三條靜默失敗路徑落 `cortex-planning-failure/v1`
+    evidence，供 `work_actions._read_planning_failure_record`／
+    `_planning_failure_hint` 消費，讓 `recover-planning` 對 define 失敗結構性
+    可用（過去全庫只有 reader、沒有任何 producer，recover-planning 對這個
+    它最該覆蓋的場景永遠 fail-closed）。
+
+    原子寫入模式與 `work_bridge._write_json_evidence` 一致（tmp、fsync、
+    rename、0400）；body 直接落 reader 要求的頂層欄位（不套 envelope），
+    因為 reader 直接讀 `schema`/`run_id`/`classification`/`reason`，
+    `_write_json_evidence` 的 `{"payload": ..., "hash": ...}` envelope 與
+    content-hash 檔名不符這裡的讀取契約，故不直接共用、改用同樣手法的
+    小工廠避免跨模組奇怪依賴。目錄名必須是 `planning-recovery`——
+    reader 用 `path.parent.name` 判斷。
+    """
+
+    body = {
+        "schema": "cortex-planning-failure/v1",
+        "run_id": run_id,
+        "classification": classification,
+        "reason": reason,
+        "created_at": _utcnow(),
+    }
+    digest = verification.canonical_json_hash(body)
+    directory = coordinator_root.resolve() / "evidence" / "planning-recovery"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{run_id}-{digest}.json"
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content:
+            raise RuntimeError("workflow planning failure evidence conflict")
+        return str(target)
+    temporary = directory / f".{target.name}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        target.chmod(0o400)
+        fsync_directory(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(target)
+
+
+def _record_planning_failure_evidence(
+    run,
+    *,
+    coordinator_root: Path,
+    classification: str,
+    reason: str,
+) -> tuple[str, ...]:
+    """呼叫端 wrapper：evidence 寫入失敗不得讓 define 路徑爆炸（fail-open
+    僅限 evidence 記錄本身），失敗時只 log 註記、`run.evidence_refs` 原樣
+    帶回，needs_human 仍照舊落地——不因為記不下證據就讓整個 define
+    請求跟著炸。
+    """
+
+    try:
+        evidence_path = _write_planning_failure_evidence(
+            coordinator_root=coordinator_root,
+            run_id=run.run_id,
+            classification=classification,
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence 記錄本身 fail-open
+        logger.error(
+            "planning-failure-evidence-write-failed run_id=%s classification=%s error=%s: %s",
+            run.run_id,
+            classification,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return run.evidence_refs
+    return (*run.evidence_refs, evidence_path)
 
 
 def apply_workflow_action(
@@ -7671,9 +8581,40 @@ def apply_workflow_action(
                 primary=primary,
                 worktree=_required_workflow_string(args, "artifact_root"),
             )
-        except Exception:
+        except Exception as exc:
+            # #393：recover-planning 靠 `cortex-planning-failure/v1` evidence
+            # 判定能不能恢復——過去全庫只有 reader（work_actions.
+            # _read_planning_failure_record）、這三條 needs_human 路徑沒有任何
+            # 一條寫 evidence，導致 recover-planning 對 define 靜默失敗結構性
+            # 不可用。這裡歸類 `environment`（runtime 初始化本身出問題，非
+            # 內容缺陷），reason 沿用 #392 已組好的字串再併上例外摘要。
+            failure_reason = (
+                f"planning-runtime-initialization-failed: {type(exc).__name__}: {str(exc)[:200]}"
+            )
+            evidence_refs = _record_planning_failure_evidence(
+                run,
+                coordinator_root=transaction_root,
+                classification="environment",
+                reason=failure_reason,
+            )
             run = registry._manager_update_workflow_run(
-                run.run_id, facets=("needs_human",), brainstorm_required=True
+                run.run_id,
+                facets=("needs_human",),
+                brainstorm_required=True,
+                evidence_refs=evidence_refs,
+            )
+            # #391：needs_human 的 reason 過去只塞進回傳值——daemon periodic
+            # tick 觸發時（未經活人在旁的 request/response）沒人消費回傳值，
+            # reason 隨呼叫堆疊蒸發，run row 只留下一個查不出原因的
+            # needs_human facet。這裡結構化落一筆 log（run_id／reason／底層
+            # exception 型別與訊息前 200 字），至少留下可追查的軌跡；exception
+            # 本身仍整段吞掉不重拋，維持既有 fail-soft 行為不變。
+            logger.error(
+                "planning-runtime-initialization-failed run_id=%s reason=%s error=%s: %s",
+                run.run_id,
+                "planning-runtime-initialization-failed",
+                type(exc).__name__,
+                str(exc)[:200],
             )
             return {
                 "run_id": run.run_id,
@@ -7686,8 +8627,27 @@ def apply_workflow_action(
         secondary_planner = runtime.secondary_planner
         primary_integrator = runtime.primary_integrator
     if primary_questioner is None or secondary_planner is None or primary_integrator is None:
+        # #393：同上一條路徑，補 evidence 才能讓 recover-planning 對這條
+        # needs_human 出口可用；沒有底層 exception 可附，classification 仍歸
+        # `environment`（runtime 元件缺失，非內容缺陷）。
+        evidence_refs = _record_planning_failure_evidence(
+            run,
+            coordinator_root=transaction_root,
+            classification="environment",
+            reason="planning-runtime-unavailable",
+        )
         run = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), brainstorm_required=True
+            run.run_id,
+            facets=("needs_human",),
+            brainstorm_required=True,
+            evidence_refs=evidence_refs,
+        )
+        # #391：runtime_factory 沒被呼叫（或呼叫成功但沒補齊三個角色）時同樣
+        # 落一筆 log，理由同上——reason 不能只活在回傳值裡。
+        logger.error(
+            "planning-runtime-unavailable run_id=%s reason=%s",
+            run.run_id,
+            "planning-runtime-unavailable",
         )
         return {
             "run_id": run.run_id,
@@ -7730,8 +8690,40 @@ def apply_workflow_action(
     )
     if result.state != "ready" or result.gate_refs.brainstorm_peer is None:
         publication.rollback()
+        # #393：brainstorm 未收斂預設歸內容缺陷（非 runtime 環境問題），
+        # classification 落 `content`——`_read_planning_failure_record` 仍接受
+        # 此值，但 `_resume_decision` 對 `content` 一律不浮現 recover-planning
+        # （見 claim.py 的 fail-closed 判準），行為與 issue 393 的 fail-closed
+        # 意圖一致。`result.reason` 理論上不應為空，仍防禦性 fallback 避免
+        # evidence 的 reason 欄位落空字串。
+        # #416：唯一例外——reason 命中 `_is_planning_authority_residue_failure`
+        # 判準時（abandon 未回滾的發佈殘留撞見 `_publish_planning_artifacts`
+        # 的 authority fail-closed），這其實是環境／狀態殘留而非模型內容
+        # 缺陷，改歸 `environment`，讓 `_resume_decision` 可以浮現
+        # recover-planning，不必再燒一個世代改名重識別才能繞過。
+        brainstorm_not_ready_reason = result.reason or "brainstorm-not-ready"
         run = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), brainstorm_required=True
+            run.run_id,
+            facets=("needs_human",),
+            brainstorm_required=True,
+            evidence_refs=_record_planning_failure_evidence(
+                run,
+                coordinator_root=transaction_root,
+                classification=(
+                    "environment"
+                    if _is_planning_authority_residue_failure(brainstorm_not_ready_reason)
+                    else "content"
+                ),
+                reason=brainstorm_not_ready_reason,
+            ),
+        )
+        # #391：run_heterogeneous_brainstorm 沒能收斂到 ready 狀態時，同樣的
+        # reason-只活在回傳值裡問題——比照上面兩條 runtime 缺失路徑補一筆 log。
+        logger.error(
+            "brainstorm-not-ready run_id=%s state=%s reason=%s",
+            run.run_id,
+            result.state,
+            result.reason,
         )
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": result.reason}
     try:

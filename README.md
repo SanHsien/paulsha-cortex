@@ -40,8 +40,10 @@ persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role p
 ```powershell
 pipx install git+https://github.com/SanHsien/paulsha-cortex.git
 cortex --help
-cortex --version
+cortex --version   # 應印出 0.1.5
 ```
+
+本 fork 尚未發布 wheel／sdist；upstream 授權未明前不對外發佈衍生套件。上式追蹤 mutable `main`，正式驗收應 pin 到已通過 fork CI 的 commit SHA。
 
 也可在專案內直接安裝：
 
@@ -223,6 +225,15 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    ```
 
    `recover` 不提供 `--allow-unsafe` 等旁路旗標；需要專家級低階參數時仍使用既有 coordinator 命令。
+
+12. 用 `digest` 家族把 `attention`／`ready`／`held`／`degraded`／`recent_done` 快照組裝成排程可推播的 digest（供外部 timer/cron 呼叫，取代純拉取式監控）：
+
+    ```bash
+    cortex digest emit
+    cortex digest emit --json
+    ```
+
+    預設投遞方式是無外部依賴的檔案 outbox：寫入 `<coordinator_root>/digest/outbox/<timestamp>-<random>.json`（`--json` 輸出的 `delivery.path` 即落檔位置）。設定 `PSC_DIGEST_DELIVERY_CMD`（typed argv，比照 `PSC_PREFLIGHT_CMD` 慣例）後，改把 digest JSON 從 stdin pipe 給該命令，兩者擇一、不 fallback——命令非零 exit 或逾時（預設 10 秒）會直接回報錯誤並以非零 exit code 結束，不會靜默改寫檔案 outbox。`cortex digest` 本身不建立 systemd timer；要排程執行請在既有 `cortex-manager.timer` 之外另建一個 `OnCalendar`／`OnUnitActiveSec` timer 呼叫 `cortex digest emit`（或由既有 cron 呼叫），部署層自行決定頻率。
 
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。mutation request 目前採分級 timeout：`fanout` / `tick` 為 60 秒，`complete` / `work-action` 為 30 秒，其餘為 5 秒；timeout 後 daemon 可能仍在工作，請回到 `cortex status` 或 `cortex request show <request-id>` 查證。
 
@@ -447,6 +458,11 @@ Manager 在建立 worktree／sandbox／job row／model session **之前**，會�
 - `bridge:` 依內建對照表落到 module 或 executable 探測；
 - `provider:` 讀 provider snapshot 的新鮮度。
 
+本 fork 的 `openspec-archive`／`policy-commit` 另宣告 `provider:executor`。這個
+sentinel 會解析成當次 identity 的實際 executor，在 ship side effect 前以有界
+probe 驗登入態；失敗時先依既有 identity 次序 reroute，全部不可用才進
+`needs_human`。Copilot token 只從受控 runtime env 取得，不從 `gh` keyring 自動複製。
+
 `SubprocessLauncher.executor_environment()` 用與 `launch()` 相同的
 `_git_scope_env()`／`_review_scope_env()` 產生 env，因此 preflight 與正式 job 的
 interpreter、`PATH`、`HOME`／sandbox policy 一致（reviewer 會走最小 env）。
@@ -593,9 +609,11 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 | 介面 | 預設路徑 | 環境變數 |
 | --- | --- | --- |
 | preflight command (delivery) | 無預設（delivery 時必填） | `PSC_PREFLIGHT_CMD` |
-| control root | `~/.agents/control` | `PSC_CONTROL_ROOT` |
-| coordinator root | `~/.agents/coordinator` | `PSC_COORDINATOR_ROOT` |
-| specs root | `~/.agents/specs` | `PSC_SPECS_ROOT` |
+| digest delivery command | 無預設（未設定時改寫檔案 outbox） | `PSC_DIGEST_DELIVERY_CMD` |
+| digest 檔案 outbox | `<coordinator_root>/digest/outbox` | 隨 `PSC_COORDINATOR_ROOT` 覆寫 |
+| control root | 依 `PSC_INSTANCE` 讀 installer env；未安裝時為 `~/.agents/control`（未 instance 化，見下方說明） | `PSC_CONTROL_ROOT` |
+| coordinator root | `~/.agents/coordinator`（未 instance 化，operator 域，見下方說明） | `PSC_COORDINATOR_ROOT` |
+| specs root | `~/.agents/specs`（未 instance 化，operator 域，見下方說明） | `PSC_SPECS_ROOT` |
 | run root | 依 `PSC_INSTANCE`（預設`cortex`）讀installer env；未安裝時為`~/.agents/run/<instance>` | `PSC_RUN_ROOT`（最高優先） |
 | monitor state root | `~/.agents/monitor` | `PSC_MONITOR_STATE_ROOT` |
 | config root | `~/.config/paulshaclaw` | `PSC_CONFIG_ROOT` |
@@ -605,6 +623,8 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 
 Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 branch，並始終以 run repository 作為 `ScriptWorktreeCreator` 的 git來源，以確保 builder worktree 在對應 repo 池內建立。
 
+`cortex install service` 會把 `PSC_CONTROL_ROOT` 寫成 `<agents_root>/control/<instance>`（比照 `PSC_RUN_ROOT` 的 `run/<instance>` 模式），讓 `manager.lock` 天生 per-instance；`service-manager.sh` 透過 `cortex control lock-path`（與 daemon 同一套 `config/runtime.py` 解析鏈）取得 lock 路徑，不再自行硬寫預設值（issue #375）。`PSC_PROJECT_CONFIG_ROOT` 與 `PSC_CONTROL_ROOT` 皆屬 installer 的 managed path：每次 `cortex install service` 都會依目前 `PSC_AGENTS_ROOT`／instance 重新推導並覆寫，不會被既有值鎖住（issue #371）；`cortex doctor` 的 `managed-path-drift` probe 可在尚未重跑 install 前就偵測到殘留的舊值。`PSC_MANAGER_SPECS_DIR`／`PSC_COORDINATOR_ROOT`／`PSC_SPECS_ROOT` 目前仍未 instance 化、也不在 installer 的 managed_env 之列（evaluate 後決定留待後續 follow-up；多 instance 共用同一 `PSC_AGENTS_ROOT` 時這三者會共用同一份 specs/coordinator 狀態）。
+
 `PSC_PREFLIGHT_CMD` 必須為 typed argv，不可使用 shell wrapper。delivery preflight 常見設定範例：
 
 ```bash
@@ -612,6 +632,14 @@ export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
 ```
 
 實際值請替換為 repo 實際提供的 module / executable，且禁止用 `sh -c` 形式包裝。
+
+`PSC_DIGEST_DELIVERY_CMD` 語法與限制比照 `PSC_PREFLIGHT_CMD`（typed argv、`shlex.split` 解析），差別是這個變數本身是選填的——未設定時 `cortex digest emit` 改寫檔案 outbox，設定後才改採該命令並停用檔案 outbox（兩者互斥、不 fallback）：
+
+```bash
+export PSC_DIGEST_DELIVERY_CMD='/path/to/relay-script --channel ops'
+```
+
+`cortex digest emit` 會把 digest JSON 從 stdin pipe 給該命令；命令需自行解析 stdin 並負責實際投遞（例如轉發到 Slack/Telegram webhook），cortex 本身不內建任何外部通知整合。
 
 共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；installer在後者持久化`PSC_INSTANCE`與`PSC_AGENTS_ROOT`。Interactive CLI以同一`PSC_INSTANCE`選取bootstrap env，不掃描猜測其他instance；symlink、malformed或relative root會fail-closed。installer重跑時，PY／PSC_REPO_ROOT會與env中`PSC_REPO_IDENTITY`身分戳記（由git remote origin正規化而來，SSH/HTTPS視為同一身分；非git/無origin則退回路徑指紋）比對；同身分、或戳記缺席（首次安裝／既有舊env遷移）才會更新並保留既有operator roots，跨身分變更須帶`--rebind`明確放行，否則fail-closed並於錯誤訊息附上env檔實際路徑（`cortex doctor`可在潛伏期內偵測此類漂移）。Monitor socket預設為`$PSC_RUN_ROOT/project-monitor.sock`，也可由`project-cortex.yaml`的`monitor.socket_path`覆寫；production `MonitorSocketClient`與service使用相同config解析。
 

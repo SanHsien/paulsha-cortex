@@ -158,6 +158,7 @@ def build_wrapper_script(
     worktree: str,
     repo_root: str | None,
     run_gates: bool,
+    stdin_prompt: str | None = None,
 ) -> str:
     """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
 
@@ -170,9 +171,26 @@ def build_wrapper_script(
 
     gate 階段的 stdout/stderr 一律導向 /dev/null：JSONL log 是 terminal evidence 的
     來源，混入 gate 輸出會讓 ``_extract_terminal_json`` 讀到非 terminal 的內容。
+
+    ``stdin_prompt``（issue #442）：既有 copilot/claude/codex/agy 皆把 prompt 當作
+    argv 的一個元素；`cg`（見 `build_cg_argv`）改走「prompt 經 stdin」的介面
+    （`cg --headless --stdin`），argv 本身不含 prompt。非 None 時改以
+    ``printf %s <prompt> | <inner argv>`` 組出管線，把 prompt 經標準輸入餵給內層
+    命令；``$?``（bash 未開 pipefail 時）取自管線最後一個命令，即內層命令本身，
+    語意與既有「$? 為模型 exit code」不變。內層命令顯式 ``2>/dev/null``：cg 的
+    stderr 是人類可讀 summary banner（非 terminal evidence），Popen 層雖以
+    ``stderr=STDOUT`` 併入同一份 log fd，但那只重導向這個 bash 進程自己的 fd 2；
+    管線內命令的顯式重導向可覆寫，藉此讓 banner 不混入 JSONL log（下游
+    `_extract_terminal_json` 只能安全解析乾淨 stdout）。
     """
 
-    script = f'{shlex.join(inner_argv)}; printf %s "$?" > {shlex.quote(sentinel)}'
+    if stdin_prompt is None:
+        command = shlex.join(inner_argv)
+    else:
+        command = (
+            f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
+        )
+    script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
     if not run_gates or not repo_root:
         return script
     gate_argv = [
@@ -287,6 +305,58 @@ def _git_scope_env() -> dict[str, str]:
         for key, value in os.environ.items()
         if key not in _GIT_REPOSITORY_ENV_KEYS and not key.startswith("GIT_CONFIG_")
     }
+
+
+def _prepend_wrapper_pythonpath(env: dict[str, str]) -> None:
+    """Make the source wrapper importable without dropping operator paths."""
+
+    package_root = str(Path(__file__).resolve().parents[2])
+    inherited = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        os.pathsep.join((package_root, inherited)) if inherited else package_root
+    )
+
+
+# #396 item 2(b)：copilot executor 的 credential 注入契約——依優先序列出 copilot
+# CLI 認得的既有 env var 名稱（見 porcelain/bootstrap.py `_executor_status` 的
+# login_fix 訊息："請設定 COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN"）。
+_COPILOT_TOKEN_ENV_VARS: tuple[str, ...] = (
+    "COPILOT_GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+def _copilot_credential_env(env: Mapping[str, str]) -> dict[str, str]:
+    """把既有可設定來源的 token 正規化成 copilot CLI 優先讀取的 env var。
+
+    背景（issue #396 item 2）：copilot builder job 派出即失敗，因為 job env 沒有
+    COPILOT_GITHUB_TOKEN／GH_TOKEN，唯一有效 token 只在 gh CLI 的 OS keyring
+    ——headless daemon 本就讀不到桌面 keyring，此函式刻意不去碰它，避免多一個
+    平台相依的失敗模式。
+
+    這裡只做「這個 process 的 env 裡已經有的三個候選名稱之一，正規化成
+    copilot CLI 優先序最高的那個」；至於 token 怎麼進到 process env——沿用本
+    repo 既有的可設定來源（daemon 自身的 systemd EnvironmentFile／
+    `~/.agents/core/runtime/<instance>.env`，與 porcelain/bootstrap.py
+    `_instance_runtime_env_path` 同一份機制，PSC_MANAGER_EXECUTOR 也是這樣佈署
+    的）——留給 operator 決定，不是本函式的責任。
+
+    COPILOT_GITHUB_TOKEN 已存在時視為 operator 明確指定，不覆寫；三個候選皆缺
+    （或皆為空字串）時回傳空 dict，呼叫端不改動 env（fail-soft：沒有 token 不
+    是這個函式該擋的錯，讓 job 依現行行為派出、由 copilot CLI 自己的登入態訊息
+    或 #369 的 executor_auth 探測回報）。
+    """
+
+    if env.get("COPILOT_GITHUB_TOKEN"):
+        return {}
+    token = next(
+        (env[name] for name in _COPILOT_TOKEN_ENV_VARS[1:] if env.get(name)),
+        None,
+    )
+    if token is None:
+        return {}
+    return {"COPILOT_GITHUB_TOKEN": token}
 
 
 def _review_scope_env() -> dict[str, str]:
@@ -477,9 +547,12 @@ def build_claude_argv(
     read_only: bool = False,
     review_only: bool = False,
     review_terminal_kind: str | None = None,
+    commit_required: bool = False,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude launcher cannot bypass permissions")
+    if commit_required and (read_only or review_only or allow_unsafe):
+        raise ValueError("commit-required Claude builder requires enforced workspace-write")
     if review_only and worktree is None:
         raise ValueError("read-only Claude reviewer requires a Candidate checkout")
     if review_only:
@@ -538,6 +611,16 @@ def build_claude_argv(
         argv += ["--model", model]
     if worktree is not None and not review_only:
         argv.extend(["--add-dir", worktree])
+        # #396 item 3：linked worktree 的 .git 只是個指向 repo 外部（objects／
+        # refs／index）的檔案；builder 完成後對這些外部路徑 git add/commit 若不在
+        # sandbox 的放行清單內，會被擋下回 requires approval（headless 無人可
+        # approve）→ candidate-worktree-dirty。比照 build_copilot_argv／
+        # build_codex_argv 既有的 commit_required 分支，把同一份 linked-worktree
+        # git 寫入目錄透過 --add-dir 放行；非 commit-required（例如 planner）維持
+        # 原行為不放寬。
+        if commit_required:
+            for git_write_dir in _linked_worktree_git_write_dirs(worktree):
+                argv += ["--add-dir", git_write_dir]
     return argv
 
 
@@ -618,6 +701,69 @@ def build_agy_argv(
     return argv
 
 
+# cg（copilot API／glm-5.2 經 llm-share 巷道）的預設身分——operator 的
+# `$HOME/.local/bin/cg` thin wrapper 已固定 `HIPPO_COPILOT_ENV_FILE` 指向
+# llm-share env（含 `COPILOT_MODEL=glm-5.2`），這裡的常數只是 argv 沒收到明確
+# `model` 時的落地預設，實際身分仍由 operator 的 env file 決定。
+_CG_DEFAULT_MODEL = "glm-5.2"
+_CG_VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_CG_DEFAULT_EFFORT = "medium"
+
+
+def build_cg_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = None,
+    allow_unsafe: bool = False,
+    model: str | None = None,
+    read_only: bool = False,
+    review_only: bool = False,
+    commit_required: bool = False,
+    effort: str | None = None,
+) -> list[str]:
+    """Build the headless `cg`（copilot API／glm-5.2 via llm-share）invocation.
+
+    Operator-provided、smoke-verified 契約（issue #442）：
+    ``cg --model {MODEL} --effort {low|medium|high|xhigh} --headless --stdin``
+    ——prompt 經 stdin 傳入（不是 argv 參數，見 `SubprocessLauncher.launch` 的
+    stdin plumbing）、乾淨 response 寫到 stdout、summary banner 寫到 stderr、
+    exit 0 表示成功。`cg` wrapper 自帶 ``--available-tools=__none__`` ＋
+    ``--disable-builtin-mcps`` ＋ throwaway HOME：zero-tool，不能跑任何 tool、
+    不能寫檔、不能 commit。因此 cg 只能服務 read-only 的 planner／reviewer
+    persona，絕不可當 builder——``prompt``／``slice_id``／``log_dir``／
+    ``worktree``／``remote`` 是為了滿足與其餘 builder 共用的呼叫介面而接收，
+    實際不會進入回傳的 argv（prompt 由呼叫端經 stdin 餵入）。
+
+    比照 `build_agy_argv` 對 `allow_unsafe` 的拒絕模式：agy 與 cg 都是 read-only
+    planner，這裡同樣 fail-closed，而非靜默降級成安全形狀——commit_required／
+    unsafe／非 read-only-或-review-only 的「builder 語境」一律 raise，讓誤用在
+    建構期就顯性失敗，不會把一個從未被授權寫入的 executor 悄悄放進 builder 角色。
+    """
+    if allow_unsafe:
+        raise ValueError("cg executor does not support unsafe mode")
+    if commit_required:
+        raise ValueError("cg executor is zero-tool and cannot commit")
+    if not (read_only or review_only):
+        raise ValueError("cg executor requires read-only or review-only mode")
+    resolved_effort = effort or _CG_DEFAULT_EFFORT
+    if resolved_effort not in _CG_VALID_EFFORTS:
+        raise ValueError(
+            f"cg executor effort must be one of {sorted(_CG_VALID_EFFORTS)}, got {resolved_effort!r}"
+        )
+    return [
+        "cg",
+        "--model",
+        model or _CG_DEFAULT_MODEL,
+        "--effort",
+        resolved_effort,
+        "--headless",
+        "--stdin",
+    ]
+
+
 @runtime_checkable
 class AgentLauncher(Protocol):
     def launch(
@@ -630,11 +776,26 @@ class AgentLauncher(Protocol):
     ) -> LaunchHandle: ...
 
 
+# 目前支援的 headless executor 家族——這是唯一真相來源：`cli.py` 的
+# `--executor`/`--review-executor` choices 與 `SubprocessLauncher.__init__` 的
+# 建構驗證都直接消費這個字典的 key（不重複列舉），新增一筆即兩處自動同步。
+#
+# 新增 executor 前的必要條件：先確認其 CLI 介面（prompt 怎麼傳、輸出格式、
+# sandbox/approval 旗標怎麼關），寫一個對應的 `build_<executor>_argv`，仿照本檔
+# 其餘 builder 附近散落的「smoke 實證」註解方式留下驗證依據，再加進這個字典。
+#
+# `cg`（copilot API／glm-5.2 巷道）自 issue #442 起已支援：#396 item 1 當時找不到
+# CLI 介面文件或 smoke 紀錄而刻意 out-of-scope；operator 已提供並 smoke 驗證介面
+# 契約（見 `build_cg_argv` docstring），故補上 `build_cg_argv` 並在此登記。cg 是
+# zero-tool（無法跑任何 tool／寫檔／commit），`build_cg_argv` 與
+# `SubprocessLauncher.__init__` 對 commit_required／allow_unsafe／非
+# read-only-或-review-only 的建構請求一律 raise，只服務 planner／reviewer 角色。
 _ARGV_BUILDERS = {
     "copilot": build_copilot_argv,
     "claude": build_claude_argv,
     "codex": build_codex_argv,
     "agy": build_agy_argv,
+    "cg": build_cg_argv,
 }
 
 
@@ -653,13 +814,21 @@ class SubprocessLauncher:
         review_only: bool = False,
         commit_required: bool = False,
         review_terminal_kind: str | None = None,
+        effort: str | None = None,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
         if executor == "agy" and allow_unsafe:
             raise ValueError("agy executor refuses unsafe mode")
+        if executor == "cg" and allow_unsafe:
+            raise ValueError("cg executor refuses unsafe mode")
         if (read_only or review_only) and executor == "copilot":
             raise ValueError("copilot executor has no enforced read-only planning mode")
+        # cg 是 zero-tool（見 build_cg_argv docstring）：與 copilot 相反，這裡要求
+        # 而非禁止 read-only/review-only——builder 語境（both False）在建構期即
+        # 顯性拒絕，不留給呼叫端在 launch() 時才踩空。
+        if executor == "cg" and not (read_only or review_only):
+            raise ValueError("cg executor requires read-only or review-only mode")
         if read_only and review_only:
             raise ValueError("launcher cannot be both planner-read-only and reviewer-read-only")
         if (read_only or review_only) and allow_unsafe:
@@ -684,6 +853,21 @@ class SubprocessLauncher:
         self._review_only = review_only
         self._commit_required = commit_required
         self._review_terminal_kind = review_terminal_kind
+        # cg-only：`--effort low|medium|high|xhigh`。其餘 executor 沒有對應概念
+        # （不同於 `model`，本 repo 目前沒有既有的「effort 來源」可直接映射），
+        # 存下不驗證——合法值集合在 `build_cg_argv` 驗證，未指定時落地預設
+        # `_CG_DEFAULT_EFFORT`；非 cg 的 executor 忽略此欄位。
+        self._effort = effort
+
+    @property
+    def executor(self) -> str:
+        """公開 executor CLI 家族（copilot/claude/codex/agy/cg）。
+
+        #381：spawn admission limiter 需要在啟動前依 provider 分桶節流；
+        沒有 per-slice identity 可查時，這是唯一能從已注入的 launcher
+        自報「實際會是哪個 provider」的管道（見 spawn_admission.resolve_provider）。
+        """
+        return self._executor
 
     def as_read_only(self) -> "SubprocessLauncher":
         """Return an equivalent launcher with the executor's strict planning contract."""
@@ -697,6 +881,7 @@ class SubprocessLauncher:
             read_only=True,
             review_only=False,
             commit_required=False,
+            effort=self._effort,
         )
 
     def as_review_only(self, *, terminal_kind: str) -> "SubprocessLauncher":
@@ -712,6 +897,7 @@ class SubprocessLauncher:
             review_only=True,
             commit_required=False,
             review_terminal_kind=terminal_kind,
+            effort=self._effort,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
@@ -730,6 +916,7 @@ class SubprocessLauncher:
             read_only=False,
             review_only=False,
             commit_required=True,
+            effort=self._effort,
         )
 
     def _should_run_gates(self, env: Mapping[str, str]) -> bool:
@@ -765,7 +952,7 @@ class SubprocessLauncher:
             }
             if self._relay_target is not None:
                 env["PSC_RELAY_TARGET"] = self._relay_target
-        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        _prepend_wrapper_pythonpath(env)
         # interpreter：job wrapper 使用目前的 Python；gate/model 的可執行檔仍由
         # executor env 的 PATH 解析，避免 Windows 依賴 Bash。
         interpreter = shutil.which("python3", path=env.get("PATH", "")) or shutil.which(
@@ -806,10 +993,18 @@ class SubprocessLauncher:
             "read_only": self._read_only,
             "review_only": self._review_only,
         }
-        if self._executor in {"codex", "copilot"}:
+        # #396 item 3：claude 併入 commit_required 傳遞——builder-persona 的
+        # as_commit_required() 轉換（autonomy.dispatch_ready）對三個 executor
+        # 一視同仁，build_claude_argv 缺這個 kwarg 會讓轉換對 claude 變 no-op。
+        # cg 併入同一份 kwarg（issue #442）：self._commit_required 對任何成功建構
+        # 的 cg launcher 恆為 False（見 __init__ 的 cg 專屬不變量），這裡顯式傳遞
+        # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
+        if self._executor in {"codex", "copilot", "claude", "cg"}:
             builder_kwargs["commit_required"] = self._commit_required
         if self._executor == "claude":
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
+        if self._executor == "cg":
+            builder_kwargs["effort"] = self._effort
         inner_argv = _ARGV_BUILDERS[self._executor](
             **builder_kwargs,
         )
@@ -826,7 +1021,9 @@ class SubprocessLauncher:
             }
             if self._relay_target is not None:
                 env["PSC_RELAY_TARGET"] = self._relay_target
-        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            if self._executor == "copilot":
+                env.update(_copilot_credential_env(env))
+        _prepend_wrapper_pythonpath(env)
         log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
         # 跨進程 durable 完成判定由 typed-argv Python wrapper 寫入 exit sentinel；
         # 不經 shell，prompt 含換行／空白仍維持單一 token。
@@ -851,15 +1048,29 @@ class SubprocessLauncher:
         ]
         if self._should_run_gates(env):
             argv.append("--run-gates")
+        # cg（issue #442）以 stdin 傳 prompt，並丟棄只供人讀的 stderr banner；
+        # 仍走 typed-argv Python wrapper，因此 Windows 不需要 Bash。
+        if self._executor == "cg":
+            argv.extend(["--forward-stdin", "--discard-child-stderr"])
         argv.extend(["--", *inner_argv])
         with open(log_path, "wb") as logf:
-            proc = subprocess.Popen(
-                argv,
-                cwd=worktree,
-                env=env,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-            )
+            popen_options: dict[str, object] = {
+                "cwd": worktree,
+                "env": env,
+                "stdout": logf,
+                "stderr": subprocess.STDOUT,
+            }
+            if self._executor == "cg":
+                popen_options["stdin"] = subprocess.PIPE
+            proc = subprocess.Popen(argv, **popen_options)
+            if self._executor == "cg":
+                assert proc.stdin is not None
+                try:
+                    proc.stdin.write(prompt.encode("utf-8"))
+                except (BrokenPipeError, OSError):
+                    pass
+                finally:
+                    proc.stdin.close()
         return LaunchHandle(
             executor=self._executor,
             model_id=self._model,

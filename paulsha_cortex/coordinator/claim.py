@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.schema import BAND_LEVELS
+from paulsha_cortex.github_rate_limit import is_rate_limit_signal
 
 from . import verification
 
@@ -32,6 +33,20 @@ REASON_PROVIDER_MISSING_CANONICAL = "provider-authority-missing-canonical"
 REASON_PROVIDER_INVALID_CANONICAL = "provider-authority-invalid-canonical"
 REASON_PROVIDER_MISSING_LEGACY = "provider-authority-missing-legacy"
 REASON_PROVIDER_INVALID_LEGACY = "provider-authority-invalid-legacy"
+# #370：canonical provider 因 rate limit degraded 是暫時性的，與其他
+# authority-invalid 情境（missing/malformed/停擺）分開分類，讓 resume 的
+# durable backoff 能認得出「等待 reset 即可」而非「需要人工排查」。
+REASON_PROVIDER_RATE_LIMITED_CANONICAL = "provider-authority-rate-limited-canonical"
+# #389：canonical row 本身存在、可解析，但因 lifecycle 尚未給出可 claim 的形狀
+# 而被 `_authority_from_canonical_row` 略過的三種情境。修法前這三種分支一律
+# `return None`：呼叫端（`_load_work_authorities_with_diagnostics`）只把它們
+# 當成「這列不算」悄悄丟棄、不留診斷，於是 `load_work_authority` 找不到目標
+# 也找不到 skip 診斷，只能落回與「row 根本不存在」「issue 被多個 work_id 認領」
+# 共用的泛化 `confirmed work authority missing or ambiguous`。三者各自獨立
+# reason code，讓 load_work_authority 能對「目標就是這一種」給專屬訊息。
+REASON_AUTHORITY_ALL_INFERRED = "authority-all-inferred"
+REASON_AUTHORITY_NOT_STARTABLE = "authority-not-startable"
+REASON_AUTHORITY_NO_TODO_SOURCE = "authority-no-confirmed-todo-source"
 
 _UNSAFE_LABEL_PREFIXES = ("/", "~")
 
@@ -467,8 +482,22 @@ def _authority_from_canonical_row(
             work_id=work_id_label,
             field="sources",
         )
+    # #389 診斷訊息一律用 `work_id_label`（已過 `_diagnostic_label` 安全過濾），
+    # 不得直接把 `work_id` 原始值嵌進訊息文字——此時 `work_id` 只確定是
+    # `str`，尚未通過下方的 identity 安全正規式驗證，直接嵌入會繞過
+    # `_diagnostic_label` 既有的「拒絕看似檔案路徑的值」防線（tier: shareable
+    # — AI-SEC-001 契約，見檔案頂部 `_diagnostic_label` docstring）。
+    safe_work_id = work_id_label or "<redacted>"
     if sources and all(source["confidence"] == "inferred" for source in sources):
-        return None
+        raise AuthorityValidationError(
+            f"work item '{safe_work_id}' has no confirmed sources yet (all "
+            "sources are inferred): cannot be evaluated for claiming until "
+            "at least one source is confirmed",
+            reason_code=REASON_AUTHORITY_ALL_INFERRED,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="sources",
+        )
     confirmed = [
         source
         for source in sources
@@ -476,10 +505,28 @@ def _authority_from_canonical_row(
     ]
     has_workflow = any(source.get("kind") == "workflow_run" for source in confirmed)
     if next_actions is not None and "start" not in next_actions and not has_workflow:
-        return None
+        state_label = _diagnostic_label(row.get("state")) or "not-startable"
+        raise AuthorityValidationError(
+            f"work item '{safe_work_id}' is in '{state_label}' state: needs "
+            "an active todo source (workstream todo.md path link or openspec "
+            "change) to become claimable",
+            reason_code=REASON_AUTHORITY_NOT_STARTABLE,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="next_actions",
+        )
     todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
     if not any(source.get("kind") in todo_kinds for source in confirmed):
-        return None
+        raise AuthorityValidationError(
+            f"work item '{safe_work_id}' has no confirmed todo-kind source "
+            "(todo/superpowers_spec/superpowers_plan/openspec): needs an "
+            "active todo source (workstream todo.md path link or openspec "
+            "change) to become claimable",
+            reason_code=REASON_AUTHORITY_NO_TODO_SOURCE,
+            repo=repo_label,
+            work_id=work_id_label,
+            field="sources",
+        )
     if re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
         raise AuthorityValidationError(
             "canonical work authority identity invalid",
@@ -501,13 +548,33 @@ def _authority_from_canonical_row(
         )
     revision = github.get("revision")
     last_success_at = github.get("last_success_at")
+    status = github.get("status")
     if (
-        github.get("status") != "ok"
+        status != "ok"
         or not isinstance(revision, str)
         or not revision
         or not isinstance(last_success_at, str)
     ):
-        if github.get("status") != "ok":
+        if status != "ok":
+            # #370：provider 因 rate limit 而 degraded 是暫時性的（reset 後
+            # 自然恢復），不是真正的 authority 損毀——upstream（resume 的
+            # durable backoff、Manager log）需要能不重新解析訊息文字就分辨
+            # 出這種情況，才能給出「限流中、稍後自動重試」而非要求人工
+            # 介入。訊號來源是 Monitor GitHubWorkProvider.scan() 寫入的
+            # diagnostics（見 monitor/providers.py），本身已用同一套
+            # github_rate_limit 分類器產生。
+            diagnostics = github.get("diagnostics")
+            if isinstance(diagnostics, list) and any(
+                isinstance(entry, str) and is_rate_limit_signal(entry) for entry in diagnostics
+            ):
+                raise AuthorityValidationError(
+                    "durable GitHub provider authority rate-limited",
+                    reason_code=REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+                    repo=repo_label,
+                    work_id=work_id_label,
+                    provider_id=provider_id,
+                    field="status",
+                )
             field = "status"
         elif not isinstance(revision, str) or not revision:
             field = "revision"
@@ -901,17 +968,36 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
             raise ValueError("active workflow pre-freeze identity digest missing")
 
 
+def claim_key_for_authority_digest(*, repo: str, work_id: str, authority_digest: str) -> str:
+    """Deterministic ``claim:v1:...`` key for an exact (repo, work_id,
+    authority_digest) triple.
+
+    Factored out of ``build_claim_key`` (#373) so an in-place authority-digest
+    rewrite — ``registry._manager_reset_workflow_for_authority_restart`` —
+    can re-derive the same key a fresh claim would produce for that digest,
+    without needing the full ``WorkAuthority`` object. Keeping ``claim_key``
+    in sync with ``source_revision`` after an authority restart is the fix
+    for #373: previously the reset only rewrote ``source_revision``, leaving
+    ``claim_key`` permanently mismatched against
+    ``work_actions._expected_claim_key(authority)`` — every subsequent
+    automatic scan tick re-triggered the same reset, stripping the
+    ``needs_human`` facet and re-raising the workflow job binding mismatch
+    forever.
+    """
+    payload = {"repo": repo, "work_id": work_id, "authority_digest": authority_digest}
+    digest = verification.canonical_json_hash(payload)
+    return f"claim:v1:{digest}"
+
+
 def build_claim_key(candidate: ClaimCandidate) -> str:
     _validate_candidate(candidate)
     if not candidate.source_revisions:
         raise ValueError("new claim requires authoritative source revisions")
-    payload = {
-        "repo": candidate.repo,
-        "work_id": candidate.work_id,
-        "authority_digest": work_authority_digest(candidate.authority),
-    }
-    digest = verification.canonical_json_hash(payload)
-    return f"claim:v1:{digest}"
+    return claim_key_for_authority_digest(
+        repo=candidate.repo,
+        work_id=candidate.work_id,
+        authority_digest=work_authority_digest(candidate.authority),
+    )
 
 
 def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:

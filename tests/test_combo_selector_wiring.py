@@ -14,6 +14,7 @@ from paulsha_cortex.coordinator import manager as coordinator_manager
 from paulsha_cortex.coordinator import work_actions as coordinator_work_actions
 from paulsha_cortex.coordinator import work_bridge
 from paulsha_cortex.coordinator.claim import canonical_work_snapshot_path, load_work_authority
+from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowRun, WorkflowStep
 from paulsha_cortex.monitor import providers
@@ -194,6 +195,91 @@ def test_start_canonical_workflow_bypass_marker_visible(
 
     assert run.combo == "feature-oneshot"
     assert run.combo_selection["source"] == "bypass-default"
+
+
+def test_start_canonical_workflow_freezes_combo_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue #390：resume 等後續呼叫（見 contract.py 對 resume 的 fail-closed
+    設計，CLI 不會轉發 combo）不得因為沒帶 combo_override 就重新對
+    mapped_issue_titles 跑 select_combo——標題本身無 task-type 標記時 auto
+    會選到 bypass-default／feature-oneshot，與 claim 時的顯式覆寫
+    （fix-standard）不同，manifest bytes 因而漂移，被 _write_manifest 的
+    byte 比對誤判為 canonical workflow manifest conflict。凍結後第二次呼叫
+    必須沿用 claim 時的 combo，不得 raise。
+    """
+    workspace = _repo(tmp_path / "repo")
+    # 標題無 conventional-commit 前綴 → classify_title 判 unparseable →
+    # select_combo 走 bypass-default／feature-oneshot，刻意與顯式覆寫的
+    # fix-standard 不同，藉此製造「resume 重選會漂移」的條件。
+    snapshot = _write_snapshot(tmp_path, monkeypatch, titles={202: "assorted housekeeping"})
+    authority = load_work_authority(repo="acme/demo", work_id="work", snapshot_path=snapshot)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = "claim:v1:" + "3" * 64
+
+    frozen_manifest = work_bridge.default_workflow_manifest(
+        "work", change="work", combo_name="fix-standard"
+    )
+
+    def fake_apply_workflow_action(_registry, *, args, **_kwargs):
+        run = _registry._manager_create_workflow_run(
+            work_id=args["work_id"],
+            repo=args["repo"],
+            claim_key=args["claim_key"],
+            source_revision=args["source_revision"],
+            workspace_root=args["artifact_root"],
+            combo=frozen_manifest.combo,
+            current_phase="define",
+            steps=frozen_manifest.steps,
+            issue_refs=tuple(args["issue_refs"]),
+            openspec_refs=tuple(args["openspec_refs"]),
+            pr_refs=tuple(args["pr_refs"]),
+            attempts={"define": 1},
+            combo_selection=args["combo_selection"],
+        )
+        return {"run_id": run.run_id}
+
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.manager.apply_workflow_action",
+        fake_apply_workflow_action,
+    )
+    identity_registry = IdentityRegistry.from_rows(
+        (
+            {
+                "executor": "codex",
+                "model_id": "gpt",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+        )
+    )
+
+    claim_run = work_bridge.start_canonical_workflow(
+        registry=registry,
+        authority=authority,
+        claim_key=claim_key,
+        coordinator_root=tmp_path / "coordinator",
+        explicit_repo_root=workspace,
+        identity_registry=identity_registry,
+        combo_override="fix-standard",
+    )
+    assert claim_run.combo == "fix-standard"
+    assert claim_run.combo_selection["source"] == "explicit-override"
+
+    # resume：不帶 combo_override（比照 contract.py 對 resume 的 fail-closed
+    # 行為），MUST NOT raise，且 combo 仍凍結在 claim 時的 fix-standard。
+    resumed_run = work_bridge.start_canonical_workflow(
+        registry=registry,
+        authority=authority,
+        claim_key=claim_key,
+        coordinator_root=tmp_path / "coordinator",
+        explicit_repo_root=workspace,
+        identity_registry=identity_registry,
+        combo_override=None,
+    )
+    assert resumed_run.combo == "fix-standard"
+    assert resumed_run.run_id == claim_run.run_id
 
 
 def test_workflow_run_combo_selection_roundtrip() -> None:
