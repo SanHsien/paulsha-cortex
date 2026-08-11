@@ -100,6 +100,83 @@ class CrossProcessCompletionTests(unittest.TestCase):
             self.assertEqual(updated["status"], "failed")
             self.assertNotEqual(updated["status"], "running")
 
+    # ----------------------------------------------------------- #384: provider_outcome wiring
+
+    def test_failed_job_with_rate_limit_signal_in_log_gets_typed_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            log_path = Path(d) / "slice-a.jsonl"
+            log_path.write_text(
+                "starting build...\nError: secondary rate limit exceeded. Please wait.\n",
+                encoding="utf-8",
+            )
+            _seed_job(state, log_path=str(log_path))
+            exit_sentinel_path(str(log_path)).write_text("1", encoding="utf-8")
+
+            fresh_reg = JobRegistry(state_path=state)
+            disp = Dispatcher(fresh_reg, pane_sender=None, worktree_creator=None)
+            updated = disp.poll_headless_done("slice-a-1")
+
+            self.assertEqual(updated["status"], "failed")
+            outcome = updated["provider_outcome"]
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome["outcome"], "rate_limited")
+            self.assertEqual(outcome["authority"], "text_signal")
+            self.assertTrue(outcome["retryable"])
+
+    def test_failed_job_with_no_signal_gets_unknown_hint_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            log_path = Path(d) / "slice-a.jsonl"
+            log_path.write_text("not json\n", encoding="utf-8")
+            _seed_job(state, log_path=str(log_path))
+            exit_sentinel_path(str(log_path)).write_text("3", encoding="utf-8")
+
+            fresh_reg = JobRegistry(state_path=state)
+            disp = Dispatcher(fresh_reg, pane_sender=None, worktree_creator=None)
+            updated = disp.poll_headless_done("slice-a-1")
+
+            self.assertEqual(updated["status"], "failed")
+            outcome = updated["provider_outcome"]
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome["outcome"], "unknown")
+            self.assertEqual(outcome["authority"], "hint")
+            self.assertFalse(outcome["retryable"])
+
+    def test_exited_job_has_no_provider_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            log_path = Path(d) / "slice-a.jsonl"
+            log_path.write_text('{"type":"result","ok":true}\n', encoding="utf-8")
+            _seed_job(state, log_path=str(log_path))
+            exit_sentinel_path(str(log_path)).write_text("0", encoding="utf-8")
+
+            fresh_reg = JobRegistry(state_path=state)
+            disp = Dispatcher(fresh_reg, pane_sender=None, worktree_creator=None)
+            updated = disp.poll_headless_done("slice-a-1")
+
+            self.assertEqual(updated["status"], "exited")
+            self.assertIsNone(updated["provider_outcome"])
+
+    def test_missing_launch_handle_failure_classifies_as_unknown_hint(self) -> None:
+        # launch 本身失敗（無 log_path 可分類，read_log_tail 回 None）——分類器
+        # 誠實回報「沒有訊號」（unknown/hint），不是偽造出一個具體 outcome，
+        # 也不是省略欄位；retryable 仍是 False（HINT 永不驅動 retry）。
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            _seed_job(state, log_path=None, pid=None)
+
+            fresh_reg = JobRegistry(state_path=state)
+            disp = Dispatcher(fresh_reg, pane_sender=None, worktree_creator=None)
+            updated = disp.poll_headless_done("slice-a-1")
+
+            self.assertEqual(updated["status"], "failed")
+            outcome = updated["provider_outcome"]
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome["outcome"], "unknown")
+            self.assertEqual(outcome["authority"], "hint")
+            self.assertFalse(outcome["retryable"])
+
 
 if __name__ == "__main__":
     unittest.main()

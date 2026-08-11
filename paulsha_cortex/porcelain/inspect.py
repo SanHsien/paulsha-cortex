@@ -89,6 +89,20 @@ def _print_status(status: dict[str, Any]) -> None:
     sys.stdout.write(
         "attention: " + json.dumps(status.get("attention", []), ensure_ascii=False, sort_keys=True) + "\n"
     )
+    # #384：typed provider failure 分類（見 slice_status_entry 的
+    # ``provider_outcome`` 投影）已經包含在上面的 JSON 裡，這裡再加一行可掃視
+    # 摘要——不必展開整包 JSON 就能看出是哪個 slice、哪一種 outcome（auth／
+    # rate_limited／transient／content／quota／unknown）、可不可 retry。
+    for entry in status.get("attention", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        outcome = entry.get("provider_outcome")
+        if not isinstance(outcome, dict) or not outcome.get("outcome"):
+            continue
+        sys.stdout.write(
+            f"  provider_failure[{entry.get('slice_id', '-')}]: {outcome.get('outcome')} "
+            f"(authority={outcome.get('authority')}, retryable={outcome.get('retryable')})\n"
+        )
     sys.stdout.write(
         "in_flight: " + json.dumps(status.get("in_flight", []), ensure_ascii=False, sort_keys=True) + "\n"
     )

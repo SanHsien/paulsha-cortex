@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from paulsha_cortex.config import paths
 from . import verification
@@ -550,6 +550,24 @@ class JobRegistry:
             raise ValueError(
                 f"coordinator 狀態檔 workflow_evidence 格式錯誤（fail-closed）: {self._state_path}"
             )
+        # #384：executor 失敗的 typed 分類（provider_outcome.py）。舊狀態檔沒有
+        # 這個欄位（None）；有的話必須是固定四鍵形狀，鍵值型別比照
+        # ProviderFailureClassification.to_dict()。
+        provider_outcome = job.get("provider_outcome")
+        if provider_outcome is not None and (
+            not isinstance(provider_outcome, dict)
+            or set(provider_outcome) != {"outcome", "authority", "reason", "retryable"}
+            or not isinstance(provider_outcome.get("outcome"), str)
+            or not provider_outcome["outcome"]
+            or not isinstance(provider_outcome.get("authority"), str)
+            or not provider_outcome["authority"]
+            or not isinstance(provider_outcome.get("reason"), str)
+            or not provider_outcome["reason"]
+            or not isinstance(provider_outcome.get("retryable"), bool)
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 provider_outcome 格式錯誤（fail-closed）: {self._state_path}"
+            )
         for field in ("workflow_inputs", "workflow_outputs"):
             value = job.get(field)
             if value is not None and (
@@ -820,6 +838,9 @@ class JobRegistry:
             # fail closed（見 manager._workflow_acceptance_definition_drifted）。
             "workflow_test_policy": workflow_test_policy,
             "workflow_evidence": None,
+            # #384：executor 失敗的 typed 分類（見 provider_outcome.py），只在
+            # `update_headless_result` 收到失敗結果且能分類時才會被寫入。
+            "provider_outcome": None,
             "usage": None,
             "usage_raw": None,
             "usage_reason": None,
@@ -982,11 +1003,17 @@ class JobRegistry:
         *,
         status: str,
         exit_code: int,
+        provider_outcome: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in TERMINAL_JOB_STATUSES:
             raise ValueError(
                 f"headless 完成結果 status 須為 'exited' 或 'failed'，收到: {status!r}"
             )
+        if provider_outcome is not None and (
+            not isinstance(provider_outcome, Mapping)
+            or set(provider_outcome) != {"outcome", "authority", "reason", "retryable"}
+        ):
+            raise ValueError("provider_outcome 格式錯誤（fail-closed）")
         job = self._find_job(job_id)
         _validate_transition(
             field="job status",
@@ -997,6 +1024,10 @@ class JobRegistry:
         job["status"] = status
         job["exit_code"] = exit_code
         job["exited_at"] = _now_iso()
+        # #384：executor 失敗的 typed 分類（見 provider_outcome.py）。只在呼叫端
+        # 傳入時才寫入——`status == "exited"` 或呼叫端未提供分類（例如 launch
+        # 本身失敗、根本沒有 executor 輸出可分類）時保持 None，不偽造分類。
+        job["provider_outcome"] = dict(provider_outcome) if provider_outcome is not None else None
         # #325：usage 抽取是盡力而為的附加資訊，任何失敗都不得影響上面已判定
         # 好的 status/exit_code/exited_at——extract_usage 本身已 fail-soft，
         # 這裡再包一層防禦性雙保險。

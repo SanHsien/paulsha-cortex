@@ -27,6 +27,7 @@ from . import autonomy
 from . import completion
 from . import planning_runtime
 from . import provider_backoff
+from . import provider_outcome
 from . import seams
 from . import review as foreign_review
 from . import terminal_contract
@@ -618,6 +619,14 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
                 latest_action = latest.get("action")
                 if isinstance(latest_action, str) and latest_action:
                     reason = latest_action
+    # #384：manifest 上的 typed provider failure 分類（None 除非本輪終局是
+    # build-phase failure 且分類得到結果，見上面 write_manifest 的呼叫端）。
+    # 投影出來讓 `cortex inspect status` 不必自己解析 `reason` 字串。
+    manifest_provider_outcome = (
+        manifest.get("provider_outcome") if isinstance(manifest, dict) else None
+    )
+    if provider_outcome.ProviderFailureClassification.from_dict(manifest_provider_outcome) is None:
+        manifest_provider_outcome = None
     authority = manifest.get("work_authority") if isinstance(manifest, dict) else None
     authority_repo = authority.get("repo") if isinstance(authority, dict) else None
     repo = _status_repo(
@@ -636,6 +645,7 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
         "reviewer_job_id": reviewer_job_id,
         "reviewer_job_state": reviewer_job_state,
         "reason": reason,
+        "provider_outcome": manifest_provider_outcome,
         "repo": repo,
         "candidate": slice_row.get("candidate"),
         "target_remote": slice_row.get("target_remote"),
@@ -1761,6 +1771,11 @@ def complete_tick(
             completion_record = None
             gate_status = "failed" if status == "failed" else "needs_human"
             gate_reason = None
+            # #384：build-phase failure 的 typed 分類，供下面 manifest 寫入時
+            # 投影給 `cortex inspect status` 讀（見 slice_status_entry）。只有
+            # `elif status == "failed":` 分支會賦值；其餘終局（passed／
+            # needs_human 但非 builder failure）維持 None。
+            slice_provider_outcome_payload: dict[str, object] | None = None
 
             if job.get("kind") == "review":
                 try:
@@ -1818,7 +1833,21 @@ def complete_tick(
                             pass
                 elif status == "failed":
                     gate_status = "failed"
-                    gate_reason = "builder-failed"
+                    # #384：不再一律壓平成 "builder-failed"——`job` 已在
+                    # `Dispatcher._finalize_headless` 分類過（見
+                    # provider_outcome.py），有分類時把 outcome 併進 gate_reason，
+                    # 供 operator／`cortex inspect status` 直接看出是 auth／
+                    # rate_limited／transient／content／quota 哪一種，不必回頭
+                    # 翻 log。slice lane 沒有 workflow lane 的 `run.attempts`
+                    # 可持久化 retry 計數，故本 lane 只做分類與可觀測性，不做
+                    # bounded auto-retry（沿用既有 operator `retry-build` 手動
+                    # 復原路徑）。
+                    classification = provider_outcome.classification_from_job(job)
+                    if classification is not None:
+                        gate_reason = f"builder-failed-{classification.outcome.value}"
+                        slice_provider_outcome_payload = classification.to_dict()
+                    else:
+                        gate_reason = "builder-failed"
                     if slice_row is not None:
                         try:
                             registry.update_slice(slice_id, state="failed", gate_state="failed")
@@ -1975,6 +2004,10 @@ def complete_tick(
                         else None
                     ),
                     "completed_at": clock(),
+                    # #384：typed provider failure 分類（None 除非本輪終局是
+                    # build-phase failure 且分類得到結果）。`slice_status_entry`
+                    # 讀回這個欄位投影給 `cortex inspect status`。
+                    "provider_outcome": slice_provider_outcome_payload,
                 },
             )
             if not publish_evidence and gate_reason in {
@@ -2963,6 +2996,85 @@ def _schema_retry_attempt_key(card_id: str) -> str:
     """
 
     return f"schema-mismatch:{card_id}"
+
+
+def _provider_retry_attempt_key(card_id: str) -> str:
+    """#384：provider 失敗（rate_limited／transient）bounded retry 計數在
+    ``run.attempts`` 上的鍵。比照 :func:`_schema_retry_attempt_key` 的樣板——
+    同一份 ``run.attempts`` 字典上以字首區分兩種完全不同性質的重試（schema
+    mismatch 是模型輸出形狀問題；provider 失敗是 executor/服務層問題），
+    互不影響、各自的 needs_human 原因也分開回報。
+    """
+
+    return f"provider-retry:{card_id}"
+
+
+def _provider_failure_reroute(
+    run,
+    step,
+    identities: IdentityRegistry,
+    *,
+    failed_job: Mapping[str, object],
+    classification: "provider_outcome.ProviderFailureClassification",
+):
+    """#384：provider 失敗時，在既有 candidate 順序上 re-route，不放寬
+    independence domain（forward-looking 約束：禁 policy-shopping，例如
+    Codex builder 失敗後不得 re-route 成也用 Codex 的 reviewer）。
+
+    複用 :func:`runtime_preflight.evaluate_dispatch_gate`（#369 已把 provider
+    snapshot 接進生產的同一套機制）：把「剛剛觀察到的這次失敗」餵成一筆
+    僅本次呼叫可見、in-memory 的 provider snapshot，讓 gate 依
+    :func:`_workflow_identity_candidates`（既有 domain-filtered 順序，完全未
+    改動）跳過剛失敗的 identity、選下一個候選。刻意不觸碰
+    ``_EXECUTOR_AUTH_CACHE`` 或任何 durable snapshot——這只是這一次 retry
+    決策的暫時性輸入，不影響其他 dispatch 熱路徑（`provider_prober=None`：
+    不觸發任何真實 CLI 探測子行程）。
+
+    只剩失敗的那個 identity 本身合格時，`evaluate_dispatch_gate` 必然又選回
+    它——這不是 bug，是唯一合法選擇（沒有domain-合法的替代候選可換）。
+    """
+
+    from .runtime_preflight import (
+        DEFAULT_PROVIDER_TTL_SECONDS,
+        PROVIDER_EXECUTOR_SENTINEL,
+        ProviderFreshness,
+        RuntimeCapability,
+        evaluate_dispatch_gate,
+        host_environment,
+    )
+
+    candidates = _workflow_identity_candidates(run, step, identities)
+    failed_executor = failed_job.get("executor")
+    observed_at = time.time()
+
+    def _snapshot_lookup(provider_id: str) -> ProviderFreshness | None:
+        if provider_id != failed_executor:
+            # 其餘候選：無快照 -> STALE_SNAPSHOT（non-blocking，直接放行，
+            # 不多探測、不 spawn 任何子行程）。
+            return None
+        return ProviderFreshness(
+            provider_id=provider_id,
+            status="degraded",
+            observed_at=observed_at,
+            ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
+            source="provider-failure-observed",
+            reason=f"{classification.outcome.value}: {classification.reason}",
+        )
+
+    # `_workflow_identity_candidates` 在無合格候選時已 raise ValueError——與
+    # `_select_workflow_identity` 完全相同的既有錯誤行為，這裡刻意不吞掉它
+    # （沒有候選是設定錯誤，不是「這次 retry 剛好找不到人可換」）。
+    decision = evaluate_dispatch_gate(
+        card=step.card,
+        requirements=(RuntimeCapability(kind="provider", name=PROVIDER_EXECUTOR_SENTINEL),),
+        candidates=candidates,
+        environment_for=lambda _identity: host_environment(),
+        snapshot_lookup=_snapshot_lookup,
+        provider_prober=None,
+    )
+    if decision.action == "needs_human":
+        return None
+    return decision.identity
 
 
 def _canonicalize_card_terminal(raw: Mapping[str, object]) -> dict[str, object]:
@@ -6579,6 +6691,7 @@ def _dispatch_workflow_card(
     retry_failed: bool = False,
     operator_recovery_job_id: str | None = None,
     force_new_build: bool = False,
+    forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object] | None:
     """#381：workflow lane 的實際 spawn 點。spawn_admission 未注入時解析為
@@ -6770,11 +6883,20 @@ def _dispatch_workflow_card(
     # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
     # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
     # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
-    gate = _runtime_preflight_gate(
-        run,
-        step,
-        identities=identities,
-        launcher_factory=launcher_factory,
+    # #384：`forced_identity` 提供時（provider 失敗 bounded retry 的 re-route
+    # 決策，見 `resume_workflow_run`／`_provider_failure_reroute`）代表呼叫端
+    # 已經跑過一次針對「剛剛觀察到的失敗」的 evaluate_dispatch_gate 決策，這裡
+    # 不再重跑一次通用 preflight（重跑不會產生更好的答案，只是多付一次探測
+    # 成本）。
+    gate = (
+        None
+        if forced_identity is not None
+        else _runtime_preflight_gate(
+            run,
+            step,
+            identities=identities,
+            launcher_factory=launcher_factory,
+        )
     )
     if gate is not None and gate.action == "needs_human":
         updated = registry._manager_update_workflow_run(
@@ -6793,6 +6915,12 @@ def _dispatch_workflow_card(
         launcher = gate.launcher
         if launcher is None:
             raise ValueError("workflow launcher unavailable")
+    elif forced_identity is not None:
+        identity = forced_identity
+        launcher = launcher_factory(identity)
+        if launcher is None:
+            raise ValueError("workflow launcher unavailable")
+        launcher = _specialize_workflow_launcher(launcher, step)
     else:
         identity = _select_workflow_identity(run, step, identities)
         launcher = launcher_factory(identity)
@@ -7078,6 +7206,7 @@ def dispatch_workflow_card(
     coordinator_root: str | Path,
     retry_failed: bool = False,
     force_new_build: bool = False,
+    forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object] | None:
     """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
@@ -7090,6 +7219,7 @@ def dispatch_workflow_card(
         coordinator_root=coordinator_root,
         retry_failed=retry_failed,
         force_new_build=force_new_build,
+        forced_identity=forced_identity,
         spawn_admission=spawn_admission,
     )
 
@@ -7465,6 +7595,7 @@ def resume_workflow_run(
         return {"run_id": run.run_id, "current_phase": run.current_phase, "job_id": job["job_id"], "reason": "in-flight"}
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         failure_reason = "job-failed"
+        sandbox_ok = True
         try:
             _discard_reviewer_sandbox(
                 job,
@@ -7473,18 +7604,70 @@ def resume_workflow_run(
             )
         except ValueError:
             failure_reason = "reviewer-candidate-drift"
-        updated = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), gate_status="running"
-        )
+            sandbox_ok = False
         # #260 R6：失敗回報附帶唯讀 terminal 診斷（observed HEAD／job id／失敗
         # 原因），沿用 #261 的 `_terminal_parse_diagnostics`；診斷與授權分離，
         # 不得因此授予任何 candidate authority。
         diagnostics = _terminal_parse_diagnostics(job)
+        # #384：不再一律壓平成 "job-failed"。`job` 已在
+        # `Dispatcher._finalize_headless` 分類過（provider_outcome.py）；沙箱
+        # drift 時（sandbox_ok is False）刻意不看分類、不重試——candidate 已被
+        # reviewer 動過，跟 provider 是哪一種失敗無關，必須 fail closed。
+        classification = (
+            provider_outcome.classification_from_job(job) if sandbox_ok else None
+        )
+        status_fields: dict[str, object] = {}
+        if classification is not None:
+            status_fields["provider_outcome"] = classification.outcome.value
+            status_fields["provider_outcome_authority"] = classification.authority.value
+            failure_reason = f"job-failed-{classification.outcome.value}"
+        if sandbox_ok and classification is not None and classification.retryable:
+            retry_key = _provider_retry_attempt_key(step.card)
+            attempts = dict(run.attempts)
+            seen = attempts.get(retry_key, 0)
+            status_fields["provider_retry_count"] = seen
+            status_fields["provider_retry_limit"] = terminal_contract.MAX_PROVIDER_RETRIES
+            if seen < terminal_contract.MAX_PROVIDER_RETRIES:
+                rerouted_identity = _provider_failure_reroute(
+                    run, step, identities, failed_job=job, classification=classification,
+                )
+                replacement = dispatch_workflow_card(
+                    dispatcher,
+                    run=run,
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                    retry_failed=True,
+                    forced_identity=rerouted_identity,
+                )
+                if replacement is None:
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "reason": "not-dispatchable",
+                    }
+                current = registry.get_workflow_run(run.run_id)
+                attempts = dict(current.attempts)
+                attempts[retry_key] = seen + 1
+                registry._manager_update_workflow_run(run.run_id, attempts=attempts)
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "job_id": replacement["job_id"],
+                    "reason": "provider-failure-retry",
+                    **{**status_fields, "provider_retry_count": seen + 1},
+                    "terminal_diagnostics": diagnostics.as_dict(),
+                }
+            failure_reason = "provider-retry-exhausted"
+        updated = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), gate_status="running"
+        )
         return {
             "run_id": run.run_id,
             "current_phase": updated.current_phase,
             "job_id": job["job_id"],
             "reason": failure_reason,
+            **status_fields,
             "terminal_diagnostics": diagnostics.as_dict(),
         }
     if _malformed_workflow_card_terminal(job):
