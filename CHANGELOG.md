@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #374：`_log_error` 的單槽去重被多筆錯誤輪替瓦解**：`_LOG_ERROR_DEDUP_STATE` 過去是單槽 `dict`，daemon 一輪 tick 交錯產生多個不同 signature（實測每輪 14 個，來自 #373 的 14 個受害 run）時，下一筆 signature 一旦不同就整槽重置，使去重恆判定為「新 signature」——每筆都印，#249 的抑制摘要在多 signature 交錯下從未觸發（實測交錯 3 signature 各 200 筆共 600 筆 → 印 600 行、抑制 0 行）。既有測試只送單一重複 signature，破損實作下仍照樣綠燈。改為以 signature 為 key 的多槽 `OrderedDict` LRU（容量上限 `LOG_ERROR_DEDUP_MAX_SLOTS=64`，超出時淘汰最久未用者，避免 signature 含 `source_revision` 時無界成長），每個 signature 各自獨立計數與抑制，交錯不再互相重置對方計數；既有週期摘要語意與對外介面不變。新增 2 個回歸測試（交錯多 signature、LRU 淘汰），修正前已確認交錯案例 RED。
+
+### Fixed
 - **Issue #418：#414 materialize 出的 canonical plan 檔與 brainstorm evidence 對帳必炸**：`_validated_brainstorm_planning_authority` 過去單純用 `set(persisted) - set(scanned)` 非空即 raise，`_materialize_plan_card_output`（#414）為對齊 build 端 declared input pattern 而產生的 canonical plan 副本天生不在 brainstorm evidence 列表內，每次 resume 對帳必 `needs_human`。新增合法副本例外路徑：`kind`／`work_id`／`baseline_sha256`（byte-copy）／ref 落在 plan phase output pattern 內四條全符合才排除於 omission 之外，其餘真正的 omission 維持 raise；回傳的 authority tuple 仍保留該副本以 seed 進 build worktree。新增 3 個回歸測試，修正前已確認重現 `omits persisted authority` 的 RED。
 
 ### Changed
