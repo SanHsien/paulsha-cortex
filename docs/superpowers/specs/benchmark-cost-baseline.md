@@ -56,21 +56,25 @@ prompt caching）；`model_wall` 為 ledger 逐回合 `wall_clock_ms` 合計（�
 | sonnet 級（$3 / $15） | ≈ $0.34 |
 | opus 級（$15 / $75） | ≈ $1.71 |
 
-N 取 6–10（#456 會給精確值；非 Anthropic 身分如 codex／agy 走各自 CLI 訂閱
-登入態，無逐 token 帳單，USD 記 0 但仍吃該家配額）：
+N＝**11**（`#456` R7 定案，(executor, model_id, persona) 粒度：15 格 − 硬約束排除
+4 格；每格＝一次完整 deck run）。其中**近期可實測僅 builder 3 格**——pilot-v1 目前
+只量 builder 維度（planner／reviewer 題庫待 `paulsha-patchmud#13`），其餘 8 格待
+題庫落地。非 Anthropic 身分（codex／agy／cg）走各自 CLI 訂閱登入態，無逐 token
+帳單，USD 記 0 但仍吃該家配額：
 
-| 情境 | N=6 | N=10 |
+| 情境 | 近期可實測（builder 3 格） | 全量上界（11 格） |
 |---|---:|---:|
-| 全數 haiku 級 | ≈ $0.7 | ≈ $1.1 |
-| 全數 sonnet 級 | ≈ $2.0 | ≈ $3.4 |
-| **上界：全數 opus 級** | ≈ $10.2 | **≈ $17.1** |
+| 全數 haiku 級 | ≈ $0.34 | ≈ $1.3 |
+| 全數 sonnet 級 | ≈ $1.0 | ≈ $3.7 |
+| **上界：全數 opus 級** | ≈ $5.1 | **≈ $18.8** |
 
-牆鐘：haiku 實測 2 分鐘／deck；保守放大 3–5 倍給慢模型，單身分 ≤ 10 分鐘、
-N=10 依序全跑 ≤ 100 分鐘。**pilot-v1 目前只量 builder 維度**
-（planner／reviewer 題庫待 `paulsha-patchmud#13`）；若未來三 persona 各有同規模
-deck，預算上界 ×3 ≈ **$51、5 小時**（N=10、全 opus 級、依序）。
+牆鐘：haiku 實測 2 分鐘／deck；保守放大 3–5 倍給慢模型，單格 ≤ 10 分鐘、
+11 格依序全跑 ≤ 110 分鐘。planner／reviewer 專用 deck 規模未知，上表以
+「與 pilot-v1 同規模」為一階假設。若 `#456` R4 待確認身分全數登錄
+（`gemini-3.6-flash-high` +1、`gpt-5.4-codex` +3 → N=15），opus 級上界
+≈ **$26**；兩票數字須同步更新（`#456` R7 分期註記）。
 
-結論：**美元成本不是「一次性」語意的主要約束（上界 $17 起、極端 $51），
+結論：**美元成本不是「一次性」語意的主要約束（上界 $19 起、極端 $26），
 真正的稀缺資源是限流配額與牆鐘**——sonnet 煙霧測試的連續 429 證明評測流量
 與並行派工互撞是現實風險，這直接決定 §4.2 的排程定案。
 
