@@ -31,6 +31,7 @@ from . import seams
 from . import review as foreign_review
 from . import terminal_contract
 from . import verification
+from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
 from .registry import slice_repin_eligible
 from ..config.paths import worktree_root_for
 from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
@@ -2122,6 +2123,7 @@ def run_tick(
     review_model: str | None = None,
     identity_registry=None,
     launcher_factory=None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict:
     """跑完整 manager tick：fanout（dispatch_ready）→ complete_tick →（可選）收尾 janitor。
 
@@ -2183,6 +2185,7 @@ def run_tick(
                 handoff_dir=handoff_dir,
                 identity_registry=identity_registry,
                 launcher_factory=launcher_factory,
+                spawn_admission=spawn_admission,
             )
         except autonomy.DispatchReadyError as exc:
             dispatched = list(exc.jobs)
@@ -6576,7 +6579,12 @@ def _dispatch_workflow_card(
     retry_failed: bool = False,
     operator_recovery_job_id: str | None = None,
     force_new_build: bool = False,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object] | None:
+    """#381：workflow lane 的實際 spawn 點。spawn_admission 未注入時解析為
+    零間隔 no-op（見 spawn_admission.resolve_limiter）——只有 resume_workflow_run
+    /manager_daemon periodic tick 顯式注入同一個 instance 時，兩條 lane 才會
+    對同一 provider 共用節流時間軸。"""
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
         raise RuntimeError("workflow dispatch requires dispatcher registry")
@@ -7018,6 +7026,8 @@ def _dispatch_workflow_card(
             shutil.rmtree(reviewer_sandbox, ignore_errors=True)
         raise
     try:
+        # #381：真正 spawn 前才 admit，不佔住這張卡接下來的整個執行期。
+        resolve_limiter(spawn_admission).admit(resolve_provider(identity=identity, launcher=launcher))
         handle = launcher.launch(
             slice_id=str(job["job_id"]),
             prompt=_workflow_job_prompt(
@@ -7068,6 +7078,7 @@ def dispatch_workflow_card(
     coordinator_root: str | Path,
     retry_failed: bool = False,
     force_new_build: bool = False,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object] | None:
     """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
 
@@ -7079,6 +7090,7 @@ def dispatch_workflow_card(
         coordinator_root=coordinator_root,
         retry_failed=retry_failed,
         force_new_build=force_new_build,
+        spawn_admission=spawn_admission,
     )
 
 
@@ -7169,6 +7181,7 @@ def resume_workflow_run(
     coordinator_root: str | Path,
     ship_validator: Callable[..., object] | None = None,
     operator_resume: bool = False,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object]:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -7331,6 +7344,7 @@ def resume_workflow_run(
                     coordinator_root=coordinator_root,
                     retry_failed=retry,
                     operator_recovery_job_id=retry_recovery_job_id,
+                    spawn_admission=spawn_admission,
                 )
             return dispatch_workflow_card(
                 dispatcher,
@@ -7339,6 +7353,7 @@ def resume_workflow_run(
                 launcher_factory=launcher_factory,
                 coordinator_root=coordinator_root,
                 retry_failed=retry,
+                spawn_admission=spawn_admission,
             )
         except Exception:
             current = registry.get_workflow_run(bound_run.run_id)
