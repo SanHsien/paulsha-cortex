@@ -2722,6 +2722,20 @@ def _audit_phase_steps(
             inputs=step.inputs,
             outputs=outputs if step.phase == phase and (card_id is None or step.card == card_id) else step.outputs,
             gate_result=gate_result if step.phase == phase and (card_id is None or step.card == card_id) else step.gate_result,
+            # #379 複驗發現：此函式過去重建每個 step 時漏傳
+            # skill_ref/action/commit_policy/test_policy，導致 WorkflowStep 的
+            # dataclass 預設值（None）覆寫掉「完全不在本次 (phase, card_id)
+            # 範圍內」的其他 step 的既有值——包含尚未輪到的 build phase 卡片。
+            # 實務上，run 通常在 claim phase 就先 advance 過一次，因此 build
+            # phase 卡片的 test_policy 在真正被拿來跑之前就已經被抹成 None，
+            # #307 的 red-required 語意反轉、以及 #379 由 test_policy 導出
+            # 應驗 gate 名稱的機制都會因此變成 dead code。這四個欄位本就只
+            # 該由 deck compile 決定、run 存續期間不變，故一律原樣帶過，不
+            # 受 (phase, card_id) 命中與否影響。
+            skill_ref=step.skill_ref,
+            action=step.action,
+            commit_policy=step.commit_policy,
+            test_policy=step.test_policy,
         )
         for step in steps
     )
@@ -3032,6 +3046,49 @@ def _workflow_step_test_policy(registry, job: Mapping[str, object]) -> str | Non
     return None
 
 
+def _expected_gate_names_for_test_policy(test_policy: str | None) -> frozenset[str]:
+    """#379：從 plan 的驗收條件（deck compile 依 combo/cards.yaml 綁在每個 build
+    phase 卡片上的 ``test_policy``）機械導出這個 phase 應驗的 gate 名稱集合。
+
+    ``test_policy`` 目前是 workflow lane 裡唯一由 spec/plan（而非 operator 的
+    ``PSC_GATE_CMD_*`` env）決定的驗收訊號：``None``／``"none"`` 代表卡片本就
+    不要求測試（例如 worktree-isolation 這類不動 candidate 程式碼的卡），維持
+    既有 #308 的合法空 ledger 放行語意；其餘合法值（``"red-required"``／
+    ``"focused"``／``"full"``）皆代表這張卡的正確產出需要跑測試，對應 ledger
+    裡 :data:`terminal_contract.RED_REQUIRED_TEST_GATE_NAME`（"pytest"）這個
+    gate 名稱——與 #307 red-required 反轉引用的是同一個名稱來源，不另立一套。
+    """
+
+    if test_policy in (None, "none"):
+        return frozenset()
+    return frozenset({terminal_contract.RED_REQUIRED_TEST_GATE_NAME})
+
+
+def _workflow_acceptance_definition_drifted(
+    job: Mapping[str, object], *, fresh_test_policy: str | None
+) -> bool:
+    """#379：驗收判準（test_policy）pinned-input drift 偵測，比照既有
+    ``_pinned_input_mismatches``／``_review_inputs_drifted`` 的「派工當下 pin
+    一份快照、harvest 時與現況比對」模式。
+
+    ``job["workflow_test_policy"]`` 是 :func:`_dispatch_workflow_card` 派工當下
+    寫入的快照（見該函式對 ``registry.create_job`` 的呼叫）；``fresh_test_policy``
+    是 harvest 當下重新從 registry 現有 ``WorkflowRun.steps`` 讀到的值。兩者不
+    一致代表這張卡的驗收判準在派工之後被動過——無論肇因是 operator／其他行程
+    的合法變更，還是任何讓 builder 自報得以「改判準讓自報成真」的路徑，都必須
+    fail closed，不得沿用新值靜默通過。
+
+    ``job`` 沒有 ``workflow_test_policy`` 欄位（例如非經
+    :func:`_dispatch_workflow_card` 真正派工路徑建立的 legacy／測試 job）時視為
+    「未 pin」，不受本檢查約束——維持既有行為，不因為新增這道保護而誤殺舊資料。
+    """
+
+    pinned = job.get("workflow_test_policy")
+    if pinned is None:
+        return False
+    return pinned != fresh_test_policy
+
+
 def _assert_terminal_gate_consistency(
     raw: Mapping[str, object],
     *,
@@ -3053,6 +3110,14 @@ def _assert_terminal_gate_consistency(
     ``test_policy=red-required``（tdd-red）卡對測試 gate 的語意反轉在
     :func:`terminal_contract.authorize_terminal` 生效；未提供或解析不到時
     ``test_policy`` 視為 ``None``，行為與反轉前完全相同。
+
+    #379：同一份 ``test_policy`` 另外餵給 :func:`_expected_gate_names_for_test_policy`
+    導出這個 phase 應驗的 gate 名稱集合，交給 ``authorize_terminal`` 的
+    ``expected_gate_names`` 參數把 #308 的空/局部 ledger 早退收斂成「只有 plan
+    本就沒有應驗 gate 時才放行」。派工當下 pin 進 job 的 ``workflow_test_policy``
+    與這裡重新解析出的現值不一致時（:func:`_workflow_acceptance_definition_drifted`），
+    在呼叫 ``authorize_terminal`` 之前就先 fail closed，不讓「判準本身被動過」
+    偽裝成一次乾淨的 gate 驗證。
     """
 
     try:
@@ -3064,11 +3129,27 @@ def _assert_terminal_gate_consistency(
     log_path = job.get("log_path")
     if not isinstance(log_path, str) or not log_path:
         return
+    test_policy = _workflow_step_test_policy(registry, job)
+    if _workflow_acceptance_definition_drifted(job, fresh_test_policy=test_policy):
+        raise terminal_contract.TerminalContractError(
+            "workflow card 的驗收判準（test_policy）自派工後已變動："
+            f"pinned={job.get('workflow_test_policy')!r}，現值={test_policy!r}；"
+            "不得沿用新值讓 builder 自報靜默通過",
+            reason="workflow-acceptance-definition-drift",
+            validation_path="$.gate_evidence",
+            errors=(
+                {
+                    "pinned_test_policy": job.get("workflow_test_policy"),
+                    "current_test_policy": test_policy,
+                },
+            ),
+        )
     terminal_contract.authorize_terminal(
         envelope,
         ledger_path=terminal_contract.gate_ledger_path(log_path),
         require_ledger=job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES,
-        test_policy=_workflow_step_test_policy(registry, job),
+        test_policy=test_policy,
+        expected_gate_names=_expected_gate_names_for_test_policy(test_policy),
     )
 
 
@@ -5946,12 +6027,123 @@ def _specialize_workflow_launcher(launcher, step):
     return launcher
 
 
-def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher_factory):
+# #369：provider capability 探測的死碼修復。修復前 `_runtime_preflight_gate`
+# 呼叫 `evaluate_dispatch_gate` 時從未傳入 `snapshot_lookup`／`provider_prober`
+# （兩者預設 None）——`_resolve_provider_freshness` 在 `snapshot_lookup is None`
+# 時直接回 STALE_SNAPSHOT，而 STALE_SNAPSHOT 不在 `_BLOCKING_OUTCOMES`（只有
+# CAPABILITY_MISSING／PROVIDER_UNAVAILABLE 會擋），所以任何 `provider:` 宣告
+# 在生產環境永遠放行，等於整條路徑是死碼。以下兩個 factory 把它接上真正的
+# 資料源：GitHub 走既有 monitor durable snapshot（唯讀，無快照時安全回退成
+# STALE_SNAPSHOT，不變更行為的保守面）；executor 走 dispatch-time 的登入態
+# 探測（`coordinator.executor_auth`），以 process-level 快取避免每次 dispatch
+# 都重新 spawn CLI 子行程（見 `_EXECUTOR_AUTH_CACHE`）。
+#
+# cards.yaml 尚未有卡片宣告 `provider:executor`（見 #369 changelog 的風險
+# 說明）：sentinel 機制已就緒且有完整測試覆蓋，但要接上前先確認 CI／各執行
+# 環境對 claude／codex／copilot CLI 的可得性，避免 dispatch 熱路徑意外 spawn
+# 子行程；`provider:github:<repo>` 純讀 monitor 快照檔，無此風險，已直接接上
+# openspec-archive／policy-commit 兩張 ship-phase 卡。
+_EXECUTOR_AUTH_CACHE: dict[str, object] = {}
+
+
+def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> object | None:
+    from paulsha_cortex.monitor.work_models import parse_timestamp
+
+    from .runtime_preflight import DEFAULT_PROVIDER_TTL_SECONDS, ProviderFreshness
+
+    try:
+        snapshot = snapshot_store.load()
+    except Exception:  # noqa: BLE001 - monitor 快照壞掉不得拖垮 dispatch
+        return None
+    if snapshot is None:
+        return None
+    provider = snapshot.providers.get(provider_id)
+    if provider is None:
+        return None
+    try:
+        observed_at = parse_timestamp(provider.last_attempt_at).timestamp()
+    except ValueError:
+        return None
+    reason = "; ".join(provider.diagnostics) if provider.diagnostics else None
+    return ProviderFreshness(
+        provider_id=provider.provider_id,
+        status=provider.status,
+        observed_at=observed_at,
+        ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
+        source="monitor-snapshot",
+        reason=reason,
+    )
+
+
+def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
+    """#369：executor 登入態的「快照」層——實際是 process-level 快取。
+
+    沒有既有的 durable executor-auth snapshot 基礎設施（GitHub 有，monitor
+    daemon 會定期掃描並落盤；executor CLI 登入態沒有），因此第一次查詢時合成
+    一筆「已過期」的紀錄，讓 `_resolve_provider_freshness` 的 stale 分支去
+    呼叫 `provider_prober` 做一次真正探測；探測結果回寫這個 cache，後續在
+    TTL 內的查詢會直接命中 `is_fresh()`、不再重新 spawn 子行程。
+    """
+
+    from .runtime_preflight import ProviderFreshness
+
+    cached = _EXECUTOR_AUTH_CACHE.get(provider_id)
+    if cached is not None:
+        return cached
+    from .executor_auth import EXECUTOR_AUTH_TTL_SECONDS
+
+    return ProviderFreshness(
+        provider_id=provider_id,
+        status="degraded",
+        observed_at=0.0,
+        ttl_seconds=EXECUTOR_AUTH_TTL_SECONDS,
+        source="cold-start",
+        reason="no prior executor auth probe",
+    )
+
+
+def _executor_auth_prober(provider_id: str) -> object | None:
+    from .executor_auth import check_executor_auth
+
+    result = check_executor_auth(provider_id)
+    _EXECUTOR_AUTH_CACHE[provider_id] = result
+    return result
+
+
+def _combined_provider_snapshot_lookup(*, snapshot_store) -> Callable[[str], object | None]:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    def _lookup(provider_id: str) -> object | None:
+        if provider_id in EXECUTOR_CANDIDATES:
+            return _executor_auth_snapshot_lookup(provider_id)
+        return _monitor_provider_snapshot_lookup(provider_id, snapshot_store=snapshot_store)
+
+    return _lookup
+
+
+def _combined_provider_prober(provider_id: str) -> object | None:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    if provider_id in EXECUTOR_CANDIDATES:
+        return _executor_auth_prober(provider_id)
+    # GitHub 目前只用 monitor snapshot，不做額外 live probe：monitor daemon
+    # 本身已定期刷新該快照，再疊一層 live probe 只是重複付網路成本
+    # （#369 範圍界定，見 changelog）。
+    return None
+
+
+def _runtime_preflight_gate(
+    run, step, *, identities: IdentityRegistry, launcher_factory, snapshot_store=None
+):
     """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
 
     回傳 None 代表這張 card 未宣告任何 capability，呼叫端照原路徑走；否則回傳
     `DispatchGateDecision`，其中 `launcher` 只在通過 preflight 的 identity 上建立
     ——被擋下的 identity 不會產生任何 model session。
+
+    `snapshot_store` 預設 None 時延後到真正需要時才建立
+    `monitor.work_snapshot.WorkSnapshotStore()`（讀既有 monitor durable
+    snapshot）；測試可注入指向 tmp_path 的 store，不觸碰真實安裝路徑。
     """
 
     from .runtime_preflight import card_runtime_requirements, evaluate_dispatch_gate
@@ -5987,12 +6179,20 @@ def _runtime_preflight_gate(run, step, *, identities: IdentityRegistry, launcher
 
         return host_environment()
 
+    active_store = snapshot_store
+    if active_store is None:
+        from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+        active_store = WorkSnapshotStore()
+
     return evaluate_dispatch_gate(
         card=step.card,
         requirements=requirements,
         candidates=candidates,
         environment_for=_environment_for,
         launcher_factory=_launcher_for,
+        snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
+        provider_prober=_combined_provider_prober,
     )
 
 
@@ -6814,6 +7014,10 @@ def _dispatch_workflow_card(
             workflow_sandbox_hash=sandbox_hash,
             workflow_output_baseline=output_baseline,
             workflow_builder_job_id=builder_job_id if step.persona == "reviewer" else None,
+            # #379：派工當下 pin 住這張卡的驗收判準（test_policy），供 harvest 時
+            # 與 registry 現有 WorkflowRun.steps 的現值比對出 drift（見
+            # manager._workflow_acceptance_definition_drifted）。
+            workflow_test_policy=step.test_policy,
         )
     except BaseException:
         if planner_sandbox is not None:

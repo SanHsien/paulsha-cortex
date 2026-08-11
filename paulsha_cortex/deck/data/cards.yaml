@@ -140,6 +140,10 @@ cards:
     requires: ["openspec/changes/<change>/tasks.md"]
     produces: ["openspec/changes/archive/*<change>*"]
     persona_binding: manager
+    # #369：ship phase 落地變更需要 GitHub 可達（issue/PR 狀態核對、archive
+    # 與 remote 一致性）；provider snapshot degraded 時擋在 dispatch 前，避免
+    # 耗費一整個 session 後才因連線問題失敗。
+    runtime_capabilities: ["provider:github:hamanpaul/paulsha-cortex"]
 
   - id: policy-commit
     kind: skill
@@ -151,7 +155,16 @@ cards:
     requires: []
     produces: []          # 證據 = conventional commit 本身（不機驗檔案）
     persona_binding: manager
+    # #369：conventional commit 落地後緊接著就是 push／PR 流程，同樣需要
+    # GitHub 可達；宣告與 openspec-archive 相同的 provider 需求。
+    runtime_capabilities: ["provider:github:hamanpaul/paulsha-cortex"]
 
+  # issue #378：builder 的「實證」交付可能是 rigged setup（兩條對照臂共用可變
+  # 狀態、差異由 setup 順序而非被測性質產生、verdict 判準為恆真式）——現有
+  # verification gate（persona-scope／command／artifacts exists）只驗「跑得起來
+  # 且測試綠」，不驗「結論站不站得住腳」。本卡的任務不是覆核 builder 結論，而是
+  # 主動嘗試推翻它；命中時走 review.py 既有的 BLOCKING_FINDING_CATEGORIES
+  # fail-closed 通道（verification-bypass／acceptance），不新建機制。
   - id: adversarial-review
     kind: skill
     type: headless
@@ -161,6 +174,8 @@ cards:
     requires: ["reports/review/*<task-slug>*.md"]
     produces: ["reports/review/*<task-slug>*-adversarial.md"]
     persona_binding: reviewer
+    execution:
+      action: "對抗式檢視本次交付的 evidence／實證主張（含 benchmark／research／hardware 對照實驗）是否為 rigged setup：目標不是確認 builder 結論，而是主動嘗試推翻——(a) 兩條對照臂是否共用 mutable state 或一次性資源，使差異由 setup 順序（setup-order dependency）而非被測性質產生；(b) verdict 判準是否為恆真式（tautological verdict，把兩臂互換順序或改為各自獨立執行後結論是否仍成立）；(c) 結論是否真由觀測值導出，而非預設寫死或由 selection bias 保證。任一項成立即為 rigged evidence，MUST 以 verification-bypass 或 acceptance category 回報 blocking finding，不得放行。"
 
   - id: receiving-code-review
     kind: skill

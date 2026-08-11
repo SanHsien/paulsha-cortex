@@ -37,12 +37,19 @@ from paulsha_cortex.deck.compile import compile_combo, emit
 from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
 
 
-def _gate_ledger_passed(log_path) -> None:
+def _gate_ledger_passed(log_path, *, gates: list[dict[str, object]] | None = None) -> None:
     """#261：模擬 manager wrapper 在模型行程結束後寫下的 gate ledger。
 
     真實流程中這份檔案由 `launcher` 產生的 wrapper script 呼叫
     `paulsha_cortex.coordinator.gate_ledger` 寫出，模型碰不到；沒有它的話
     build／verify 的 `passed` 會（正確地）因為缺乏獨立 gate 證據而 fail closed。
+
+    #379：預設仍是空 gate 清單（維持既有多數呼叫端模擬「operator 未宣告
+    PSC_GATE_CMD_*」的情境）；呼叫端如果在模擬一張 test_policy 非
+    none／null 的卡片（例如 tdd-red／subagent-build），必須顯式傳入
+    ``gates`` 帶上對應的 pytest 條目——否則 manager 現在會（正確地）因為
+    plan 宣告的應驗 gate 沒出現在 ledger 而 fail closed，而不是像修復前那樣
+    vacuous pass。
     """
 
     path = terminal_contract.gate_ledger_path(log_path)
@@ -53,7 +60,7 @@ def _gate_ledger_passed(log_path) -> None:
                 "schema_version": terminal_contract.GATE_LEDGER_SCHEMA_VERSION,
                 "kind": "workflow-gate-ledger",
                 "slice_id": Path(log_path).stem,
-                "gates": [],
+                "gates": gates if gates is not None else [],
             }
         ),
         encoding="utf-8",
@@ -2052,7 +2059,14 @@ def test_build_card_advances_candidate_only_to_exact_descendant_head(tmp_path: P
         session_name="wf-tdd-red",
         log_path=str(log),
     )
-    _gate_ledger_passed(log)
+    # #379：tdd-red 卡 test_policy=red-required，manager 現在會要求 ledger 裡
+    # 出現 pytest 這個 gate；exit_code=1（RED 如預期失敗）才是 #307 語意反轉
+    # 認可的合格證據，對稱既有 test_manager_harvest_authorizes_tdd_red_card_
+    # with_expected_red_pytest 的寫法。
+    _gate_ledger_passed(
+        log,
+        gates=[{"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"}],
+    )
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
     terminal = manager.terminalize_workflow_job(
         registry,
@@ -2966,7 +2980,18 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
             log_path.with_suffix(".exit").write_text("0", encoding="utf-8")
-            _gate_ledger_passed(log_path)
+            # #379：build phase 卡片若宣告 test_policy（tdd-red=red-required／
+            # subagent-build=focused），manager 現在要求 ledger 出現對應的
+            # pytest gate，否則 fail closed；其餘卡片（含 worktree-isolation
+            # 與 plan/verify/review phase）維持既有空 gate 清單。
+            build_gate_rows = None
+            if phase == "build" and card == "tdd-red":
+                build_gate_rows = [
+                    {"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"}
+                ]
+            elif phase == "build" and card == "subagent-build":
+                build_gate_rows = [{"name": "pytest", "status": "passed", "exit_code": 0}]
+            _gate_ledger_passed(log_path, gates=build_gate_rows)
             return LaunchHandle(
                 executor=str(job["executor"]), model_id=str(job["model_id"]),
                 session_name=slice_id, pid=100, log_path=str(log_path),
