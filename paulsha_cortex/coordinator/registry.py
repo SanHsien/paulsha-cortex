@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from . import verification
+from .claim import claim_key_for_authority_digest
 from .usage_extractors import extract_usage
 from .workflow import (
     GateEvidenceRef,
@@ -1920,6 +1921,17 @@ class JobRegistry:
         review gate——比照 `_manager_reset_workflow_after_archive` 的『只清 verify/
         review』模式，build phase 已產出的 Candidate 維持不變，不是
         `_manager_reset_workflow_for_retry_build` 那種整個 build phase 級重置。
+
+        #373：`claim_key` 必須跟著 `authority_digest` 同步重算，否則
+        `work_actions._claim_action` 的觸發條件
+        （`canonical_run.claim_key != _expected_claim_key(authority)`）在 reset
+        之後仍然為真——同一個未再變動的 authority digest 會讓每一次 automatic
+        scan（每個 daemon tick）都重新判定為「authority 已變更」，重跑本函式：
+        剝除 needs_human、attempts["verify"] 無界累加，並讓
+        `manager.resume_workflow_run` 在同一 tick 內撞上已改寫的
+        `source_revision` 造成 workflow job binding mismatch，形成永久重觸發
+        迴圈。`claim_key` 同步後，下一次 automatic scan 只要 authority 沒有
+        再變，觸發條件即為假，reset 只在 authority 真的前進時才會再次發生。
         """
 
         index = self._find_workflow_run_index(run_id)
@@ -1955,6 +1967,11 @@ class JobRegistry:
                 "verify": current.attempts.get("verify", 0) + 1,
             },
             gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            # #373 根治：claim_key 必須與 authority_digest 同步重算（見上方
+            # docstring），否則觸發條件永久為真，形成每 tick 重新 reset 的迴圈。
+            claim_key=claim_key_for_authority_digest(
+                repo=current.repo, work_id=current.work_id, authority_digest=authority_digest
+            ),
             source_revision=authority_digest,
             verified_head=None,
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),

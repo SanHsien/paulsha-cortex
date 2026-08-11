@@ -901,17 +901,36 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
             raise ValueError("active workflow pre-freeze identity digest missing")
 
 
+def claim_key_for_authority_digest(*, repo: str, work_id: str, authority_digest: str) -> str:
+    """Deterministic ``claim:v1:...`` key for an exact (repo, work_id,
+    authority_digest) triple.
+
+    Factored out of ``build_claim_key`` (#373) so an in-place authority-digest
+    rewrite — ``registry._manager_reset_workflow_for_authority_restart`` —
+    can re-derive the same key a fresh claim would produce for that digest,
+    without needing the full ``WorkAuthority`` object. Keeping ``claim_key``
+    in sync with ``source_revision`` after an authority restart is the fix
+    for #373: previously the reset only rewrote ``source_revision``, leaving
+    ``claim_key`` permanently mismatched against
+    ``work_actions._expected_claim_key(authority)`` — every subsequent
+    automatic scan tick re-triggered the same reset, stripping the
+    ``needs_human`` facet and re-raising the workflow job binding mismatch
+    forever.
+    """
+    payload = {"repo": repo, "work_id": work_id, "authority_digest": authority_digest}
+    digest = verification.canonical_json_hash(payload)
+    return f"claim:v1:{digest}"
+
+
 def build_claim_key(candidate: ClaimCandidate) -> str:
     _validate_candidate(candidate)
     if not candidate.source_revisions:
         raise ValueError("new claim requires authoritative source revisions")
-    payload = {
-        "repo": candidate.repo,
-        "work_id": candidate.work_id,
-        "authority_digest": work_authority_digest(candidate.authority),
-    }
-    digest = verification.canonical_json_hash(payload)
-    return f"claim:v1:{digest}"
+    return claim_key_for_authority_digest(
+        repo=candidate.repo,
+        work_id=candidate.work_id,
+        authority_digest=work_authority_digest(candidate.authority),
+    )
 
 
 def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
