@@ -5925,6 +5925,36 @@ class _PlanningPublicationTransaction:
                 raise PlanningPublicationDrift("planning uncommitted rollback drift") from exc
 
 
+# #416：`_publish_planning_artifacts` 對「檔案已存在但無/與目前 authority
+# 不符」一律 fail-closed（見下方兩處 raise），這正是 abandon 未回滾已發佈
+# 殘留檔（`work_actions._gc_abandoned_planning_artifacts` 修復前的缺口）撞見
+# 下一世代重新發佈同一 destinations 時的典型死鎖地雷特徵——屬環境／狀態
+# 殘留，不是模型內容缺陷。這兩個訊息子字串必須與下方兩個 raise 的字面文字
+# 完全一致，`_is_planning_authority_residue_failure` 才能正確辨識。
+_PLANNING_AUTHORITY_RESIDUE_MARKERS = (
+    "planning artifact lacks current planning authority",
+    "planning artifact current authority drift",
+)
+
+
+def _is_planning_authority_residue_failure(reason: str | None) -> bool:
+    """判斷 brainstorm not-ready 的 reason 是否為 #416 的 authority 殘留死鎖。
+
+    只窄判斷 `run_heterogeneous_brainstorm` 對 `artifact_writer` 例外包出的
+    `primary-artifact-write-rejected: ...` 前綴、且訊息命中
+    `_PLANNING_AUTHORITY_RESIDUE_MARKERS` 兩個明確子字串之一。
+    `_publish_planning_artifacts` 其餘的內容型驗證錯誤（schema 不合法、路徑
+    逃出 governed roots、artifact 未通過驗收……）刻意不在此範圍內，維持
+    #393 既有的 `content` 分類與 fail-closed 意圖，不擴大分類映射。
+    """
+
+    return (
+        reason is not None
+        and reason.startswith("primary-artifact-write-rejected:")
+        and any(marker in reason for marker in _PLANNING_AUTHORITY_RESIDUE_MARKERS)
+    )
+
+
 def _publish_planning_artifacts(
     root_value: str,
     rows: object,
@@ -8634,12 +8664,18 @@ def apply_workflow_action(
     )
     if result.state != "ready" or result.gate_refs.brainstorm_peer is None:
         publication.rollback()
-        # #393：brainstorm 未收斂屬內容缺陷（非 runtime 環境問題），
-        # classification 歸 `content`——`_read_planning_failure_record` 仍接受
+        # #393：brainstorm 未收斂預設歸內容缺陷（非 runtime 環境問題），
+        # classification 落 `content`——`_read_planning_failure_record` 仍接受
         # 此值，但 `_resume_decision` 對 `content` 一律不浮現 recover-planning
         # （見 claim.py 的 fail-closed 判準），行為與 issue 393 的 fail-closed
         # 意圖一致。`result.reason` 理論上不應為空，仍防禦性 fallback 避免
         # evidence 的 reason 欄位落空字串。
+        # #416：唯一例外——reason 命中 `_is_planning_authority_residue_failure`
+        # 判準時（abandon 未回滾的發佈殘留撞見 `_publish_planning_artifacts`
+        # 的 authority fail-closed），這其實是環境／狀態殘留而非模型內容
+        # 缺陷，改歸 `environment`，讓 `_resume_decision` 可以浮現
+        # recover-planning，不必再燒一個世代改名重識別才能繞過。
+        brainstorm_not_ready_reason = result.reason or "brainstorm-not-ready"
         run = registry._manager_update_workflow_run(
             run.run_id,
             facets=("needs_human",),
@@ -8647,8 +8683,12 @@ def apply_workflow_action(
             evidence_refs=_record_planning_failure_evidence(
                 run,
                 coordinator_root=transaction_root,
-                classification="content",
-                reason=result.reason or "brainstorm-not-ready",
+                classification=(
+                    "environment"
+                    if _is_planning_authority_residue_failure(brainstorm_not_ready_reason)
+                    else "content"
+                ),
+                reason=brainstorm_not_ready_reason,
             ),
         )
         # #391：run_heterogeneous_brainstorm 沒能收斂到 ready 狀態時，同樣的

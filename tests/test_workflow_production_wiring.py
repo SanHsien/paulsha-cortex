@@ -447,6 +447,110 @@ def test_brainstorm_not_ready_logs_reason_before_needs_human(
     )
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "primary-artifact-write-rejected: ValueError: planning artifact lacks current "
+        "planning authority: docs/superpowers/specs/fix-416-design.md",
+        "primary-artifact-write-rejected: ValueError: planning artifact current authority "
+        "drift: docs/superpowers/specs/fix-416-design.md",
+    ],
+)
+def test_planning_authority_residue_write_rejection_is_environment_classified(reason: str) -> None:
+    """issue #416（選做修法 3）：`_publish_planning_artifacts` 對「已存在但無/與
+    目前 authority 不符」的檔案一律 fail-closed（見 manager.py
+    `_publish_planning_artifacts` 的兩處 raise），正是 abandon 未回滾發佈殘留
+    撞見下一世代重新發佈同一 destinations 的死鎖地雷特徵——屬環境／狀態殘留
+    而非模型內容缺陷，`manager._is_planning_authority_residue_failure` 必須把
+    它辨識出來，好讓呼叫端可以改歸 `environment`（進而讓
+    recover-planning 可用）。"""
+
+    assert manager._is_planning_authority_residue_failure(reason) is True
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        None,
+        "no-heterogeneous-planner",
+        "question-pack-malformed: RuntimeError: questioner exploded",
+        # #416 判準刻意窄：write-rejected 前綴存在，但底層錯誤不是 authority
+        # 殘留（例如整合出的路徑逃出 governed roots），仍必須維持 content。
+        "primary-artifact-write-rejected: ValueError: planning artifact path outside "
+        "governed roots",
+    ],
+)
+def test_planning_authority_residue_classifier_stays_content_for_unrelated_reasons(
+    reason: str | None,
+) -> None:
+    """反向情境：非 authority 殘留特徵的失敗（含 write-rejected 但底層是其他
+    內容型驗證錯誤）必須維持既有 `content` 分類，不擴大 #393 的分類映射。"""
+
+    assert manager._is_planning_authority_residue_failure(reason) is False
+
+
+def test_brainstorm_authority_residue_write_rejection_records_environment_and_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue #416 端到端：`run_heterogeneous_brainstorm` 因 `_publish_planning_
+    artifacts` 的 authority fail-closed 回 `primary-artifact-write-rejected:
+    ValueError: planning artifact lacks current planning authority: ...` 時，
+    `apply_workflow_action` 必須把 evidence 落成 `environment`（而不是 #393
+    預設的 `content`），讓 `_planning_failure_hint`／`_read_planning_failure_
+    record` 顯示可 recover-planning——修法前這條分支恆為 `content`，
+    recover-planning 永遠不可用，只能改名重識別（issue 內文記載的短期實操）
+    燒一個世代繞過。
+    """
+
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    args = _workflow_args(manifest_path, tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "gpt-primary",
+                "independence_domain": "openai", "capabilities": ["planning"],
+            }
+        ]
+    )
+    residue_reason = (
+        "primary-artifact-write-rejected: ValueError: planning artifact lacks current "
+        "planning authority: docs/superpowers/specs/fix-416-design.md"
+    )
+    monkeypatch.setattr(
+        manager,
+        "run_heterogeneous_brainstorm",
+        lambda **_: BrainstormResult(
+            state="needs_human",
+            reason=residue_reason,
+            secondary_domain=None,
+            gate_refs=PlanningGateRefs(),
+        ),
+    )
+
+    result = manager.apply_workflow_action(
+        registry,
+        args=args,
+        identity_registry=identities,
+        primary_questioner=lambda *a, **k: None,
+        secondary_planner=lambda *a, **k: None,
+        primary_integrator=lambda *a, **k: None,
+        coordinator_root=tmp_path,
+    )
+
+    persisted = registry.get_workflow_run(result["run_id"])
+    assert persisted.facets == ("needs_human",)
+    assert result["reason"] == residue_reason
+    _assert_planning_failure_evidence_recoverable(
+        coordinator_root=tmp_path,
+        persisted=persisted,
+        classification="environment",
+        reason=residue_reason,
+    )
+
+
 def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
