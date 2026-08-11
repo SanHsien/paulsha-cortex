@@ -12,6 +12,7 @@ from .contract_command import build_dispatch_prompt
 from .dispatcher import _default_git_runner
 from .launcher import AgentLauncher, LaunchHandle
 from .model_identities import load_model_identities
+from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
 from . import verification
 
 # is_satisfied predicate 型別：收 slice_id，回該相依是否「已滿足」（可釋放下游）。
@@ -454,10 +455,19 @@ def dispatch_ready(
     handoff_dir: str = DEFAULT_HANDOFF_DIR,
     identity_registry=None,
     launcher_factory=None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> list[dict]:
     """算就緒集，對每單位經注入的 headless AgentLauncher 各啟一個 agent（一單位一 job）。
 
     隔離靠 per-worktree headless session，故並行安全。
+
+    spawn_admission（#381）：就緒集在同一次呼叫內背靠背 spawn 多個 agent 時，
+    同一 provider（executor CLI，例如 copilot 啟動時連續探測 GitHub `/user`
+    約 6-7 次）會瞬間把獨立於 core rate_limit 的 quota bucket 打爆。真正 launch
+    前先呼叫 ``limiter.admit(provider)``：同一 provider 未跑滿最小間隔就等待，
+    不同 provider 互不阻塞，spawn 成功即釋放（不佔住 job 的整個執行期）。
+    未注入（``None``）時解析為零間隔 no-op，與過去「完全沒有這個參數」的行為
+    等價——只有呼叫端顯式建構並注入 limiter 才會真的節流。
 
     fail-fast（reviewer #112-3）：manager 自主 fan-out 一律走 headless launcher。
     persona 契約 prompt 是多行文字，舊 tmux pane 路徑用 `send-keys -l` 會把每個
@@ -487,6 +497,7 @@ def dispatch_ready(
             launcher = commit_required_factory()
     runner = git_runner or _default_git_runner
     resolved_identity_registry = identity_registry
+    limiter = resolve_limiter(spawn_admission)
     jobs: list[dict] = []
     errors: list[tuple[str, Exception]] = []
     for m in ready:
@@ -513,6 +524,7 @@ def dispatch_ready(
             active_launcher = launcher
             executor = m.get("executor")
             model_id = m.get("model_id")
+            identity = None
             if isinstance(executor, str) and executor and isinstance(model_id, str) and model_id:
                 if resolved_identity_registry is None:
                     resolved_identity_registry = load_model_identities()
@@ -561,6 +573,11 @@ def dispatch_ready(
                 slice_id=slice_id,
                 builder_job_id=job.get("job_id"),
                 dispatch_base=base_sha or dispatch_head,
+            )
+            # #381：真正 spawn 前才 admit——記錄下這次要用的 job row 之後、
+            # Popen 之前，讓等待時間不計入「job 已在跑」的錯覺。
+            limiter.admit(
+                resolve_provider(identity=identity, executor=executor, launcher=active_launcher)
             )
             handle = active_launcher.launch(
                 slice_id=slice_id,
