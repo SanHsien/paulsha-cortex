@@ -95,6 +95,96 @@ class SliceActionFlagTests(unittest.TestCase):
         self.assertEqual(args.slice_id, "slice-a")
         self.assertEqual(args.action, "retry-build")
         self.assertEqual(args.actor, "operator")
+        self.assertIsNone(args.review_executor)
+        self.assertIsNone(args.review_model)
+
+    def test_slice_action_help_mentions_review_identity_override(self) -> None:
+        # #396 item 4：retry-review 落 needs_human(reviewer-identity-missing) 時，
+        # slice-action 介面先前沒有 --review-executor/--review-model 可帶——
+        # 比照 complete/tick 既有的 identity override 機制補上。
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["slice-action", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("--review-executor", buf.getvalue())
+        self.assertIn("--review-model", buf.getvalue())
+        self.assertIn("foreign reviewer", buf.getvalue())
+
+    def test_slice_action_parses_review_identity_override(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "slice-action", "slice-a", "retry-review", "--actor", "operator",
+                "--review-executor", "codex", "--review-model", "gpt-5.4",
+            ]
+        )
+        self.assertEqual(args.review_executor, "codex")
+        self.assertEqual(args.review_model, "gpt-5.4")
+
+    def test_slice_action_review_identity_choices_reject_unknown_executor(self) -> None:
+        parser = _build_parser()
+        with self.assertRaises(SystemExit) as exc:
+            parser.parse_args(
+                [
+                    "slice-action", "slice-a", "retry-review", "--actor", "operator",
+                    "--review-executor", "cg",
+                ]
+            )
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_slice_action_forwards_review_identity_into_submitted_request(self) -> None:
+        submitted = []
+        rc = cli.main(
+            [
+                "slice-action", "slice-a", "retry-review", "--actor", "operator",
+                "--review-executor", "codex", "--review-model", "gpt-5.4",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=lambda kind, args, actor: submitted.append(
+                (kind, args, actor)
+            )
+            or "req-slice-1",
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"launched": True},
+            },
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "slice-action")
+        self.assertEqual(
+            submitted[0][1],
+            {
+                "slice_id": "slice-a",
+                "action": "retry-review",
+                "actor": "operator",
+                "review_executor": "codex",
+                "review_model": "gpt-5.4",
+            },
+        )
+
+    def test_slice_action_omits_review_identity_when_not_provided(self) -> None:
+        # 沒帶 --review-executor/--review-model 時 request args 維持既有形狀
+        # （不夾帶 None 值），不影響既有 daemon 端測試對 args 字典的精確比對。
+        submitted = []
+        rc = cli.main(
+            ["slice-action", "slice-a", "retry-build", "--actor", "operator"],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=lambda kind, args, actor: submitted.append(
+                (kind, args, actor)
+            )
+            or "req-slice-2",
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {},
+            },
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            submitted[0][1],
+            {"slice_id": "slice-a", "action": "retry-build", "actor": "operator"},
+        )
 
 
 class WorkActionFlagTests(unittest.TestCase):
