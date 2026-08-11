@@ -21,7 +21,13 @@ STEP_GATE_RESULTS = frozenset({"pending", "running", "passed", "failed", "needs_
 # #205：run-scoped 模型鏈覆寫／解析結果三段固定為 planner／builder／reviewer，
 # 與 WorkflowStep.persona 的合法值對齊（見 deck.schema 對 persona 的定義）。
 MODEL_CHAIN_PERSONAS = frozenset({"planner", "builder", "reviewer"})
-MODEL_CHAIN_RESOLUTION_SOURCES = frozenset({"override", "registry"})
+# #452 C：source 值域擴充——"patchmud-profile"（該段身分帶該 persona 的實測
+# 側寫）／"default-envelope"（查表投影落在 DEFAULT_ENVELOPE 保守預設）。
+# "registry" 保留為既有 run 的 legacy 值（#452 前的紀錄照舊可載入）；新紀錄
+# 一律記 override／patchmud-profile／default-envelope 三者之一。
+MODEL_CHAIN_RESOLUTION_SOURCES = frozenset(
+    {"override", "registry", "patchmud-profile", "default-envelope"}
+)
 COMBO_SELECTION_SOURCES = frozenset({"task-type-auto", "explicit-override", "bypass-default"})
 
 
@@ -46,8 +52,9 @@ def _validate_model_chain_override(value: object, *, field_name: str) -> None:
 
 
 def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
-    """#205 D5：解析結果稽核紀錄——{persona: {executor, model_id,
-    independence_domain, source}}，source 只能是 override 或 registry。"""
+    """#205 D5／#452 C：解析結果稽核紀錄——{persona: {executor, model_id,
+    independence_domain, source}}，source ∈ MODEL_CHAIN_RESOLUTION_SOURCES
+    （override／registry(legacy)／patchmud-profile／default-envelope）。"""
     if value is None:
         return
     if not isinstance(value, dict):

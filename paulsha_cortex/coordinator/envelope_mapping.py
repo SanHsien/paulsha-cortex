@@ -22,6 +22,16 @@ from typing import Mapping
 
 from paulsha_cortex.deck.schema import BAND_LEVELS
 
+# #452 schema v3 落地後，封套常數的單一真值搬移至 model_identities.py
+# （#454 spec 非目標第三條）；本模組 re-export 既有名稱維持 API 相容。
+from .model_identities import (
+    ACCEPTANCE_MODES_DOMAIN,
+    CONSISTENCY_SCOPE_DOMAIN,
+    DEFAULT_ENVELOPE,
+    ENVELOPE_FIELDS,
+    ENVELOPE_SOURCE_DEFAULT as SOURCE_DEFAULT,
+    ENVELOPE_SOURCE_MEASURED as SOURCE_MEASURED,
+)
 from .workflow import MODEL_CHAIN_PERSONAS
 
 #: 本模組支援的 patchmud report schema 版本（report.yaml 頂層 ``schema_version``）。
@@ -37,35 +47,6 @@ BAND_RULE_ID = "clear-rate-ladder-v1"
 _YELLOW_MIN_RATIO = (3, 4)  # clear_rate ≥ 3/4 → 收 yellow
 _GREEN_MIN_RATIO = (1, 4)  # clear_rate ≥ 1/4 → 收 green
 
-#: `#209` R2 的兩個封閉值域全集（宣告順序即輸出的 canonical 順序）。
-CONSISTENCY_SCOPE_DOMAIN = (
-    "code",
-    "test",
-    "spec",
-    "openspec",
-    "changelog",
-    "docs",
-    "pr",
-    "issue",
-)
-ACCEPTANCE_MODES_DOMAIN = (
-    "focused_tests",
-    "repo_gate",
-    "live_evidence",
-    "github_closure",
-)
-
-#: 封套四欄位名（`#209` R2；輸出 dict 的 key 集合固定為此四欄）。
-ENVELOPE_FIELDS = (
-    "accepts_bands",
-    "invariant_ceiling",
-    "consistency_scope",
-    "acceptance_modes",
-)
-
-SOURCE_MEASURED = "measured"
-SOURCE_DEFAULT = "default"
-
 # 逐欄 provenance 理由碼（穩定字串，供 #452 CLI diff 預覽與測試斷言）。
 REASON_MEASURED_CLEAR_RATE = f"measured:{BAND_RULE_ID}"
 REASON_BELOW_GREEN_FLOOR = f"measured:{BAND_RULE_ID}:below-green-floor"
@@ -79,28 +60,6 @@ REASON_NO_ARTIFACT_CLASS_ANNOTATION = (
 REASON_FOCUSED_TESTS_ONLY = (
     "not-measurable:deck-acceptance-covers-focused-tests-only"
 )
-
-
-def _persona_default(bands: tuple[str, ...]) -> Mapping[str, object]:
-    return {
-        "accepts_bands": bands,
-        "invariant_ceiling": None,
-        "consistency_scope": CONSISTENCY_SCOPE_DOMAIN,
-        "acceptance_modes": ACCEPTANCE_MODES_DOMAIN,
-    }
-
-
-#: `#453` R1–R4 定案的 per-persona 保守預設封套（單一真值；值為 tuple 防止
-#: 呼叫端誤改常數）。builder／reviewer 不含 red（#223 攔截鏈下 red 不可達
-#: build／review）；planner 全值域含 red（needs_decomposition 收斂路徑必需）；
-#: `invariant_ceiling` 為 bypass sentinel ``None``，MUST NOT 讀成 0。
-#: `#452` schema v3 落地查表投影時 SHALL 以本常數為單一真值（屆時得整體搬移至
-#: ``model_identities.py``，本模組改 import，不得出現第二份定值）。
-DEFAULT_ENVELOPE: Mapping[str, Mapping[str, object]] = {
-    "planner": _persona_default(tuple(BAND_LEVELS)),
-    "builder": _persona_default(tuple(BAND_LEVELS[:2])),
-    "reviewer": _persona_default(tuple(BAND_LEVELS[:2])),
-}
 
 
 class EnvelopeMappingError(ValueError):

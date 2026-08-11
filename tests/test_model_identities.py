@@ -23,13 +23,14 @@ def _completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
     )()
 
 
-def test_packaged_v2_registry_has_google_agy_default() -> None:
+def test_packaged_v3_registry_has_google_agy_default() -> None:
     registry = load_model_identities()
 
     agy = registry.require("agy", AGY_MODEL_ID)
-    assert registry.schema_version == 2
+    assert registry.schema_version == 3
     assert agy.independence_domain == "google"
-    assert agy.capabilities == ("planning",)
+    # #456 R3：agy 追加 review 候選 capability（planning 綁定不變）。
+    assert agy.capabilities == ("planning", "review")
     assert agy.live_probe == "agy-plan-sandbox"
 
 
@@ -47,7 +48,7 @@ identities:
 
     registry = load_model_identities(tmp_path, use_packaged_default=True)
 
-    assert registry.schema_version == 2
+    assert registry.schema_version == 3
     assert registry.require("agy", AGY_MODEL_ID).independence_domain == "google"
     assert registry.require("codex", "gpt-primary").independence_domain == "openai"
 
@@ -78,16 +79,28 @@ identities:
         ("claude", "planner"),
         ("copilot", "build"),
         ("agy", AGY_MODEL_ID),
+        ("copilot", "gpt-5.4"),
+        ("claude", "sonnet"),
+        ("codex", "gpt-5.3-codex-spark"),
+        ("cg", "glm-5.2"),
     ]
 
 
 def test_packaged_default_without_custom_file_returns_packaged_only(tmp_path: Path) -> None:
     registry = load_model_identities(tmp_path, use_packaged_default=True)
 
+    # #452 B／#456 R3：packaged roster 登錄 5 個候選身分，agy 維持首位
+    # （PLANNER_PRIORITY 熱路徑選擇不變）。
     assert [
         (identity.executor, identity.model_id)
         for identity in registry.identities
-    ] == [("agy", AGY_MODEL_ID)]
+    ] == [
+        ("agy", AGY_MODEL_ID),
+        ("copilot", "gpt-5.4"),
+        ("claude", "sonnet"),
+        ("codex", "gpt-5.3-codex-spark"),
+        ("cg", "glm-5.2"),
+    ]
 
 
 def test_v2_registry_is_strict_and_rejects_unknown_or_duplicate_rows(tmp_path: Path) -> None:
