@@ -22,6 +22,24 @@ from paulsha_cortex.coordinator.launcher import (
 from paulsha_cortex.lib.processes import pid_exists
 
 
+def _wait_for_child_exit(pid: int, *, timeout: float = 10.0) -> bool:
+    """Bounded cross-platform wait that also reaps POSIX zombies."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.name != "nt":
+            try:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return not pid_exists(pid)
+            if waited_pid == pid:
+                return True
+        elif not pid_exists(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 class ArgvTests(unittest.TestCase):
     def test_copilot_argv(self) -> None:
         argv = build_copilot_argv(prompt="PROMPT", slice_id="slice-a", log_dir="/lg")
@@ -735,10 +753,9 @@ class ArgvTests(unittest.TestCase):
                     worktree=d,
                     log_dir=str(log_dir),
                 )
-                deadline = time.monotonic() + 10
-                while pid_exists(handle.pid) and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                self.assertFalse(pid_exists(handle.pid), "cg wrapper should exit")
+                self.assertTrue(
+                    _wait_for_child_exit(handle.pid), "cg wrapper should exit"
+                )
                 self.assertEqual(
                     Path(handle.log_path).read_text(encoding="utf-8"), "HELLO-FROM-STDIN",
                 )
@@ -1413,9 +1430,9 @@ class ArgvTests(unittest.TestCase):
                 # 斷言 MUST 在 with 內（tmpdir 尚未清除）
                 self.assertTrue(sentinel.is_file(), "sentinel exit 檔應由跨平台包裝寫出")
                 self.assertEqual(sentinel.read_text().strip(), "7")
-                deadline = time.monotonic() + 10
-                while pid_exists(handle.pid) and time.monotonic() < deadline:
-                    time.sleep(0.05)
+                self.assertTrue(
+                    _wait_for_child_exit(handle.pid), "process wrapper should exit"
+                )
         finally:
             launcher_module._ARGV_BUILDERS.clear()
             launcher_module._ARGV_BUILDERS.update(orig_builders)
