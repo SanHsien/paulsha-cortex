@@ -403,6 +403,162 @@ class ReviewVerdictValidationTests(unittest.TestCase):
 
         self.assertEqual(verdict["state"], "passed")
 
+    # issue #378：adversarial-review 卡對 rigged evidence（例如兩條對照臂共用
+    # 可變狀態、verdict 判準為恆真式）回報 blocking finding 時，必須真的走到
+    # review.py 既有的 fail-closed 通道——這裡直接驗證 verification-bypass／
+    # acceptance 兩個 category（cards.yaml 的 adversarial-review 任務描述指定
+    # 回報用的正是這兩個 category）都會使 state 落 rejected 且 finding.blocking
+    # 為真。validate_review_verdict 對任何 review 卡一視同仁（不吃 card_id），
+    # 故本測試同時證明「已接上」不需另外新建接線。
+    def test_verification_bypass_finding_from_rigged_evidence_is_blocking(self) -> None:
+        from paulsha_cortex.coordinator import review
+
+        verdict = review.validate_review_verdict(
+            {
+                "schema_version": 1,
+                "builder_job_id": "slice-a-1",
+                "reviewer_job_id": "slice-a-2",
+                "candidate": "b" * 40,
+                "launch_identity": {
+                    "executor": "codex",
+                    "model_id": "gpt-5.4",
+                    "independence_domain": "openai",
+                },
+                "findings": [
+                    {
+                        "category": "verification-bypass",
+                        "severity": "critical",
+                        "summary": "provider arm drains the shared PTY before the naive arm reads it",
+                        "evidence": [
+                            {
+                                "path": "tools/evidence-case-probes/case2_transient_burst.py",
+                                "line": 58,
+                                "detail": "naive arm opens the same slave_path after provider already read it to empty",
+                            },
+                        ],
+                        "recommendation": "run each arm against an independent fixture before trusting the verdict",
+                    }
+                ],
+            },
+            builder_job_id="slice-a-1",
+            reviewer_job_id="slice-a-2",
+            candidate="b" * 40,
+            launch_identity={
+                "executor": "codex",
+                "model_id": "gpt-5.4",
+                "independence_domain": "openai",
+            },
+        )
+
+        self.assertEqual(verdict["state"], "rejected")
+        self.assertTrue(verdict["findings"][0]["blocking"])
+
+    def test_acceptance_finding_from_tautological_verdict_is_blocking(self) -> None:
+        from paulsha_cortex.coordinator import review
+
+        verdict = review.validate_review_verdict(
+            {
+                "schema_version": 1,
+                "builder_job_id": "slice-a-1",
+                "reviewer_job_id": "slice-a-2",
+                "candidate": "b" * 40,
+                "launch_identity": {
+                    "executor": "codex",
+                    "model_id": "gpt-5.4",
+                    "independence_domain": "openai",
+                },
+                "findings": [
+                    {
+                        "category": "acceptance",
+                        "severity": "critical",
+                        "summary": "verdict predicate overlap_seconds > 0.0 is a tautology, not evidence of contention",
+                        "evidence": [
+                            {
+                                "path": "tools/evidence-case-probes/case4_exclusive_lease.py",
+                                "line": 20,
+                                "detail": "naive actor only sleeps; no shared resource is ever touched",
+                            },
+                        ],
+                        "recommendation": "require the naive arm to actually contend for the shared resource",
+                    }
+                ],
+            },
+            builder_job_id="slice-a-1",
+            reviewer_job_id="slice-a-2",
+            candidate="b" * 40,
+            launch_identity={
+                "executor": "codex",
+                "model_id": "gpt-5.4",
+                "independence_domain": "openai",
+            },
+        )
+
+        self.assertEqual(verdict["state"], "rejected")
+        self.assertTrue(verdict["findings"][0]["blocking"])
+
+    def test_gate_evaluation_rejects_when_adversarial_review_finds_rigged_evidence(self) -> None:
+        # 端到端串 manager.py 實際的兩段消費鏈：validate_review_verdict 產出
+        # normalized findings → build_gate_evaluation/validate_gate_evaluation
+        # （manager.py:4768-4788 的真實呼叫順序）。這是 _workflow_job_prompt
+        # 的 review 分支（manager.py:7681）實際消費的形狀，同樣不吃 card_id，
+        # 故 adversarial-review 卡與 code-review 卡走同一套 fail-closed 邏輯，
+        # 不需另外新建接線。
+        from paulsha_cortex.coordinator import review
+
+        reviewer_identity = {
+            "executor": "codex",
+            "model_id": "gpt-5.4",
+            "independence_domain": "openai",
+        }
+        builder_identity = {
+            "executor": "copilot",
+            "model_id": "gpt-5.4",
+            "independence_domain": "openai",
+        }
+        verdict = review.validate_review_verdict(
+            {
+                "schema_version": 1,
+                "builder_job_id": "slice-a-1",
+                "reviewer_job_id": "slice-a-2",
+                "candidate": "b" * 40,
+                "launch_identity": reviewer_identity,
+                "findings": [
+                    {
+                        "category": "verification-bypass",
+                        "severity": "critical",
+                        "summary": "setup-order dependency: provider arm mutates shared state before naive arm runs",
+                        "evidence": [
+                            {
+                                "path": "tools/evidence-case-probes/case2_transient_burst.py",
+                                "line": 58,
+                                "detail": "shared PTY drained first",
+                            },
+                        ],
+                        "recommendation": "isolate each arm's fixture",
+                    }
+                ],
+            },
+            builder_job_id="slice-a-1",
+            reviewer_job_id="slice-a-2",
+            candidate="b" * 40,
+            launch_identity=reviewer_identity,
+        )
+        evaluation = review.build_gate_evaluation(
+            slice_id="slice-a-adversarial-review",
+            state=str(verdict["state"]),
+            reason="blocking-findings",
+            builder_job_id="slice-a-1",
+            reviewer_job_id="slice-a-2",
+            candidate="b" * 40,
+            launch_identity={"builder": builder_identity, "reviewer": reviewer_identity},
+            findings=verdict["findings"],
+        )
+
+        validated = review.validate_gate_evaluation(evaluation)
+
+        self.assertEqual(validated["state"], "rejected")
+        self.assertTrue(validated["findings"][0]["blocking"])
+
     def test_verdict_evidence_accepts_null_line_and_rejects_absolute_path(self) -> None:
         from paulsha_cortex.coordinator import review
 

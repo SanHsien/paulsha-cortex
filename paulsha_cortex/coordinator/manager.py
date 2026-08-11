@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,13 +26,14 @@ from ..persona import gate, handoff
 from . import autonomy
 from . import completion
 from . import planning_runtime
+from . import provider_backoff
 from . import seams
 from . import review as foreign_review
 from . import terminal_contract
 from . import verification
 from .registry import slice_repin_eligible
 from ..config.paths import worktree_root_for
-from .claim import decomposition_route
+from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
 from .model_identities import (
     AGY_DOMAIN,
     AGY_LIVE_PROBE,
@@ -148,6 +150,44 @@ def _existing_manifest_job_id(path: Path) -> str | None:
         return None
     job_id = payload.get("job_id")
     return job_id if isinstance(job_id, str) else None
+
+
+def _supersede_handoff_manifest(
+    *,
+    handoff_dir: str,
+    slice_id: str,
+    action: str,
+    actor: str,
+    clock: Callable[[], str] = _utcnow,
+) -> None:
+    """操作者復原動作（recover-pre-candidate／abandon）後，替殘留 handoff manifest
+    補上 superseded 稽核標記（issue #383）。
+
+    `run_tick()`/`dispatch_gate_scan()` 的 fanout 放行判定改成與 registry 現況
+    對帳（`_manifest_still_blocks_fanout`），本函式失敗與否都不影響「復原後
+    下一輪 tick 能不能重派」這個驗收條件——這裡純粹補稽核可見性，讓直接檢視
+    manifest 檔的人（非只看 tick 行為）也能看出這份終局紀錄已經過期，而不是
+    誤以為它仍是這個 slice 的最新狀態。
+
+    不刪檔（保留稽核紀錄）；只在既有 payload 補 `superseded_at`/`superseded_by`/
+    `superseded_reason` 三欄後覆寫回同一路徑。manifest 不存在（尚未跑過任何
+    job）／壞檔／symlink／已標記過，皆 best-effort no-op——復原是主動作，
+    manifest 標記是次要動作，不得讓次要動作的失敗連帶讓復原本身 raise。
+    """
+    manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+    if manifest_path.is_symlink():
+        return
+    payload = _read_manifest_payload(manifest_path)
+    if payload is None or payload.get("superseded_at") is not None:
+        return
+    payload = dict(payload)
+    payload["superseded_at"] = clock()
+    payload["superseded_by"] = actor
+    payload["superseded_reason"] = action
+    try:
+        handoff.write_manifest(manifest_path, payload)
+    except OSError:
+        pass
 
 
 def _is_workflow_lane_job(job: dict) -> bool:
@@ -1288,6 +1328,13 @@ def apply_slice_action(
             consumed_at=consumed_at,
             result="ok",
         )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-abandon",
+            actor=actor,
+            clock=clock,
+        )
         latest = registry.get_slice(slice_id)
         return {
             "slice_id": slice_id,
@@ -1360,6 +1407,13 @@ def apply_slice_action(
             gate_state="pending",
             builder_job_id=None,
             candidate=None,
+        )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-recover-pre-candidate",
+            actor=actor,
+            clock=clock,
         )
         latest = registry.get_slice(slice_id)
         return {
@@ -1962,6 +2016,91 @@ def complete_tick(
     return summary
 
 
+def _manifest_still_blocks_fanout(registry, slice_id: str) -> bool:
+    """判斷殘留 handoff 終局 manifest 是否仍該擋本輪 fanout（issue #383 提案 2）。
+
+    manifest 只反映「某個 job 曾經跑到終局」，不代表「這個 slice 現在仍該被
+    跳過」——`apply_slice_action` 的 `recover-pre-candidate`／`abandon` 等復原
+    動作會把 registry state 撥回 `"pending"`（可重派），但沒有義務刪除舊
+    manifest（保留稽核紀錄）。此處與 registry 現況對帳，而不是只看 handoff
+    目錄有沒有檔案：
+
+    - registry 查無此 slice（從未建過 slice row，例如純 handoff-only 情境）
+      → 無法確認已復原，保守照舊擋。
+    - `state == "pending"` → 已被復原到可重派狀態，manifest 過期，不擋。
+    - 其餘狀態（needs_human/failed/building/verified/completed 等）→ 與
+      manifest 描述的終局一致，照舊擋。
+    """
+    if registry is None:
+        return True
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return True
+    return str(slice_row.get("state")) != "pending"
+
+
+def dispatch_gate_scan(
+    metas: list[dict],
+    *,
+    handoff_dir: str,
+    registry,
+) -> tuple[list[dict], dict[str, dict], list[dict]]:
+    """算出本輪允許進 `dispatch_ready()`/`ready_units()` 就緒判定的 meta 子集。
+
+    `run_tick()` 與 `manager_daemon.py` 的 `request_type == "fanout"` 分支皆呼叫
+    本函式，消除兩條路徑各自維護一份過濾邏輯導致的分歧（issue #383 複驗指出
+    「fanout 路徑不只沒 already_terminal 過濾、連 in-flight active 過濾也沒
+    有」）。兩層過濾疊加：
+
+    1. in-flight 過濾：registry 中仍 dispatched/running 的 job 對應 slice 本趟
+       不重派（同一 slice 一 job 不變量，review F-A）。
+    2. handoff 終局過濾：已有 handoff 終局紀錄（needs_human/failed/passed/
+       verified 皆算）的 slice 預設不重派（issue #339 冪等）——但終局是否仍
+       該擋，改與 registry 現況對帳而非只看檔案存不存在（`_manifest_still_blocks_fanout`，
+       issue #383 提案 2），避免復原後的 slice 被殘留 manifest 永久靜默跳過。
+
+    回 `(fanout_metas, already_terminal, needs_human)`：
+    - `fanout_metas`：真正該餵給 `dispatch_ready()` 的子集。
+    - `already_terminal`：slice_id -> manifest payload，供呼叫端組 needs_human
+      清單用途——不論是否阻擋 fanout 皆收，維持既有回報語意（不受本次對帳
+      影響，複驗要求 needs_human 回傳語意不變）。
+    - `needs_human`：manifest `gate_status == "needs_human"` 的清單（維持既有
+      語意；即使已復原也照列，這是操作者可見的歷史軌跡，不是「靜默」問題）。
+    """
+    already_terminal: dict[str, dict] = {}
+    needs_human: list = []
+    blocking: set[str] = set()
+    for meta in metas:
+        slice_id = meta.get("slice_id") if isinstance(meta, dict) else None
+        if not isinstance(slice_id, str) or not slice_id:
+            continue
+        manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        already_terminal[slice_id] = payload
+        if payload.get("gate_status") == "needs_human":
+            needs_human.append(
+                {
+                    "slice_id": slice_id,
+                    "gate_reason": payload.get("gate_reason"),
+                    "handoff_path": str(manifest_path),
+                }
+            )
+        if _manifest_still_blocks_fanout(registry, slice_id):
+            blocking.add(slice_id)
+
+    active: set[str] = set()
+    if registry is not None:
+        active = {j.get("task") for j in registry.list_jobs() if j.get("status") in IN_FLIGHT_STATUSES}
+    fanout_metas = [m for m in metas if m.get("slice_id") not in active and m.get("slice_id") not in blocking]
+    return fanout_metas, already_terminal, needs_human
+
+
 def run_tick(
     dispatcher,
     *,
@@ -2020,47 +2159,19 @@ def run_tick(
     # 不論 dispatch_skipped 與否都要掃描——這段刻意放在 idle 判斷之前、兩分支共用，
     # 因為「idle gate 擋不擋新工作」跟「有沒有 job 卡在 needs_human 待人工」是兩件事，
     # 高負載（not-idle）時操作者更需要看到 needs_human 清單，不能被 idle-skip 短路成空清單。
-    already_terminal: dict[str, dict] = {}
-    needs_human: list = []
-    for meta in metas:
-        slice_id = meta.get("slice_id") if isinstance(meta, dict) else None
-        if not isinstance(slice_id, str) or not slice_id:
-            continue
-        manifest_path = Path(handoff_dir) / f"{slice_id}.json"
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        already_terminal[slice_id] = payload
-        if payload.get("gate_status") == "needs_human":
-            needs_human.append(
-                {
-                    "slice_id": slice_id,
-                    "gate_reason": payload.get("gate_reason"),
-                    "handoff_path": str(manifest_path),
-                }
-            )
+    # fanout_metas 已與 registry 現況對帳（dispatch_gate_scan，issue #383 提案 2）：
+    # 復原動作（recover-pre-candidate 等）把 slice 撥回 pending 後，殘留的舊終局
+    # manifest 不再讓它被永久跳過。
+    registry = getattr(dispatcher, "_registry", None)
+    fanout_metas, already_terminal, needs_human = dispatch_gate_scan(
+        metas, handoff_dir=handoff_dir, registry=registry
+    )
     # idle gate 只擋「派工側（新工作，會啟 agent，昂貴）」；完成側（poll→manifest，便宜的
     # 回收/記帳）一律跑，否則高負載時 job 完成/失敗狀態與下游釋放會被埋住（review F-C）。
     if require_idle and not idle.is_idle(max_load=max_load, probe=idle_probe):
         dispatch_skipped: str | bool = "not-idle"
     else:
         dispatch_skipped = False
-        # 冪等：跳過 registry 中已有 dispatched/running job 的 slice，避免 oneshot+timer
-        # 反覆對同一 slice 重派（review F-A：一 slice 一 job 不變量）。
-        registry = getattr(dispatcher, "_registry", None)
-        active = (
-            {j.get("task") for j in registry.list_jobs() if j.get("status") in IN_FLIGHT_STATUSES}
-            if registry is not None
-            else set()
-        )
-        fanout_metas = [
-            m
-            for m in metas
-            if m.get("slice_id") not in active and m.get("slice_id") not in already_terminal
-        ]
         try:
             dispatched = autonomy.dispatch_ready(
                 fanout_metas,
@@ -6934,6 +7045,36 @@ def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path
     )
 
 
+def _provider_rate_limit_result(
+    exc: BaseException, *, run_id: str, current_phase: str, coordinator_root: str | Path
+) -> dict[str, object] | None:
+    """#370: translate a canonical-authority rate-limit failure into a soft,
+    non-raising resume result instead of the generic needs_human+re-raise
+    path used for every other ship_validator/authority failure.
+
+    Returns ``None`` (meaning: "not this case, handle it the old way") for
+    every exception except an :class:`AuthorityValidationError` carrying
+    :data:`REASON_PROVIDER_RATE_LIMITED_CANONICAL` -- a real authority
+    defect (malformed row, missing provider, genuine auth failure upstream,
+    ...) still needs_human+raises exactly as before.
+
+    Records a durable backoff deadline (survives daemon restart -- see
+    ``provider_backoff.py``) so the *next* resume attempt, operator-driven
+    or periodic-tick, can short-circuit before the window has passed
+    instead of re-hitting the same rate limit immediately.
+    """
+    if not (isinstance(exc, AuthorityValidationError) and exc.reason_code == REASON_PROVIDER_RATE_LIMITED_CANONICAL):
+        return None
+    provider_id = exc.provider_id or "github"
+    backoff = provider_backoff.record_backoff(coordinator_root, provider_id, now=time.time())
+    return {
+        "run_id": run_id,
+        "current_phase": current_phase,
+        "reason": "provider-rate-limited",
+        "retry_after_epoch": backoff.deadline_epoch,
+    }
+
+
 def resume_workflow_run(
     dispatcher,
     *,
@@ -6948,6 +7089,29 @@ def resume_workflow_run(
     if registry is None:
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
+    if ship_validator is not None:
+        # #370: a prior resume already recorded a durable rate-limit
+        # backoff for this run's GitHub provider (see
+        # `_provider_rate_limit_result` below) -- short-circuit *before*
+        # doing any work, so an operator retrying early (or a periodic
+        # tick landing before the window clears) gets an explicit "still
+        # rate limited, retry after <time>" instead of walking the whole
+        # resume flow only to hit ship_validator and the same wall again.
+        # Gated on `ship_validator is not None` because that's the only
+        # thing in this function that can ever touch GitHub provider
+        # authority; canonical claim:v1 runs are wired with one uniformly
+        # regardless of phase, so this deliberately pauses all phases for
+        # a rate-limited repo, not just the review->ship transition.
+        active = provider_backoff.active_backoff(
+            coordinator_root, f"github:{run.repo}", now=time.time()
+        )
+        if active is not None:
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "provider-rate-limited",
+                "retry_after_epoch": active.deadline_epoch,
+            }
     pre_resume_gate_status = run.gate_status
     retry_failed = False
     recovery_job_id: str | None = None
@@ -7125,7 +7289,15 @@ def resume_workflow_run(
                     coordinator_root=coordinator_root,
                     trusted_terminal=True,
                 )
-            except Exception:
+            except Exception as exc:
+                rate_limited = _provider_rate_limit_result(
+                    exc,
+                    run_id=run.run_id,
+                    current_phase=run.current_phase,
+                    coordinator_root=coordinator_root,
+                )
+                if rate_limited is not None:
+                    return rate_limited
                 current = registry.get_workflow_run(run.run_id)
                 registry._manager_update_workflow_run(
                     run.run_id,
@@ -7140,15 +7312,26 @@ def resume_workflow_run(
                     "current_phase": run.current_phase,
                     "reason": "ship-validator-unavailable",
                 }
-            return apply_workflow_action(
-                registry,
-                args={"action": "refresh-completion", "run_id": run.run_id},
-                identity_registry=identities,
-                ship_validator=ship_validator,
-                git_runner=getattr(dispatcher, "_git_runner", None),
-                coordinator_root=coordinator_root,
-                trusted_terminal=True,
-            )
+            try:
+                return apply_workflow_action(
+                    registry,
+                    args={"action": "refresh-completion", "run_id": run.run_id},
+                    identity_registry=identities,
+                    ship_validator=ship_validator,
+                    git_runner=getattr(dispatcher, "_git_runner", None),
+                    coordinator_root=coordinator_root,
+                    trusted_terminal=True,
+                )
+            except Exception as exc:
+                rate_limited = _provider_rate_limit_result(
+                    exc,
+                    run_id=run.run_id,
+                    current_phase=run.current_phase,
+                    coordinator_root=coordinator_root,
+                )
+                if rate_limited is not None:
+                    return rate_limited
+                raise
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
     jobs = [
         job
@@ -7298,7 +7481,15 @@ def resume_workflow_run(
             coordinator_root=coordinator_root,
             trusted_terminal=True,
         )
-    except Exception:
+    except Exception as exc:
+        rate_limited = _provider_rate_limit_result(
+            exc,
+            run_id=run.run_id,
+            current_phase=run.current_phase,
+            coordinator_root=coordinator_root,
+        )
+        if rate_limited is not None:
+            return rate_limited
         current = registry.get_workflow_run(run.run_id)
         registry._manager_update_workflow_run(
             run.run_id,

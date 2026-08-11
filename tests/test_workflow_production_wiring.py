@@ -958,6 +958,129 @@ def test_ship_validator_failure_persists_needs_human_on_review_complete_run(
     assert stopped.gate_status == "failed"
 
 
+def _rate_limited_ship_run(tmp_path: Path) -> tuple[JobRegistry, WorkflowRun]:
+    steps = tuple(
+        WorkflowStep.from_dict({**step.to_dict(), "gate_result": "passed"})
+        if step.phase != "ship"
+        else step
+        for step in _manifest().steps
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"review": 1},
+        candidate_head="a" * 40,
+        verified_head="a" * 40,
+        gate_status="running",
+    )
+    return registry, run
+
+
+def test_ship_validator_rate_limit_does_not_raise_or_require_operator(tmp_path: Path) -> None:
+    """#370: a canonical GitHub provider AuthorityValidationError classified
+    as rate-limited (REASON_PROVIDER_RATE_LIMITED_CANONICAL, raised by
+    `load_work_authority` inside a real `build_production_ship_validator`)
+    must not behave like an arbitrary ship_validator failure -- it's a known
+    transient condition that resolves itself, not something needing a human.
+    Unlike `test_ship_validator_failure_persists_needs_human_on_review_complete_run`
+    (an *unclassified* RuntimeError, which correctly still needs_human+raises),
+    this must return a soft "provider-rate-limited" result and leave needs_human
+    untouched -- so a plain periodic tick resume (no operator) naturally
+    retries once the durable backoff clears, no human required."""
+    from paulsha_cortex.coordinator.claim import (
+        REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+        AuthorityValidationError,
+    )
+
+    registry, run = _rate_limited_ship_run(tmp_path)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    calls = []
+
+    def rate_limited_validator(**kwargs):
+        calls.append(kwargs)
+        raise AuthorityValidationError(
+            "durable GitHub provider authority rate-limited",
+            reason_code=REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+            repo=run.repo,
+            work_id=run.work_id,
+            provider_id=f"github:{run.repo}",
+            field="status",
+        )
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path,
+        operator_resume=True,
+        ship_validator=rate_limited_validator,
+    )
+
+    assert len(calls) == 1
+    assert result["reason"] == "provider-rate-limited"
+    assert result["run_id"] == run.run_id
+    assert isinstance(result.get("retry_after_epoch"), float)
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in persisted.facets
+    assert persisted.current_phase == "review"
+
+    # Durable: the backoff deadline is now on disk under coordinator_root,
+    # readable independently of anything resume_workflow_run kept in memory.
+    from paulsha_cortex.coordinator import provider_backoff
+
+    active = provider_backoff.active_backoff(tmp_path, f"github:{run.repo}", now=0.0)
+    assert active is not None
+    assert active.deadline_epoch == result["retry_after_epoch"]
+
+
+def test_resume_before_backoff_deadline_short_circuits_without_calling_ship_validator(
+    tmp_path: Path,
+) -> None:
+    """#370 acceptance: "operator resume 在 deadline 前給明確限流中訊息，
+    而非立即重撞" -- a resume attempt made *before* a previously-recorded
+    backoff deadline must not invoke ship_validator (and therefore not
+    touch GitHub-derived authority) again at all."""
+    import time
+
+    from paulsha_cortex.coordinator import provider_backoff
+
+    registry, run = _rate_limited_ship_run(tmp_path)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    # Real wall-clock "now" -- resume_workflow_run's short-circuit check
+    # compares the durable deadline against `time.time()`, not a fake clock.
+    provider_backoff.record_backoff(tmp_path, f"github:{run.repo}", now=time.time())
+
+    def must_not_be_called(**_kwargs):
+        raise AssertionError("ship_validator must not be called before backoff deadline")
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path,
+        operator_resume=True,
+        ship_validator=must_not_be_called,
+    )
+
+    assert result["reason"] == "provider-rate-limited"
+    assert "retry_after_epoch" in result
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in persisted.facets
+
+
 @pytest.mark.parametrize("terminal_phase", ["merged", "done"])
 def test_post_merge_closure_skips_active_planning_path_reconciliation(
     tmp_path: Path,

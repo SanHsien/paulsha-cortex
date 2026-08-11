@@ -15,6 +15,8 @@ from typing import Callable, Mapping, Sequence
 from urllib.parse import quote
 from unittest.mock import patch
 
+from .github_rate_limit import is_rate_limit_signal
+
 DOCTOR_SCHEMA = "cortex-doctor/v1"
 AUTO_LABEL = "cortex:auto-on-going"
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -79,6 +81,38 @@ def _process(
     if not isinstance(returncode, int):
         return 1, ""
     return returncode, stdout if isinstance(stdout, str) else ""
+
+
+def _gh_auth_probe(runner: Runner) -> ProbeResult:
+    """#370: ``gh auth status`` exits non-zero on rate limit *and* on a
+    genuinely invalid credential -- exit code alone can't tell them apart,
+    and misreporting a rate limit as "authentication failed" sends
+    operators chasing a token that isn't actually broken (see #370's
+    runtime evidence: a secondary rate limit was misdiagnosed this way).
+    Classifies stderr/stdout the same way as the Monitor GitHub provider
+    (`monitor/providers.py`) and canonical authority classification
+    (`coordinator/claim.py`) so all three agree. Never echoes the raw
+    command output into the probe detail -- only a fixed, secret-free
+    string (see ``test_doctor_does_not_echo_credentials_from_failed_command``).
+    """
+    try:
+        raw = runner(["gh", "auth", "status"], shell=False, capture_output=True, text=True, timeout=45)
+    except Exception:
+        return ProbeResult("gh-auth", "fail", "authentication failed", True)
+    returncode = getattr(raw, "returncode", None)
+    if returncode == 0:
+        return ProbeResult("gh-auth", "pass", "authenticated", True)
+    stderr = getattr(raw, "stderr", "")
+    stdout = getattr(raw, "stdout", "")
+    message = "\n".join(value for value in (stderr, stdout) if isinstance(value, str))
+    if is_rate_limit_signal(message):
+        return ProbeResult(
+            "gh-auth",
+            "warn",
+            "GitHub rate limit exceeded -- wait for the window to reset before treating this as a credential failure",
+            False,
+        )
+    return ProbeResult("gh-auth", "fail", "authentication failed", True)
 
 
 def _valid_repo(value: str | None) -> bool:
@@ -812,10 +846,7 @@ def run_doctor(
             )
         )
     else:
-        auth_code, _ = _process(runner, ["gh", "auth", "status"])
-        probes.append(
-            ProbeResult("gh-auth", "pass" if auth_code == 0 else "fail", "authenticated" if auth_code == 0 else "authentication failed", True)
-        )
+        probes.append(_gh_auth_probe(runner))
         repo_code, repo_stdout = _process(
             runner,
             ["gh", "api", "--include", f"repos/{repo}"],
