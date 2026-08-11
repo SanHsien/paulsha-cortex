@@ -210,6 +210,116 @@ def test_resume_existing_needs_human_reenters_canonical_starter(tmp_path: Path) 
     assert result["result"]["run"]["facets"] == []
 
 
+def test_periodic_auto_claim_scan_retries_run_stuck_at_define(tmp_path: Path) -> None:
+    """issue #420 RED→GREEN：auto-claim 建立的 run 若在 `apply_workflow_action
+    (action="start")` 的 claim→define→plan 同步續推段中途被中斷（例如
+    `_load_planning_artifacts` 一類、未被任何 needs_human 分支接住的例外），
+    會停在 `current_phase="define"`、facets 乾淨、`brainstorm_required`
+    仍是預設 False——`decide_auto_claim` 對這個 authority 之後每輪都只會判定
+    `_resume_decision` 的 `action="resume"`（因為 `active_status=="ongoing"`）。
+
+    修復前：`_claim_action` 的既有-run 分支只在 `args["action"] == "resume"`
+    （即人工經 `cortex work resume` 觸發）才重呼叫 `workflow_starter`；
+    periodic auto-claim scan 固定帶 `args={"action": "auto-scan"}`，永遠不滿足
+    這個字面比對，導致 `workflow_starter` 永遠不會再被呼叫、run 永久卡在
+    define——這正是 explicit intake 在同一 request 內能同步跑 define→plan→
+    build、而 auto-claim 建的 run 卻無人接手續推的根因。
+
+    修復後：`automatic=True`（auto-claim scan 的呼叫方式）且
+    `decision.action == "resume"` 時也觸發同樣的重試，讓下一輪 periodic tick
+    的 auto-claim scan 能把這個 run 續推到 plan（甚至更後面）。
+    """
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    # reason=None -> facets=()，模擬「define 已建立、但續推被中斷」的乾淨卡住
+    # 狀態，不是 needs_human。
+    stuck = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, claim_key, None)
+    assert stuck.current_phase == "define"
+    assert stuck.facets == ()
+    assert stuck.brainstorm_required is False
+
+    calls: list[tuple[str, str | None]] = []
+
+    def retrying_starter(bound_authority, bound_claim_key, reason):
+        calls.append((bound_claim_key, reason))
+        # 模擬 start_canonical_workflow 重跑一次 define 續推段這次成功，
+        # 推進到 plan（比照 apply_workflow_action 的 report.complete 分支）。
+        return registry._manager_update_workflow_run(
+            stuck.run_id,
+            current_phase="plan",
+            attempts={**stuck.attempts, "plan": 1},
+            brainstorm_required=False,
+            facets=(),
+        )
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        runner=lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"labels": [{"name": "cortex:auto-on-going"}]}),
+            stderr="",
+        ),
+        workflow_registry=registry,
+        workflow_starter=retrying_starter,
+    )
+
+    assert calls == [(claim_key, None)]
+    assert result[0]["action"] == "resume"
+    assert result[0]["run"]["run_id"] == stuck.run_id
+    assert result[0]["run"]["current_phase"] == "plan"
+    assert registry.get_workflow_run(stuck.run_id).current_phase == "plan"
+
+
+def test_periodic_auto_claim_scan_does_not_retry_needs_human_run(tmp_path: Path) -> None:
+    """#420 修復的邊界：只有 `decision.action == "resume"`（active_status ==
+    "ongoing"，facets 乾淨）才在 auto-claim scan 觸發重試。needs_human run
+    的 `decision.action == "needs_human"`，不受影響——維持 #373 的守衛：
+    auto-claim 不得自動清除或重試 needs_human run，仍須等人工
+    `cortex work resume` 接手。
+    """
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    stuck = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, claim_key, "planning-runtime-unavailable")
+    assert stuck.facets == ("needs_human",)
+
+    def forbidden_starter(*args, **kwargs):
+        raise AssertionError(
+            "auto-claim scan must not re-invoke workflow_starter for a "
+            "needs_human run"
+        )
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        runner=lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"labels": [{"name": "cortex:auto-on-going"}]}),
+            stderr="",
+        ),
+        workflow_registry=registry,
+        workflow_starter=forbidden_starter,
+    )
+
+    assert result[0]["action"] == "needs_human"
+    assert registry.get_workflow_run(stuck.run_id).current_phase == "define"
+    assert registry.get_workflow_run(stuck.run_id).facets == ("needs_human",)
+
+
 def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
     tmp_path: Path,
 ) -> None:
