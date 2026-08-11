@@ -124,12 +124,16 @@ class SliceActionFlagTests(unittest.TestCase):
         self.assertEqual(args.review_model, "gpt-5.4")
 
     def test_slice_action_review_identity_choices_reject_unknown_executor(self) -> None:
+        # issue #442：`cg` 由「未知 executor」範例改為真正的合法選項（見
+        # test_coordinator_launcher.py 的 cg 回歸測試），這裡改用一個確定不在
+        # `_ARGV_BUILDERS` 的字面值，繼續守住「未知 executor 一律被 argparse
+        # choices 拒絕」這條契約本身，而不是巧合地依賴 cg 曾經未支援。
         parser = _build_parser()
         with self.assertRaises(SystemExit) as exc:
             parser.parse_args(
                 [
                     "slice-action", "slice-a", "retry-review", "--actor", "operator",
-                    "--review-executor", "cg",
+                    "--review-executor", "not-a-real-executor",
                 ]
             )
         self.assertEqual(exc.exception.code, 2)

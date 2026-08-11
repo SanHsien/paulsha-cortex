@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Added
+- **Issue #442（第一部分）：新增 `cg`（copilot API／glm-5.2 via llm-share）launcher 支援**：`launcher.build_cg_argv` 依 operator 提供並 smoke 驗證的介面契約（prompt 經 stdin、`--headless --stdin`、model 預設 `glm-5.2`、effort 合法值 low/medium/high/xhigh）組出 argv，登記進 `_ARGV_BUILDERS`；cg 為 zero-tool executor，`build_cg_argv`／`SubprocessLauncher.__init__` 對 commit_required／unsafe／builder 語境一律 raise，只服務 read-only 的 planner／reviewer。`SubprocessLauncher.launch()` 新增 stdin plumbing（`printf %s <prompt> | <inner argv> 2>/dev/null`），其餘 executor 零影響。詳見 `changelog.d/cg-launcher-support.md`。
+
 ## [0.1.5] - 2026-08-11
 
 ### Added

@@ -158,6 +158,7 @@ def build_wrapper_script(
     worktree: str,
     repo_root: str | None,
     run_gates: bool,
+    stdin_prompt: str | None = None,
 ) -> str:
     """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
 
@@ -170,9 +171,26 @@ def build_wrapper_script(
 
     gate 階段的 stdout/stderr 一律導向 /dev/null：JSONL log 是 terminal evidence 的
     來源，混入 gate 輸出會讓 ``_extract_terminal_json`` 讀到非 terminal 的內容。
+
+    ``stdin_prompt``（issue #442）：既有 copilot/claude/codex/agy 皆把 prompt 當作
+    argv 的一個元素；`cg`（見 `build_cg_argv`）改走「prompt 經 stdin」的介面
+    （`cg --headless --stdin`），argv 本身不含 prompt。非 None 時改以
+    ``printf %s <prompt> | <inner argv>`` 組出管線，把 prompt 經標準輸入餵給內層
+    命令；``$?``（bash 未開 pipefail 時）取自管線最後一個命令，即內層命令本身，
+    語意與既有「$? 為模型 exit code」不變。內層命令顯式 ``2>/dev/null``：cg 的
+    stderr 是人類可讀 summary banner（非 terminal evidence），Popen 層雖以
+    ``stderr=STDOUT`` 併入同一份 log fd，但那只重導向這個 bash 進程自己的 fd 2；
+    管線內命令的顯式重導向可覆寫，藉此讓 banner 不混入 JSONL log（下游
+    `_extract_terminal_json` 只能安全解析乾淨 stdout）。
     """
 
-    script = f'{shlex.join(inner_argv)}; printf %s "$?" > {shlex.quote(sentinel)}'
+    if stdin_prompt is None:
+        command = shlex.join(inner_argv)
+    else:
+        command = (
+            f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
+        )
+    script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
     if not run_gates or not repo_root:
         return script
     gate_argv = [
@@ -673,6 +691,69 @@ def build_agy_argv(
     return argv
 
 
+# cg（copilot API／glm-5.2 經 llm-share 巷道）的預設身分——operator 的
+# `$HOME/.local/bin/cg` thin wrapper 已固定 `HIPPO_COPILOT_ENV_FILE` 指向
+# llm-share env（含 `COPILOT_MODEL=glm-5.2`），這裡的常數只是 argv 沒收到明確
+# `model` 時的落地預設，實際身分仍由 operator 的 env file 決定。
+_CG_DEFAULT_MODEL = "glm-5.2"
+_CG_VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_CG_DEFAULT_EFFORT = "medium"
+
+
+def build_cg_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = None,
+    allow_unsafe: bool = False,
+    model: str | None = None,
+    read_only: bool = False,
+    review_only: bool = False,
+    commit_required: bool = False,
+    effort: str | None = None,
+) -> list[str]:
+    """Build the headless `cg`（copilot API／glm-5.2 via llm-share）invocation.
+
+    Operator-provided、smoke-verified 契約（issue #442）：
+    ``cg --model {MODEL} --effort {low|medium|high|xhigh} --headless --stdin``
+    ——prompt 經 stdin 傳入（不是 argv 參數，見 `SubprocessLauncher.launch` 的
+    stdin plumbing）、乾淨 response 寫到 stdout、summary banner 寫到 stderr、
+    exit 0 表示成功。`cg` wrapper 自帶 ``--available-tools=__none__`` ＋
+    ``--disable-builtin-mcps`` ＋ throwaway HOME：zero-tool，不能跑任何 tool、
+    不能寫檔、不能 commit。因此 cg 只能服務 read-only 的 planner／reviewer
+    persona，絕不可當 builder——``prompt``／``slice_id``／``log_dir``／
+    ``worktree``／``remote`` 是為了滿足與其餘 builder 共用的呼叫介面而接收，
+    實際不會進入回傳的 argv（prompt 由呼叫端經 stdin 餵入）。
+
+    比照 `build_agy_argv` 對 `allow_unsafe` 的拒絕模式：agy 與 cg 都是 read-only
+    planner，這裡同樣 fail-closed，而非靜默降級成安全形狀——commit_required／
+    unsafe／非 read-only-或-review-only 的「builder 語境」一律 raise，讓誤用在
+    建構期就顯性失敗，不會把一個從未被授權寫入的 executor 悄悄放進 builder 角色。
+    """
+    if allow_unsafe:
+        raise ValueError("cg executor does not support unsafe mode")
+    if commit_required:
+        raise ValueError("cg executor is zero-tool and cannot commit")
+    if not (read_only or review_only):
+        raise ValueError("cg executor requires read-only or review-only mode")
+    resolved_effort = effort or _CG_DEFAULT_EFFORT
+    if resolved_effort not in _CG_VALID_EFFORTS:
+        raise ValueError(
+            f"cg executor effort must be one of {sorted(_CG_VALID_EFFORTS)}, got {resolved_effort!r}"
+        )
+    return [
+        "cg",
+        "--model",
+        model or _CG_DEFAULT_MODEL,
+        "--effort",
+        resolved_effort,
+        "--headless",
+        "--stdin",
+    ]
+
+
 @runtime_checkable
 class AgentLauncher(Protocol):
     def launch(
@@ -693,18 +774,18 @@ class AgentLauncher(Protocol):
 # sandbox/approval 旗標怎麼關），寫一個對應的 `build_<executor>_argv`，仿照本檔
 # 其餘 builder 附近散落的「smoke 實證」註解方式留下驗證依據，再加進這個字典。
 #
-# `cg`（copilot API／glm-5.2 巷道，見 issue #396 item 1）刻意不在這裡：本 repo
-# 找不到任何 cg CLI 介面的文件或 smoke 紀錄，貿然假設它與 copilot 同介面（同旗標
-# 只是換 model）屬臆測——猜錯會把錯誤旗標打進一個從未驗證過的 CLI，比維持現狀
-# （fail-closed：`--executor cg` 在 argparse 層即被拒絕、`SubprocessLauncher("cg")`
-# 建構期即拋 `ValueError`）更危險。這是刻意保留的 extension point：要支援 cg，
-# 第一步是在能跑 cg 的環境對它的 CLI 做一次等價於本檔案 codex/copilot 附近那些
-# smoke 驗證的手動測試，再依那份證據寫 `build_cg_argv` 並加入下面的字典。
+# `cg`（copilot API／glm-5.2 巷道）自 issue #442 起已支援：#396 item 1 當時找不到
+# CLI 介面文件或 smoke 紀錄而刻意 out-of-scope；operator 已提供並 smoke 驗證介面
+# 契約（見 `build_cg_argv` docstring），故補上 `build_cg_argv` 並在此登記。cg 是
+# zero-tool（無法跑任何 tool／寫檔／commit），`build_cg_argv` 與
+# `SubprocessLauncher.__init__` 對 commit_required／allow_unsafe／非
+# read-only-或-review-only 的建構請求一律 raise，只服務 planner／reviewer 角色。
 _ARGV_BUILDERS = {
     "copilot": build_copilot_argv,
     "claude": build_claude_argv,
     "codex": build_codex_argv,
     "agy": build_agy_argv,
+    "cg": build_cg_argv,
 }
 
 
@@ -723,13 +804,21 @@ class SubprocessLauncher:
         review_only: bool = False,
         commit_required: bool = False,
         review_terminal_kind: str | None = None,
+        effort: str | None = None,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
         if executor == "agy" and allow_unsafe:
             raise ValueError("agy executor refuses unsafe mode")
+        if executor == "cg" and allow_unsafe:
+            raise ValueError("cg executor refuses unsafe mode")
         if (read_only or review_only) and executor == "copilot":
             raise ValueError("copilot executor has no enforced read-only planning mode")
+        # cg 是 zero-tool（見 build_cg_argv docstring）：與 copilot 相反，這裡要求
+        # 而非禁止 read-only/review-only——builder 語境（both False）在建構期即
+        # 顯性拒絕，不留給呼叫端在 launch() 時才踩空。
+        if executor == "cg" and not (read_only or review_only):
+            raise ValueError("cg executor requires read-only or review-only mode")
         if read_only and review_only:
             raise ValueError("launcher cannot be both planner-read-only and reviewer-read-only")
         if (read_only or review_only) and allow_unsafe:
@@ -754,10 +843,15 @@ class SubprocessLauncher:
         self._review_only = review_only
         self._commit_required = commit_required
         self._review_terminal_kind = review_terminal_kind
+        # cg-only：`--effort low|medium|high|xhigh`。其餘 executor 沒有對應概念
+        # （不同於 `model`，本 repo 目前沒有既有的「effort 來源」可直接映射），
+        # 存下不驗證——合法值集合在 `build_cg_argv` 驗證，未指定時落地預設
+        # `_CG_DEFAULT_EFFORT`；非 cg 的 executor 忽略此欄位。
+        self._effort = effort
 
     @property
     def executor(self) -> str:
-        """公開 executor CLI 家族（copilot/claude/codex/agy）。
+        """公開 executor CLI 家族（copilot/claude/codex/agy/cg）。
 
         #381：spawn admission limiter 需要在啟動前依 provider 分桶節流；
         沒有 per-slice identity 可查時，這是唯一能從已注入的 launcher
@@ -777,6 +871,7 @@ class SubprocessLauncher:
             read_only=True,
             review_only=False,
             commit_required=False,
+            effort=self._effort,
         )
 
     def as_review_only(self, *, terminal_kind: str) -> "SubprocessLauncher":
@@ -792,6 +887,7 @@ class SubprocessLauncher:
             review_only=True,
             commit_required=False,
             review_terminal_kind=terminal_kind,
+            effort=self._effort,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
@@ -810,6 +906,7 @@ class SubprocessLauncher:
             read_only=False,
             review_only=False,
             commit_required=True,
+            effort=self._effort,
         )
 
     def _should_run_gates(self, env: Mapping[str, str]) -> bool:
@@ -888,10 +985,15 @@ class SubprocessLauncher:
         # #396 item 3：claude 併入 commit_required 傳遞——builder-persona 的
         # as_commit_required() 轉換（autonomy.dispatch_ready）對三個 executor
         # 一視同仁，build_claude_argv 缺這個 kwarg 會讓轉換對 claude 變 no-op。
-        if self._executor in {"codex", "copilot", "claude"}:
+        # cg 併入同一份 kwarg（issue #442）：self._commit_required 對任何成功建構
+        # 的 cg launcher 恆為 False（見 __init__ 的 cg 專屬不變量），這裡顯式傳遞
+        # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
+        if self._executor in {"codex", "copilot", "claude", "cg"}:
             builder_kwargs["commit_required"] = self._commit_required
         if self._executor == "claude":
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
+        if self._executor == "cg":
+            builder_kwargs["effort"] = self._effort
         inner_argv = _ARGV_BUILDERS[self._executor](
             **builder_kwargs,
         )
@@ -922,6 +1024,10 @@ class SubprocessLauncher:
         # #261：同理清掉上一輪的 gate ledger，避免 harvest 讀到前一次的 gate 結果。
         ledger = terminal_contract.gate_ledger_path(log_path)
         Path(ledger).unlink(missing_ok=True)
+        # cg（issue #442）走 stdin 傳 prompt，不是 argv 參數（見 build_cg_argv）：
+        # 其餘 executor 維持既有「prompt 為 argv 一個元素」路徑，stdin_prompt=None
+        # 時 build_wrapper_script 的行為與改動前逐字相同（零影響）。
+        stdin_prompt = prompt if self._executor == "cg" else None
         script = build_wrapper_script(
             inner_argv=inner_argv,
             sentinel=sentinel,
@@ -929,6 +1035,7 @@ class SubprocessLauncher:
             worktree=worktree,
             repo_root=env.get("PSC_REPO_ROOT"),
             run_gates=self._should_run_gates(env),
+            stdin_prompt=stdin_prompt,
         )
         # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
         argv = ["bash", "-c" if self._review_only else "-lc", script]
