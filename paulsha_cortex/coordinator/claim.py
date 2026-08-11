@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.schema import BAND_LEVELS
+from paulsha_cortex.github_rate_limit import is_rate_limit_signal
 
 from . import verification
 
@@ -32,6 +33,10 @@ REASON_PROVIDER_MISSING_CANONICAL = "provider-authority-missing-canonical"
 REASON_PROVIDER_INVALID_CANONICAL = "provider-authority-invalid-canonical"
 REASON_PROVIDER_MISSING_LEGACY = "provider-authority-missing-legacy"
 REASON_PROVIDER_INVALID_LEGACY = "provider-authority-invalid-legacy"
+# #370：canonical provider 因 rate limit degraded 是暫時性的，與其他
+# authority-invalid 情境（missing/malformed/停擺）分開分類，讓 resume 的
+# durable backoff 能認得出「等待 reset 即可」而非「需要人工排查」。
+REASON_PROVIDER_RATE_LIMITED_CANONICAL = "provider-authority-rate-limited-canonical"
 
 _UNSAFE_LABEL_PREFIXES = ("/", "~")
 
@@ -501,13 +506,33 @@ def _authority_from_canonical_row(
         )
     revision = github.get("revision")
     last_success_at = github.get("last_success_at")
+    status = github.get("status")
     if (
-        github.get("status") != "ok"
+        status != "ok"
         or not isinstance(revision, str)
         or not revision
         or not isinstance(last_success_at, str)
     ):
-        if github.get("status") != "ok":
+        if status != "ok":
+            # #370：provider 因 rate limit 而 degraded 是暫時性的（reset 後
+            # 自然恢復），不是真正的 authority 損毀——upstream（resume 的
+            # durable backoff、Manager log）需要能不重新解析訊息文字就分辨
+            # 出這種情況，才能給出「限流中、稍後自動重試」而非要求人工
+            # 介入。訊號來源是 Monitor GitHubWorkProvider.scan() 寫入的
+            # diagnostics（見 monitor/providers.py），本身已用同一套
+            # github_rate_limit 分類器產生。
+            diagnostics = github.get("diagnostics")
+            if isinstance(diagnostics, list) and any(
+                isinstance(entry, str) and is_rate_limit_signal(entry) for entry in diagnostics
+            ):
+                raise AuthorityValidationError(
+                    "durable GitHub provider authority rate-limited",
+                    reason_code=REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+                    repo=repo_label,
+                    work_id=work_id_label,
+                    provider_id=provider_id,
+                    field="status",
+                )
             field = "status"
         elif not isinstance(revision, str) or not revision:
             field = "revision"

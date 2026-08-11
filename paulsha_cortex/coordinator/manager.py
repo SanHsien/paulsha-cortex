@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,13 +26,14 @@ from ..persona import gate, handoff
 from . import autonomy
 from . import completion
 from . import planning_runtime
+from . import provider_backoff
 from . import seams
 from . import review as foreign_review
 from . import terminal_contract
 from . import verification
 from .registry import slice_repin_eligible
 from ..config.paths import worktree_root_for
-from .claim import decomposition_route
+from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
 from .model_identities import (
     AGY_DOMAIN,
     AGY_LIVE_PROBE,
@@ -6815,6 +6817,36 @@ def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path
     )
 
 
+def _provider_rate_limit_result(
+    exc: BaseException, *, run_id: str, current_phase: str, coordinator_root: str | Path
+) -> dict[str, object] | None:
+    """#370: translate a canonical-authority rate-limit failure into a soft,
+    non-raising resume result instead of the generic needs_human+re-raise
+    path used for every other ship_validator/authority failure.
+
+    Returns ``None`` (meaning: "not this case, handle it the old way") for
+    every exception except an :class:`AuthorityValidationError` carrying
+    :data:`REASON_PROVIDER_RATE_LIMITED_CANONICAL` -- a real authority
+    defect (malformed row, missing provider, genuine auth failure upstream,
+    ...) still needs_human+raises exactly as before.
+
+    Records a durable backoff deadline (survives daemon restart -- see
+    ``provider_backoff.py``) so the *next* resume attempt, operator-driven
+    or periodic-tick, can short-circuit before the window has passed
+    instead of re-hitting the same rate limit immediately.
+    """
+    if not (isinstance(exc, AuthorityValidationError) and exc.reason_code == REASON_PROVIDER_RATE_LIMITED_CANONICAL):
+        return None
+    provider_id = exc.provider_id or "github"
+    backoff = provider_backoff.record_backoff(coordinator_root, provider_id, now=time.time())
+    return {
+        "run_id": run_id,
+        "current_phase": current_phase,
+        "reason": "provider-rate-limited",
+        "retry_after_epoch": backoff.deadline_epoch,
+    }
+
+
 def resume_workflow_run(
     dispatcher,
     *,
@@ -6829,6 +6861,29 @@ def resume_workflow_run(
     if registry is None:
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
+    if ship_validator is not None:
+        # #370: a prior resume already recorded a durable rate-limit
+        # backoff for this run's GitHub provider (see
+        # `_provider_rate_limit_result` below) -- short-circuit *before*
+        # doing any work, so an operator retrying early (or a periodic
+        # tick landing before the window clears) gets an explicit "still
+        # rate limited, retry after <time>" instead of walking the whole
+        # resume flow only to hit ship_validator and the same wall again.
+        # Gated on `ship_validator is not None` because that's the only
+        # thing in this function that can ever touch GitHub provider
+        # authority; canonical claim:v1 runs are wired with one uniformly
+        # regardless of phase, so this deliberately pauses all phases for
+        # a rate-limited repo, not just the review->ship transition.
+        active = provider_backoff.active_backoff(
+            coordinator_root, f"github:{run.repo}", now=time.time()
+        )
+        if active is not None:
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "provider-rate-limited",
+                "retry_after_epoch": active.deadline_epoch,
+            }
     pre_resume_gate_status = run.gate_status
     retry_failed = False
     recovery_job_id: str | None = None
@@ -7006,7 +7061,15 @@ def resume_workflow_run(
                     coordinator_root=coordinator_root,
                     trusted_terminal=True,
                 )
-            except Exception:
+            except Exception as exc:
+                rate_limited = _provider_rate_limit_result(
+                    exc,
+                    run_id=run.run_id,
+                    current_phase=run.current_phase,
+                    coordinator_root=coordinator_root,
+                )
+                if rate_limited is not None:
+                    return rate_limited
                 current = registry.get_workflow_run(run.run_id)
                 registry._manager_update_workflow_run(
                     run.run_id,
@@ -7021,15 +7084,26 @@ def resume_workflow_run(
                     "current_phase": run.current_phase,
                     "reason": "ship-validator-unavailable",
                 }
-            return apply_workflow_action(
-                registry,
-                args={"action": "refresh-completion", "run_id": run.run_id},
-                identity_registry=identities,
-                ship_validator=ship_validator,
-                git_runner=getattr(dispatcher, "_git_runner", None),
-                coordinator_root=coordinator_root,
-                trusted_terminal=True,
-            )
+            try:
+                return apply_workflow_action(
+                    registry,
+                    args={"action": "refresh-completion", "run_id": run.run_id},
+                    identity_registry=identities,
+                    ship_validator=ship_validator,
+                    git_runner=getattr(dispatcher, "_git_runner", None),
+                    coordinator_root=coordinator_root,
+                    trusted_terminal=True,
+                )
+            except Exception as exc:
+                rate_limited = _provider_rate_limit_result(
+                    exc,
+                    run_id=run.run_id,
+                    current_phase=run.current_phase,
+                    coordinator_root=coordinator_root,
+                )
+                if rate_limited is not None:
+                    return rate_limited
+                raise
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
     jobs = [
         job
@@ -7179,7 +7253,15 @@ def resume_workflow_run(
             coordinator_root=coordinator_root,
             trusted_terminal=True,
         )
-    except Exception:
+    except Exception as exc:
+        rate_limited = _provider_rate_limit_result(
+            exc,
+            run_id=run.run_id,
+            current_phase=run.current_phase,
+            coordinator_root=coordinator_root,
+        )
+        if rate_limited is not None:
+            return rate_limited
         current = registry.get_workflow_run(run.run_id)
         registry._manager_update_workflow_run(
             run.run_id,
