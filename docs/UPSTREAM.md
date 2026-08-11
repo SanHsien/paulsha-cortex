@@ -40,7 +40,7 @@
 
 | PR／Issue | 決策與理由 |
 | --- | --- |
-| upstream `#450`／Issue `#449` | 採用到 watermark `8b34e3e097f4f598b883df0db11669271f83d31f`。新增 `retire-delivered`，只有在所有 `pr_refs` 已由 provider 證明 terminal 後才把 orphan run 標為 `superseded`；退休 action 僅在有 last-known-good revision 的 rate-limit degraded 情境容忍舊 authority。上游 policy、Python 3.10–3.13、build 與 smoke 全綠。 |
+| upstream `#450`／Issue `#449` | 採用到 watermark `8b34e3e097f4f598b883df0db11669271f83d31f`。新增 `retire-delivered`，只有在所有 `pr_refs` 已由 provider 證明 terminal 後才把 orphan run 標為 `superseded`；退休 action 僅在有 last-known-good revision 的 rate-limit degraded 情境容忍舊 authority。fork review 另補 malformed merged timestamp/state fail-closed 與一致 evidence size limit。上游 policy、Python 3.10–3.13、build 與 smoke 全綠。 |
 | open upstream `#451` | 延後。這是 v0.1.6 release 收版 PR；檢查時 head `02f604c04ba0e4ae16f70294ba5541631e3b3748` 仍未合併，且 policy 與 Python 3.12 CI 失敗。只有 upstream 合併、release tag 可驗證且 fork compatibility matrix 通過後才採用，不 cherry-pick 未完成 release。 |
 
 下次只評估 `8b34e3e097f4f598b883df0db11669271f83d31f..upstream/main`，以及

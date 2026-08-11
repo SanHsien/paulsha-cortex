@@ -947,6 +947,55 @@ def test_abandon_still_refuses_any_pr_refs_run(tmp_path: Path) -> None:
         )
 
 
+def test_retire_delivered_rejects_oversized_evidence_before_superseding(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    pr_numbers = tuple(range(1, 301))
+    registry._manager_update_workflow_run(
+        run_id, pr_refs=tuple(f"acme/demo#{number}" for number in pr_numbers)
+    )
+
+    with pytest.raises(RuntimeError, match="evidence exceeds size limit"):
+        work_actions.execute_work_action(
+            args={
+                "action": "retire-delivered",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "All delivery PRs are terminal.",
+            },
+            requested_by="operator",
+            runner=_pr_lifecycle_runner(
+                {
+                    number: {
+                        "state": "closed",
+                        "merged_at": "2026-08-01T00:00:00Z",
+                    }
+                    for number in pr_numbers
+                }
+            ),
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+    assert registry.get_workflow_run(run_id).status == "ongoing"
+    assert not (state.parent / "evidence" / "work-retire-delivered").exists()
+
+
 def test_retire_delivered_proceeds_under_rate_limited_authority(tmp_path: Path) -> None:
     """Gap 2: retirement tolerates a canonical GitHub authority degraded purely
     by a rate limit (last-known-good present), while non-retirement actions on

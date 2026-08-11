@@ -1079,10 +1079,21 @@ class GitHubDeliveryClient:
         if not isinstance(pull, dict):
             raise RuntimeError("GitHub PR lifecycle status malformed")
         raw_state = pull.get("state")
-        if raw_state not in {"open", "closed"}:
+        if raw_state not in {"open", "closed"} or "merged_at" not in pull:
             raise RuntimeError("GitHub PR lifecycle status malformed")
-        merged = pull.get("merged_at") is not None
+        merged_at = pull.get("merged_at")
+        merged = merged_at is not None
         if merged:
+            if not isinstance(merged_at, str) or not merged_at.strip():
+                raise RuntimeError("GitHub PR lifecycle status malformed")
+            try:
+                parsed_merged_at = datetime.fromisoformat(
+                    merged_at.replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise RuntimeError("GitHub PR lifecycle status malformed") from error
+            if parsed_merged_at.tzinfo is None or raw_state != "closed":
+                raise RuntimeError("GitHub PR lifecycle status malformed")
             state = "merged"
         elif raw_state == "closed":
             state = "closed_unmerged"

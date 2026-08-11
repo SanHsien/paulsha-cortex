@@ -68,6 +68,8 @@ ShipExecutor = Callable[[dict[str, Any], object], dict[str, Any]]
 # last-known-good canonical GitHub authority (see the ``load_work_authority``
 # call in ``execute_work_action``). Every other action keeps fail-closed.
 _RETIREMENT_ACTIONS = frozenset({"abandon", "retire-delivered"})
+_ABANDON_EVIDENCE_MAX_BYTES = 4096
+_RETIRE_DELIVERED_EVIDENCE_MAX_BYTES = 8192
 
 
 def _positive_int(value: object, *, field: str) -> int:
@@ -2036,14 +2038,16 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
     }
 
 
-def _validate_abandon_evidence_target(target: Path, content: bytes) -> None:
+def _validate_abandon_evidence_target(
+    target: Path, content: bytes, *, max_bytes: int
+) -> None:
     try:
         metadata = target.stat()
         conflict = (
             target.is_symlink()
             or not target.is_file()
             or metadata.st_size != len(content)
-            or metadata.st_size > 4096
+            or metadata.st_size > max_bytes
             or metadata.st_mode & 0o222
             or target.read_bytes() != content
         )
@@ -2063,13 +2067,21 @@ def _write_supersede_evidence(
 
     digest = verification.canonical_json_hash(body)
     root = state_path.resolve().parent / "evidence" / subdir
-    root.mkdir(parents=True, exist_ok=True)
-    target = root / f"{body['run_id']}-{digest}.json"
     content = (
         json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
+    max_bytes = {
+        "work-abandon": _ABANDON_EVIDENCE_MAX_BYTES,
+        "work-retire-delivered": _RETIRE_DELIVERED_EVIDENCE_MAX_BYTES,
+    }.get(subdir)
+    if max_bytes is None:
+        raise ValueError("unsupported workflow supersede evidence kind")
+    if len(content) > max_bytes:
+        raise RuntimeError("workflow supersede evidence exceeds size limit")
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{body['run_id']}-{digest}.json"
     if target.exists():
-        _validate_abandon_evidence_target(target, content)
+        _validate_abandon_evidence_target(target, content, max_bytes=max_bytes)
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
         created = False
@@ -2089,7 +2101,9 @@ def _write_supersede_evidence(
                 os.link(temporary, target)
                 created = True
             except FileExistsError:
-                _validate_abandon_evidence_target(target, content)
+                _validate_abandon_evidence_target(
+                    target, content, max_bytes=max_bytes
+                )
         finally:
             temporary.unlink(missing_ok=True)
         if created:
@@ -2363,7 +2377,7 @@ def _superseded_abandon_body(
             target.is_symlink()
             or not target.is_file()
             or target.stat().st_mode & 0o222
-            or target.stat().st_size > 4096
+            or target.stat().st_size > _ABANDON_EVIDENCE_MAX_BYTES
         ):
             raise RuntimeError("WorkflowRun was superseded by different authority")
         raw = target.read_bytes()
@@ -2654,7 +2668,7 @@ def _superseded_retire_delivered_body(
             target.is_symlink()
             or not target.is_file()
             or target.stat().st_mode & 0o222
-            or target.stat().st_size > 8192
+            or target.stat().st_size > _RETIRE_DELIVERED_EVIDENCE_MAX_BYTES
         ):
             raise RuntimeError("WorkflowRun was superseded by different authority")
         raw = target.read_bytes()
