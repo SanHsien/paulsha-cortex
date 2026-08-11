@@ -126,13 +126,18 @@ def _required_fields() -> list[dict[str, str]]:
         },
         {
             "name": "target_branch",
-            "current": "null",
-            "required": "main",
+            "current": "deck emit 已自動推導為 feature/<change|task-slug>（非 null）",
+            "required": "確認分支名稱符合預期；不符合才需手動改",
         },
         {
             "name": "verification",
-            "current": "null",
-            "required": "改成完整 object，包含 persona-scope、name=policy check、full_suite baseline=no-regression",
+            "current": (
+                "deck emit 已自動填好完整 object（非 null）：checks 含 persona-scope 與 "
+                "name=policy command、tests、full_suite baseline=no-regression；argv 依 "
+                ".project-policy.yml 的 preflight.steps 導出，偵測不到時為 fail-closed "
+                "placeholder（誤執行會非零退出）並在 compile 輸出印過 warning"
+            ),
+            "required": "確認 checks/tests/full_suite 的 argv 對應真實驗證指令；若曾看到 placeholder warning 必須手動補上真實指令",
         },
     ]
 
@@ -141,8 +146,8 @@ def _next_steps() -> list[str]:
     return [
         "編輯 emitted spec，完成 checklist 前都維持 dispatch: hold。",
         "將 plan 改成確切的 accepted plan 路徑。",
-        "將 target_branch 設為 main。",
-        "將 verification 改成完整契約，包含 persona-scope、policy 與 full_suite。",
+        "確認 target_branch（已自動推導）符合預期。",
+        "確認 verification 的 checks/tests/full_suite argv 對應真實驗證指令；若曾看到 placeholder warning 必須手動補上真實指令。",
         "執行列出的 deck verify 指令。",
         "全部確認完成後，再手動把 dispatch: hold 改成 dispatch: auto。",
     ]

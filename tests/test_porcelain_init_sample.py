@@ -109,7 +109,7 @@ def test_init_sample_routes_before_coordinator_and_prints_hold_checklist(
     assert "plan" in captured.out
     assert "目前 deck emit 產生的 glob 路徑" in captured.out
     assert "target_branch" in captured.out
-    assert "main" in captured.out
+    assert "自動推導" in captured.out  # #380：target_branch 自 #101 起非 null，提示須反映實況
     assert "verification" in captured.out
     assert "persona-scope" in captured.out
     assert "policy" in captured.out
