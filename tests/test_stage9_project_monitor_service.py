@@ -671,7 +671,13 @@ class Stage9ServerTests(unittest.TestCase):
             _socket_send_request(sock, {"kind": "list_projects"})
             _socket_recv_line(sock)
             sock.close()
-        deadline = time.time() + 1.0
+        # 1.0s -> 2.0s (matches the other generous polls in this file, e.g.
+        # the deadlines above): the accept loop now registers each handler
+        # thread in `_connection_threads` *before* starting it (issue #445),
+        # so discard is no longer lazy/racy and this bound only needs to
+        # absorb ordinary CPU-scheduling delay under a loaded CI runner, not
+        # a permanently-orphaned dead-thread entry.
+        deadline = time.time() + 2.0
         while time.time() < deadline and self.server._connection_threads:
             time.sleep(0.02)
         self.assertEqual(self.server._connection_threads, [])

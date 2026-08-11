@@ -193,12 +193,22 @@ class MonitorServer:
                 t = threading.Thread(
                     target=self._handle_connection, args=(conn,), daemon=True
                 )
-                t.start()
+                # Register *before* start() (issue #445): if a handler thread
+                # runs to completion faster than this loop resumes after
+                # start(), appending it post-hoc would register an
+                # already-dead thread that `_handle_connection`'s own
+                # finally-block self-removal never had a chance to discard
+                # (it wasn't in the list yet when that ran) — and nothing
+                # else clears it until another connection happens to arrive.
+                # Registering first guarantees the thread is always present
+                # in `_connection_threads` before it can possibly finish, so
+                # its own self-removal is always effective.
                 with self._connection_threads_lock:
                     self._connection_threads = [
                         thread for thread in self._connection_threads if thread.is_alive()
                     ]
                     self._connection_threads.append(t)
+                t.start()
         finally:
             self._teardown(
                 listener,
