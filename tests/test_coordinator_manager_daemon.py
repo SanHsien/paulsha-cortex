@@ -1711,6 +1711,62 @@ def test_slice_action_request_runs_manager_action(monkeypatch, tmp_path):
     assert captured["actor"] == "operator"
 
 
+def test_slice_action_request_forwards_review_identity(monkeypatch, tmp_path):
+    # #396 item 4：retry-review 落 needs_human(reviewer-identity-missing) 時，
+    # slice-action 需要能補 foreign reviewer identity。manager_daemon 這一層
+    # 早已讀 args.get("review_executor"/"review_model")（見
+    # build_request_executor 對 "slice-action" 分支），缺口純粹在 CLI 表層沒有
+    # 對應旗標；這個測試證明 CLI 補上旗標後，端到端（request args → daemon →
+    # apply_slice_action kwargs）確實會把 identity 帶到底。
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = "20260703T090013Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    _write_request(
+        req_id,
+        type="slice-action",
+        args={
+            "slice_id": "slice-a",
+            "action": "retry-review",
+            "actor": "operator",
+            "review_executor": "codex",
+            "review_model": "gpt-5.4",
+        },
+    )
+    registry = FakeRegistry()
+    dispatcher = FakeDispatcher(registry, worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"))
+    captured: dict[str, object] = {}
+
+    def fake_apply(dispatcher_arg, **kwargs):
+        captured["dispatcher"] = dispatcher_arg
+        captured.update(kwargs)
+        return {"slice_id": kwargs["slice_id"], "action": kwargs["action"], "result": "ok"}
+
+    monkeypatch.setattr(manager_daemon.manager, "apply_slice_action", fake_apply)
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=RecordingLauncher(),
+    )
+
+    manager_daemon.run_loop(
+        request_executor=request_executor,
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=300.0,
+        now_fn=lambda: "2026-07-03T09:05:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _: None,
+        pid=1,
+        max_rounds=1,
+    )
+
+    done = contract.read_json(constants.done_dir() / f"{req_id}.json")
+    assert done["status"] == "ok"
+    assert captured["review_executor"] == "codex"
+    assert captured["review_model"] == "gpt-5.4"
+
+
 def test_work_action_request_has_one_manager_owned_execution_path(tmp_path):
     registry = FakeRegistry()
     dispatcher = FakeDispatcher(

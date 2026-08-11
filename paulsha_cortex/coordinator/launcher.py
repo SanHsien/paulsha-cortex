@@ -289,6 +289,48 @@ def _git_scope_env() -> dict[str, str]:
     }
 
 
+# #396 item 2(b)：copilot executor 的 credential 注入契約——依優先序列出 copilot
+# CLI 認得的既有 env var 名稱（見 porcelain/bootstrap.py `_executor_status` 的
+# login_fix 訊息："請設定 COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN"）。
+_COPILOT_TOKEN_ENV_VARS: tuple[str, ...] = (
+    "COPILOT_GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+def _copilot_credential_env(env: Mapping[str, str]) -> dict[str, str]:
+    """把既有可設定來源的 token 正規化成 copilot CLI 優先讀取的 env var。
+
+    背景（issue #396 item 2）：copilot builder job 派出即失敗，因為 job env 沒有
+    COPILOT_GITHUB_TOKEN／GH_TOKEN，唯一有效 token 只在 gh CLI 的 OS keyring
+    ——headless daemon 本就讀不到桌面 keyring，此函式刻意不去碰它，避免多一個
+    平台相依的失敗模式。
+
+    這裡只做「這個 process 的 env 裡已經有的三個候選名稱之一，正規化成
+    copilot CLI 優先序最高的那個」；至於 token 怎麼進到 process env——沿用本
+    repo 既有的可設定來源（daemon 自身的 systemd EnvironmentFile／
+    `~/.agents/core/runtime/<instance>.env`，與 porcelain/bootstrap.py
+    `_instance_runtime_env_path` 同一份機制，PSC_MANAGER_EXECUTOR 也是這樣佈署
+    的）——留給 operator 決定，不是本函式的責任。
+
+    COPILOT_GITHUB_TOKEN 已存在時視為 operator 明確指定，不覆寫；三個候選皆缺
+    （或皆為空字串）時回傳空 dict，呼叫端不改動 env（fail-soft：沒有 token 不
+    是這個函式該擋的錯，讓 job 依現行行為派出、由 copilot CLI 自己的登入態訊息
+    或 #369 的 executor_auth 探測回報）。
+    """
+
+    if env.get("COPILOT_GITHUB_TOKEN"):
+        return {}
+    token = next(
+        (env[name] for name in _COPILOT_TOKEN_ENV_VARS[1:] if env.get(name)),
+        None,
+    )
+    if token is None:
+        return {}
+    return {"COPILOT_GITHUB_TOKEN": token}
+
+
 def _review_scope_env() -> dict[str, str]:
     """Keep only non-secret process basics for an untrusted read-only reviewer."""
 
@@ -477,9 +519,12 @@ def build_claude_argv(
     read_only: bool = False,
     review_only: bool = False,
     review_terminal_kind: str | None = None,
+    commit_required: bool = False,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude launcher cannot bypass permissions")
+    if commit_required and (read_only or review_only or allow_unsafe):
+        raise ValueError("commit-required Claude builder requires enforced workspace-write")
     if review_only and worktree is None:
         raise ValueError("read-only Claude reviewer requires a Candidate checkout")
     if review_only:
@@ -538,6 +583,16 @@ def build_claude_argv(
         argv += ["--model", model]
     if worktree is not None and not review_only:
         argv.extend(["--add-dir", worktree])
+        # #396 item 3：linked worktree 的 .git 只是個指向 repo 外部（objects／
+        # refs／index）的檔案；builder 完成後對這些外部路徑 git add/commit 若不在
+        # sandbox 的放行清單內，會被擋下回 requires approval（headless 無人可
+        # approve）→ candidate-worktree-dirty。比照 build_copilot_argv／
+        # build_codex_argv 既有的 commit_required 分支，把同一份 linked-worktree
+        # git 寫入目錄透過 --add-dir 放行；非 commit-required（例如 planner）維持
+        # 原行為不放寬。
+        if commit_required:
+            for git_write_dir in _linked_worktree_git_write_dirs(worktree):
+                argv += ["--add-dir", git_write_dir]
     return argv
 
 
@@ -630,6 +685,21 @@ class AgentLauncher(Protocol):
     ) -> LaunchHandle: ...
 
 
+# 目前支援的 headless executor 家族——這是唯一真相來源：`cli.py` 的
+# `--executor`/`--review-executor` choices 與 `SubprocessLauncher.__init__` 的
+# 建構驗證都直接消費這個字典的 key（不重複列舉），新增一筆即兩處自動同步。
+#
+# 新增 executor 前的必要條件：先確認其 CLI 介面（prompt 怎麼傳、輸出格式、
+# sandbox/approval 旗標怎麼關），寫一個對應的 `build_<executor>_argv`，仿照本檔
+# 其餘 builder 附近散落的「smoke 實證」註解方式留下驗證依據，再加進這個字典。
+#
+# `cg`（copilot API／glm-5.2 巷道，見 issue #396 item 1）刻意不在這裡：本 repo
+# 找不到任何 cg CLI 介面的文件或 smoke 紀錄，貿然假設它與 copilot 同介面（同旗標
+# 只是換 model）屬臆測——猜錯會把錯誤旗標打進一個從未驗證過的 CLI，比維持現狀
+# （fail-closed：`--executor cg` 在 argparse 層即被拒絕、`SubprocessLauncher("cg")`
+# 建構期即拋 `ValueError`）更危險。這是刻意保留的 extension point：要支援 cg，
+# 第一步是在能跑 cg 的環境對它的 CLI 做一次等價於本檔案 codex/copilot 附近那些
+# smoke 驗證的手動測試，再依那份證據寫 `build_cg_argv` 並加入下面的字典。
 _ARGV_BUILDERS = {
     "copilot": build_copilot_argv,
     "claude": build_claude_argv,
@@ -815,7 +885,10 @@ class SubprocessLauncher:
             "read_only": self._read_only,
             "review_only": self._review_only,
         }
-        if self._executor in {"codex", "copilot"}:
+        # #396 item 3：claude 併入 commit_required 傳遞——builder-persona 的
+        # as_commit_required() 轉換（autonomy.dispatch_ready）對三個 executor
+        # 一視同仁，build_claude_argv 缺這個 kwarg 會讓轉換對 claude 變 no-op。
+        if self._executor in {"codex", "copilot", "claude"}:
             builder_kwargs["commit_required"] = self._commit_required
         if self._executor == "claude":
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
@@ -835,6 +908,8 @@ class SubprocessLauncher:
             }
             if self._relay_target is not None:
                 env["PSC_RELAY_TARGET"] = self._relay_target
+            if self._executor == "copilot":
+                env.update(_copilot_credential_env(env))
         log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
         # 跨進程 durable 完成判定：以 bash -lc 包裝，子進程結束時把 $? 寫入 exit sentinel。
         # 用 shlex.join 安全嵌入內層 argv（prompt 含換行/空白仍為單一 token），
