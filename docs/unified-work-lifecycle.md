@@ -88,6 +88,7 @@ cortex doctor --probe-live --repo owner/repo --json
 - 省略 `--issue`／`--kind`／`--ref` 時，直接沿用 work_id 現有的 confirmed authority（等價於單獨呼叫 `start`）——這是「work_id 已有 confirmed Todo 或已 link issue」時的常見用法。
 - 兩種路徑最終都轉交既有 `start` 語意（`claim_key` 去重、`--combo` override 皆比照 `start`），不繞過 `default_workflow_manifest`／`validate_manager_spine`。
 - **Intake 不會憑空建立新 authority**：`.cortex/work-items.yaml` 這份 override 檔與受監控的 `work-items.snapshot.json` 是兩份分開維護的狀態，override 寫入後仍要等下一輪 Monitor correlation 才會併入快照。因此若 work_id 既無 confirmed Todo、也未曾 link 過 issue，且本次呼叫也沒有帶 `--issue`／`--kind`/`--ref`，intake 會 fail-closed 拒絕，不建立 WorkflowRun；純文字任務仍需要先有明文授權來源（confirmed Todo 或 linked issue）才能進件。
+- **只 link issue 不足以讓 work item 變成可 claim**（#389）：`intake --issue N` 成功寫入 link 後，work item 仍停在四態 read model 的 `topic`（見上方「四態 read model」），因為 lifecycle reducer 只在 `active_todo`（存在 `todo`／`superpowers_spec`／`superpowers_plan`／`openspec` 其中一種 active 來源）成立時才會前進到 `todo`，而只有 `todo` 狀態才會投影出 `start` next_action。換句話說，claim 的完整前置條件是「confirmed Todo 來源」，**不是**「confirmed Todo 或 linked issue」二選一——issue 只負責把 work item 從無到有變出來（`topic`），要能被 claim 還需要另外用 `cortex work link <work_id> --repo <owner/repo> --kind todo --ref <path/to/todo.md>`（或 openspec/spec-plan）補上一個 active 的 Todo 來源。對只連結 issue、沒有 Todo 來源的 work item 呼叫 `intake`／`start` 會 fail-closed，錯誤訊息會標示該 work item 目前所在的 lifecycle state 與缺少的 Todo 來源（`reason=authority-not-startable` 或 `authority-no-confirmed-todo-source`），不再與「work_id 完全不存在」共用同一句泛化訊息。
 
 ```bash
 cortex work intake unified-work-lifecycle --repo owner/repo --issue 14
