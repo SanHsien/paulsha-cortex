@@ -808,9 +808,19 @@ def build_request_executor(
             model=requested_model,
         )
         if request_type == "fanout":
+            # issue #383：手動 `cortex fanout` 過去直接把全部 metas 餵給
+            # dispatch_ready_fn，完全沒有 run_tick() 那層 in-flight active／
+            # already_terminal 過濾——同一 snapshot 下兩條路徑對同一批 slice
+            # 給出不同答案。這裡改呼叫與 run_tick() 共用的 dispatch_gate_scan()，
+            # 消除分歧：仍會排除 in-flight job／與 registry 現況一致的終局
+            # manifest，但已復原（registry state=="pending"）的 slice 不再被
+            # 殘留 manifest 誤擋。
+            fanout_metas, _already_terminal, _needs_human = manager.dispatch_gate_scan(
+                metas, handoff_dir=request_handoff_dir, registry=getattr(dispatcher, "_registry", None)
+            )
             jobs = _call_with_supported_kwargs(
                 dispatch_ready_fn,
-                metas,
+                fanout_metas,
                 predicate,
                 dispatcher,
                 persona=persona,

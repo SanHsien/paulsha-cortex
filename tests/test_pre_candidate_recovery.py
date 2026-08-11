@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
@@ -86,6 +87,63 @@ def test_recover_pre_candidate_removes_worktree_and_resets_slice(tmp_path: Path)
     latest_slice = reg.get_slice("slice-3a")
     assert latest_slice["state"] == "pending"
     assert latest_slice["gate_state"] == "pending"
+
+
+def test_recover_pre_candidate_supersedes_stale_handoff_manifest(tmp_path: Path) -> None:
+    # issue #383：recover-pre-candidate 撥回 pending 之後，殘留的舊終局 handoff
+    # manifest 應被標記 superseded（稽核可見性）——run_tick 的放行判定本身已改成
+    # 跟 registry 現況對帳（不依賴這個標記，見 dispatch_gate_scan/
+    # _manifest_still_blocks_fanout），這裡單獨驗證標記本身確實落地。
+    state_path = tmp_path / "jobs.json"
+    reg = JobRegistry(state_path=state_path)
+    builder_job = reg.create_job(
+        task="slice-super",
+        persona="builder",
+        branch="feature/slice-super",
+        pane="",
+        worktree=str(tmp_path / "wt" / "feature-slice-super"),
+    )
+    reg.update_headless_result(builder_job["job_id"], status="failed", exit_code=1)
+    reg.create_slice(
+        slice_id="slice-super",
+        spec_path="specs/slice-super.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-super.md",
+        plan_hash="plan-sha",
+        target_branch="main",
+        builder_job_id=builder_job["job_id"],
+        reviewer_job_id=None,
+        candidate=None,
+    )
+    reg.update_slice("slice-super", state="needs_human", gate_state="needs_human")
+
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = handoff_dir / "slice-super.json"
+    manifest_path.write_text(
+        json.dumps({"slice_id": "slice-super", "job_id": builder_job["job_id"], "gate_status": "failed"}),
+        encoding="utf-8",
+    )
+
+    pane_sender = MagicMock()
+    wt_creator = MagicMock()
+    dispatcher = Dispatcher(reg, pane_sender=pane_sender, worktree_creator=wt_creator)
+
+    res = manager.apply_slice_action(
+        dispatcher=dispatcher,
+        slice_id="slice-super",
+        action="recover-pre-candidate",
+        actor="test-operator",
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+    )
+
+    assert res["result"] == "ok"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["gate_status"] == "failed"
+    assert manifest["superseded_by"] == "test-operator"
+    assert manifest["superseded_reason"] == "operator-recover-pre-candidate"
+    assert isinstance(manifest["superseded_at"], str) and manifest["superseded_at"]
 
 
 def test_recover_pre_candidate_fail_closed_when_candidate_exists(tmp_path: Path) -> None:
