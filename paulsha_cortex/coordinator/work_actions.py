@@ -63,6 +63,14 @@ logger = logging.getLogger(__name__)
 Runner = Callable[..., object]
 ShipExecutor = Callable[[dict[str, Any], object], dict[str, Any]]
 
+# Retirement-family actions tear down a local stuck run and never depend on an
+# issue's live open/closed state, so they tolerate a rate-limited-but-
+# last-known-good canonical GitHub authority (see the ``load_work_authority``
+# call in ``execute_work_action``). Every other action keeps fail-closed.
+_RETIREMENT_ACTIONS = frozenset({"abandon", "retire-delivered"})
+_ABANDON_EVIDENCE_MAX_BYTES = 4096
+_RETIRE_DELIVERED_EVIDENCE_MAX_BYTES = 8192
+
 
 def _positive_int(value: object, *, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -2030,14 +2038,16 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
     }
 
 
-def _validate_abandon_evidence_target(target: Path, content: bytes) -> None:
+def _validate_abandon_evidence_target(
+    target: Path, content: bytes, *, max_bytes: int
+) -> None:
     try:
         metadata = target.stat()
         conflict = (
             target.is_symlink()
             or not target.is_file()
             or metadata.st_size != len(content)
-            or metadata.st_size > 4096
+            or metadata.st_size > max_bytes
             or metadata.st_mode & 0o222
             or target.read_bytes() != content
         )
@@ -2047,16 +2057,31 @@ def _validate_abandon_evidence_target(target: Path, content: bytes) -> None:
         raise RuntimeError("workflow abandon evidence conflict")
 
 
-def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
+def _write_supersede_evidence(
+    body: dict[str, Any], *, state_path: Path, subdir: str
+) -> dict[str, str]:
+    """Durable, content-addressed supersede-evidence writer shared by the
+    ``work-abandon`` and ``work-retire-delivered`` paths (create-with-O_EXCL +
+    hardlink + fsync; a colliding target is re-validated byte-for-byte, so a
+    replayed write is idempotent rather than a conflict)."""
+
     digest = verification.canonical_json_hash(body)
-    root = state_path.resolve().parent / "evidence" / "work-abandon"
-    root.mkdir(parents=True, exist_ok=True)
-    target = root / f"{body['run_id']}-{digest}.json"
+    root = state_path.resolve().parent / "evidence" / subdir
     content = (
         json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
+    max_bytes = {
+        "work-abandon": _ABANDON_EVIDENCE_MAX_BYTES,
+        "work-retire-delivered": _RETIRE_DELIVERED_EVIDENCE_MAX_BYTES,
+    }.get(subdir)
+    if max_bytes is None:
+        raise ValueError("unsupported workflow supersede evidence kind")
+    if len(content) > max_bytes:
+        raise RuntimeError("workflow supersede evidence exceeds size limit")
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{body['run_id']}-{digest}.json"
     if target.exists():
-        _validate_abandon_evidence_target(target, content)
+        _validate_abandon_evidence_target(target, content, max_bytes=max_bytes)
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
         created = False
@@ -2076,7 +2101,9 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
                 os.link(temporary, target)
                 created = True
             except FileExistsError:
-                _validate_abandon_evidence_target(target, content)
+                _validate_abandon_evidence_target(
+                    target, content, max_bytes=max_bytes
+                )
         finally:
             temporary.unlink(missing_ok=True)
         if created:
@@ -2088,6 +2115,16 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
                 fsync_directory(root)
                 raise
     return {"ref": str(target), "hash": digest}
+
+
+def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
+    return _write_supersede_evidence(body, state_path=state_path, subdir="work-abandon")
+
+
+def _retire_delivered_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
+    return _write_supersede_evidence(
+        body, state_path=state_path, subdir="work-retire-delivered"
+    )
 
 
 def _read_planning_failure_record(
@@ -2340,7 +2377,7 @@ def _superseded_abandon_body(
             target.is_symlink()
             or not target.is_file()
             or target.stat().st_mode & 0o222
-            or target.stat().st_size > 4096
+            or target.stat().st_size > _ABANDON_EVIDENCE_MAX_BYTES
         ):
             raise RuntimeError("WorkflowRun was superseded by different authority")
         raw = target.read_bytes()
@@ -2540,6 +2577,273 @@ def _abandon_action(
         "reason": reason,
         "actor": actor,
         "expected_run_id": expected_run_id,
+        "evidence": record,
+        "run": updated.to_dict(),
+    }
+
+
+def _validate_retirement_operator_inputs(args: dict[str, Any]) -> tuple[str, str, str]:
+    """Shared expected_run_id/actor/reason admission for the retirement family
+    (``abandon`` and ``retire-delivered``). Returns the validated triple."""
+
+    expected_run_id = args.get("expected_run_id")
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(expected_run_id, str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+    ):
+        raise ValueError("retire-delivered requires exact expected_run_id")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+    ):
+        raise ValueError("retire-delivered requires bounded actor")
+    if (
+        not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+    ):
+        raise ValueError("retire-delivered requires bounded reason")
+    return expected_run_id, actor, reason
+
+
+def _retire_delivered_pr_terminal_status(
+    run, *, authority, runner: Runner
+) -> list[dict[str, str]]:
+    """Prove every ``pr_ref`` of ``run`` is terminal (merged/closed) via the
+    existing GitHub provider seam. Refuses (``RuntimeError``) on the first PR
+    that is still open, or on any malformed/cross-repo ref — retirement must
+    never supersede a run while a delivery could still be in flight."""
+
+    github = GitHubDeliveryClient(runner=runner)
+    statuses: list[dict[str, str]] = []
+    for ref in run.pr_refs:
+        match = re.fullmatch(rf"{re.escape(authority.repo)}#([1-9][0-9]*)", str(ref))
+        if match is None:
+            raise RuntimeError("retire-delivered PR ref malformed or cross-repo")
+        lifecycle = github.fetch_pr_lifecycle_status(
+            repo=authority.repo, pr_number=int(match.group(1))
+        )
+        if not lifecycle.terminal:
+            raise RuntimeError("retire-delivered refuses a non-terminal PR")
+        statuses.append({"ref": ref, "state": lifecycle.state})
+    statuses.sort(key=lambda entry: entry["ref"])
+    return statuses
+
+
+def _superseded_retire_delivered_body(
+    run,
+    *,
+    state_path: Path,
+    actor: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Re-derive the retire-delivered evidence body from the durable file when
+    the run is *already* superseded (crash between outcome emit and terminal
+    transition). Mirrors ``_superseded_abandon_body`` but reads back the
+    ``pr_terminal_status`` proof instead of re-querying GitHub — so re-entry
+    stays sound even when the provider is currently rate-limited."""
+
+    root = state_path.resolve().parent / "evidence" / "work-retire-delivered"
+    candidates: list[Path] = []
+    pattern = re.compile(rf"{re.escape(run.run_id)}-([0-9a-f]{{64}})\.json")
+    for value in run.evidence_refs:
+        path = Path(value)
+        if (
+            not path.is_absolute()
+            or path.parent != root
+            or pattern.fullmatch(path.name) is None
+        ):
+            continue
+        candidates.append(path)
+    if len(candidates) != 1:
+        raise RuntimeError("WorkflowRun was superseded by different authority")
+    target = candidates[0]
+    try:
+        if (
+            target.is_symlink()
+            or not target.is_file()
+            or target.stat().st_mode & 0o222
+            or target.stat().st_size > _RETIRE_DELIVERED_EVIDENCE_MAX_BYTES
+        ):
+            raise RuntimeError("WorkflowRun was superseded by different authority")
+        raw = target.read_bytes()
+        body = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "WorkflowRun was superseded by different authority"
+        ) from error
+    required = {
+        "schema",
+        "repo",
+        "work_id",
+        "run_id",
+        "authority_digest",
+        "actor",
+        "reason",
+        "pr_terminal_status",
+    }
+    pr_terminal_status = body.get("pr_terminal_status") if isinstance(body, dict) else None
+    if (
+        not isinstance(body, dict)
+        or set(body) != required
+        or body.get("schema") != "cortex-work-retire-delivered/v1"
+        or body.get("repo") != run.repo
+        or body.get("work_id") != run.work_id
+        or body.get("run_id") != run.run_id
+        or re.fullmatch(r"[0-9a-f]{64}", str(body.get("authority_digest"))) is None
+        or body.get("actor") != actor
+        or body.get("reason") != reason
+        or not isinstance(pr_terminal_status, list)
+        or not pr_terminal_status
+        or any(
+            not isinstance(entry, dict)
+            or set(entry) != {"ref", "state"}
+            or entry.get("state") not in {"merged", "closed_unmerged"}
+            for entry in pr_terminal_status
+        )
+    ):
+        raise RuntimeError("WorkflowRun was superseded by different authority")
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    digest = verification.canonical_json_hash(body)
+    if raw != content or target.name != f"{run.run_id}-{digest}.json":
+        raise RuntimeError("WorkflowRun was superseded by different authority")
+    return body
+
+
+def _retire_delivered_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    runner: Runner,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """Supersede one *delivered* orphan run whose every PR is terminal.
+
+    The gap this fills: a work item whose real delivery happened outside the
+    cortex pipeline (a fallback subagent merged the PR directly) leaves its
+    WorkflowRun stuck ``ongoing`` with terminal ``pr_refs`` — it can neither
+    ship (dirty candidate) nor ``abandon`` (the pre-delivery gate rejects any
+    ``pr_refs``). This action is the explicit, evidence-backed retirement path:
+    it proves every ``pr_ref`` PR is terminal (merged/closed) through the
+    provider seam, records that proof as audit evidence, then supersedes the
+    run. ``abandon``'s pre-delivery strictness is deliberately left intact.
+    """
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "expected_run_id", "reason",
+    }
+    if extras:
+        raise ValueError(
+            f"retire-delivered rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    expected_run_id, actor, reason = _validate_retirement_operator_inputs(args)
+    related = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo and run.work_id == authority.work_id
+    ]
+    exact = [run for run in related if run.run_id == expected_run_id]
+    if len(exact) != 1:
+        raise RuntimeError("retire-delivered expected WorkflowRun CAS mismatch")
+    run = exact[0]
+    if run.status == "superseded":
+        body = _superseded_retire_delivered_body(
+            run,
+            state_path=state_path,
+            actor=actor,
+            reason=reason,
+        )
+        record = _retire_delivered_record(body, state_path=state_path)
+        workflow_registry._manager_validate_workflow_retire_delivered(
+            run.run_id,
+            evidence_ref=record["ref"],
+        )
+        outcome_store = engineering_outcome.OutcomeStore(
+            engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+        )
+        engineering_outcome.emit_outcome(
+            outcome_store,
+            run=run,
+            authority=authority,
+            jobs=workflow_registry.list_jobs(),
+            outcome="abandoned",
+            attempt_digest=record["hash"],
+            reason_code=reason,
+        )
+        updated = workflow_registry._manager_retire_delivered_workflow_run(
+            run.run_id,
+            evidence_ref=record["ref"],
+        )
+        _gc_abandoned_planning_artifacts(updated)
+        return {
+            "action": "retired-delivered",
+            "reason": reason,
+            "actor": actor,
+            "expected_run_id": expected_run_id,
+            "pr_terminal_status": body["pr_terminal_status"],
+            "evidence": record,
+            "run": updated.to_dict(),
+        }
+    if any(item.status == "ongoing" and item.run_id != run.run_id for item in related):
+        raise RuntimeError("retire-delivered refuses a different active WorkflowRun")
+    if not run.pr_refs:
+        raise RuntimeError("retire-delivered requires a delivered run with pr refs")
+    pr_terminal_status = _retire_delivered_pr_terminal_status(
+        run, authority=authority, runner=runner
+    )
+    body = {
+        "schema": "cortex-work-retire-delivered/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": work_authority_digest(authority),
+        "actor": actor,
+        "reason": reason,
+        "pr_terminal_status": pr_terminal_status,
+    }
+    digest = verification.canonical_json_hash(body)
+    target = (
+        state_path.resolve().parent
+        / "evidence"
+        / "work-retire-delivered"
+        / f"{run.run_id}-{digest}.json"
+    )
+    workflow_registry._manager_validate_workflow_retire_delivered(
+        run.run_id,
+        evidence_ref=str(target),
+    )
+    record = _retire_delivered_record(body, state_path=state_path)
+    outcome_store = engineering_outcome.OutcomeStore(
+        engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+    )
+    engineering_outcome.emit_outcome(
+        outcome_store,
+        run=run,
+        authority=authority,
+        jobs=workflow_registry.list_jobs(),
+        outcome="abandoned",
+        attempt_digest=record["hash"],
+        reason_code=reason,
+    )
+    updated = workflow_registry._manager_retire_delivered_workflow_run(
+        run.run_id,
+        evidence_ref=record["ref"],
+    )
+    _gc_abandoned_planning_artifacts(updated)
+    return {
+        "action": "retired-delivered",
+        "reason": reason,
+        "actor": actor,
+        "expected_run_id": expected_run_id,
+        "pr_terminal_status": pr_terminal_status,
         "evidence": record,
         "run": updated.to_dict(),
     }
@@ -3920,8 +4224,8 @@ def execute_work_action(
     if action not in {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
         "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
-        "intake",
+        "recover-repair-commit", "abandon", "retire-delivered", "auto", "ship",
+        "review-attest", "intake",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -3938,6 +4242,15 @@ def execute_work_action(
         repo=repo,
         work_id=work_id,
         snapshot_path=snapshot_path,
+        # #370 follow-up: the retirement family (abandon / retire-delivered)
+        # tears down a *local* stuck run and never depends on an issue's live
+        # open/closed state, so a canonical GitHub provider that is merely
+        # rate-limited (degraded with a rate-limit diagnostic, but still
+        # carrying a prior last-known-good revision/last_success_at) must not
+        # block cleanup — the very moment the system is throttled is when
+        # stuck runs most need clearing. Claim/start and every other action
+        # keep the strict fail-closed default: they need fresh authority.
+        allow_rate_limited_last_known_good=action in _RETIREMENT_ACTIONS,
     )
     now_epoch = now()
     resolved_state_path = Path(state_path) if state_path is not None else _run_state_path()
@@ -4016,6 +4329,14 @@ def execute_work_action(
         result = _abandon_action(
             args=args,
             authority=authority,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "retire-delivered":
+        result = _retire_delivered_action(
+            args=args,
+            authority=authority,
+            runner=runner,
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
         )

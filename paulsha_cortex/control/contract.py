@@ -19,8 +19,8 @@ WORK_ACTIONS = frozenset(
     {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
         "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
-        "intake",
+        "recover-repair-commit", "abandon", "retire-delivered", "auto", "ship",
+        "review-attest", "intake",
     }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
@@ -173,7 +173,7 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     "work-action recover-repair-commit requires exact expected_run_id"
                 )
-        if action == "abandon":
+        if action in {"abandon", "retire-delivered"}:
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")
             reason = args.get("reason")
@@ -181,21 +181,21 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 not isinstance(expected_run_id, str)
                 or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
             ):
-                raise ValueError("work-action abandon requires exact expected_run_id")
+                raise ValueError(f"work-action {action} requires exact expected_run_id")
             if (
                 not isinstance(actor, str)
                 or actor != actor.strip()
                 or not 1 <= len(actor) <= 128
                 or not actor.isprintable()
             ):
-                raise ValueError("work-action abandon requires bounded actor")
+                raise ValueError(f"work-action {action} requires bounded actor")
             if (
                 not isinstance(reason, str)
                 or reason != reason.strip()
                 or not 1 <= len(reason) <= 500
                 or not reason.isprintable()
             ):
-                raise ValueError("work-action abandon requires bounded reason")
+                raise ValueError(f"work-action {action} requires bounded reason")
     requested_by = payload.get("requested_by")
     if not isinstance(requested_by, str) or not requested_by:
         raise ValueError("request requested_by must be a non-empty string")

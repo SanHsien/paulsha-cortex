@@ -204,8 +204,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[
             "link", "unlink", "start", "resume", "retry-build", "retry-verify",
             "retry-review", "recover-planning", "recover-pre-candidate",
-            "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
-            "intake",
+            "recover-repair-commit", "abandon", "retire-delivered", "auto",
+            "ship", "review-attest", "intake",
         ],
     )
     p_work.add_argument("work_id")
@@ -216,8 +216,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--actor")
     p_work.add_argument("--failure-classification")
     p_work.add_argument("--failure-reason")
-    p_work.add_argument("--expected-run-id", help="abandon 使用的 exact WorkflowRun CAS")
-    p_work.add_argument("--reason", help="abandon 的單行審計理由（最多 500 字）")
+    p_work.add_argument(
+        "--expected-run-id",
+        help="abandon／retire-delivered 使用的 exact WorkflowRun CAS",
+    )
+    p_work.add_argument(
+        "--reason", help="abandon／retire-delivered 的單行審計理由（最多 500 字）"
+    )
     p_work.add_argument(
         "--combo",
         help="start／intake 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",

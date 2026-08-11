@@ -229,6 +229,25 @@ class MergeStatus:
     merge_commit: str | None
 
 
+@dataclass(frozen=True)
+class PullRequestLifecycleStatus:
+    """Terminal-lifecycle classification for one PR.
+
+    ``fetch_merge_status`` only answers "is this merged?" — it cannot tell a
+    *closed-unmerged* PR apart from an *open* one (both report
+    ``merged=False``). The delivered-orphan retirement path (see
+    ``work_actions._retire_delivered_action``) needs exactly that distinction:
+    a run may be retired only once every one of its PRs has reached a terminal
+    state (merged OR closed), proving no delivery is still in flight. ``state``
+    uses the same vocabulary as ``coordinator.gc`` (``merged`` /
+    ``closed_unmerged`` / ``open``).
+    """
+
+    number: int
+    state: str
+    terminal: bool
+
+
 def evaluate_remote_closure(
     *,
     facts: RemoteClosureFacts,
@@ -1044,6 +1063,44 @@ class GitHubDeliveryClient:
             merged=merged,
             pr_head=head.lower(),
             merge_commit=merge_commit.lower() if merged else None,
+        )
+
+    def fetch_pr_lifecycle_status(
+        self, *, repo: str, pr_number: int
+    ) -> PullRequestLifecycleStatus:
+        """Read-only terminal-lifecycle fact for one PR (merged/closed/open).
+
+        Any malformed remote fact fails closed (``RuntimeError``) rather than
+        being optimistically treated as terminal — retirement must never
+        supersede a run on the strength of an unparseable PR state.
+        """
+        self._repo_parts(repo)
+        pull = self._api(f"repos/{repo}/pulls/{pr_number}")
+        if not isinstance(pull, dict):
+            raise RuntimeError("GitHub PR lifecycle status malformed")
+        raw_state = pull.get("state")
+        if raw_state not in {"open", "closed"} or "merged_at" not in pull:
+            raise RuntimeError("GitHub PR lifecycle status malformed")
+        merged_at = pull.get("merged_at")
+        merged = merged_at is not None
+        if merged:
+            if not isinstance(merged_at, str) or not merged_at.strip():
+                raise RuntimeError("GitHub PR lifecycle status malformed")
+            try:
+                parsed_merged_at = datetime.fromisoformat(
+                    merged_at.replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise RuntimeError("GitHub PR lifecycle status malformed") from error
+            if parsed_merged_at.tzinfo is None or raw_state != "closed":
+                raise RuntimeError("GitHub PR lifecycle status malformed")
+            state = "merged"
+        elif raw_state == "closed":
+            state = "closed_unmerged"
+        else:
+            state = "open"
+        return PullRequestLifecycleStatus(
+            number=pr_number, state=state, terminal=state != "open"
         )
 
     def merge(

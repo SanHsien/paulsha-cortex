@@ -235,6 +235,27 @@ def test_fetch_merge_status_binds_merged_side_effect_to_exact_pr_head() -> None:
     assert status.merge_commit == MERGE
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"state": "open"},
+        {"state": "open", "merged_at": False},
+        {"state": "open", "merged_at": "2026-08-01T00:00:00Z"},
+        {"state": "closed", "merged_at": ""},
+        {"state": "closed", "merged_at": 1},
+        {"state": "closed", "merged_at": "not-a-timestamp"},
+        {"state": "closed", "merged_at": "2026-08-01T00:00:00"},
+    ],
+)
+def test_fetch_pr_lifecycle_status_rejects_malformed_or_inconsistent_merge_fact(
+    payload,
+) -> None:
+    with pytest.raises(RuntimeError, match="lifecycle status malformed"):
+        GitHubDeliveryClient(runner=lambda argv, **kwargs: Result(payload)).fetch_pr_lifecycle_status(
+            repo="acme/demo", pr_number=7
+        )
+
+
 def test_ensure_pr_metadata_updates_and_rereads_exact_remote_fields() -> None:
     calls: list[list[str]] = []
 

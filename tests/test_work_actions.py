@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import replace
 from pathlib import Path
 import subprocess
@@ -729,6 +730,330 @@ def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
             state_path=state,
             workflow_registry=registry,
         )
+
+
+def _pr_lifecycle_runner(states: dict[int, dict]):
+    """Fake ``gh`` runner answering ``gh api repos/<repo>/pulls/<N>`` from a
+    map of PR number -> raw pull payload (``state`` / ``merged_at``)."""
+
+    def runner(argv, **kwargs):
+        assert argv[:2] == ["gh", "api"], argv
+        match = re.search(r"/pulls/(\d+)$", argv[2])
+        assert match is not None, argv[2]
+        payload = states.get(int(match.group(1)))
+        if payload is None:
+            return SimpleNamespace(returncode=1, stdout="", stderr="not found")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    return runner
+
+
+def _canonical_rate_limited_snapshot(path: Path, *, revision="gh-rev-lkg") -> Path:
+    """Canonical-schema snapshot whose ``github:acme/demo`` provider is degraded
+    by a *rate limit* yet still carries a last-known-good revision/timestamp."""
+
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "work-items-snapshot/v1",
+                "providers": {
+                    "github:acme/demo": {
+                        "status": "degraded",
+                        "revision": revision,
+                        "last_success_at": "2026-08-07T11:19:26Z",
+                        "diagnostics": [
+                            "github rate limit exceeded",
+                            "github:acme/demo stale",
+                        ],
+                    }
+                },
+                "work_items": [
+                    {
+                        "repo": "acme/demo",
+                        "work_id": "demo",
+                        "sources": [
+                            {
+                                "confidence": "confirmed",
+                                "kind": "todo",
+                                "ref": "docs/todo.md",
+                                "source_id": "todo:demo",
+                                "revision": "todo-rev-1",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_retire_delivered_supersedes_ongoing_run_when_all_prs_terminal(
+    tmp_path: Path,
+) -> None:
+    """Gap 1: a delivered orphan (``ongoing`` + terminal ``pr_refs``) that the
+    pre-delivery ``abandon`` gate refuses gets an explicit, evidence-backed
+    retirement — but only once *every* PR is proven terminal."""
+
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    registry._manager_update_workflow_run(
+        run_id, pr_refs=("acme/demo#110", "acme/demo#171")
+    )
+
+    args = {
+        "action": "retire-delivered",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "Delivered outside the pipeline; PRs terminal.",
+    }
+
+    # A run with no pr_refs is not a delivered orphan — use abandon instead.
+    registry._manager_update_workflow_run(run_id, pr_refs=())
+    with pytest.raises(RuntimeError, match="requires a delivered run with pr refs"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            runner=_pr_lifecycle_runner({}),
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    registry._manager_update_workflow_run(
+        run_id, pr_refs=("acme/demo#110", "acme/demo#171")
+    )
+
+    # A still-open PR must refuse and leave the run untouched (no evidence).
+    with pytest.raises(RuntimeError, match="non-terminal PR"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            runner=_pr_lifecycle_runner(
+                {
+                    110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"},
+                    171: {"state": "open", "merged_at": None},
+                }
+            ),
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    assert not (state.parent / "evidence" / "work-retire-delivered").exists()
+    assert registry.get_workflow_run(run_id).status == "ongoing"
+
+    terminal_runner = _pr_lifecycle_runner(
+        {
+            110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"},
+            171: {"state": "closed", "merged_at": None},
+        }
+    )
+    first = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        runner=terminal_runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+    retired = registry.get_workflow_run(run_id)
+    assert retired.status == "superseded"
+    assert "blocked" in retired.facets
+    assert retired.completion_record_path is None
+    assert first["result"]["action"] == "retired-delivered"
+    assert first["result"]["pr_terminal_status"] == [
+        {"ref": "acme/demo#110", "state": "merged"},
+        {"ref": "acme/demo#171", "state": "closed_unmerged"},
+    ]
+    evidence = Path(first["result"]["evidence"]["ref"])
+    assert evidence.is_file()
+    assert evidence.stat().st_mode & 0o222 == 0
+    payload = json.loads(evidence.read_text(encoding="utf-8"))
+    assert payload["schema"] == "cortex-work-retire-delivered/v1"
+    assert payload["run_id"] == run_id
+    assert payload["actor"] == "operator"
+    assert payload["reason"] == args["reason"]
+    assert payload["pr_terminal_status"] == first["result"]["pr_terminal_status"]
+    assert str(evidence) in retired.evidence_refs
+
+    # Idempotent re-entry re-derives the proof from the durable evidence
+    # (no GitHub call), so it stays sound even if the provider is throttled.
+    second = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        runner=_pr_lifecycle_runner({}),
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+    assert first == second
+
+    # A different reason must not silently mint a second retirement.
+    with pytest.raises(RuntimeError, match="different authority"):
+        work_actions.execute_work_action(
+            args={**args, "reason": "A different reason."},
+            requested_by="operator",
+            runner=terminal_runner,
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+
+def test_abandon_still_refuses_any_pr_refs_run(tmp_path: Path) -> None:
+    """Gap 1 guard: the new retire path must NOT weaken abandon — a run with
+    pr_refs is still rejected by the strict pre-delivery gate."""
+
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#8",))
+    with pytest.raises(ValueError, match="only permits pre-delivery"):
+        work_actions.execute_work_action(
+            args={
+                "action": "abandon",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "issue": 12,
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "should be refused",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+
+def test_retire_delivered_rejects_oversized_evidence_before_superseding(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    pr_numbers = tuple(range(1, 301))
+    registry._manager_update_workflow_run(
+        run_id, pr_refs=tuple(f"acme/demo#{number}" for number in pr_numbers)
+    )
+
+    with pytest.raises(RuntimeError, match="evidence exceeds size limit"):
+        work_actions.execute_work_action(
+            args={
+                "action": "retire-delivered",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "All delivery PRs are terminal.",
+            },
+            requested_by="operator",
+            runner=_pr_lifecycle_runner(
+                {
+                    number: {
+                        "state": "closed",
+                        "merged_at": "2026-08-01T00:00:00Z",
+                    }
+                    for number in pr_numbers
+                }
+            ),
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+    assert registry.get_workflow_run(run_id).status == "ongoing"
+    assert not (state.parent / "evidence" / "work-retire-delivered").exists()
+
+
+def test_retire_delivered_proceeds_under_rate_limited_authority(tmp_path: Path) -> None:
+    """Gap 2: retirement tolerates a canonical GitHub authority degraded purely
+    by a rate limit (last-known-good present), while non-retirement actions on
+    the same throttled snapshot still fail closed."""
+
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#8",))
+
+    # The provider is now rate-limited (canonical schema, last-known-good kept).
+    _canonical_rate_limited_snapshot(snapshot)
+
+    from paulsha_cortex.coordinator.claim import (
+        AuthorityValidationError,
+        REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+    )
+
+    # resume (needs fresh authority) must still fail closed under rate limit.
+    with pytest.raises(AuthorityValidationError) as excinfo:
+        work_actions.execute_work_action(
+            args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    assert excinfo.value.reason_code == REASON_PROVIDER_RATE_LIMITED_CANONICAL
+
+    # retire-delivered proceeds anyway using the last-known-good authority.
+    result = work_actions.execute_work_action(
+        args={
+            "action": "retire-delivered",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "actor": "operator",
+            "expected_run_id": run_id,
+            "reason": "Throttled but must still clear the orphan.",
+        },
+        requested_by="operator",
+        runner=_pr_lifecycle_runner(
+            {8: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+        ),
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+    assert result["result"]["action"] == "retired-delivered"
+    assert registry.get_workflow_run(run_id).status == "superseded"
 
 
 def test_abandon_orphan_rescue_allows_refs_drift_when_authority_lost_all_mappings(
