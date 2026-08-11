@@ -2141,6 +2141,121 @@ class RunTickTests(unittest.TestCase):
                 [{"slice_id": "s", "gate_reason": "missing-slice-proof", "handoff_path": str(hdir / "s.json")}],
             )
 
+    def test_run_tick_redispatches_slice_recovered_after_stale_terminal_manifest(self) -> None:
+        # issue #383：already_terminal 過去只看 handoff 目錄有沒有 manifest 檔，完全
+        # 不比對 registry 實際狀態——recover-pre-candidate 等復原動作把 slice 撥回
+        # state="pending"（可重派）後，殘留的終局 manifest（gate_status 落
+        # passed/failed/verified）仍會讓 tick 永久靜默跳過這個已復原的 slice（票面
+        # 重現場景）。修復後：與 registry 對帳（dispatch_gate_scan 提案 2），
+        # state=="pending" 代表已復原，不再讓殘留 manifest 擋 fanout。
+        def _git_runner(args):
+            if args and args[0] == "rev-parse":
+                return "f" * 40
+            if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+                return ""
+            if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+                return "e" * 40
+            if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base":
+                return ""
+            return ""
+
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            disp = _HeadlessDispatcher(reg)
+            disp._git_runner = _git_runner
+            hdir = Path(d) / "handoff"
+            hdir.mkdir(parents=True, exist_ok=True)
+
+            # 殘留終局 manifest：模擬先前一輪 build 失敗留下的 handoff 紀錄。
+            (hdir / "s.json").write_text(
+                json.dumps(
+                    {
+                        "slice_id": "s",
+                        "job_id": "old-job",
+                        "gate_status": "failed",
+                        "gate_reason": "verification-failed",
+                        "completed_at": "T-1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # registry 顯示 slice 已被復原（比照 apply_slice_action 的
+            # recover-pre-candidate 落點：state/gate_state=pending、
+            # builder_job_id/candidate 皆清空）。
+            reg.create_slice(
+                slice_id="s",
+                spec_path="/specs/s.md",
+                spec_hash="0" * 64,
+                plan_path="p.md",
+                plan_hash="1" * 64,
+                target_branch="main",
+                builder_job_id=None,
+                reviewer_job_id=None,
+                candidate=None,
+            )
+            reg.update_slice("s", state="pending", gate_state="pending")
+
+            launcher = _RecordingLauncher()
+            metas = [_dispatch_meta("s")]
+            summary = manager.run_tick(
+                disp, metas=metas, launcher=launcher, is_satisfied=lambda x: True,
+                handoff_dir=str(hdir), clock=lambda: "T0",
+            )
+
+            self.assertEqual([call["slice_id"] for call in launcher.calls], ["s"])
+            self.assertEqual(len(summary["dispatched"]), 1)
+            self.assertFalse(any(e.get("stage") == "fanout" for e in summary["errors"]))
+
+    def test_run_tick_still_skips_slice_whose_registry_state_matches_stale_manifest(self) -> None:
+        # 反例（避免對帳過寬）：registry state 仍是 needs_human（未經任何復原動作），
+        # 即使 dispatch_gate_scan 改看 registry，也不能誤放行——manifest 與 registry
+        # 現況一致時照舊擋。
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            disp = _HeadlessDispatcher(reg)
+            hdir = Path(d) / "handoff"
+            hdir.mkdir(parents=True, exist_ok=True)
+            (hdir / "s.json").write_text(
+                json.dumps(
+                    {
+                        "slice_id": "s",
+                        "job_id": "old-job",
+                        "gate_status": "needs_human",
+                        "gate_reason": "missing-slice-proof",
+                        "completed_at": "T-1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            reg.create_slice(
+                slice_id="s",
+                spec_path="/specs/s.md",
+                spec_hash="0" * 64,
+                plan_path="p.md",
+                plan_hash="1" * 64,
+                target_branch="main",
+                builder_job_id=None,
+                reviewer_job_id=None,
+                candidate=None,
+            )
+            reg.update_slice("s", state="needs_human", gate_state="needs_human")
+
+            class _AssertNoLaunch:
+                def launch(self, *, slice_id, prompt, worktree, log_dir):  # pragma: no cover
+                    raise AssertionError(f"未復原的 slice 不應被重派: {slice_id}")
+
+            metas = [_dispatch_meta("s")]
+            summary = manager.run_tick(
+                disp, metas=metas, launcher=_AssertNoLaunch(), is_satisfied=lambda x: True,
+                handoff_dir=str(hdir), clock=lambda: "T0",
+            )
+
+            self.assertEqual(summary["dispatched"], [])
+            self.assertEqual(
+                summary["needs_human"],
+                [{"slice_id": "s", "gate_reason": "missing-slice-proof", "handoff_path": str(hdir / "s.json")}],
+            )
+
     def test_idle_skip_still_reports_needs_human(self) -> None:
         # idle gate 只擋「新工作（fanout）」，不得連帶把 needs_human 回報短路成空清單——
         # 高負載（not-idle）時操作者更需要看到卡住待人工的清單。
