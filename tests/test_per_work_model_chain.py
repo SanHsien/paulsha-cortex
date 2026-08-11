@@ -300,6 +300,8 @@ def test_evidence_records_resolution_and_source(tmp_path: Path) -> None:
     }
 
     # planner 段沒有覆寫，走共享 registry；來源標記必須能分辨兩者不同。
+    # #452 C：非覆寫段的 source 記實際解析依據——該身分無實測側寫、查表投影
+    # 落在保守預設 → "default-envelope"（"registry" 保留為 #452 前 legacy 值）。
     planner_step = _step(after_builder, phase="plan", persona="planner")
     planner_identity = manager._select_workflow_identity(after_builder, planner_step, _BUILDER_IDENTITIES)
     manager._record_resolved_model_chain(registry, after_builder, planner_step, planner_identity)
@@ -310,7 +312,7 @@ def test_evidence_records_resolution_and_source(tmp_path: Path) -> None:
         "executor": "claude",
         "model_id": "planner-one",
         "independence_domain": "anthropic",
-        "source": "registry",
+        "source": "default-envelope",
     }
     # builder 段的紀錄沒有被 planner 段的更新蓋掉（逐段合併，不是整段覆蓋）。
     assert final_run.resolved_model_chain["builder"]["model_id"] == "builder-two"

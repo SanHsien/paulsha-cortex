@@ -180,7 +180,33 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    cortex inspect work porcelain-inspect --repo hamanpaul/paulsha-cortex
    cortex inspect doctor --json
    cortex inspect service --json
+   cortex inspect models --json
    ```
+
+   `cortex inspect models` 顯示每個 model identity × persona 的能力封套投影：
+   四欄位值、逐欄來源（`measured`＝patchmud 實測、`default`＝保守預設窗口）與
+   實測 provenance（deck、deck content hash、patchmud 版本、評測時間）。
+
+   模型能力封套的實測值由選配的評測巷道產生（沒有 patchmud 的機器一律走保守
+   預設，行為與未評測時相同）：
+
+   ```bash
+   cortex model profile            # 偵測 patchmud、跑 deck、產 diff 預覽（不寫檔）
+   cortex model profile --apply    # 人工複核後把實測封套寫入 packaged registry 檔
+   cortex model profile --force    # 忽略評測指紋強制重評
+   ```
+
+   評測指紋為 `(executor, model_id, persona, deck_id, deck content_sha256,
+   patchmud version)`；指紋未變時重跑會回報 `already-profiled` 直接跳過。
+   patchmud 目前僅有 anthropic adapter，roster 內只有 `claude/sonnet` 可被驅動；
+   其餘身分會逐一回報 `adapter-unavailable` 並誠實維持預設封套。
+
+   > **升級遷移註記**：packaged roster 已收編 `copilot/gpt-5.4`、
+   > `claude/sonnet`、`codex/gpt-5.3-codex-spark`、`cg/glm-5.2` 四個身分。
+   > 若 host overlay（`$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`）先前
+   > 已自行宣告其中任一鍵、且內容與 packaged 列不逐欄相等，升級後 registry
+   > 載入會 fail-closed（`custom identity shadows packaged default`）——請自
+   > overlay 移除該列，或改成與 packaged 逐欄相等。
 
 9. 用 `service` 家族管理 installer、systemd runtime 與 fallback logs：
 
