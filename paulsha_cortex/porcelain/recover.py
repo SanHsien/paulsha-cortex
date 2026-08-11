@@ -60,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "action",
         choices=(
             "retry-build", "resume", "recover-pre-candidate",
-            "recover-repair-commit", "abandon",
+            "recover-repair-commit", "abandon", "retire-delivered",
         ),
     )
     work.add_argument("--repo", required=True)

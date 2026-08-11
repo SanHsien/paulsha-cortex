@@ -49,7 +49,7 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|abandon|auto|review-attest|ship> ...
+usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|abandon|retire-delivered|auto|review-attest|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
@@ -63,6 +63,7 @@ work item commands:
   retry-verify  以 exact Candidate CAS 只重跑 verification，不重建 candidate
   retry-review  以 exact Candidate CAS 只重跑 foreign review，不重跑 builder
   abandon   以 exact WorkflowRun CAS 將 pre-delivery run 標成 superseded
+  retire-delivered  以 exact WorkflowRun CAS 退休交付已在管線外完成、pr_refs 全 terminal（merged/closed）的孤兒 run
   recover-planning  對 define/needs_human 的 planning 失敗作可恢復重跑
   recover-pre-candidate  對 candidate 產生前的 builder 失敗作可恢復重跑並回收 worktree
   recover-repair-commit  對 repair commit 已存在但缺 terminal evidence 的 build 失敗做具 CAS 的採納恢復

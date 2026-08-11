@@ -2155,3 +2155,80 @@ class JobRegistry:
         self._workflows[index] = updated
         self._persist()
         return self._copy_workflow_run(updated)
+
+    def _manager_validate_workflow_retire_delivered(
+        self,
+        run_id: str,
+        *,
+        evidence_ref: str,
+    ) -> WorkflowRun:
+        """Read-only admission check for retiring one *delivered* orphan run.
+
+        ``_manager_validate_workflow_abandon`` only admits a *pre-delivery*
+        run (no ``pr_refs``, not shipping, no completion record) — so a run
+        whose delivery already happened outside the cortex pipeline (a
+        fallback subagent built and merged the PR directly) is stuck: it
+        carries terminal ``pr_refs`` yet can neither ship (a dirty candidate)
+        nor abandon (the pre-delivery gate). This sibling admits exactly that
+        orphan: an ``ongoing`` run that REQUIRES ``pr_refs`` (the delivered
+        signature), trusting the work-action layer to have proven every one of
+        those PRs is terminal (merged/closed) *before* calling. The registry
+        stays pure and never touches GitHub itself; existing ``abandon`` is
+        left untouched — pre-delivery runs must still use the strict path.
+        """
+
+        if not isinstance(evidence_ref, str) or not evidence_ref:
+            raise ValueError("workflow retire-delivered evidence ref missing")
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current.status == "superseded":
+            if evidence_ref not in current.evidence_refs:
+                raise ValueError("workflow already superseded by different authority")
+            return self._copy_workflow_run(current)
+        if current.status != "ongoing":
+            raise ValueError("workflow retire-delivered requires ongoing run")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("workflow retire-delivered refuses active workflow job")
+        if not current.pr_refs:
+            raise ValueError(
+                "workflow retire-delivered requires a delivered run with pr refs"
+            )
+        return self._copy_workflow_run(current)
+
+    def _manager_retire_delivered_workflow_run(
+        self,
+        run_id: str,
+        *,
+        evidence_ref: str,
+    ) -> WorkflowRun:
+        """Supersede one delivered orphan run whose PRs are all terminal.
+
+        The state transition is byte-identical to
+        ``_manager_abandon_workflow_run`` — the only difference is the
+        admission gate above. Idempotent re-entry (run already ``superseded``
+        by this same evidence) returns the current copy, matching the abandon
+        crash-window contract (#275).
+        """
+
+        self._manager_validate_workflow_retire_delivered(
+            run_id,
+            evidence_ref=evidence_ref,
+        )
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current.status == "superseded":
+            return self._copy_workflow_run(current)
+        updated = replace(
+            current,
+            status="superseded",
+            facets=tuple(sorted(set(current.facets) | {"blocked", "planning_released"})),
+            evidence_refs=(*current.evidence_refs, evidence_ref),
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)

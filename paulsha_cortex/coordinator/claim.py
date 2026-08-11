@@ -322,7 +322,11 @@ def mapped_issue_titles(
 
 
 def _authority_from_row(
-    *, row: object, providers: dict, snapshot_hash: str
+    *,
+    row: object,
+    providers: dict,
+    snapshot_hash: str,
+    allow_rate_limited_last_known_good: bool = False,
 ) -> WorkAuthority | None:
     if not isinstance(row, dict):
         raise AuthorityValidationError(
@@ -338,6 +342,7 @@ def _authority_from_row(
             row=row,
             providers=providers,
             snapshot_hash=snapshot_hash,
+            allow_rate_limited_last_known_good=allow_rate_limited_last_known_good,
         )
     github = providers.get(GITHUB_PROVIDER_ID)
     if not isinstance(github, dict):
@@ -436,7 +441,11 @@ def _authority_from_row(
 
 
 def _authority_from_canonical_row(
-    *, row: dict, providers: dict, snapshot_hash: str
+    *,
+    row: dict,
+    providers: dict,
+    snapshot_hash: str,
+    allow_rate_limited_last_known_good: bool = False,
 ) -> WorkAuthority | None:
     repo = row.get("repo")
     work_id = row.get("work_id")
@@ -555,39 +564,54 @@ def _authority_from_canonical_row(
         or not revision
         or not isinstance(last_success_at, str)
     ):
+        # #370：provider 因 rate limit 而 degraded 是暫時性的（reset 後自然
+        # 恢復），不是真正的 authority 損毀——upstream（resume 的 durable
+        # backoff、Manager log）需要能不重新解析訊息文字就分辨出這種情況，
+        # 才能給出「限流中、稍後自動重試」而非要求人工介入。訊號來源是
+        # Monitor GitHubWorkProvider.scan() 寫入的 diagnostics（見
+        # monitor/providers.py），本身已用同一套 github_rate_limit 分類器產生。
+        rate_limited = False
         if status != "ok":
-            # #370：provider 因 rate limit 而 degraded 是暫時性的（reset 後
-            # 自然恢復），不是真正的 authority 損毀——upstream（resume 的
-            # durable backoff、Manager log）需要能不重新解析訊息文字就分辨
-            # 出這種情況，才能給出「限流中、稍後自動重試」而非要求人工
-            # 介入。訊號來源是 Monitor GitHubWorkProvider.scan() 寫入的
-            # diagnostics（見 monitor/providers.py），本身已用同一套
-            # github_rate_limit 分類器產生。
             diagnostics = github.get("diagnostics")
-            if isinstance(diagnostics, list) and any(
+            rate_limited = isinstance(diagnostics, list) and any(
                 isinstance(entry, str) and is_rate_limit_signal(entry) for entry in diagnostics
-            ):
-                raise AuthorityValidationError(
-                    "durable GitHub provider authority rate-limited",
-                    reason_code=REASON_PROVIDER_RATE_LIMITED_CANONICAL,
-                    repo=repo_label,
-                    work_id=work_id_label,
-                    provider_id=provider_id,
-                    field="status",
-                )
-            field = "status"
-        elif not isinstance(revision, str) or not revision:
-            field = "revision"
-        else:
-            field = "last_success_at"
-        raise AuthorityValidationError(
-            "durable GitHub provider authority invalid",
-            reason_code=REASON_PROVIDER_INVALID_CANONICAL,
-            repo=repo_label,
-            work_id=work_id_label,
-            provider_id=provider_id,
-            field=field,
+            )
+        # #370 follow-up：退休語境（work_actions._RETIREMENT_ACTIONS）不依賴
+        # issue 即時開關狀態，只要 snapshot 還留有先前成功的 last-known-good
+        # revision/last_success_at 就能安全續行——正好在系統被限流、最需要清
+        # stuck run 的時候放行清理。僅在「rate-limit degraded 且 last-known-good
+        # 齊全」的窄條件下豁免；claim/start 等需要即時 authority 的語境維持預設
+        # False，一律 fail-closed。其餘 degraded／缺 revision／壞 timestamp 仍嚴
+        # 格拒絕。
+        have_last_known_good = (
+            isinstance(revision, str) and bool(revision) and isinstance(last_success_at, str)
         )
+        if not (allow_rate_limited_last_known_good and rate_limited and have_last_known_good):
+            if status != "ok":
+                if rate_limited:
+                    raise AuthorityValidationError(
+                        "durable GitHub provider authority rate-limited",
+                        reason_code=REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+                        repo=repo_label,
+                        work_id=work_id_label,
+                        provider_id=provider_id,
+                        field="status",
+                    )
+                field = "status"
+            elif not isinstance(revision, str) or not revision:
+                field = "revision"
+            else:
+                field = "last_success_at"
+            raise AuthorityValidationError(
+                "durable GitHub provider authority invalid",
+                reason_code=REASON_PROVIDER_INVALID_CANONICAL,
+                repo=repo_label,
+                work_id=work_id_label,
+                provider_id=provider_id,
+                field=field,
+            )
+        # else：rate-limited 但被退休語境豁免——沿用 last-known-good 的
+        # revision/last_success_at 繼續建構 authority。
     try:
         last_success = datetime.fromisoformat(last_success_at.replace("Z", "+00:00")).timestamp()
     except ValueError as exc:
@@ -754,7 +778,9 @@ def claim_identity_digest(authority: WorkAuthority) -> str:
 
 
 def _load_work_authorities_with_diagnostics(
-    *, snapshot_path: str | Path | None = None
+    *,
+    snapshot_path: str | Path | None = None,
+    allow_rate_limited_last_known_good: bool = False,
 ) -> tuple[tuple[WorkAuthority, ...], tuple[AuthorityValidationError, ...]]:
     """Parse every row independently (#206 AC4): one row's validation failure
     is recorded as ``AuthorityValidationError`` diagnostics and the row is
@@ -773,7 +799,12 @@ def _load_work_authorities_with_diagnostics(
     skipped: list[AuthorityValidationError] = []
     for row in payload["work_items"]:
         try:
-            authority = _authority_from_row(row=row, providers=providers, snapshot_hash=digest)
+            authority = _authority_from_row(
+                row=row,
+                providers=providers,
+                snapshot_hash=digest,
+                allow_rate_limited_last_known_good=allow_rate_limited_last_known_good,
+            )
         except AuthorityValidationError as exc:
             skipped.append(exc)
             continue
@@ -814,8 +845,24 @@ def load_work_authority(
     repo: str,
     work_id: str,
     snapshot_path: str | Path | None = None,
+    allow_rate_limited_last_known_good: bool = False,
 ) -> WorkAuthority:
-    authorities, skipped = _load_work_authorities_with_diagnostics(snapshot_path=snapshot_path)
+    """Load one confirmed WorkAuthority.
+
+    ``allow_rate_limited_last_known_good`` (default ``False``, i.e. strict
+    fail-closed) is opt-in for the *retirement* context only (see
+    ``work_actions._RETIREMENT_ACTIONS``): when the canonical GitHub provider
+    is degraded specifically by a rate limit but still carries a prior
+    last-known-good ``revision``/``last_success_at``, the authority is built
+    from that snapshot instead of raising, so a stuck local run can still be
+    torn down while the provider is throttled. Every other caller keeps the
+    strict default and needs fresh authority.
+    """
+
+    authorities, skipped = _load_work_authorities_with_diagnostics(
+        snapshot_path=snapshot_path,
+        allow_rate_limited_last_known_good=allow_rate_limited_last_known_good,
+    )
     matches = [
         authority
         for authority in authorities
