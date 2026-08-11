@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -20,7 +21,7 @@ from paulsha_cortex.coordinator.github_delivery import (
 )
 from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
 from paulsha_cortex.coordinator.registry import JobRegistry
-from paulsha_cortex.coordinator.workflow import GateEvidenceRef
+from paulsha_cortex.coordinator.workflow import GateEvidenceRef, PlanningArtifactAuthority
 
 
 HEAD = "a" * 40
@@ -682,6 +683,155 @@ def test_abandon_orphan_rescue_allows_refs_drift_when_authority_lost_all_mapping
     assert result["result"]["action"] == "abandoned"
     rescued = registry.get_workflow_run(run_id)
     assert rescued.status == "superseded"
+
+
+def _start_run_with_planning_authority(
+    tmp_path: Path,
+    *,
+    registry: JobRegistry,
+    ref: str,
+    content: bytes,
+    kind: str = "spec",
+) -> tuple[str, Path]:
+    """啟動一個 run，並把 `ref` 綁定為它的 planning_authority——模擬 brainstorm
+    define 已成功發佈該檔案到 workspace_root（未 git 提交）。回傳 (run_id,
+    絕對路徑)。"""
+
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    workspace_root = Path(run.workspace_root)
+    target = workspace_root / ref
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    registry._manager_update_workflow_run(
+        run_id,
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=kind,
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            ),
+        ),
+    )
+    return run_id, target
+
+
+def _abandon_args(run_id: str) -> dict:
+    return {
+        "action": "abandon",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "issue 416：清掉未提交 planning artifact 殘留的回歸測試。",
+    }
+
+
+def test_abandon_gc_removes_untracked_planning_artifact_matching_baseline_hash(
+    tmp_path: Path,
+) -> None:
+    """issue #416：run 被 abandon 前，brainstorm define 已把 spec/design 發佈到
+    workspace_root（未 git 提交）。abandon 之前沒人回滾這些殘留——下一世代
+    重新 claim、brainstorm 再對同一 destinations 發佈時，`_publish_planning_
+    artifacts` 對「檔案已存在但無對應 authority」一律 fail-closed 拒收
+    （`lacks current planning authority`），殘留檔變成死鎖地雷。
+
+    這裡驗證 abandon 之後，未追蹤且 hash 與發佈時 baseline 相符的殘留檔會被
+    回滾刪除——RED（修法前）：`_abandon_action` 完全不知道 planning_authority
+    的存在，檔案在 abandon 之後依然原封不動留著。
+    """
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    ref = "docs/superpowers/specs/fix-416-spec.md"
+    content = b"# Fix 416 Spec\n\n## Requirements\n\ndemo\n"
+    run_id, target = _start_run_with_planning_authority(
+        tmp_path, registry=registry, ref=ref, content=content,
+    )
+    assert target.is_file()
+
+    work_actions.execute_work_action(
+        args=_abandon_args(run_id),
+        requested_by="operator",
+        snapshot_path=tmp_path / "snapshot.json",
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    abandoned = registry.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert not target.exists(), (
+        "abandon 之後未追蹤、hash 相符的殘留 planning artifact 必須被回滾刪除"
+        "（issue #416：否則下一世代 brainstorm 重新發佈同一路徑時會被 authority"
+        " 檢查必拒）"
+    )
+
+
+def test_abandon_gc_preserves_planning_artifact_with_hash_drift(tmp_path: Path) -> None:
+    """operator 手動改過殘留檔（現存內容與發佈時 baseline_sha256 不符）時，GC
+    必須留檔並且不得誤刪——不可信的 drift 交給人工判斷，不能悄悄清掉。"""
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    ref = "docs/superpowers/specs/fix-416-drift-spec.md"
+    original = b"# Fix 416 Spec\n\n## Requirements\n\noriginal\n"
+    run_id, target = _start_run_with_planning_authority(
+        tmp_path, registry=registry, ref=ref, content=original,
+    )
+    target.write_bytes(b"# Fix 416 Spec\n\n## Requirements\n\noperator edited this\n")
+
+    work_actions.execute_work_action(
+        args=_abandon_args(run_id),
+        requested_by="operator",
+        snapshot_path=tmp_path / "snapshot.json",
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    abandoned = registry.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert target.is_file(), "hash 不符（operator 手改）的殘留檔必須保留，不可誤刪"
+    assert b"operator edited this" in target.read_bytes()
+
+
+def test_abandon_gc_preserves_git_tracked_planning_artifact(tmp_path: Path) -> None:
+    """已被 git 追蹤的檔案（例如 operator 刻意 commit 過）不屬於「未提交殘留」
+    範圍，GC 必須完全不碰它——只清未追蹤的發佈殘留。"""
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    ref = "docs/superpowers/specs/fix-416-tracked-spec.md"
+    content = b"# Fix 416 Spec\n\n## Requirements\n\ntracked\n"
+    run_id, target = _start_run_with_planning_authority(
+        tmp_path, registry=registry, ref=ref, content=content,
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", ref], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.email=t@example.com", "-c", "user.name=t",
+         "commit", "-q", "-m", "commit the planning artifact"],
+        check=True,
+    )
+
+    work_actions.execute_work_action(
+        args=_abandon_args(run_id),
+        requested_by="operator",
+        snapshot_path=tmp_path / "snapshot.json",
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    abandoned = registry.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert target.is_file(), "git 已追蹤的檔案必須保留，GC 只清未追蹤的發佈殘留"
 
 
 def test_abandon_evidence_is_immutable_at_link_creation(
