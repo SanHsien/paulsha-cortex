@@ -1,2 +1,0 @@
-### Added
-- **open-issue 批次（369–385）work item 進件登錄**：`.cortex/work-items.yaml` 新增 14 個 work item 條目，將 15 張 open issue（369、370、371、372、373、374、375、378、379、380、381、382、383、384、385）連結為可 claim 的 work authority；371 與 375 因同動 `installer.py` 的 `managed_env`／`preserve_existing` 而合併為單一 work item（`fix-installer-managed-env`）避免平行修改互撞；386 為 tracking gate 不建 work item。各 work item 的規劃權威為對應 issue 上 2026-08-10 的獨立複驗 comment（含 root cause 更正與修復標的）。純進件登錄，不含任何實作。
