@@ -1,0 +1,1 @@
+新增 `docs/superpowers/specs/benchmark-cost-baseline.md`：以單一身分實跑 patchmud pilot-v1 全 8 關的評測成本基準（per-encounter 與全 deck 的 tokens／wall-time／USD 實測表）、N 身分全量 profile 預算外推，並定案 pricing snapshot 是否納入 #452 評測指紋、補評測排程位置與重評觸發條件（issue #455）。
