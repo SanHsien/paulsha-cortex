@@ -161,6 +161,35 @@ def test_inspect_status_human_and_json_report_same_snapshot(
     assert "degraded" in human
 
 
+def test_inspect_status_text_mode_prints_attention_entries(
+    inspect_runtime: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """issue #372 複驗點名的缺漏：--json 已含 attention，文字模式過去漏印。"""
+    updated_at = datetime.now(timezone.utc).isoformat()
+    payload = contract.build_status(
+        ready=[],
+        in_flight=[],
+        recent_done=[],
+        daemon={"pid": os.getpid(), "last_tick_at": updated_at, "idle": False},
+        updated_at=updated_at,
+    )
+    payload["attention"] = [
+        {"slice_id": "slice-needs-human", "slice_state": "needs_human", "reason": "verify-failed"}
+    ]
+    contract.atomic_write_json(constants.status_path(), payload)
+
+    assert _run_cli(["inspect", "status", "--json"]) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["status"]["attention"][0]["slice_id"] == "slice-needs-human"
+
+    assert _run_cli(["inspect", "status"]) == 0
+    human = capsys.readouterr().out
+    assert "attention" in human
+    assert "slice-needs-human" in human
+    assert "verify-failed" in human
+
+
 def test_inspect_status_uses_runtime_degraded_evaluation(
     inspect_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],

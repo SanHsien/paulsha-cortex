@@ -84,6 +84,11 @@ def _print_status(status: dict[str, Any]) -> None:
     sys.stdout.write(f"degraded: {status.get('degraded')}\n")
     sys.stdout.write("ready: " + json.dumps(status.get("ready", []), ensure_ascii=False, sort_keys=True) + "\n")
     sys.stdout.write("held: " + json.dumps(status.get("held", []), ensure_ascii=False, sort_keys=True) + "\n")
+    # issue #372 複驗點名的缺漏：attention（needs_human slice）過去只有 --json
+    # 輸出看得到，文字模式漏印，讓操作者巡檢時容易錯過需要人工介入的項目。
+    sys.stdout.write(
+        "attention: " + json.dumps(status.get("attention", []), ensure_ascii=False, sort_keys=True) + "\n"
+    )
     sys.stdout.write(
         "in_flight: " + json.dumps(status.get("in_flight", []), ensure_ascii=False, sort_keys=True) + "\n"
     )
