@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Added
+- **Issue #453（#452 子項）：定案無 benchmark 時的保守預設封套值**：新增 `docs/superpowers/specs/default-envelope-values-spec.md`——四欄位各給唯一定案值與可追溯推導：`accepts_bands` 依 persona 定為 builder/reviewer `[green, yellow]`、planner 全值域含 red（#223 攔截鏈：red 在 plan 相位被 `needs_decomposition` 路由回派 planner，build/review 不可達）；`invariant_ceiling` 走 bypass 例外 sentinel `null`（值域無界無上確界、歷史分布經查證不存在——#210 R3＋runtime evidence root 零命中；#209 R2 缺省語意本就為此欄預留 bypass）；`consistency_scope`／`acceptance_modes` 取 #209 R2 全值域（封閉有限值域、上確界可寫出，且可觀測性靠值與 provenance 可辨而非過濾）。存放機制定案 `DEFAULT_ENVELOPE` per-persona 常數於查表投影套用、registry 檔案永不寫入預設值（per-persona 預設無法攤平成 (executor, model_id) 每列單值）。另定證據層規則（`source=="default"` 在既有 capability_probe／envelope_lookup seam 維持 bypass 字節）與 #452 實作必須照做的 bit-identical 回歸測試規格（T1 golden 雙配置決策軌跡／T2 預設值恆不排除 property test／T3 loader 相容）。詳見 `changelog.d/default-envelope-values.md`。
+
 ## [0.1.6] - 2026-08-11
 
 ### Added
