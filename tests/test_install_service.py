@@ -93,6 +93,7 @@ def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):
         "PSC_RUN_ROOT=/custom/run\n"
         "PSC_MONITOR_STATE_ROOT=/custom/monitor\n"
         "PSC_PROJECT_CONFIG_ROOT=/custom/config\n"
+        "PSC_CONTROL_ROOT=/custom/control\n"
         "PY=/stale/python\n",
         encoding="utf-8",
     )
@@ -109,11 +110,24 @@ def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):
     assert "PSC_WORKTREE_ROOT=/custom/worktrees" in env_lines
     assert "PSC_RUN_ROOT=/custom/run" in env_lines
     assert "PSC_MONITOR_STATE_ROOT=/custom/monitor" in env_lines
-    assert "PSC_PROJECT_CONFIG_ROOT=/custom/config" in env_lines
     # managed key 就地更新、不重複
     assert f"PY={sys.executable}" in env_lines
     assert sum(line.startswith("PY=") for line in env_lines) == 1
     assert f"PSC_REPO_ROOT={repo_root.resolve()}" in env_lines
+    # #371 回歸：PSC_PROJECT_CONFIG_ROOT 不再是「已有值就保留」。preserve_existing
+    # 曾把它與 PSC_RUN_ROOT/PSC_MONITOR_STATE_ROOT 一視同仁地鎖住，導致一個早期
+    # 殘留的錯誤值永遠無法被 `cortex install service` 重裝修復（issue #371 實測
+    # hippo instance 正是卡在這裡，多 instance 因此共用同一份 GitHub 配額）。
+    # 現在每次 install 都必須以目前 PSC_AGENTS_ROOT 推導值覆寫。這裡沒有另外
+    # delenv PSC_AGENTS_ROOT，所以套用 conftest 的 `_clear_runtime_env` guard
+    # 預設值（tmp_path/"unset-psc-root-guard"/"agents"），不是 home/.agents。
+    guard_agents_root = tmp_path / "unset-psc-root-guard" / "agents"
+    assert "PSC_PROJECT_CONFIG_ROOT=/custom/config" not in env_lines
+    assert f"PSC_PROJECT_CONFIG_ROOT={guard_agents_root / 'config' / 'paulsha'}" in env_lines
+    # #375：PSC_CONTROL_ROOT 是新收進 managed_env 的鍵，且明確「絕不可」放進
+    # preserve_existing——否則會複製 #371 剛修好的同一種鎖死 bug（複驗明確警告）。
+    assert "PSC_CONTROL_ROOT=/custom/control" not in env_lines
+    assert f"PSC_CONTROL_ROOT={guard_agents_root / 'control' / 'beta'}" in env_lines
 
 
 def test_install_reconciles_legacy_codex_relay_hook(tmp_path, monkeypatch):
@@ -231,6 +245,145 @@ def test_install_existing_agents_root_drives_new_specific_defaults(tmp_path, mon
     assert f"PSC_AGENTS_ROOT={custom_agents}" in env_lines
     assert f"PSC_RUN_ROOT={custom_agents / 'run' / 'beta'}" in env_lines
     assert f"PSC_MONITOR_STATE_ROOT={custom_agents / 'monitor'}" in env_lines
+
+
+def test_install_reinstall_repairs_project_config_root_after_agents_root_isolation(
+    tmp_path, monkeypatch
+):
+    """issue #371 逐步重現：instance 最初在預設（未隔離）PSC_AGENTS_ROOT 下裝過一次，
+    寫下 PSC_PROJECT_CONFIG_ROOT=<home>/.agents/config/paulsha；之後 operator 為了
+    multi-instance 隔離手動把 PSC_AGENTS_ROOT 改成 instance 專屬路徑（實測 hippo 的
+    PSC_RUN_ROOT/PSC_MONITOR_STATE_ROOT 都正確跟著換了，唯獨 PSC_PROJECT_CONFIG_ROOT
+    卡住)，reinstall 後 PSC_PROJECT_CONFIG_ROOT 必須跟著新 agents_root 重新推導，
+    不能繼續指向舊的共用路徑（否則多 instance 會共掃同一組 repo，打爆共用 GitHub
+    配額）。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    runtime_dir = home / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    env_file = runtime_dir / "hippo-manager.env"
+    isolated_agents_root = home / ".agents" / "instances" / "hippo-open-issues"
+    # 只有 PSC_PROJECT_CONFIG_ROOT 是「錯」的（仍指向未隔離前的舊預設路徑）；
+    # 其餘三個都已經是正確的 instance-scoped 值——這正是票面實測的狀態。
+    env_file.write_text(
+        f"PSC_AGENTS_ROOT={isolated_agents_root}\n"
+        f"PSC_RUN_ROOT={isolated_agents_root / 'run' / 'hippo'}\n"
+        f"PSC_MONITOR_STATE_ROOT={isolated_agents_root / 'monitor'}\n"
+        f"PSC_PROJECT_CONFIG_ROOT={home / '.agents' / 'config' / 'paulsha'}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    monkeypatch.chdir(repo_root)
+
+    assert installer.main(["service", "--instance", "hippo"]) == 0
+
+    env_lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert f"PSC_PROJECT_CONFIG_ROOT={home / '.agents' / 'config' / 'paulsha'}" not in env_lines
+    assert (
+        f"PSC_PROJECT_CONFIG_ROOT={isolated_agents_root / 'config' / 'paulsha'}" in env_lines
+    )
+    # 對照組不能跟著壞掉：本來就正確的三個值必須維持不變。
+    assert f"PSC_AGENTS_ROOT={isolated_agents_root}" in env_lines
+    assert f"PSC_RUN_ROOT={isolated_agents_root / 'run' / 'hippo'}" in env_lines
+    assert f"PSC_MONITOR_STATE_ROOT={isolated_agents_root / 'monitor'}" in env_lines
+
+
+def test_install_writes_instance_scoped_control_root_to_env_file(tmp_path, monkeypatch):
+    """issue #375：PSC_CONTROL_ROOT 現在必須是 managed_env 的一員，且預設落在
+    `<agents_root>/control/<instance>`（比照 PSC_RUN_ROOT 的 `run/<instance>`），
+    讓 manager.lock 天生 per-instance，不必依賴 operator 另外隔離 PSC_AGENTS_ROOT。"""
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    env_file = tmp_path / ".agents" / "core" / "runtime" / "beta-manager.env"
+    env_lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert f"PSC_CONTROL_ROOT={tmp_path / '.agents' / 'control' / 'beta'}" in env_lines
+
+
+def test_install_two_instances_under_shared_agents_root_get_distinct_control_roots(
+    tmp_path, monkeypatch
+):
+    """issue #375 驗收條件：同機安裝兩個 instance（預設共用同一個 agents_root）後，
+    兩者的 lock 檔路徑（透過 PSC_CONTROL_ROOT）不得相同，否則第二個 instance 的
+    manager daemon 搶不到鎖，靜默 adopt 對方 pid、work item 完全不會被處理。"""
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+
+    assert installer.main(["service", "--instance", "alpha"]) == 0
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    runtime_dir = tmp_path / ".agents" / "core" / "runtime"
+    alpha_lines = (runtime_dir / "alpha-manager.env").read_text(encoding="utf-8").splitlines()
+    beta_lines = (runtime_dir / "beta-manager.env").read_text(encoding="utf-8").splitlines()
+    alpha_control = next(line for line in alpha_lines if line.startswith("PSC_CONTROL_ROOT="))
+    beta_control = next(line for line in beta_lines if line.startswith("PSC_CONTROL_ROOT="))
+
+    assert alpha_control != beta_control
+    assert alpha_control == f"PSC_CONTROL_ROOT={tmp_path / '.agents' / 'control' / 'alpha'}"
+    assert beta_control == f"PSC_CONTROL_ROOT={tmp_path / '.agents' / 'control' / 'beta'}"
+
+
+def test_install_control_root_stale_value_is_corrected_not_preserved(tmp_path, monkeypatch):
+    """複驗明確警告：把 PSC_CONTROL_ROOT 收進 managed_env 時若也加進
+    preserve_existing，會複製 #371 完全相同的鎖死 bug。這裡直接證明一個既有的
+    (錯誤) PSC_CONTROL_ROOT 行在 reinstall 後會被推導值覆寫，而不是被保留。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    runtime_dir = home / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    env_file = runtime_dir / "beta-manager.env"
+    env_file.write_text("PSC_CONTROL_ROOT=/stale/control\n", encoding="utf-8")
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    monkeypatch.chdir(repo_root)
+
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    env_lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert "PSC_CONTROL_ROOT=/stale/control" not in env_lines
+    assert f"PSC_CONTROL_ROOT={home / '.agents' / 'control' / 'beta'}" in env_lines
+
+
+def test_install_leaves_specs_and_coordinator_roots_as_operator_domain(tmp_path, monkeypatch):
+    """#375 複驗點名 PSC_MANAGER_SPECS_DIR／PSC_COORDINATOR_ROOT／PSC_SPECS_ROOT
+    同樣未 instance-scoped、同樣會 implicit alias 到同一路徑。本次合併修復（#371+
+    #375）評估後決定：這三者牽動面遠大於 CONTROL_ROOT／PROJECT_CONFIG_ROOT（
+    coordinator_root 是 jobs.json/delivery-journal 等大量呼叫點的共用 state root，
+    specs_dir 預設還被 shell wrapper 硬寫繞過 PSC_AGENTS_ROOT），暫不收進
+    managed_env，留給後續 follow-up 專票處理。這個 pin 測試把「目前仍是 operator
+    域」的決策釘住，避免日後不小心把它們加進 managed_env 卻忘了一併處理
+    preserve_existing 語意（重蹈 #371 覆轍）。"""
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    env_file = tmp_path / ".agents" / "core" / "runtime" / "beta-manager.env"
+    env_lines = env_file.read_text(encoding="utf-8").splitlines()
+    keys = {line.split("=", 1)[0] for line in env_lines if "=" in line}
+    assert "PSC_MANAGER_SPECS_DIR" not in keys
+    assert "PSC_COORDINATOR_ROOT" not in keys
+    assert "PSC_SPECS_ROOT" not in keys
 
 
 def test_install_rejects_symlinked_bootstrap_without_overwriting_target(tmp_path, monkeypatch):
