@@ -6180,11 +6180,13 @@ def _specialize_workflow_launcher(launcher, step):
 # 探測（`coordinator.executor_auth`），以 process-level 快取避免每次 dispatch
 # 都重新 spawn CLI 子行程（見 `_EXECUTOR_AUTH_CACHE`）。
 #
-# cards.yaml 尚未有卡片宣告 `provider:executor`（見 #369 changelog 的風險
-# 說明）：sentinel 機制已就緒且有完整測試覆蓋，但要接上前先確認 CI／各執行
-# 環境對 claude／codex／copilot CLI 的可得性，避免 dispatch 熱路徑意外 spawn
-# 子行程；`provider:github:<repo>` 純讀 monitor 快照檔，無此風險，已直接接上
-# openspec-archive／policy-commit 兩張 ship-phase 卡。
+# #442：`provider:executor` sentinel 已（小範圍）接上 cards——openspec-archive
+# ／policy-commit 兩張 ship-phase 卡宣告了它（與 #369 先行接上的
+# `provider:github:<repo>` 併存），啟用前已在部署環境驗證 claude／codex／
+# copilot CLI 皆在場且登入態探測可用（見 #442 PR 的驗證紀錄）。其餘卡仍
+# 維持 hold：待 ship-phase 觀測無誤後再擴大，避免 dispatch 熱路徑對更多
+# combo 意外 spawn 探測子行程。探測成本由 `_EXECUTOR_AUTH_CACHE`（process-
+# level、TTL 900s）與 ProbeBudget 上限共同約束。
 _EXECUTOR_AUTH_CACHE: dict[str, object] = {}
 
 
