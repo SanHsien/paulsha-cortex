@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-11
+
 ### Added
 - **Issue #442（第一部分）：新增 `cg`（copilot API／glm-5.2 via llm-share）launcher 支援**：`launcher.build_cg_argv` 依 operator 提供並 smoke 驗證的介面契約（prompt 經 stdin、`--headless --stdin`、model 預設 `glm-5.2`、effort 合法值 low/medium/high/xhigh）組出 argv，登記進 `_ARGV_BUILDERS`；cg 為 zero-tool executor，`build_cg_argv`／`SubprocessLauncher.__init__` 對 commit_required／unsafe／builder 語境一律 raise，只服務 read-only 的 planner／reviewer。`SubprocessLauncher.launch()` 新增 stdin plumbing（`printf %s <prompt> | <inner argv> 2>/dev/null`），其餘 executor 零影響。詳見 `changelog.d/cg-launcher-support.md`。
 - **交付後孤兒 run 的明確退休路徑 `cortex work retire-delivered`（Gap 1）**：交付發生在 cortex 管線之外（fallback 巷道 subagent 直接做完並 merge）時，對應的 `WorkflowRun` 會卡在 `ongoing`／`verify`／`needs_human`、且其 build 階段建的 PR（`pr_refs`）早已 terminal，既有 `abandon` 的 pre-delivery 閘門使之無法退休、亦無法 ship，形成死角。新增獨立、意圖明確的退休 work-action `retire-delivered`：先透過既有 provider seam（新增 `GitHubDeliveryClient.fetch_pr_lifecycle_status`，走既有 `_api`、不自 subprocess `gh`）驗證每個 `pr_ref` 的 PR 都為 terminal（merged／closed），再落 audit evidence（`work-retire-delivered/`，schema `cortex-work-retire-delivered/v1`）並將 run 標為 `superseded`；registry 層維持純粹、不打 GitHub，退休 admission 只要求 `ongoing`＋無 active job＋`pr_refs` 非空。沿用 exact WorkflowRun CAS（`--expected-run-id`）＋bounded actor/reason，並具 idempotent 重入（已 superseded 時從 durable evidence 重讀 terminal 證明、不再打 GitHub）。**刻意不弱化既有 `abandon` 的 pre-delivery 嚴格性**。詳見 `changelog.d/orphan-run-retirement.md`。
