@@ -190,6 +190,49 @@ def test_inspect_status_text_mode_prints_attention_entries(
     assert "verify-failed" in human
 
 
+def test_inspect_status_text_mode_prints_provider_outcome_for_attention_entries(
+    inspect_runtime: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#384：build-phase provider failure（typed 分類）必須從 attention entry
+    投影出來——`--json` 已透過 slice_status_entry 的 ``provider_outcome`` 欄位
+    passthrough，文字模式另外印一行摘要（比照 #372 的 attention 修法），不必
+    展開整包 JSON 就能看出是哪種 outcome、可不可 retry。
+    """
+    updated_at = datetime.now(timezone.utc).isoformat()
+    payload = contract.build_status(
+        ready=[],
+        in_flight=[],
+        recent_done=[],
+        daemon={"pid": os.getpid(), "last_tick_at": updated_at, "idle": False},
+        updated_at=updated_at,
+    )
+    payload["attention"] = [
+        {
+            "slice_id": "slice-rate-limited",
+            "slice_state": "needs_human",
+            "reason": "builder-failed-rate_limited",
+            "provider_outcome": {
+                "outcome": "rate_limited",
+                "authority": "text_signal",
+                "reason": "rate limit signal detected in executor output",
+                "retryable": True,
+            },
+        }
+    ]
+    contract.atomic_write_json(constants.status_path(), payload)
+
+    assert _run_cli(["inspect", "status", "--json"]) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["status"]["attention"][0]["provider_outcome"]["outcome"] == "rate_limited"
+
+    assert _run_cli(["inspect", "status"]) == 0
+    human = capsys.readouterr().out
+    assert "slice-rate-limited" in human
+    assert "rate_limited" in human
+    assert "retryable=True" in human
+
+
 def test_inspect_status_uses_runtime_degraded_evaluation(
     inspect_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],

@@ -53,6 +53,14 @@ MAX_NORMALIZE_ATTEMPTS = 1
 # D5：同一個確定性 mismatch 最多回派模型的次數上限。
 MAX_SCHEMA_RETRIES = 2
 
+# #384：同一張 workflow card 因 provider 失敗（rate_limited／transient，見
+# `coordinator.provider_outcome.RETRYABLE_OUTCOMES`）最多 bounded retry 的次數
+# 上限。與 MAX_SCHEMA_RETRIES 分開命名、分開計數（`run.attempts` 的 key 前綴
+# 不同，見 `manager._provider_retry_attempt_key`）——schema mismatch 是模型輸出
+# 形狀問題，provider 失敗是 executor/服務層問題，逾限時的 needs_human 原因也
+# 不同，不應共用同一個計數器與門檻。
+MAX_PROVIDER_RETRIES = 2
+
 GATE_LEDGER_SCHEMA_VERSION = 1
 GATE_LEDGER_KIND = "workflow-gate-ledger"
 

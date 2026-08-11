@@ -8,6 +8,7 @@ from typing import Callable
 from paulsha_cortex.config import paths
 
 from .completion import classify_completion
+from .provider_outcome import classify_provider_failure, read_log_tail
 from .registry import JobRegistry
 from .seams import PaneSender, WorktreeCreator
 
@@ -206,8 +207,17 @@ class Dispatcher:
     ) -> dict[str, object]:
         last_jsonl_line = _last_nonempty_line(log_path)
         status = classify_completion(exit_code=exit_code, last_jsonl_line=last_jsonl_line)
+        # #384：只在真的失敗時才分類——分類器本身也會拒絕 exit_code == 0
+        # （防禦性），這裡額外用 status 把「exited 但非零 exit code 目前尚未走
+        # classify_completion 的 failed 分支」這種邊界情況也排除掉，避免對
+        # 明明成功的 job 做無意義的 log 讀取與分類。
+        provider_outcome = None
+        if status == "failed":
+            output = read_log_tail(log_path)
+            provider_outcome = classify_provider_failure(exit_code=exit_code, output=output).to_dict()
         return self._registry.update_headless_result(
             job_id,
             status=status,
             exit_code=exit_code,
+            provider_outcome=provider_outcome,
         )
