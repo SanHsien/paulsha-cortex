@@ -50,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--identity",
         action="append",
         default=[],
-        help="只處理指定身分（executor/model_id，可重複）",
+        help="只處理指定身分（executor/model_id 或 executor:model_id，可重複；查無對應身分即報錯）",
     )
     profile.add_argument("--json", action="store_true", help="輸出 cortex-porcelain/model-profile/v1 JSON")
     return parser

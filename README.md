@@ -201,6 +201,13 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    patchmud 目前僅有 anthropic adapter，roster 內只有 `claude/sonnet` 可被驅動；
    其餘身分會逐一回報 `adapter-unavailable` 並誠實維持預設封套。
 
+   > **升級遷移註記**：packaged roster 已收編 `copilot/gpt-5.4`、
+   > `claude/sonnet`、`codex/gpt-5.3-codex-spark`、`cg/glm-5.2` 四個身分。
+   > 若 host overlay（`$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`）先前
+   > 已自行宣告其中任一鍵、且內容與 packaged 列不逐欄相等，升級後 registry
+   > 載入會 fail-closed（`custom identity shadows packaged default`）——請自
+   > overlay 移除該列，或改成與 packaged 逐欄相等。
+
 9. 用 `service` 家族管理 installer、systemd runtime 與 fallback logs：
 
    ```bash

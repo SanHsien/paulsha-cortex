@@ -148,6 +148,21 @@ def test_v2_file_rejects_envelope_fields(tmp_path: Path) -> None:
         load_model_identities(tmp_path, use_packaged_default=False)
 
 
+def test_from_rows_construction_layer_gates_envelope_by_schema_version() -> None:
+    # 對抗審查修正：v1/v2 的封套 fail-closed 不只在檔案載入層成立——直接呼叫
+    # from_rows(schema_version=2) 構造帶封套欄位的 registry 也必須被擋下
+    # （建構層與檔案層同一條規則，閘門由 schema_version 推導）。
+    row = _measured_row()
+    with pytest.raises(ValueError, match="unexpected"):
+        IdentityRegistry.from_rows([row], schema_version=2)
+    with pytest.raises(ValueError, match="unexpected"):
+        IdentityRegistry.from_rows([row], schema_version=1)
+    # v3（含預設 schema_version）照常接受。
+    assert IdentityRegistry.from_rows([row], schema_version=3).require(
+        "claude", "sonnet"
+    ).accepts_bands == ("green", "yellow")
+
+
 def test_v3_measured_file_roundtrip_and_projection(tmp_path: Path) -> None:
     (tmp_path / "model-identities.yaml").write_text(V3_MEASURED_FILE, encoding="utf-8")
     registry = load_model_identities(tmp_path, use_packaged_default=False)

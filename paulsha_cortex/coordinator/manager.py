@@ -6081,9 +6081,10 @@ def _measured_profile_partition(
     - 帶該 persona 實測側寫（accepts_bands source=measured）的身分排前
       （解析優先序：override > measured 側寫 > registry/預設；同層維持既有
       registry 順序，stable partition 不重排）。
-    - 實測 accepts_bands 排除本 run sizing_band 的身分被剔除，附可觀測理由
-      （#209 R1：被排除的身分原因可觀測）。band 未知（planning 尚未產出）或
-      封套來自預設（#453 零過濾不變量）時一律不過濾。
+    - 實測 accepts_bands 排除本 run 的 sizing_band 的身分被剔除，理由隨
+      excluded 回傳給呼叫端（#209 R1：全滅時進 fail-closed 錯誤訊息，部分
+      剔除時由呼叫端落 manager log，兩者皆可觀測）。band 未知（planning 尚未
+      產出）或封套來自預設（#453 零過濾不變量）時一律不過濾。
     """
 
     from .model_identities import ENVELOPE_SOURCE_MEASURED, project_envelope
@@ -6159,9 +6160,20 @@ def _workflow_identity_candidates_for_persona(
         return [identity]
     candidates = _identity_candidates_for_persona(persona, identities, builder_domains)
     if persona == "builder" and run.primary_domain is not None:
+        # #452 對抗審查修正：primary_domain 是「同 domain 優先」的**排序偏好**，
+        # 不是合法性限制（見 _identity_candidates_for_persona docstring）。舊實
+        # 作「preferred 非空即整組收窄」在 packaged roster 只有 agy 時無害，但
+        # roster 擴充 build 候選（#456 R3）後，僅為候選宣告的 packaged 身分會把
+        # host overlay 的可跑 builder 整個擠出候選清單，#262 preflight re-route
+        # 因此失去 fallback——packaged 登錄不隱含本機可用（比照 doctor #456 R6
+        # 的候選宣告語意）。改為 preferred 排前、其餘保留在後：首選不變，
+        # fallback 不丟。
         preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
         if preferred:
-            candidates = preferred
+            rest = [
+                item for item in candidates if item.independence_domain != run.primary_domain
+            ]
+            candidates = preferred + rest
     if not candidates:
         raise ValueError(f"no configured identity for workflow persona: {persona}")
     # #452 C：measured 側寫優先＋band 過濾（三段 persona 之外的 catch-all
@@ -6172,6 +6184,20 @@ def _workflow_identity_candidates_for_persona(
         ordered, excluded = _measured_profile_partition(
             persona, getattr(run, "sizing_band", None), candidates
         )
+        if excluded and ordered:
+            # #452 對抗審查修正（#209 R1）：部分剔除（仍有存活候選）時排除理由
+            # 也要可觀測——落 manager log，不再靜默丟棄；全滅時走下方
+            # fail-closed 錯誤訊息。
+            logger.info(
+                "workflow run=%s persona=%s measured 側寫剔除候選：%s（存活候選 %d）",
+                getattr(run, "run_id", None),
+                persona,
+                "; ".join(
+                    f"{identity.executor}/{identity.model_id}: {reason}"
+                    for identity, reason in excluded
+                ),
+                len(ordered),
+            )
         if not ordered:
             detail = "; ".join(
                 f"{identity.executor}/{identity.model_id}: {reason}"

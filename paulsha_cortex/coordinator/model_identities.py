@@ -336,7 +336,6 @@ class IdentityRegistry:
         rows: Iterable[Mapping[str, object]],
         *,
         schema_version: int = MODEL_IDENTITY_SCHEMA_VERSION,
-        allow_envelope: bool = True,
     ) -> "IdentityRegistry":
         identities: list[ModelIdentity] = []
         seen: set[tuple[str, str]] = set()
@@ -347,8 +346,11 @@ class IdentityRegistry:
             "capabilities",
             "live_probe",
         }
-        if allow_envelope:
-            # schema v3（#452 B）才認得封套欄位；v1/v2 檔案帶了一律 fail-closed。
+        if int(schema_version) >= 3:
+            # schema v3（#452 B）才認得封套欄位；v1/v2 帶了一律 fail-closed。
+            # #452 對抗審查修正：閘門由 schema_version 直接推導（原本獨立的
+            # allow_envelope 參數預設 True，讓「封套欄位是 v3 才有的契約」只在
+            # 檔案載入層成立、建構層可繞過）。
             allowed |= set(ENVELOPE_FIELDS) | {"profile_provenance"}
         for index, row in enumerate(rows):
             if not isinstance(row, Mapping):
@@ -470,12 +472,9 @@ def _load_model_identity_file(path: Path) -> IdentityRegistry:
                 normalized["live_probe"] = AGY_LIVE_PROBE
             normalized_rows.append(normalized)
         rows = normalized_rows
-    return IdentityRegistry.from_rows(
-        rows,
-        schema_version=int(schema_version),
-        # 封套欄位是 schema v3（#452 B）才有的契約；v1/v2 檔案帶了照舊 fail-closed。
-        allow_envelope=int(schema_version) >= 3,
-    )
+    # 封套欄位是 schema v3（#452 B）才有的契約；v1/v2 檔案帶了照舊 fail-closed
+    # （閘門在 from_rows 內由 schema_version 推導，建構層與檔案層同一條規則）。
+    return IdentityRegistry.from_rows(rows, schema_version=int(schema_version))
 
 
 def load_model_identities(
@@ -502,8 +501,13 @@ def load_model_identities(
         if packaged_identity is not None and packaged_identity == identity:
             continue
         if packaged_identity is not None:
+            # #452 對抗審查修正：roster 擴為 5 身分後，既有 host overlay 撞鍵的
+            # 機率大增（尤其 claude/sonnet 舊 operator 寫法）——錯誤訊息附行動
+            # 指引，操作者不用翻 code 就知道怎麼解。
             raise ValueError(
                 f"model-identities custom identity shadows packaged default: {key[0]}/{key[1]}"
+                "（packaged roster v3 已收編此身分：請自 host overlay 移除該列，"
+                "或改成與 packaged 逐欄相等）"
             )
         additions.append(identity)
     return IdentityRegistry(

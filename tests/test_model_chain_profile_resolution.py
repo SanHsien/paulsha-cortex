@@ -56,9 +56,9 @@ def _default_builder_row(executor: str, model_id: str, domain: str) -> dict:
     }
 
 
-def _run(*, sizing_band=None, override=None) -> SimpleNamespace:
+def _run(*, sizing_band=None, override=None, primary_domain=None) -> SimpleNamespace:
     return SimpleNamespace(
-        primary_domain=None,
+        primary_domain=primary_domain,
         steps=[],
         sizing_band=sizing_band,
         model_chain_override=override,
@@ -90,14 +90,53 @@ def test_measured_profile_candidates_sort_before_default() -> None:
     ]
 
 
-def test_measured_band_filter_excludes_with_observable_reason() -> None:
-    # red 不在 measured accepts_bands → 該身分被剔除，僅剩 default 身分。
-    candidates = manager._workflow_identity_candidates(
-        _run(sizing_band="red"), _step("builder"), REGISTRY
+def test_overlay_builder_survives_packaged_primary_domain_preference(tmp_path: Path) -> None:
+    # 對抗審查修正鎖定：host overlay 宣告的 builder 與 packaged roster 併存時，
+    # primary_domain 偏好命中 packaged 身分（僅為候選宣告、不隱含本機可用）
+    # 不得把 overlay builder 整組擠出候選清單——preferred 排前、其餘保留在後，
+    # #262 preflight re-route 才有 fallback 可用。
+    overlay = tmp_path / "model-identities.yaml"
+    overlay.write_text(
+        "schema_version: 3\n"
+        "identities:\n"
+        "  - executor: codex\n"
+        "    model_id: gpt-5.4\n"
+        "    independence_domain: openai\n"
+        "    capabilities: [build]\n",
+        encoding="utf-8",
     )
+    roster = load_model_identities(tmp_path, use_packaged_default=True)
+    candidates = manager._workflow_identity_candidates(
+        _run(primary_domain="anthropic"), _step("builder"), roster
+    )
+    keys = [(item.executor, item.model_id) for item in candidates]
+    # 偏好仍是偏好：同 domain 的 packaged 身分排前。
+    assert keys[0] == ("claude", "sonnet")
+    # overlay builder 不被剔除（v0.1.6 部署的實際可跑 builder 保住 fallback）。
+    assert ("codex", "gpt-5.4") in keys
+
+
+def test_measured_band_filter_excludes_with_observable_reason(caplog) -> None:
+    # red 不在 measured accepts_bands → 該身分被剔除，僅剩 default 身分。
+    # 對抗審查修正（#209 R1）：部分剔除（仍有存活候選）時排除理由不得靜默
+    # 丟棄——必須落 manager log。
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="paulsha_cortex.coordinator.manager"):
+        candidates = manager._workflow_identity_candidates(
+            _run(sizing_band="red"), _step("builder"), REGISTRY
+        )
     assert [(item.executor, item.model_id) for item in candidates] == [
         ("copilot", "gpt-5.4"),
     ]
+    exclusion_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "measured 側寫剔除候選" in record.getMessage()
+    ]
+    assert len(exclusion_logs) == 1
+    assert "claude/sonnet" in exclusion_logs[0]
+    assert "sizing_band=red" in exclusion_logs[0]
     # band 未知（planning 尚未產出）→ 不過濾（#453 零過濾不變量）。
     candidates = manager._workflow_identity_candidates(
         _run(sizing_band=None), _step("builder"), REGISTRY

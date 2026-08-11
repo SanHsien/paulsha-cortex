@@ -196,7 +196,12 @@ def test_t1_golden_dual_config_decision_surfaces_byte_equal(tmp_path: Path) -> N
                 )
 
     # Surface 3：sizing_band() + decomposition_route()——三帶 × depth {0,1,2}。
-    # 純函式不消費封套；雙配置下同一輸入必同輸出（byte-equal）。
+    # 純函式不消費封套（spec R6 的證明目標是「行為凍結在 v0.1.6 golden」）。
+    # 對抗審查修正：原本「同一運算式算兩次 assert 相等」是恆真式，任何實作
+    # 變異都轉不紅；改與 checked-in golden 比對。
+    golden_band_by_total = {0: "green", 3: "green", 4: "yellow", 6: "yellow", 7: "red", 10: "red"}
+    golden_route_by_depth = {0: "needs_decomposition", 1: "needs_decomposition", 2: "needs_human"}
+    assert DECOMPOSITION_DEPTH_LIMIT == 2
     routes = {
         (total, depth): (sizing_band(total), decomposition_route(decomposition_depth=depth))
         for total in (0, 3, 4, 6, 7, 10)
@@ -204,16 +209,13 @@ def test_t1_golden_dual_config_decision_surfaces_byte_equal(tmp_path: Path) -> N
     }
     assert _canonical({f"{k}": v for k, v in routes.items()}) == _canonical(
         {
-            f"{(total, depth)}": (
-                sizing_band(total),
-                decomposition_route(decomposition_depth=depth),
-            )
+            f"{(total, depth)}": (golden_band_by_total[total], golden_route_by_depth[depth])
             for total in (0, 3, 4, 6, 7, 10)
-            for depth in (0, 1, DECOMPOSITION_DEPTH_LIMIT)
+            for depth in (0, 1, 2)
         }
     )
 
-    # Surface 4：repair_budget_for_band()——預算值或例外。
+    # Surface 4：repair_budget_for_band()——預算值或例外，凍結 golden。
     def _budget(band):
         try:
             return {"budget": repair_budget_for_band(band)}
@@ -222,10 +224,22 @@ def test_t1_golden_dual_config_decision_surfaces_byte_equal(tmp_path: Path) -> N
 
     budgets = {str(band): _budget(band) for band in (*_BANDS, None)}
     assert _canonical(budgets) == _canonical(
-        {str(band): _budget(band) for band in (*_BANDS, None)}
+        {
+            "green": {"budget": 1},
+            "yellow": {"budget": 2},
+            "red": {
+                "error": (
+                    "red band 不得進入 ship repair budget"
+                    "（應由 #223 的路由在更早階段攔截，這裡僅做防禦性拒絕）"
+                )
+            },
+            "None": {"budget": 2},
+        }
     )
 
-    # Surface 5：validate_completion_record()——normalized 輸出或例外。
+    # Surface 5：validate_completion_record()——normalized 輸出或例外，凍結
+    # golden：valid payload 的 normalized 輸出恆等於輸入本身（round-trip），
+    # 缺鍵 payload 的錯誤訊息逐字凍結。
     valid_payload = {
         "schema_version": COMPLETION_SCHEMA_VERSION,
         "slice_id": "slice-a",
@@ -255,29 +269,46 @@ def test_t1_golden_dual_config_decision_surfaces_byte_equal(tmp_path: Path) -> N
         except ValueError as exc:
             return {"error": str(exc)}
 
-    for payload in (valid_payload, {"schema_version": COMPLETION_SCHEMA_VERSION}):
-        assert _canonical(_completion(payload)) == _canonical(_completion(payload))
+    assert _canonical(_completion(valid_payload)) == _canonical(
+        {"normalized": valid_payload}
+    )
+    missing_error = (
+        "completion record missing keys: builder_job_id, candidate, completed_at, "
+        "dispatch_base, docs_class, plan_hash, review_evaluation_hash, "
+        "review_evaluation_path, review_policy, reviewer_job_id, slice_id, spec_hash, "
+        "target_branch, target_ref, target_ref_sha, target_remote, "
+        "verification_evidence_hash, verification_evidence_path, verification_hash"
+    )
+    assert _canonical(
+        _completion({"schema_version": COMPLETION_SCHEMA_VERSION})
+    ) == _canonical({"error": missing_error})
 
 
 def test_t1_capability_observation_bytes_match_v016_bypass(tmp_path: Path) -> None:
     """預設封套 provider 對 packaged 身分回 None → capability 格 observation
-    與 v0.1.6 的 `_passed("capability", bypass="envelope_unavailable")` 字節相同。"""
+    與 v0.1.6 的 `_passed("capability", bypass="envelope_unavailable")` 字節相同。
+
+    對抗審查修正：sizing_band 四值全掃（與 surface 1 的 band 迴圈對齊）——
+    R5 違規若只在特定 band 觸發（如 verdict 只對 red 回非 None），固定餵
+    green 的版本抓不到。
+    """
 
     registry = _packaged_registry(tmp_path)
     for identity in registry.identities:
         for persona in _PERSONAS:
-            lookup = build_capability_lookup(registry, persona=persona, sizing_band="green")
-            probe = cr.capability_probe(capability_lookup=lookup)
-            context = cr.ReadinessContext(
-                authority=_authority(tmp_path),
-                executor_identity=f"{identity.executor}/{identity.model_id}",
-            )
-            result = probe(context)
-            baseline = cr.capability_probe(capability_lookup=None)(context)
-            assert _canonical(dict(result.observation)) == _canonical(
-                dict(baseline.observation)
-            )
-            assert result.passed and baseline.passed
+            for band in (*_BANDS, None):
+                lookup = build_capability_lookup(registry, persona=persona, sizing_band=band)
+                probe = cr.capability_probe(capability_lookup=lookup)
+                context = cr.ReadinessContext(
+                    authority=_authority(tmp_path),
+                    executor_identity=f"{identity.executor}/{identity.model_id}",
+                )
+                result = probe(context)
+                baseline = cr.capability_probe(capability_lookup=None)(context)
+                assert _canonical(dict(result.observation)) == _canonical(
+                    dict(baseline.observation)
+                )
+                assert result.passed and baseline.passed
 
 
 # ---------------------------------------------------------------------------

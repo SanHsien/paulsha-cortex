@@ -294,6 +294,46 @@ def test_porcelain_model_profile_text_output(fake_patchmud: SimpleNamespace, cap
     assert "--- " in out and "+++ " in out  # unified diff 預覽
 
 
+def test_identity_filter_accepts_both_spellings_and_narrows_cells(
+    fake_patchmud: SimpleNamespace,
+) -> None:
+    # `/` 與 `:` 兩種拼法都接受（與 build_capability_lookup 的解析一致）。
+    for spelling in ("claude/sonnet", "claude:sonnet"):
+        result = mp.run_model_profile(
+            _options(fake_patchmud, identity_filter=(spelling,)), sleep=lambda _s: None
+        )
+        labels = {(cell["executor"], cell["model_id"]) for cell in result["cells"]}
+        assert labels == {("claude", "sonnet")}
+
+
+def test_identity_filter_unknown_identity_is_explicit_error(
+    fake_patchmud: SimpleNamespace, capsys
+) -> None:
+    # 對抗審查修正：--identity 打錯字不得靜默產出零 cells＋exit 0（操作者會誤
+    # 信「全部已評測完」）；查無對應身分 → 明確錯誤、porcelain exit 2。
+    with pytest.raises(ValueError, match="查無對應身分"):
+        mp.run_model_profile(
+            _options(fake_patchmud, identity_filter=("claude/sonnet-typo",)),
+            sleep=lambda _s: None,
+        )
+    code = porcelain_model.main(
+        [
+            "profile",
+            "--patchmud-bin",
+            str(fake_patchmud.bin),
+            "--patchmud-root",
+            str(fake_patchmud.root),
+            "--registry-file",
+            str(fake_patchmud.registry),
+            "--identity",
+            "claude:sonnet-typo",
+        ]
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "查無對應身分" in err and "claude:sonnet-typo" in err
+
+
 def test_render_registry_file_roundtrips_through_subset_loader(tmp_path: Path) -> None:
     rows = [
         {

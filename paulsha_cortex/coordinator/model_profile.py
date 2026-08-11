@@ -316,6 +316,31 @@ def run_model_profile(
     }
 
     registry = _load_model_identity_file(Path(registry_file))
+    # #452 對抗審查修正：--identity 打錯字時不得靜默產出零 cells 讓操作者誤信
+    # 「全部已評測完」——查無對應身分即明確報錯（porcelain 層以 exit 2 呈現）；
+    # `/` 與 `:` 兩種拼法都接受（與 build_capability_lookup 的解析一致）。
+    identity_filter: tuple[str, ...] = ()
+    if options.identity_filter:
+        known_labels = {
+            f"{identity.executor}/{identity.model_id}" for identity in registry.identities
+        }
+        normalized: list[str] = []
+        unknown: list[str] = []
+        for raw in options.identity_filter:
+            text = str(raw).strip()
+            label = text if "/" in text else text.replace(":", "/", 1)
+            if label not in known_labels:
+                unknown.append(text)
+            normalized.append(label)
+        if unknown:
+            raise ValueError(
+                "--identity 查無對應身分："
+                + ", ".join(unknown)
+                + "（registry 內可用："
+                + ", ".join(sorted(known_labels))
+                + "；接受 executor/model_id 或 executor:model_id 拼法）"
+            )
+        identity_filter = tuple(normalized)
     rows = [identity.to_dict() for identity in registry.identities]
     row_index = {
         (str(row["executor"]), str(row["model_id"])): position
@@ -330,7 +355,7 @@ def run_model_profile(
 
     for identity, persona, persona_measurable in _profile_cells(registry, measured_personas):
         label = f"{identity.executor}/{identity.model_id}"
-        if options.identity_filter and label not in options.identity_filter:
+        if identity_filter and label not in identity_filter:
             continue
         cell: dict[str, object] = {
             "executor": identity.executor,

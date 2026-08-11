@@ -21,19 +21,31 @@
     `project_envelope()`（缺省→套 `DEFAULT_ENVELOPE[persona]`、標
     `source=default`）。v1/v2 檔案照載、shadow 檢查語意不變。packaged registry
     升 v3 並登錄 #456 R3 的 5 身分 roster（純候選宣告、無實測封套；agy 列首
-    位保住 planner 熱路徑選擇不變）。
+    位保住 planner 熱路徑選擇不變）。**部署遷移註記**：roster 由 1 身分擴為
+    5 身分，若 host overlay（`$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`）
+    已宣告被收編的四鍵之一（`copilot/gpt-5.4`、`claude/sonnet`、
+    `codex/gpt-5.3-codex-spark`、`cg/glm-5.2`）且內容與 packaged 列不逐欄相等，
+    升級後 registry 載入會 fail-closed（shadow 檢查語意本身不變，這是 roster
+    擴張的側效應）——升級前請檢查各 host overlay，移除被收編的鍵或改成與
+    packaged 逐欄相等；shadow 錯誤訊息已附行動指引。
   - **C claim 解析**：`MODEL_CHAIN_RESOLUTION_SOURCES` 擴充
     `patchmud-profile`／`default-envelope`（`registry` 保留為 legacy 值）；
     解析優先序 run-scoped override（#205）> measured 側寫 > registry/預設，
-    `resolved_model_chain` durable evidence 記實際 source。接上
-    `claim_readiness.capability_probe` 的 `capability_lookup` seam
+    `resolved_model_chain` durable evidence 記實際 source。提供
+    `claim_readiness.capability_probe` 的 `capability_lookup` provider
     （`build_capability_lookup()`＋`evaluate_capability()`：#209 R1 六項全
     評估不短路、被排除原因可觀測；#453 R5 全 default → `None` 維持
-    `envelope_unavailable` bypass 字節）與 yellow plan review 的
-    `envelope_lookup` seam（`plan_review_envelope_projection()`：#454 R5 兩鍵
-    任一 default → `None`，v1 現況證據字節與 `envelope_lookup=None` 逐位元
-    相同）。measured band 過濾與 measured-first 排序落在
-    `manager._workflow_identity_candidates`（override 不受過濾）。
+    `envelope_unavailable` bypass 字節）——**claim 熱路徑尚未把 provider 傳入
+    `capability_probe`，seam 接線待 #211 readiness pipeline 落地**；yellow plan
+    review 的 `envelope_lookup` seam 則已實際接上
+    （`manager._plan_review_envelope_lookup` →
+    `plan_review_envelope_projection()`：#454 R5 兩鍵任一 default → `None`，
+    v1 現況證據字節與 `envelope_lookup=None` 逐位元相同）。measured band 過濾
+    與 measured-first 排序落在 `manager._workflow_identity_candidates`
+    （override 不受過濾；primary_domain 偏好維持排序語意——preferred 排前、
+    其餘候選保留在後，host overlay builder 不因 packaged 候選宣告被剔除，
+    保住 #262 re-route fallback；部分剔除的排除理由落 manager log，全滅時
+    fail-closed 錯誤訊息帶逐身分理由）。
   - **D 一次性語意**：評測指紋 `(executor, model_id, persona, deck_id,
     deck content_sha256, patchmud version)` 存 `profile_provenance.fingerprint`
     （不含 pricing，#455 §4.1）；指紋未變 → `already-profiled` skip、deck 內容
@@ -56,4 +68,14 @@
     below-green-floor 不落檔／429 退避／inspect models 顯示）、
     `tests/test_model_chain_profile_resolution.py`（measured 優先序與 band
     過濾、override 優先、resolved source 三值、roster 前後 planner 選擇與
-    secondary planner 不變）。
+    secondary planner 不變、overlay builder 與 packaged roster 併存不被剔除）。
+  - **對抗審查修正**：(1) builder primary_domain 偏好由「preferred 非空即整組
+    收窄」改為「preferred 排前、其餘保留」——packaged 候選宣告不得把 host
+    overlay 可跑 builder 擠出 #262 re-route fallback；(2) measured band 部分
+    剔除（仍有存活候選）時排除理由落 manager log，不再靜默丟棄；(3)
+    `IdentityRegistry.from_rows` 封套欄位閘門改由 schema_version 直接推導，
+    建構層與檔案載入層同一條 v1/v2 fail-closed 規則；(4) `--identity` 過濾
+    查無對應身分即明確報錯（exit 2；`/` 與 `:` 拼法皆接受），不再靜默產出
+    零 cells；(5) T1 surface 3–5 改與 checked-in golden 比對（原自反相等為
+    恆真式）、capability observation 補位測試 sizing_band 四值全掃；(6)
+    shadow 錯誤訊息附「packaged roster v3 已收編此身分」行動指引。
