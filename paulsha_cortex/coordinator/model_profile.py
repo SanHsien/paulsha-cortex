@@ -391,6 +391,11 @@ def run_model_profile(
             )
             if not ok:
                 failures.append(f"{encounter_dir.name}: {output.strip()[:200]}")
+        if failures:
+            # 先掛上逐關失敗明細：report 若因 run 全滅而失敗，操作者才看得到
+            # 根因（實跑 e2e 驗證發現的可觀測性缺口——429 全滅時只剩 report
+            # glob 錯誤，看不出是限流）。
+            cell["encounter_failures"] = failures
         report_code, report_output = _run_process(
             runner,
             [
@@ -431,8 +436,6 @@ def run_model_profile(
             cell["reason"] = "mapping-rejected"
             cell["detail"] = str(exc)
             continue
-        if failures:
-            cell["encounter_failures"] = failures
         provenance = mapping["provenance"]
         cell["observation"] = dict(provenance["observation"])
         cell["mapping_reasons"] = dict(provenance["reasons"])
