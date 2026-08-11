@@ -15,6 +15,7 @@ from paulsha_cortex.coordinator.launcher import (
     build_copilot_argv,
     build_claude_argv,
     build_codex_argv,
+    build_cg_argv,
 )
 
 
@@ -578,14 +579,170 @@ class ArgvTests(unittest.TestCase):
         self.assertTrue(builder._commit_required)
         self.assertFalse(builder._allow_unsafe)
 
-    def test_cg_executor_is_deliberately_unsupported(self) -> None:
-        # #396 item 1：`cg`（copilot API／glm-5.2 巷道）刻意未支援——CLI 介面在本
-        # repo 未經證實，貿然假設同 copilot 介面屬臆測。這個測試把「目前 fail
-        # closed」的既有行為釘住，並作為 _ARGV_BUILDERS 旁那段 extension-point
-        # 文件的可驗證對應：cg 不在白名單裡、建構期即明確拒絕。
-        self.assertNotIn("cg", launcher_module._ARGV_BUILDERS)
-        with self.assertRaisesRegex(ValueError, "unknown executor: cg"):
+    def test_cg_executor_is_supported_and_review_only(self) -> None:
+        # issue #442：改寫 #396 item 1 釘住的「cg 刻意未支援」——operator 已提供並
+        # smoke 驗證 cg 的 CLI 契約，cg 現已登記進 _ARGV_BUILDERS。cg 是 zero-tool
+        # （見 build_cg_argv docstring），只服務 read-only 的 planner／reviewer；
+        # 這裡改釘「cg 支援，但 builder 語境（既非 read_only 也非 review_only）
+        # 建構期即拒絕」。
+        self.assertIn("cg", launcher_module._ARGV_BUILDERS)
+        with self.assertRaisesRegex(ValueError, "cg executor requires read-only or review-only"):
             SubprocessLauncher("cg")
+        # read-only planner 與 review-only reviewer 兩種合法角色都能正常建構。
+        SubprocessLauncher("cg", read_only=True)
+        SubprocessLauncher(
+            "cg", review_only=True, review_terminal_kind="workflow-review-result",
+        )
+
+    def test_cg_argv_default_model_and_effort(self) -> None:
+        argv = build_cg_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=True,
+        )
+        self.assertEqual(
+            argv,
+            ["cg", "--model", "glm-5.2", "--effort", "medium", "--headless", "--stdin"],
+        )
+
+    def test_cg_argv_explicit_model_and_effort(self) -> None:
+        argv = build_cg_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=True,
+            model="glm-5.3", effort="xhigh",
+        )
+        self.assertEqual(
+            argv,
+            ["cg", "--model", "glm-5.3", "--effort", "xhigh", "--headless", "--stdin"],
+        )
+
+    def test_cg_argv_never_embeds_prompt(self) -> None:
+        # 契約核心差異：其餘 builder 把 prompt 放進 argv（見
+        # test_prompt_is_single_element）；cg 的 prompt 走 stdin，argv 本身完全
+        # 不含 prompt 字面值。
+        argv = build_cg_argv(
+            prompt="SECRET-PROMPT-TOKEN", slice_id="s", log_dir="/lg", read_only=True,
+        )
+        self.assertNotIn("SECRET-PROMPT-TOKEN", argv)
+
+    def test_cg_argv_rejects_invalid_effort(self) -> None:
+        with self.assertRaisesRegex(ValueError, "effort must be one of"):
+            build_cg_argv(
+                prompt="P", slice_id="s", log_dir="/lg", read_only=True, effort="ultra",
+            )
+
+    def test_cg_argv_rejects_unsafe_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not support unsafe mode"):
+            build_cg_argv(
+                prompt="P", slice_id="s", log_dir="/lg", read_only=True, allow_unsafe=True,
+            )
+
+    def test_cg_argv_rejects_commit_required(self) -> None:
+        with self.assertRaisesRegex(ValueError, "zero-tool and cannot commit"):
+            build_cg_argv(
+                prompt="P", slice_id="s", log_dir="/lg", commit_required=True,
+            )
+
+    def test_cg_argv_rejects_builder_context(self) -> None:
+        # 既非 read_only 也非 review_only：這是「builder 語境」，cg 的 zero-tool
+        # 契約下永遠無法真正建置任何東西，必須在建構期就顯性失敗。
+        with self.assertRaisesRegex(ValueError, "requires read-only or review-only"):
+            build_cg_argv(prompt="P", slice_id="s", log_dir="/lg")
+
+    def test_subprocess_launcher_cg_refuses_unsafe_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cg executor refuses unsafe mode"):
+            SubprocessLauncher("cg", read_only=True, allow_unsafe=True)
+
+    def test_subprocess_launcher_cg_as_commit_required_rejected(self) -> None:
+        # cg 只能是 read_only 或 review_only；as_commit_required() 對兩者皆既有的
+        # 「commit-required 需要 enforced workspace-write」守衛一律拒絕——cg 永遠
+        # 無法被轉換成 builder-persona 的 commit-required launcher。
+        base = SubprocessLauncher("cg", read_only=True)
+        with self.assertRaisesRegex(ValueError, "enforced workspace-write"):
+            base.as_commit_required()
+
+    def test_launch_cg_pipes_prompt_via_stdin_not_argv(self) -> None:
+        # stdin plumbing（issue #442）：cg 的 wrapper script 必須把 prompt 經
+        # `printf %s <prompt> |` 餵進內層 argv，而非把 prompt 當成 argv 的一個
+        # 元素（既有 copilot/claude/codex/agy 的路徑）。
+        calls = []
+
+        class _FakeProc:
+            pid = 999
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                SubprocessLauncher("cg", read_only=True).launch(
+                    slice_id="slice-cg",
+                    prompt="STDIN-PROMPT",
+                    worktree=d,
+                    log_dir=str(Path(d) / "logs"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        script = calls[0]["argv"][2]
+        inner = shlex.join(
+            ["cg", "--model", "glm-5.2", "--effort", "medium", "--headless", "--stdin"],
+        )
+        # prompt 經 printf | 餵入，緊接著才是不含 prompt 的內層 argv
+        self.assertIn(f"printf %s {shlex.quote('STDIN-PROMPT')} | {inner}", script)
+        # 內層 argv 本身（不含 prompt）維持乾淨，不因 stdin 分支而混入 prompt
+        self.assertNotIn("STDIN-PROMPT --model", script)
+        # cg 的 stderr summary banner 顯式與 stdout 分離，不混入 JSONL log
+        self.assertIn(f"{inner} 2>/dev/null", script)
+
+    def test_launch_cg_end_to_end_stdin_delivers_prompt_to_process(self) -> None:
+        # 比照既有 test_subprocess_launcher_sentinel_records_real_exit_code 的
+        # 「真跑 bash -lc，但內層命令覆寫成無害替身」手法：以 `cat` 取代真 cg
+        # binary（cat 原樣把 stdin 回顯到 stdout），驗證 prompt 真的經由 stdin
+        # （而非 argv）抵達內層命令，端到端證實 stdin plumbing 而非只驗 script 字串。
+        orig_builders = dict(launcher_module._ARGV_BUILDERS)
+        launcher_module._ARGV_BUILDERS["cg"] = lambda **_kw: ["cat"]
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                log_dir = Path(d) / "logs"
+                handle = SubprocessLauncher("cg", read_only=True).launch(
+                    slice_id="slice-cg-e2e",
+                    prompt="HELLO-FROM-STDIN",
+                    worktree=d,
+                    log_dir=str(log_dir),
+                )
+                try:
+                    os.waitpid(handle.pid, 0)
+                except ChildProcessError:
+                    pass
+                self.assertEqual(
+                    Path(handle.log_path).read_text(encoding="utf-8"), "HELLO-FROM-STDIN",
+                )
+        finally:
+            launcher_module._ARGV_BUILDERS.clear()
+            launcher_module._ARGV_BUILDERS.update(orig_builders)
+
+    def test_subprocess_launcher_passes_effort_to_cg_argv(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 741
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                SubprocessLauncher("cg", read_only=True, effort="high").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "logs"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        script = calls[0]["argv"][2]
+        self.assertIn("--effort high", script)
 
     def test_codex_argv_allow_unsafe_adds_sandbox_bypass(self) -> None:
         # 明確 opt-in allow_unsafe=True 才加入 sandbox bypass flag
