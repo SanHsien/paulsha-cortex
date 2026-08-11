@@ -26,23 +26,25 @@ Quickstart 只用既有 CLI，不要求你先理解 deck/spec 的內部模型；
 
 ## 1. 安裝
 
-```bash
-pipx install git+https://github.com/hamanpaul/paulsha-cortex.git
-cortex --version
-cortex --help
-```
-
-上面裝的是 `main` 最新碼。若要部署**特定 release**（例如 `v0.1.0`），從 tag 或
-GitHub Release 附帶的 wheel 安裝，避免裝到未發佈的變更：
+推薦：部署**特定 release**（例如目前最新 `v0.1.4`），從 tag 或 GitHub Release
+附帶的 wheel 安裝，取得已在 Python 3.10–3.13 完整 CI 驗證過、可回滾的版本：
 
 ```bash
 # 從 release tag
-pipx install "git+https://github.com/hamanpaul/paulsha-cortex.git@v0.1.0"
+pipx install "git+https://github.com/hamanpaul/paulsha-cortex.git@v0.1.4"
 
 # 或從 GitHub Release 下載的 wheel（release.yml 會把 wheel/sdist 附在該 tag 的 Release）
-pipx install ./paulsha_cortex-0.1.0-py3-none-any.whl
+pipx install ./paulsha_cortex-0.1.4-py3-none-any.whl
 
-cortex --version   # 應印出 0.1.0
+cortex --version   # 應印出 0.1.4
+cortex --help
+```
+
+若要追 `main` 最新碼（**development / edge channel**，會拿到尚未發版、未經
+release smoke 驗證的變更）：
+
+```bash
+pipx install git+https://github.com/hamanpaul/paulsha-cortex.git
 ```
 
 若你是在 repo checkout 內直接試跑，也可以用：
