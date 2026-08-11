@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Issue #382：slice gate_state 落 failed 後永久不可 repin，且 record_action 非原子突變會把半突變髒 row 沖上磁碟**：真正根因是 `JobRegistry.record_action`／`update_slice` 逐欄位「驗證→立刻寫入活物件」，多欄位 transition 若後段欄位（例如 `gate_state`）驗證失敗 raise，前段已合法驗證的欄位（例如 `state`）已經寫進活物件；raise 發生在 `_persist()` 之前不會立即沖上磁碟，但下一次**任何無關**的 `_persist()` 都會把這個半突變髒 row 一併沖上磁碟。疊加 `GATE_STATE_TRANSITIONS["failed"]` 原本不允許 `failed -> pending`（與 `SLICE_STATE_TRANSITIONS["failed"]` 不對稱）、`repin_slice()` 硬編閘門只認 `pending`/`needs_human`，讓 builder 失敗後的 slice 永久卡死：`allowed_slice_actions()` 宣告的 `retry-build` 保證被拒，`recover-pre-candidate` 則因非原子突變髒寫 `state=pending`，留下 `state=pending / gate_state=failed` 無出口死路。改為兩階段（先全驗證、再全突變、單次 persist）；`GATE_STATE_TRANSITIONS["failed"]` 補 `pending`、`SLICE_STATE_TRANSITIONS["failed"]` 補 `building`（對齊既有 `needs_human` 行為，讓 retry-build 派工路徑走得完）；`repin_slice()` 併入 `failed` 為可 repin 狀態；新增共用判準 `slice_repin_eligible()`，`allowed_slice_actions()` 據此決定是否宣告 `retry-build`，不再無條件宣告。更新既有測試（原本斷言 failed 必須拒絕 repin，已反向修正為斷言復原成功）並新增 9 個回歸測試，修復前已確認重現半突變髒寫外洩（RED）。全套 pytest：2127 passed、32 subtests passed（基線 2117/32，淨增 10）。
+
 ### Added
 - **Issue #372：cortex/hippo 缺排程觸發的跨系統 digest 出口**：新增 `paulsha_cortex/coordinator/digest.py`，把既有 `read_status()` 快照（`attention`／`ready`／`held`／`degraded`／`recent_done`）彙整成結構化 `cortex-coordinator/digest/v1` JSON（含人類可讀 `summary_text`）。投遞層二擇一、不 fallback：預設寫入無外部依賴的檔案 outbox（`<coordinator_root>/digest/outbox/<timestamp>-<random>.json`，時間戳採既有 `now_fn` 注入慣例）；設定 `PSC_DIGEST_DELIVERY_CMD`（typed argv，比照 `PSC_PREFLIGHT_CMD`）時改把 digest JSON 從 stdin pipe 給該命令（`subprocess`、`shell=False`、逾時保護），命令失敗直接 fail-closed，不靜默改寫檔案。刻意不 import custom-skills（維持 cortex 對外零 runtime 依賴定位），也不把孤兒 `coordinator_telegram_notifier.py`（僅單元測試 import、production 零呼叫）接上。新增 porcelain 子命令 `cortex digest emit`，供外部 timer/cron 排程觸發；`cortex --help` 自動列出。另修復 `porcelain/inspect.py` 文字模式漏印 `attention`（`--json` 早已有）。新增 22 個回歸測試，修正前已確認 RED。
 
