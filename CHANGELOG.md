@@ -10,6 +10,9 @@
 ### Added
 - **Issue #442（第一部分）：新增 `cg`（copilot API／glm-5.2 via llm-share）launcher 支援**：`launcher.build_cg_argv` 依 operator 提供並 smoke 驗證的介面契約（prompt 經 stdin、`--headless --stdin`、model 預設 `glm-5.2`、effort 合法值 low/medium/high/xhigh）組出 argv，登記進 `_ARGV_BUILDERS`；cg 為 zero-tool executor，`build_cg_argv`／`SubprocessLauncher.__init__` 對 commit_required／unsafe／builder 語境一律 raise，只服務 read-only 的 planner／reviewer。`SubprocessLauncher.launch()` 新增 stdin plumbing（`printf %s <prompt> | <inner argv> 2>/dev/null`），其餘 executor 零影響。詳見 `changelog.d/cg-launcher-support.md`。
 
+### Fixed
+- **Issue #445：`test_server_discards_finished_connection_threads` thread-timing flaky（連線執行緒已 `stopped` 但尚未從 `_connection_threads` list 移除）**：真正成因是 `MonitorServer.serve_forever()` accept loop 內 `t.start()` 與「登記進 `_connection_threads`」順序反了的 TOCTOU race——極快完成的連線處理執行緒可能在被登記進 list *之前* 就已跑完並自行嘗試 self-remove（此時它不在 list 裡，形同無效），accept loop 隨後才把這條已死執行緒 append 進去，且無下一條連線觸發清理，殘留永久留在 list 裡，任何長度的 poll 都等不到。修法：改為先登記再 `start()`，關閉整個 race window；測試側 poll 上限同步由 1.0s 提高到 2.0s 作防禦餘裕。詳見 `changelog.d/connection-thread-flaky.md`。
+
 ## [0.1.5] - 2026-08-11
 
 ### Added
