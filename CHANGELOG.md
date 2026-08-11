@@ -9,6 +9,7 @@
 
 ### Added
 - **Issue #453（#452 子項）：定案無 benchmark 時的保守預設封套值**：新增 `docs/superpowers/specs/default-envelope-values-spec.md`——四欄位各給唯一定案值與可追溯推導：`accepts_bands` 依 persona 定為 builder/reviewer `[green, yellow]`、planner 全值域含 red（#223 攔截鏈：red 在 plan 相位被 `needs_decomposition` 路由回派 planner，build/review 不可達）；`invariant_ceiling` 走 bypass 例外 sentinel `null`（值域無界無上確界、歷史分布經查證不存在——#210 R3＋runtime evidence root 零命中；#209 R2 缺省語意本就為此欄預留 bypass）；`consistency_scope`／`acceptance_modes` 取 #209 R2 全值域（封閉有限值域、上確界可寫出，且可觀測性靠值與 provenance 可辨而非過濾）。存放機制定案 `DEFAULT_ENVELOPE` per-persona 常數於查表投影套用、registry 檔案永不寫入預設值（per-persona 預設無法攤平成 (executor, model_id) 每列單值）。另定證據層規則（`source=="default"` 在既有 capability_probe／envelope_lookup seam 維持 bypass 字節）與 #452 實作必須照做的 bit-identical 回歸測試規格（T1 golden 雙配置決策軌跡／T2 預設值恆不排除 property test／T3 loader 相容）。詳見 `changelog.d/default-envelope-values.md`。
+- **Issue #455：評測成本實測與 pricing snapshot 處置**：新增 `docs/superpowers/specs/benchmark-cost-baseline.md`——以單一身分實跑 patchmud `decks/pilot-v1` 全 8 關，落地 per-encounter 與全 deck 的 tokens／wall-time／USD 實測成本表；據此外推 N=11 格（#456 定案，近期可實測 builder 3 格）全量 profile 的預算上界；並定案三項：pricing snapshot 是否納入 #452 評測指紋、補評測的排程位置（tick idle vs 一律手動）、重評觸發條件是否需修正。詳見 `changelog.d/benchmark-cost-baseline.md`。
 
 ## [0.1.6] - 2026-08-11
 
