@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from ..control import constants, contract
-from . import autonomy, manager, planning_runtime
+from . import autonomy, backoff, manager, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .dispatcher import Dispatcher
 from .model_identities import load_model_identities
@@ -41,14 +41,13 @@ MANAGER_CMD_MARKER = "paulsha_cortex.coordinator.manager_daemon"
 
 # Periodic-tick failure resilience (issue #249): a persistently failing tick
 # must never retry every poll cycle -- that turns a 5-minute schedule into a
-# hot loop. Consecutive failures back off the next attempt exponentially
-# (``tick_interval * BASE**min(failures, MAX_EXPONENT)``); once
-# TICK_CIRCUIT_BREAKER_THRESHOLD consecutive failures accrue, periodic ticks
-# pause entirely for TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS before one more
-# attempt is made. Request-queue processing (including a manual "tick"
-# request, the operator's rescue channel) is never gated by any of this.
-TICK_BACKOFF_MULTIPLIER_BASE = 2.0
-TICK_BACKOFF_MAX_EXPONENT = 4  # caps backoff at tick_interval * 2**4 = 16x
+# hot loop. Consecutive failures back off the next attempt exponentially via
+# `backoff.tick_backoff_seconds` (``tick_interval * BASE**min(failures,
+# MAX_EXPONENT)``, see backoff.py); once TICK_CIRCUIT_BREAKER_THRESHOLD
+# consecutive failures accrue, periodic ticks pause entirely for
+# TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS before one more attempt is made.
+# Request-queue processing (including a manual "tick" request, the
+# operator's rescue channel) is never gated by any of this.
 TICK_CIRCUIT_BREAKER_THRESHOLD = 6  # consecutive failures before ticks pause
 TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0  # cool-down before one retry
 
@@ -208,18 +207,15 @@ def _repo_from_manifest(payload: dict[str, Any]) -> str | None:
     )
 
 
-def _tick_backoff_seconds(base_interval: float, consecutive_failures: int) -> float:
-    """Exponential backoff interval for the next periodic-tick retry.
-
-    Doubles per consecutive failure, capped at ``TICK_BACKOFF_MAX_EXPONENT``
-    doublings, so a persistently failing tick backs off instead of retrying
-    on every poll cycle. ``consecutive_failures <= 0`` (no prior failure)
-    returns the unmodified ``base_interval``, preserving today's cadence.
-    """
-    if consecutive_failures <= 0:
-        return base_interval
-    exponent = min(consecutive_failures, TICK_BACKOFF_MAX_EXPONENT)
-    return base_interval * (TICK_BACKOFF_MULTIPLIER_BASE**exponent)
+# #370: the exponential curve itself now lives in `backoff.py` (pure, no
+# internal deps) so `provider_backoff.py`'s durable GitHub rate-limit
+# backoff can reuse it without a circular import back into this module.
+# Re-exported under the original names -- callers/tests/docs referencing
+# `manager_daemon._tick_backoff_seconds` / `TICK_BACKOFF_MAX_EXPONENT` /
+# `TICK_BACKOFF_MULTIPLIER_BASE` keep working unchanged.
+_tick_backoff_seconds = backoff.tick_backoff_seconds
+TICK_BACKOFF_MAX_EXPONENT = backoff.BACKOFF_MAX_EXPONENT
+TICK_BACKOFF_MULTIPLIER_BASE = backoff.BACKOFF_MULTIPLIER_BASE
 
 
 def _safe_tick_error_summary(exc: Exception) -> dict[str, str]:

@@ -195,6 +195,29 @@ def test_github_provider_rate_limit_is_degraded():
     assert any("rate limit" in item for item in result.diagnostics)
 
 
+def test_github_provider_secondary_rate_limit_mentioning_oauth_is_not_misclassified_as_auth():
+    """#370: gh's real secondary/abuse-detection rate limit message mentions
+    "OAuth" and invites re-authenticating -- the classifier must recognize
+    the rate-limit wording first, not fall into the auth-failure branch."""
+    runner = FakeRunner(
+        _completed(
+            {},
+            returncode=1,
+            stderr=(
+                "HTTP 403: You have exceeded a secondary rate limit for the "
+                "OAuth App associated with this personal access token. Please "
+                "wait a few minutes before you try again by re-authenticating."
+            ),
+        )
+    )
+
+    result = GitHubWorkProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "degraded"
+    assert any("rate limit" in item for item in result.diagnostics)
+    assert not any("authentication" in item for item in result.diagnostics)
+
+
 def test_github_provider_timeout_is_degraded():
     runner = FakeRunner(error=subprocess.TimeoutExpired(cmd=("gh", "api"), timeout=30))
 

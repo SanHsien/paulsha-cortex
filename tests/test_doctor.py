@@ -598,6 +598,101 @@ def test_github_permission_probe_fails_without_token_scope_proof(tmp_path: Path,
     assert "not proven" in permission.detail
 
 
+# --- #370：gh-auth probe 必須區分 rate limit（暫時性）與真憑證失效 ----------
+
+
+def test_gh_auth_probe_reports_rate_limit_as_warn_not_authentication_failed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """`gh auth status` 撞到 rate limit 時 exit code 也是非零，但這不是
+    憑證失效——doctor 誤報 authentication failed 會誤導排障方向（見 #370
+    的 runtime 證據：secondary rate limit 被當成 token invalid 排查）。"""
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._request_runtime_monitor",
+        lambda socket_path, payload: {
+            "ok": True,
+            "data": {"schema": "cortex-work/v1", "items": [], "sequence": 0},
+        },
+    )
+
+    def runner(argv, **kwargs):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return Result(
+                returncode=1,
+                stderr=(
+                    "You have exceeded a secondary rate limit for the OAuth "
+                    "App associated with this personal access token."
+                ),
+            )
+        if "repos/acme/demo" in argv:
+            return Result(
+                raw=(
+                    "HTTP/2 200 OK\r\nX-OAuth-Scopes: repo\r\n\r\n"
+                    '{"private":true,"permissions":{"push":true}}'
+                )
+            )
+        return Result({"name": "cortex:auto-on-going"})
+
+    report = run_doctor(
+        probe_live=True,
+        repo="acme/demo",
+        env=env,
+        home=home,
+        runner=runner,
+        agy_probe=lambda: (True, "ready"),
+    )
+    gh_auth = next(item for item in report.probes if item.name == "gh-auth")
+    assert gh_auth.status == "warn"
+    assert "authentication failed" not in gh_auth.detail
+    assert "rate limit" in gh_auth.detail.lower()
+    # A rate-limit warn on a required-in-spirit probe must not itself flip
+    # the whole report to not-ok (other probes still gate that).
+    assert report.ok
+
+
+def test_gh_auth_probe_still_reports_real_credential_failure_as_fail(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+
+    def runner(argv, **kwargs):
+        if argv[:3] == ["gh", "auth", "status"]:
+            return Result(returncode=1, stderr="The token in ~/.config/gh/hosts.yml is invalid.")
+        if "repos/acme/demo" in argv:
+            return Result(returncode=1)
+        return Result(returncode=1)
+
+    report = run_doctor(
+        probe_live=True,
+        repo="acme/demo",
+        env=env,
+        home=home,
+        runner=runner,
+        agy_probe=lambda: (False, "unavailable"),
+    )
+    gh_auth = next(item for item in report.probes if item.name == "gh-auth")
+    assert gh_auth.status == "fail"
+    assert gh_auth.detail == "authentication failed"
+    assert not report.ok
+
+
 def test_service_probe_rejects_unit_that_does_not_load_bootstrap_env(tmp_path: Path) -> None:
     from paulsha_cortex.doctor import _service_paths_probe
 
