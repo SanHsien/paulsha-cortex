@@ -28,6 +28,8 @@ def _default_git_runner(args: list[str]) -> str:
         ["git", "-C", str(repo_root), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if proc.returncode != 0:
         raise RuntimeError(

@@ -12,6 +12,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Sequence
 
+import yaml
+
 from paulsha_cortex.config import paths
 from paulsha_cortex.deploy import hooks as hook_reconcile
 from paulsha_cortex.deploy import windows_service
@@ -256,6 +258,44 @@ def _instance_env_file(runtime_dir: Path, instance: str) -> Path:
     return runtime_dir / f"{instance}.env"
 
 
+def _ensure_project_monitor_config(config_root: Path, repo_root: Path) -> tuple[Path, bool]:
+    """Create or validate the instance-local monitor authority before enablement."""
+
+    from paulsha_cortex.monitor.config import load_config
+
+    config_path = config_root / "project-cortex.yaml"
+    if config_path.is_symlink():
+        raise ValueError(f"monitor config refuses symlink: {config_path}")
+    created = False
+    if not config_path.exists():
+        payload = {
+            "workspaces": [
+                {
+                    "path": str(repo_root.resolve()),
+                    "name": repo_root.resolve().name or "repository",
+                }
+            ]
+        }
+        try:
+            with config_path.open("x", encoding="utf-8", newline="\n") as stream:
+                yaml.safe_dump(
+                    payload,
+                    stream,
+                    allow_unicode=True,
+                    sort_keys=False,
+                )
+            created = True
+        except FileExistsError:
+            created = False
+    try:
+        load_config(config_path=config_path)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise ValueError(
+            f"instance monitor config 無效：{config_path}（{exc}）"
+        ) from exc
+    return config_path, created
+
+
 def install_service_result(
     instance: str, interval: int, repo_root: Path, *, rebind: bool = False
 ) -> InstallServiceResult:
@@ -318,6 +358,10 @@ def install_service_result(
         agents_root / "config" / "paulsha",
     ):
         directory.mkdir(parents=True, exist_ok=True)
+    monitor_config_path, monitor_config_created = _ensure_project_monitor_config(
+        agents_root / "config" / "paulsha",
+        repo_root,
+    )
     if not _is_windows():
         for name, content in render_units(instance, interval, repo_root=repo_root).items():
             (unit_dir / name).write_text(content)
@@ -370,12 +414,19 @@ def install_service_result(
         hook_reconcile.default_codex_hooks_path(home)
     )
     hook_note = f"codex hooks reconcile: {hook_reconcile_result.detail}"
+    monitor_config_note = (
+        f"monitor config {'created' if monitor_config_created else 'validated'}: "
+        f"{monitor_config_path}"
+    )
     if _is_windows():
         if not windows_service.available():
             return InstallServiceResult(
                 exit_code=1,
                 mode="windows-startup",
-                message=f"Windows per-user service backend 不可用。\n{hook_note}",
+                message=(
+                    "Windows per-user service backend 不可用。\n"
+                    f"{monitor_config_note}\n{hook_note}"
+                ),
             )
         task_result = windows_service.install_startup(
             instance=instance,
@@ -386,7 +437,7 @@ def install_service_result(
         return InstallServiceResult(
             exit_code=task_result.returncode,
             mode="windows-startup",
-            message=f"{task_result.message}\n{hook_note}",
+            message=f"{task_result.message}\n{monitor_config_note}\n{hook_note}",
         )
     if not _systemctl_available():
         return InstallServiceResult(
@@ -396,6 +447,7 @@ def install_service_result(
                 f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式；"
                 "fallback 缺少 `cortex service logs --follow` 即時串流。\n"
                 f"{hook_note}"
+                f"\n{monitor_config_note}"
             ),
         )
     for stage, args in (
@@ -410,13 +462,14 @@ def install_service_result(
                 result=result,
                 unit_dir=unit_dir,
                 retry_argv=list(args),
-                hook_note=hook_note,
+                hook_note=f"{monitor_config_note}\n{hook_note}",
             )
     return InstallServiceResult(
         exit_code=0,
         mode="systemd",
         message=(
             f"installed: {instance}-manager.{{service,timer}} + {instance}-monitor.service\n"
+            f"{monitor_config_note}\n"
             f"{hook_note}"
         ),
     )

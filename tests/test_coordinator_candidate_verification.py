@@ -63,8 +63,9 @@ def _contract(
     checks: list[dict] | None = None,
     tests: list[dict] | None = None,
     full_suite: dict | None = None,
+    allowed_paths: list[str] | None = None,
 ) -> dict:
-    return {
+    contract = {
         "docs_class": docs_class,
         "review_policy": "required" if docs_class in {"code", "normative"} else "not-required",
         "required_artifacts": list(required_artifacts or []),
@@ -90,6 +91,9 @@ def _contract(
             "baseline": "no-regression",
         },
     }
+    if allowed_paths is not None:
+        contract["allowed_paths"] = list(allowed_paths)
+    return contract
 
 
 def _write_spec_and_plan(root: Path, slice_id: str, contract: dict) -> tuple[Path, Path]:
@@ -460,6 +464,45 @@ class ResultVerificationTests(unittest.TestCase):
 
             self.assertEqual(evidence["payload"]["status"], "needs_human")
             self.assertEqual(evidence["payload"]["summary"], "persona-scope-violation")
+
+    def test_slice_allowed_paths_reject_extra_change_even_with_broad_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            base_catalog = _persona_catalog(builder_paths=["**"])
+            contract = _contract(allowed_paths=["src/a.py"])
+            slice_row = _slice_row(
+                root, "slice-a", contract, dispatch_base="a" * 40, worktree=worktree
+            )
+            job = _job("slice-a", worktree)
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): _git_ok("b" * 40),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
+                    ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok("src/a.py\ndocs/extra.md\n"),
+                }
+            )
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=FakeSubprocessRunner({}),
+            )
+
+            self.assertEqual(evidence["payload"]["status"], "needs_human")
+            self.assertEqual(evidence["payload"]["summary"], "slice-scope-violation")
+            scope = evidence["payload"]["details"]["scope"]
+            self.assertEqual(scope["persona_status"], "passed")
+            self.assertEqual(scope["slice_status"], "violated")
+            self.assertEqual(scope["violations"][0]["path"], "docs/extra.md")
 
     def test_command_failures_are_fail_closed(self) -> None:
         cases = {

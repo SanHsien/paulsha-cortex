@@ -41,6 +41,9 @@ RECENT_DONE_LIMIT = 10
 # 夠短，不會讓數天前的死屍霸占僅 10 個名額；夠長，跨夜、跨個位數 tick 失敗重試仍在窗內。
 # 可用 PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS 覆寫，見 README「觀察任務狀態」章節。
 RECENT_DONE_WINDOW_SECONDS = 86400.0
+HEADLESS_STALE_AFTER_SECONDS = 900.0
+HEADLESS_MAX_RUNTIME_SECONDS = 14400.0
+HEADLESS_REPEATED_TOOL_ERROR_THRESHOLD = 3
 MANAGER_CMD_MARKER = "paulsha_cortex.coordinator.manager_daemon"
 
 # Periodic-tick failure resilience (issue #249): a persistently failing tick
@@ -230,19 +233,96 @@ def _safe_tick_error_summary(exc: Exception) -> dict[str, str]:
     return {"type": type(exc).__name__, "reason": reason}
 
 
-def _in_flight_status(registry) -> list[dict[str, Any]]:
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _in_flight_status(
+    registry,
+    *,
+    now: datetime | None = None,
+    inactivity_seconds: float | None = None,
+    max_runtime_seconds: float | None = None,
+    repeated_error_threshold: int | None = None,
+) -> list[dict[str, Any]]:
+    from .provider_outcome import read_log_tail
+
+    observed_at = now or datetime.now(timezone.utc)
+    inactivity_limit = inactivity_seconds or _positive_float_env(
+        "PSC_HEADLESS_STALE_AFTER_SECONDS", HEADLESS_STALE_AFTER_SECONDS
+    )
+    runtime_limit = max_runtime_seconds or _positive_float_env(
+        "PSC_HEADLESS_MAX_RUNTIME_SECONDS", HEADLESS_MAX_RUNTIME_SECONDS
+    )
+    error_limit = repeated_error_threshold or _positive_int_env(
+        "PSC_HEADLESS_REPEATED_TOOL_ERROR_THRESHOLD",
+        HEADLESS_REPEATED_TOOL_ERROR_THRESHOLD,
+    )
     in_flight = []
     for job in registry.list_jobs():
         status = job.get("status")
         if status not in manager.IN_FLIGHT_STATUSES:
             continue
-        in_flight.append(
-            {
-                "job_id": job.get("job_id"),
-                "slice_id": job.get("task"),
-                "state": status,
-            }
+        started_at = _parse_iso8601(job.get("started_at")) or _parse_iso8601(
+            job.get("created_at")
         )
+        elapsed = max(0.0, (observed_at - started_at).total_seconds()) if started_at else 0.0
+        last_activity = started_at
+        log_path = job.get("log_path")
+        if isinstance(log_path, str) and log_path:
+            try:
+                modified = datetime.fromtimestamp(Path(log_path).stat().st_mtime, timezone.utc)
+                if last_activity is None or modified > last_activity:
+                    last_activity = modified
+            except OSError:
+                pass
+        inactivity = (
+            max(0.0, (observed_at - last_activity).total_seconds())
+            if last_activity is not None
+            else elapsed
+        )
+        tail = read_log_tail(log_path, max_bytes=65536) if isinstance(log_path, str) else None
+        repeated_errors = (tail or "").count("InputValidationError: JSON parse failed")
+        stale_reason = None
+        if repeated_errors >= error_limit:
+            stale_reason = f"repeated-tool-validation-errors:{repeated_errors}"
+        elif elapsed >= runtime_limit:
+            stale_reason = f"max-runtime-exceeded:{int(elapsed)}s"
+        elif inactivity >= inactivity_limit:
+            stale_reason = f"no-log-progress:{int(inactivity)}s"
+        entry = {
+            "job_id": job.get("job_id"),
+            "slice_id": job.get("task"),
+            "state": status,
+        }
+        if stale_reason:
+            entry.update(
+                {
+                    "progress_state": "stale-in-flight",
+                    "elapsed_seconds": int(elapsed),
+                    "last_activity_age_seconds": int(inactivity),
+                    "stale_reason": stale_reason,
+                }
+            )
+        in_flight.append(entry)
     return in_flight
 
 
@@ -318,9 +398,10 @@ def build_status_provider(
     recent_done_provider: Callable[[], list[dict[str, Any]]],
 ) -> Callable[[], dict[str, Any]]:
     def provider() -> dict[str, Any]:
+        in_flight = _in_flight_status(registry)
         return {
             "ready": list(ready_provider()),
-            "in_flight": _in_flight_status(registry),
+            "in_flight": in_flight,
             "recent_done": list(recent_done_provider()),
         }
 
@@ -424,10 +505,23 @@ def build_runtime_status_provider(
                 slices.append(entry)
                 if entry.get("slice_state") == "needs_human":
                     attention.append(entry)
+        in_flight = _in_flight_status(registry)
+        attention.extend(
+            {
+                "job_id": item["job_id"],
+                "slice_id": item["slice_id"],
+                "slice_state": "building",
+                "reason": "stale-in-flight",
+                "detail": item.get("stale_reason"),
+                "next_actions": [],
+            }
+            for item in in_flight
+            if item.get("progress_state") == "stale-in-flight"
+        )
         return {
             "ready": ready,
             "held": held,
-            "in_flight": _in_flight_status(registry),
+            "in_flight": in_flight,
             "recent_done": recent_done_provider(),
             "slices": slices,
             "attention": attention,
@@ -486,7 +580,10 @@ def build_request_executor(
         )
         builder_identity_registry = None
         builder_launcher_factory = None
-        if request_type in {"dispatch", "fanout", "tick"}:
+        needs_builder_identity = request_type in {"dispatch", "fanout", "tick"} or (
+            request_type == "slice-action" and args.get("action") == "retry-build"
+        )
+        if needs_builder_identity:
             builder_identity_registry = workflow_identity_registry or load_model_identities()
             builder_launcher_factory = lambda identity: _resolve_launcher(
                 identity.executor,
@@ -725,6 +822,8 @@ def build_request_executor(
                     allow_unsafe=allow_unsafe,
                     model=requested_model,
                 ),
+                identity_registry=builder_identity_registry,
+                launcher_factory=builder_launcher_factory,
                 review_launcher=active_review_launcher,
                 persona=persona,
                 review_executor=requested_review_executor,

@@ -37,7 +37,7 @@ _RATE_LIMIT_PATTERN = re.compile(
 )
 
 _AUTH_PATTERN = re.compile(
-    r"bad credentials|\b401\b|authenticat|oauth|token.*invalid|invalid.*token",
+    r"bad credentials|\b401\b|authenticat|\boauth\b|token.*invalid|invalid.*token",
     re.IGNORECASE,
 )
 

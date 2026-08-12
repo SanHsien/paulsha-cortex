@@ -16,6 +16,44 @@ def _write_model_identities(root: Path, body: str) -> Path:
 
 
 class ModelIdentityRegistryTests(unittest.TestCase):
+    def test_review_prompt_lists_validator_enum_source_of_truth(self) -> None:
+        from paulsha_cortex.coordinator import review
+
+        prompt = review.build_review_prompt(
+            slice_id="slice-a",
+            plan_path="plan.md",
+            verdict_path="/tmp/verdict.json",
+            builder_job_id="slice-a-1",
+            reviewer_job_id="slice-a-2",
+            candidate="a" * 40,
+            launch_identity={
+                "executor": "codex",
+                "model_id": "gpt-5.4",
+                "independence_domain": "openai",
+            },
+        )
+
+        for value in review.VALID_FINDING_CATEGORIES | review.VALID_SEVERITIES:
+            self.assertIn(value, prompt)
+
+        terminal_prompt = review.build_review_prompt(
+            slice_id="slice-a",
+            plan_path="plan.md",
+            verdict_path="/must/not/be/used.json",
+            builder_job_id="slice-a-1",
+            reviewer_job_id="slice-a-2",
+            candidate="a" * 40,
+            launch_identity={
+                "executor": "codex",
+                "model_id": "gpt-5.4",
+                "independence_domain": "openai",
+            },
+            output_mode="terminal-json",
+        )
+        self.assertIn('"kind": "workflow-review-result"', terminal_prompt)
+        self.assertIn("不要寫入 Candidate checkout", terminal_prompt)
+        self.assertNotIn("/must/not/be/used.json", terminal_prompt)
+
     def test_foreign_reviewer_requires_explicit_known_different_domain_identity(self) -> None:
         from paulsha_cortex.coordinator import review
 
@@ -703,3 +741,45 @@ class ReviewVerdictValidationTests(unittest.TestCase):
             )
 
             self.assertNotEqual(first["path"], second["path"])
+
+    def test_absent_gate_retry_uses_reason_and_identity_in_immutable_key(self) -> None:
+        from paulsha_cortex.coordinator import review
+
+        with tempfile.TemporaryDirectory() as d:
+            first = review.write_gate_evaluation(
+                review.build_gate_evaluation(
+                    slice_id="slice-a",
+                    state="absent",
+                    reason="reviewer-identity-missing",
+                    builder_job_id="slice-a-1",
+                    reviewer_job_id=None,
+                    candidate="a" * 40,
+                    launch_identity={"builder": None, "reviewer": None},
+                    findings=[],
+                ),
+                coordinator_root=d,
+            )
+            second = review.write_gate_evaluation(
+                review.build_gate_evaluation(
+                    slice_id="slice-a",
+                    state="absent",
+                    reason="reviewer-identity-unknown",
+                    builder_job_id="slice-a-1",
+                    reviewer_job_id=None,
+                    candidate="a" * 40,
+                    launch_identity={
+                        "builder": None,
+                        "reviewer": {
+                            "executor": "codex",
+                            "model_id": "gpt-5.4",
+                            "independence_domain": "openai",
+                        },
+                    },
+                    findings=[],
+                ),
+                coordinator_root=d,
+            )
+
+            self.assertNotEqual(first["path"], second["path"])
+            self.assertTrue(Path(first["path"]).is_file())
+            self.assertTrue(Path(second["path"]).is_file())

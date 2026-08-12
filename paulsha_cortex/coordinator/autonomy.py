@@ -7,6 +7,7 @@ from typing import Callable
 from paulsha_cortex.config import paths
 
 from .._yaml import YAMLError, safe_load
+from ..persona.contract import get_persona_contract
 from . import completion
 from .contract_command import build_dispatch_prompt
 from .dispatcher import _default_git_runner
@@ -526,7 +527,6 @@ def dispatch_ready(
         job: dict | None = None
         pinned_inputs: dict | None = None
         try:
-            prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             pinned_inputs = pin_dispatch_inputs(m)
             # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
             # 或 base_sha 解析若晚點失敗，slice 落 needs_human 後 dispatch_base 不會
@@ -567,6 +567,10 @@ def dispatch_ready(
                     commit_required_factory = getattr(active_launcher, "as_commit_required", None)
                     if callable(commit_required_factory):
                         active_launcher = commit_required_factory()
+            persona_contract = get_persona_contract(persona)
+            persona_tools_factory = getattr(active_launcher, "with_persona_tools", None)
+            if persona_contract is not None and callable(persona_tools_factory):
+                active_launcher = persona_tools_factory(persona_contract.allowed_tools)
             base_sha = _resolve_target_base_sha(
                 meta=m,
                 pinned_inputs=pinned_inputs,
@@ -574,6 +578,12 @@ def dispatch_ready(
                 git_runner=runner,
             )
             worktree = _launcher_worktree(dispatcher, slice_id, base_sha=base_sha)
+            prompt = build_dispatch_prompt(
+                persona,
+                task=slice_id,
+                plan_path=m["plan"],
+                worktree_root=str(Path(worktree).resolve()),
+            )
             # baseline 須在 agent 動工前取（launch 前），否則含進 agent 的 commit → 空 diff。
             try:
                 dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])

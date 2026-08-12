@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
@@ -87,6 +88,67 @@ def test_recover_pre_candidate_removes_worktree_and_resets_slice(tmp_path: Path)
     latest_slice = reg.get_slice("slice-3a")
     assert latest_slice["state"] == "pending"
     assert latest_slice["gate_state"] == "pending"
+
+
+def test_recover_pre_candidate_cleans_real_git_registry_and_branch_is_reusable(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-b", "main")
+    git("config", "user.email", "cortex@example.invalid")
+    git("config", "user.name", "Cortex Test")
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    git("add", "README.md")
+    git("commit", "-m", "seed")
+    git("branch", "feature/slice-real")
+    worktree = tmp_path / "linked worktree"
+    git("worktree", "add", str(worktree), "feature/slice-real")
+
+    reg = JobRegistry(state_path=tmp_path / "jobs.json")
+    job = reg.create_job(
+        task="slice-real",
+        persona="builder",
+        branch="feature/slice-real",
+        pane="",
+        worktree=str(worktree),
+    )
+    reg.update_headless_result(job["job_id"], status="failed", exit_code=1)
+    reg.create_slice(
+        slice_id="slice-real",
+        spec_path="specs/slice-real.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-real.md",
+        plan_hash="plan-sha",
+        target_branch="main",
+        builder_job_id=job["job_id"],
+        candidate=None,
+    )
+    reg.update_slice("slice-real", state="needs_human", gate_state="needs_human")
+    dispatcher = Dispatcher(reg, pane_sender=MagicMock(), worktree_creator=MagicMock())
+
+    manager.apply_slice_action(
+        dispatcher,
+        slice_id="slice-real",
+        action="recover-pre-candidate",
+        actor="operator",
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        git_runner=lambda args: git(*args).stdout.strip(),
+    )
+
+    listing = git("worktree", "list", "--porcelain").stdout
+    assert str(worktree) not in listing
+    replacement = tmp_path / "replacement"
+    git("worktree", "add", str(replacement), "feature/slice-real")
+    assert replacement.is_dir()
 
 
 def test_recover_pre_candidate_supersedes_stale_handoff_manifest(tmp_path: Path) -> None:

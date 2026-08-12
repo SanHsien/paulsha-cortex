@@ -1162,6 +1162,9 @@ class JobRegistry:
         builder_job_id: str | None = None,
         reviewer_job_id: str | None = None,
         candidate: str | None = None,
+        clear_builder_job_id: bool = False,
+        clear_reviewer_job_id: bool = False,
+        clear_candidate: bool = False,
         dispatch_base: str | None = None,
         target_remote: str | None = None,
         verification_hash: str | None = None,
@@ -1211,6 +1214,12 @@ class JobRegistry:
             self._validate_existing_job_ref("builder_job_id", builder_job_id)
         if reviewer_job_id is not None:
             self._validate_existing_job_ref("reviewer_job_id", reviewer_job_id)
+        if builder_job_id is not None and clear_builder_job_id:
+            raise ValueError("builder_job_id 與 clear_builder_job_id 不可同時指定")
+        if reviewer_job_id is not None and clear_reviewer_job_id:
+            raise ValueError("reviewer_job_id 與 clear_reviewer_job_id 不可同時指定")
+        if candidate is not None and clear_candidate:
+            raise ValueError("candidate 與 clear_candidate 不可同時指定")
 
         # Phase 2 — everything validated; apply every field together.
         if state is not None:
@@ -1223,10 +1232,16 @@ class JobRegistry:
             slice_row["current_evaluation_refs"] = new_current_evaluation_refs
         if builder_job_id is not None:
             slice_row["builder_job_id"] = builder_job_id
+        elif clear_builder_job_id:
+            slice_row["builder_job_id"] = None
         if reviewer_job_id is not None:
             slice_row["reviewer_job_id"] = reviewer_job_id
+        elif clear_reviewer_job_id:
+            slice_row["reviewer_job_id"] = None
         if candidate is not None:
             slice_row["candidate"] = candidate
+        elif clear_candidate:
+            slice_row["candidate"] = None
         if dispatch_base is not None:
             slice_row["dispatch_base"] = dispatch_base
         if target_remote is not None:

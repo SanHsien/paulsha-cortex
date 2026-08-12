@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,65 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _in_flight_job(*, log_path: Path, started_at: datetime) -> dict:
+    return {
+        "job_id": "slice-stale-1",
+        "task": "slice-stale",
+        "status": "dispatched",
+        "log_path": str(log_path),
+        "started_at": started_at.isoformat(),
+        "created_at": started_at.isoformat(),
+    }
+
+
+def test_in_flight_status_distinguishes_recent_progress_from_inactivity(tmp_path):
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+    log = tmp_path / "job.jsonl"
+    log.write_text('{"type":"progress"}\n', encoding="utf-8")
+    os.utime(log, (now.timestamp() - 30, now.timestamp() - 30))
+    registry = FakeRegistry([_in_flight_job(log_path=log, started_at=now - timedelta(minutes=10))])
+
+    active = manager_daemon._in_flight_status(
+        registry,
+        now=now,
+        inactivity_seconds=300,
+        max_runtime_seconds=3600,
+    )[0]
+    os.utime(log, (now.timestamp() - 600, now.timestamp() - 600))
+    stale = manager_daemon._in_flight_status(
+        registry,
+        now=now,
+        inactivity_seconds=300,
+        max_runtime_seconds=3600,
+    )[0]
+
+    assert "progress_state" not in active
+    assert stale["progress_state"] == "stale-in-flight"
+    assert stale["stale_reason"] == "no-log-progress:600s"
+
+
+def test_in_flight_status_surfaces_repeated_tool_validation_loop(tmp_path):
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+    log = tmp_path / "job.jsonl"
+    log.write_text(
+        ("InputValidationError: JSON parse failed\n" * 4),
+        encoding="utf-8",
+    )
+    os.utime(log, (now.timestamp(), now.timestamp()))
+    registry = FakeRegistry([_in_flight_job(log_path=log, started_at=now - timedelta(minutes=2))])
+
+    status = manager_daemon._in_flight_status(
+        registry,
+        now=now,
+        inactivity_seconds=300,
+        max_runtime_seconds=3600,
+        repeated_error_threshold=3,
+    )[0]
+
+    assert status["progress_state"] == "stale-in-flight"
+    assert status["stale_reason"] == "repeated-tool-validation-errors:4"
 
 
 class FakeRegistry:
@@ -1770,6 +1830,8 @@ def test_slice_action_request_runs_manager_action(monkeypatch, tmp_path):
     assert captured["slice_id"] == "slice-a"
     assert captured["action"] == "retry-build"
     assert captured["actor"] == "operator"
+    assert captured["identity_registry"] is not None
+    assert callable(captured["launcher_factory"])
 
 
 def test_slice_action_request_forwards_review_identity(monkeypatch, tmp_path):

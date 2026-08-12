@@ -13,6 +13,43 @@ def _write_spec(dirpath: Path, name: str, frontmatter: str, body: str = "body") 
 
 
 class VerificationContractFrontmatterTests(unittest.TestCase):
+    def test_parser_accepts_bounded_slice_allowed_paths(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "bounded.md",
+                    "dispatch: hold\n"
+                    "slice_id: bounded\n"
+                    "verification:\n"
+                    "  docs_class: code\n"
+                    "  allowed_paths: [src/a.py, tests/**]\n"
+                    "  required_artifacts: []\n"
+                    "  checks: []\n"
+                    "  tests: []\n"
+                    "  full_suite:\n"
+                    "    argv: [python3, -m, pytest, -q]\n"
+                    "    cwd: .\n"
+                    "    timeout_seconds: 30\n"
+                    "    baseline: no-regression",
+                )
+            )
+
+            self.assertEqual(meta["verification"]["allowed_paths"], ["src/a.py", "tests/**"])
+
+    def test_parser_rejects_unbounded_or_escaping_slice_paths(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for value in (["**"], ["../outside.py"], []):
+                with self.subTest(value=value), self.assertRaises(
+                    verification.ContractValidationError
+                ):
+                    verification.normalize_allowed_paths(value)
+
     def test_parser_rejects_non_string_target_branch_even_for_hold_specs(self) -> None:
         from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
 

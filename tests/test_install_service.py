@@ -67,6 +67,50 @@ def test_install_writes_current_python_to_env_file(tmp_path, monkeypatch):
     assert f"PSC_PROJECT_CONFIG_ROOT={tmp_path / '.agents' / 'config' / 'paulsha'}" in env_lines
 
 
+def test_install_scaffolds_and_validates_instance_local_monitor_config(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+    from paulsha_cortex.monitor.config import load_config
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    agents_root = tmp_path / "agents"
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(agents_root))
+
+    result = installer.install_service_result("beta", 300, repo_root)
+
+    config_path = agents_root / "config" / "paulsha" / "project-cortex.yaml"
+    assert result.exit_code == 0
+    assert f"monitor config created: {config_path}" in result.message
+    loaded = load_config(config_path=config_path)
+    assert loaded.workspaces[0].path == repo_root.resolve()
+    assert loaded.workspaces[0].name == repo_root.name
+
+
+def test_install_rejects_invalid_existing_monitor_config_before_enable(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    agents_root = tmp_path / "agents"
+    config_path = agents_root / "config" / "paulsha" / "project-cortex.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("workspaces: []\n", encoding="utf-8")
+    systemctl_calls = []
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(agents_root))
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
+    monkeypatch.setattr(
+        installer,
+        "_run_systemctl_install_step",
+        lambda *args: systemctl_calls.append(args),
+    )
+
+    with pytest.raises(ValueError, match="instance monitor config 無效"):
+        installer.install_service_result("beta", 300, repo_root)
+
+    assert systemctl_calls == []
+
+
 def test_install_persists_resolved_claude_executable(tmp_path, monkeypatch):
     from paulsha_cortex.deploy import installer
 

@@ -55,6 +55,11 @@ def test_pure_auth_failure_is_not_a_rate_limit_signal() -> None:
     assert is_rate_limit_signal("HTTP 401: Bad credentials") is False
 
 
+def test_oauth_requires_token_boundary_and_does_not_match_doc_coauthoring() -> None:
+    assert is_auth_signal("skills: copilot-sdk,doc-coauthoring,docx") is False
+    assert is_auth_signal("OAuth token invalid") is True
+
+
 def test_empty_or_missing_message_matches_neither() -> None:
     assert is_rate_limit_signal(None) is False
     assert is_rate_limit_signal("") is False
