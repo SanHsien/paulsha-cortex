@@ -1356,7 +1356,7 @@ class CompleteTickVerificationTests(unittest.TestCase):
                 verification_hash="old-verification",
             )
             reg.update_status(reviewer["job_id"], "exited")
-            slice_row = reg.create_slice(
+            reg.create_slice(
                 slice_id="slice-stale-review",
                 spec_path=str(root / "spec.md"),
                 spec_hash="new-spec",
@@ -1515,7 +1515,7 @@ class CompleteTickVerificationTests(unittest.TestCase):
                 verification_hash="verification",
             )
             reg.update_status(reviewer["job_id"], "exited")
-            slice_row = reg.create_slice(
+            reg.create_slice(
                 slice_id="slice-review-terminal",
                 spec_path=str(root / "spec.md"),
                 spec_hash="spec",

@@ -73,6 +73,8 @@ class HeldLock:
             try:
                 file_lock.unlock(self.fd)
             except OSError:
+                # Missing/rotated/unreadable logs provide no newer heartbeat;
+                # retain started_at so the conservative inactivity signal still works.
                 pass
             try:
                 os.close(self.fd)

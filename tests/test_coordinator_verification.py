@@ -43,7 +43,6 @@ class VerificationContractFrontmatterTests(unittest.TestCase):
         from paulsha_cortex.coordinator import verification
 
         with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
             for value in (["**"], ["../outside.py"], []):
                 with self.subTest(value=value), self.assertRaises(
                     verification.ContractValidationError
