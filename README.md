@@ -293,18 +293,31 @@ Monitor 採 last-good 語意：workspace 或 project subtree 暫時無法讀取�
 
 ```bash
 cortex deck list
+cortex deck list mcu-feature  # 只看單一 combo 與其 card membership
 
 # 先 dry-run 預覽
 cortex deck compile feature-oneshot \
   --task "example feature 實作" \
+  --slug example-feature \
+  --repo owner/repo \
   --change example-feature
 
 # 確認後寫入 ~/.agents/specs/
 cortex deck compile feature-oneshot \
   --task "example feature 實作" \
+  --slug example-feature \
+  --repo owner/repo \
   --change example-feature \
   --emit
 ```
+
+`deck list` 會把每個 combo 的直接 cards 與 band-triggered cards 一起列出；也可帶
+combo ID 只看單一組合。task 含 CJK 等非 ASCII 字元時請用 `--slug` 提供穩定的
+branch-safe slug；未提供時 CLI 會警告。`--repo owner/repo` 會把工作歸屬寫進 spec，
+省略時仍保守維持 `repo: null`。若這張工作本身才要建立 `.project-policy.yml`，可先把
+候選檔放在 repo 內，再用 `--policy-from path/to/candidate.yml` 導出 verification；路徑
+越界、symlink 或非法 YAML 會直接拒絕。`--emit` 完成後會列出絕對 output directory 與
+每一份實際寫入的檔案。
 
 Deck 產生的 spec 預設為 `dispatch: hold`，不會立即派工。翻成 `dispatch: auto` 前，使用者應：
 
@@ -337,6 +350,9 @@ cortex tick \
   --review-executor claude \
   --review-model "<reviewer-model-id>"
 ```
+
+唯讀的 `cortex ready` 可省略 `--specs-dir`，此時沿用 manager 的
+`PSC_MANAGER_SPECS_DIR`／specs root；會改變狀態的 `fanout` 與 `tick` 仍要求明確指定。
 
 `tick` 會依序處理 ready fanout、既有 Job 輪詢、deterministic verification、必要的 foreign review 與 completion 判斷。`--executor`／`--model` 是整批 builder 預設值；spec frontmatter 若成對宣告 `executor`／`model_id`，會逐 slice 覆寫且沿用同一套 commit-required／approval-safety 語意。命令列明確指定與 per-slice 覆寫的 `(executor, model_id)` 都必須存在於 `model-identities.yaml`，才會真正進 executor argv。不要在一般操作加入 `--allow-unsafe`；它會旁路 executor approval/sandbox，且只允許單一 ready slice canary。
 

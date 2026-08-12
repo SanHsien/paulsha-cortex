@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
+
+from paulsha_cortex.config import paths
 
 from . import autonomy, broker_reaper, engineering_outcome
 from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
@@ -139,7 +142,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
-    p_ready.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
+    p_ready.add_argument(
+        "--specs-dir",
+        default=os.environ.get("PSC_MANAGER_SPECS_DIR") or str(paths.specs_root()),
+        help="要掃描的 spec 目錄（預設：manager specs 目錄）",
+    )
 
     p_fanout = sub.add_parser("fanout", help="透過 manager daemon 派送目前 ready 的 slices")
     p_fanout.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")

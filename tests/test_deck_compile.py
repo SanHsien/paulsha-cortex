@@ -735,6 +735,83 @@ preflight:
     validate_verification_contract(verification, repo_root=repo_root, auto_dispatch=True)
 
 
+def test_verification_skeleton_can_use_repo_relative_candidate_policy(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path / "deck")
+    repo_root = tmp_path / "repo"
+    candidate = repo_root / "policy" / "next.yml"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text(
+        """\
+preflight:
+  steps:
+    - kind: validation
+      argv: [python3, -m, policy_check, --repo, .]
+    - kind: tests
+      argv: [python3, -m, pytest, tests/, -q]
+""",
+        encoding="utf-8",
+    )
+
+    result = compile_combo(
+        combo,
+        cards,
+        "demo task",
+        change="demo",
+        allow_external=True,
+        repo_root=repo_root,
+        policy_from="policy/next.yml",
+    )
+
+    verification = _verification_of(result)
+    assert _policy_check(verification)["argv"] == ["python3", "-m", "policy_check", "--repo", "."]
+    assert verification["tests"][0]["argv"] == ["python3", "-m", "pytest", "tests/", "-q"]
+
+
+@pytest.mark.parametrize("policy_from", ["../outside.yml", "/outside.yml"])
+def test_policy_from_rejects_paths_outside_repo(tmp_path, policy_from):
+    cards, combo = _feature_oneshot(tmp_path / "deck")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    with pytest.raises(DeckCompileError, match="policy-from"):
+        compile_combo(
+            combo,
+            cards,
+            "demo task",
+            change="demo",
+            allow_external=True,
+            repo_root=repo_root,
+            policy_from=policy_from,
+        )
+
+
+def test_compile_combo_accepts_explicit_branch_safe_slug(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path)
+    result = compile_combo(
+        combo,
+        cards,
+        "建立共用測試 helper",
+        slug="shared-test-helper",
+        change="demo",
+        allow_external=True,
+    )
+    assert result.task_slug == "shared-test-helper"
+    assert all(path.filename.startswith("shared-test-helper-") for path in result.slices)
+
+
+@pytest.mark.parametrize("slug", ["UPPER", "has/slash", "x" * 61])
+def test_compile_combo_rejects_invalid_explicit_slug(tmp_path, slug):
+    cards, combo = _feature_oneshot(tmp_path)
+    with pytest.raises(DeckCompileError, match="slug"):
+        compile_combo(
+            combo,
+            cards,
+            "demo task",
+            slug=slug,
+            change="demo",
+            allow_external=True,
+        )
+
+
 def test_verification_skeleton_placeholder_when_no_project_policy_file(tmp_path, capsys):
     cards, combo = _feature_oneshot(tmp_path / "deck")
     repo_root = tmp_path / "bare-repo"

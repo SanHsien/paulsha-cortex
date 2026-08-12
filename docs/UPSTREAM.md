@@ -16,8 +16,8 @@
 | merge 前 origin main | `b4fe5c7bee7c1651daaf6f07fe4de734b6b66320` |
 | 首輪 review 範圍 | watermark 後 104 commits、41 merged PR、0 open PR、1 open issue |
 | 前輪增量 | `ea76673..cf791a2`：17 commits、7 merged PR、0 open PR、1 open issue |
-| 本輪增量 | `cf791a2..dc8a968`：11 commits、5 merged PR、0 open PR、1 open issue |
-| 本輪決策 | 採用 `#467`、`#468`、`#470`–`#472` 與 upstream v0.1.8；保留 fork Windows adapters，並在 fork 處理 open Issue `#473` |
+| 本輪增量 | `cf791a2..dc8a968`：11 commits、5 merged PR、0 open PR；後續新增 2 open issues |
+| 本輪決策 | 採用 `#467`、`#468`、`#470`–`#472` 與 upstream v0.1.8；保留 fork Windows adapters，並在 fork 處理 open Issues `#473`／`#474` |
 
 ## 2026-08-12 v0.1.8 PR review ledger
 
@@ -128,6 +128,27 @@ Deck compile 現在接受顯式 `--repo owner/repo`，並把該 work item 已確
 已有的宣告，不從 repo root 或 Git remote 推導，後續派工、terminal manifest 與
 `recent_done` 沿用 `#469` 已驗證的鏈路。後續只比較 upstream 是否落地等價介面與
 驗收，不重做 repo inference 方案。
+
+### `hamanpaul/paulsha-cortex#474`，fork 已處理，upstream open
+
+採用 issue 的 DX 問題，但維持既有 fail-closed 與 authority 邊界：
+
+- policy 雞生蛋：新增 `deck compile --policy-from <repo-relative-path>`，讓尚未成為
+  canonical `.project-policy.yml` 的候選檔可導出 verification。只接受 repo 內可讀、
+  非 symlink 的 YAML mapping；明確指定卻無效時直接失敗，不退回 placeholder。未指定
+  候選檔時的 warning 也會說明「先人工落地 policy」與此旗標兩條路徑。
+- emit 可見性：成功後列出 resolved absolute output directory 與每個實際寫入檔名。
+  唯讀 `cortex ready` 預設沿用 manager specs 目錄；`fanout`／`tick` 的 mutation 入口
+  仍要求明確 `--specs-dir`。
+- CJK slug：新增 branch-safe `--slug`；task 含非 ASCII 且未指定時警告，不做語意
+  transliteration 猜測。
+- combo membership：`deck list [combo]` 直接列出 combo 的 cards 與 band-triggered cards；
+  不再以全域 card catalog 讓 membership 需要人工反推。現行 `mcu-feature` 的 cards 計數
+  與 YAML 已一致，不另造資料修正。
+- `repo: null`：沿用 Issue `#473` 的顯式 `--repo owner/repo`，並在省略時新增警告；
+  不從 cwd 或 Git remote 推斷 project authority。
+
+後續只比較 upstream 是否落地等價或更嚴格的介面／驗收，不重做上述方案。
 
 ## 同步規則
 
