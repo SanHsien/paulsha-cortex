@@ -19,7 +19,6 @@ Rate limit 訊號必須先於 login 訊號判定——這是 #369 真正修的�
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import time
@@ -134,8 +133,8 @@ def check_executor_auth(
     body 的欄位級解析——那屬於 `cortex bootstrap` 一次性 preflight 的精確度，
     這裡是 dispatch 熱路徑上的輕量 best-effort 探測，靠 `classify_cli_output`
     的 returncode/文字訊號即可正確區分 rate-limit／logged-out／ok。Claude
-    可傳入已驗證的 exact executable；未傳但 process env 有明確 override 時，
-    本函式自行 fail-closed 解析，無效設定絕不退回字面 `claude`。
+    可傳入已驗證的 exact executable；未傳時本函式自行 fail-closed 解析 override
+    或 PATH，解析失敗絕不退回未綁定的字面 `claude`。
     """
 
     if executor not in EXECUTOR_CANDIDATES:
@@ -153,7 +152,7 @@ def check_executor_auth(
 
         if executable is not None:
             argv[0] = executable
-        elif os.environ.get(CLAUDE_EXECUTABLE_ENV, "").strip():
+        else:
             try:
                 argv[0] = resolve_claude_executable()
             except ValueError as exc:

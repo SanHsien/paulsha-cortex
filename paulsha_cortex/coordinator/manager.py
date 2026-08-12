@@ -6312,14 +6312,13 @@ def _executor_auth_cache_identity(provider_id: str) -> tuple[str, str | None]:
     from .launcher import CLAUDE_EXECUTABLE_ENV, resolve_claude_executable
 
     configured = os.environ.get(CLAUDE_EXECUTABLE_ENV, "").strip()
-    if not configured:
-        return provider_id, None
     try:
         executable = resolve_claude_executable()
     except ValueError:
-        # Keep an invalid explicit authority isolated from both the default CLI
-        # cache and any previous valid path; the live probe records the failure.
-        return f"{provider_id}:invalid:{configured}", None
+        # Keep unavailable PATH/override authority isolated from previous valid
+        # paths; check_executor_auth resolves again and records the failure.
+        authority = configured or os.environ.get("PATH", "")
+        return f"{provider_id}:unavailable:{authority}", None
     return f"{provider_id}:{executable}", executable
 
 

@@ -96,7 +96,9 @@ def test_check_executor_auth_ok():
         assert argv[0] == "claude"
         return _completed(0)
 
-    result = check_executor_auth("claude", runner=_runner, now=lambda: 1234.0)
+    result = check_executor_auth(
+        "claude", executable="claude", runner=_runner, now=lambda: 1234.0
+    )
     assert result.provider_id == "claude"
     assert result.status == "ok"
     assert result.reason is None
@@ -167,7 +169,9 @@ def test_check_executor_auth_handles_missing_binary():
     def _runner(argv, *, timeout):
         raise FileNotFoundError("no such file")
 
-    result = check_executor_auth("claude", runner=_runner, now=lambda: 1234.0)
+    result = check_executor_auth(
+        "claude", executable="claude", runner=_runner, now=lambda: 1234.0
+    )
     assert result.status == "degraded"
     assert "FileNotFoundError" in result.reason
 

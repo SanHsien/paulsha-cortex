@@ -97,7 +97,7 @@ def _fresh_executor_auth_cache(*executors: str) -> dict[str, ProviderFreshness]:
     import time as _time
 
     now = _time.time()
-    return {
+    cache = {
         executor: ProviderFreshness(
             provider_id=executor,
             status="ok",
@@ -107,6 +107,12 @@ def _fresh_executor_auth_cache(*executors: str) -> dict[str, ProviderFreshness]:
         )
         for executor in executors
     }
+    if "claude" in cache:
+        from paulsha_cortex.coordinator import manager
+
+        key, _executable = manager._executor_auth_cache_identity("claude")
+        cache[key] = cache["claude"]
+    return cache
 
 
 _BUILDER = ModelIdentity(
@@ -981,6 +987,10 @@ def test_manager_wiring_probes_executor_auth_via_fake_runner(tmp_path, monkeypat
     from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
 
     calls: list[tuple[str, ...]] = []
+    claude = tmp_path / ("claude.exe" if os.name == "nt" else "claude")
+    claude.write_text("#!/bin/sh\n", encoding="utf-8")
+    claude.chmod(0o755)
+    monkeypatch.setenv("PSC_CLAUDE_EXECUTABLE", str(claude))
 
     def _fake_runner(argv, *, timeout):
         calls.append(tuple(argv))
@@ -1028,8 +1038,8 @@ def test_manager_wiring_probes_executor_auth_via_fake_runner(tmp_path, monkeypat
     # 首位 candidate（claude）探測 ok 即放行：sentinel 解析成該 candidate 實際
     # 的 executor，argv 正是 executor_auth 對 claude 定義的登入態指令，且只
     # 探測一次（codex 不需被打擾）。
-    assert calls == [("claude", "auth", "status")]
-    cached = manager._EXECUTOR_AUTH_CACHE.get("claude")
+    assert calls == [(str(claude.resolve()), "auth", "status")]
+    cached = manager._EXECUTOR_AUTH_CACHE.get(f"claude:{claude.resolve()}")
     assert cached is not None and cached.status == "ok"
     outcomes = {
         finding.capability.token: finding.outcome
@@ -1078,6 +1088,33 @@ def test_manager_executor_auth_probe_and_cache_bind_custom_claude_path(
     assert manager._executor_auth_snapshot_lookup("claude") is result
 
 
+def test_manager_executor_auth_cache_changes_with_path_resolved_claude(
+    tmp_path, monkeypatch,
+):
+    from paulsha_cortex.coordinator import manager
+
+    name = "claude.exe" if os.name == "nt" else "claude"
+    first = tmp_path / "first" / name
+    second = tmp_path / "second" / name
+    first.parent.mkdir()
+    second.parent.mkdir()
+    for executable in (first, second):
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
+    monkeypatch.delenv("PSC_CLAUDE_EXECUTABLE", raising=False)
+
+    monkeypatch.setenv("PATH", str(first.parent))
+    first_key, first_path = manager._executor_auth_cache_identity("claude")
+    monkeypatch.setenv("PATH", str(second.parent))
+    second_key, second_path = manager._executor_auth_cache_identity("claude")
+
+    assert first_path == str(first.resolve())
+    assert second_path == str(second.resolve())
+    assert first_key == f"claude:{first.resolve()}"
+    assert second_key == f"claude:{second.resolve()}"
+    assert first_key != second_key
+
+
 def test_manager_wiring_reroutes_when_executor_rate_limited(tmp_path, monkeypatch):
     """#442：首位 candidate 的 executor 探測回報限流（degraded）時，gate 依
     既有 candidate 順序 re-route 到下一位（codex），而非直接 needs_human——
@@ -1092,10 +1129,14 @@ def test_manager_wiring_reroutes_when_executor_rate_limited(tmp_path, monkeypatc
     from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
 
     calls: list[tuple[str, ...]] = []
+    claude = tmp_path / ("claude.exe" if os.name == "nt" else "claude")
+    claude.write_text("#!/bin/sh\n", encoding="utf-8")
+    claude.chmod(0o755)
+    monkeypatch.setenv("PSC_CLAUDE_EXECUTABLE", str(claude))
 
     def _fake_runner(argv, *, timeout):
         calls.append(tuple(argv))
-        if argv[0] == "claude":
+        if argv[0] == str(claude.resolve()):
             # 比照 #369 實際案例：限流訊息同時帶 authenticate 字樣，分類必須
             # 是 rate_limited 而非 logged_out（executor_auth 的判定順序）。
             return _subprocess.CompletedProcess(
@@ -1146,7 +1187,10 @@ def test_manager_wiring_reroutes_when_executor_rate_limited(tmp_path, monkeypatc
     assert decision is not None
     assert decision.action == "reroute"
     assert decision.identity is _ALT_BUILDER
-    assert calls == [("claude", "auth", "status"), ("codex", "doctor", "--json")]
+    assert calls == [
+        (str(claude.resolve()), "auth", "status"),
+        ("codex", "doctor", "--json"),
+    ]
     # 被擋下的 claude 以 PROVIDER_UNAVAILABLE 記錄於 attempts，freshness 指名
     # 解析後的 executor（claude）與限流原因——sentinel 字面值不外洩。
     first = decision.attempts[0]

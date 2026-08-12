@@ -124,7 +124,8 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    設定無效時會直接停止，不會 fallback 到 PATH 上的標準 `claude`。`cortex
    bootstrap`／`doctor` 會顯示 resolved executable，啟動後的 job record 也會保存
    `executable_path` provenance；dispatch 前的 `provider:executor` auth gate 也會
-   檢查同一路徑，並以 resolved path 隔離 TTL cache。重跑 `cortex install service`
+   檢查同一路徑；override 或 PATH fallback 的 resolved path 都會隔離 TTL cache。
+   重跑 `cortex install service`
    可將 process env 的設定寫入該 instance 的 manager env。
 
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
