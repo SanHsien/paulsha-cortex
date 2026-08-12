@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Issue #465：workflow-lane handoff manifest 未寫 repo 歸屬，recent_done 永遠 repo=null**：complete_tick 終局 manifest dict 補 `workflow_repo` 欄（值取自 job record 派工時的 `workflow_repo`），讀取端 `_repo_from_manifest`（#230／PR #349 契約）現成接住；slice-lane 寫 `null`、舊 manifest 缺鍵維持 `repo=null` 不推斷；下游 paulshaclaw cockpit 不需改動。詳見 `changelog.d/workflow-lane-manifest-repo.md`。
+
 ## [0.1.7] - 2026-08-12
 
 ### Added
