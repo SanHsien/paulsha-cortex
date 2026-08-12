@@ -6,18 +6,40 @@
 | --- | --- |
 | fork | `SanHsien/paulsha-cortex` |
 | upstream | `hamanpaul/paulsha-cortex` |
-| 前次 review watermark | `b868760`（2026-08-09） |
+| 前次 review watermark | `cf791a21f980be1a2e2e5979795a0268880fb248`（v0.1.7） |
 | 首輪 upstream main | `b79c74aa20e7229c08b279fb0ec062751a8dbeca` |
 | 追補 upstream main | `8b34e3e097f4f598b883df0db11669271f83d31f` |
 | 前輪 upstream main | `ea76673ab77451fed08a7ff8527f9581cfd2ac6a` |
-| 最終 upstream main | `cf791a21f980be1a2e2e5979795a0268880fb248` |
-| upstream release | `v0.1.7`（tag object `ab060406e0bf6f7e20a82aaeb835e04b9b239a24`，dereference `cf791a2`） |
-| merge 前 origin main | `b354a42d215370ab2d95e05cd879e591ecf58342` |
+| v0.1.7 upstream main | `cf791a21f980be1a2e2e5979795a0268880fb248` |
+| 最終 upstream main | `dc8a968742ce587fba0ec013232a8a9ff1597596` |
+| upstream release | `v0.1.8`（tag object `324eb628144bd12173600e18d7638331838a45b6`，dereference `dc8a968`） |
+| merge 前 origin main | `b4fe5c7bee7c1651daaf6f07fe4de734b6b66320` |
 | 首輪 review 範圍 | watermark 後 104 commits、41 merged PR、0 open PR、1 open issue |
-| 本輪增量 | `ea76673..cf791a2`：17 commits、7 merged PR、0 open PR、1 open issue |
-| 本輪決策 | 採用 `#457`–`#463` 與 upstream v0.1.7；保留 fork hardening／Windows adapters，並在 fork 修正 Issue `#464` readiness race |
+| 前輪增量 | `ea76673..cf791a2`：17 commits、7 merged PR、0 open PR、1 open issue |
+| 本輪增量 | `cf791a2..dc8a968`：11 commits、5 merged PR、0 open PR、1 open issue |
+| 本輪決策 | 採用 `#467`、`#468`、`#470`–`#472` 與 upstream v0.1.8；保留 fork Windows adapters，並在 fork 處理 open Issue `#473` |
 
-## 2026-08-12 PR review ledger
+## 2026-08-12 v0.1.8 PR review ledger
+
+本輪上游沒有待合併的 open PR。以下 5 個 PR 均已進入 `upstream/main`；本 fork
+以 merge 保留 ancestry，並保留 Windows patchmud shebang adapter 與 native monitor
+transport。上游 v0.1.8 annotated tag 已驗證 dereference 到本輪 watermark。
+
+| PR | 決策與理由 |
+| --- | --- |
+| `#467` | 採用。修正 patchmud report 聚合鍵、agy adapter mapping、deck provenance 指紋與 run evidence 耐久化；fork 保留 Windows PATH 上 Python shebang entry point 的啟動層。 |
+| `#468` | 採用。workflow-lane handoff manifest 明確寫入 `workflow_repo`，缺值仍維持 `null`，不推斷歸屬。 |
+| `#470` | 採用。以 `wait_until_ready()` 關閉 bind→chmod 測試競態，並採用 upstream 的 slow-chmod deterministic regression；取代 fork 先前的等價修正。 |
+| `#471` | 採用。slice spec 顯式 `repo: owner/repo` 貫通 builder／reviewer job、terminal manifest 與 monitor projection；未宣告仍為 `null`。 |
+| `#472` | 採用。`VERSION=0.1.8`；release tag object `324eb62` dereference 到 `dc8a968`。 |
+
+完整 PR 邊界為：`#467`、`#468`、`#470`、`#471`、`#472`。Issue `#473`
+在 upstream 仍 open；本 fork 本輪先補 deck compile 的顯式 `--repo owner/repo` 傳遞，
+不從目錄或 remote 推導。下次只評估
+`dc8a968742ce587fba0ec013232a8a9ff1597596..upstream/main` 與之後新建／更新的
+PR 或 Issue；不要重做本節取捨。
+
+## 2026-08-12 v0.1.7 PR review ledger
 
 本輪上游沒有待合併的 open PR。以下 7 個 PR 均已進入 `upstream/main`，合併時的
 GitHub checks 無 failed／pending 狀態；本 fork 以 merge 保留 ancestry，並人工解決
@@ -91,21 +113,28 @@ Issue 已由 upstream `#459` 關閉；下列 deployment 限制仍是 fork 的安
 並有 token rotation、ACL、redaction 與 service restart tests 時，才重新評估自動化
 Copilot token 佈署。沒有這些證據，不重做「從 keyring 複製 token」探索。
 
-### `hamanpaul/paulsha-cortex#464`，fork 已處理，upstream open
+### `hamanpaul/paulsha-cortex#464`，完成
 
 Python 3.13 CI 偶發看到 socket mode `0o755`，不是 #439 的 process-wide umask
 復發。`bind()` 會先讓 socket path 可見，Unix transport 隨後才 `chmod(0o600)`；原測試
-setup 只輪詢 path existence，因此能在 chmod 前執行 `stat()`。本 fork 改以
+setup 只輪詢 path existence，因此能在 chmod 前執行 `stat()`。Upstream `#470` 已改以
 `MonitorServer.wait_until_ready()` 作為同步 authority（ready 在 bind／chmod／listen 後
-才發布），並保留權限斷言。後續只需檢查 upstream 是否採用等價修正，不重做 umask
-hypothesis；Issue 關閉前仍列為待追蹤。
+才發布），並加入 slow-chmod regression；本 fork 已採用，後續不重做 umask hypothesis。
+
+### `hamanpaul/paulsha-cortex#473`，fork 已處理，upstream open
+
+Deck compile 現在接受顯式 `--repo owner/repo`，並把該 work item 已確認的 repo
+寫入每一份輸出 slice spec；呼叫端省略時仍輸出 `repo: null`。此修正只傳遞 authority
+已有的宣告，不從 repo root 或 Git remote 推導，後續派工、terminal manifest 與
+`recent_done` 沿用 `#469` 已驗證的鏈路。後續只比較 upstream 是否落地等價介面與
+驗收，不重做 repo inference 方案。
 
 ## 同步規則
 
 ```powershell
 git fetch upstream main --tags --prune
 git rev-list --left-right --count origin/main...upstream/main
-git log --oneline cf791a21f980be1a2e2e5979795a0268880fb248..upstream/main
+git log --oneline dc8a968742ce587fba0ec013232a8a9ff1597596..upstream/main
 gh pr list --repo hamanpaul/paulsha-cortex --state open --limit 50
 gh issue list --repo hamanpaul/paulsha-cortex --state open --limit 100
 ```

@@ -342,6 +342,82 @@ class FrontmatterTests(unittest.TestCase):
             )
             self.assertEqual(meta["depends_on"], ["only-one"])  # 單一字串容錯成 list
 
+    def test_parse_repo_declaration(self) -> None:
+        # issue #469：spec frontmatter 顯式宣告 optional `repo: owner/repo`，
+        # 派工時投影進 builder job 的 workflow_repo，recent_done/slices 才有歸屬。
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "repo.md",
+                    "dispatch: auto\n"
+                    "slice_id: repo-slice\n"
+                    "plan: docs/p.md\n"
+                    "repo: hamanpaul/paulsha-cortex\n"
+                    + _v1_verification_block(),
+                )
+            )
+            self.assertIsNone(meta["parse_error"])
+            self.assertEqual(meta["repo"], "hamanpaul/paulsha-cortex")
+
+    def test_parse_repo_undeclared_is_none(self) -> None:
+        # #230/#349 契約：未顯式宣告 → null，不從路徑或 git remote 推斷。
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "norepo.md",
+                    "dispatch: auto\nslice_id: s\nplan: docs/p.md\n" + _v1_verification_block(),
+                )
+            )
+            self.assertIsNone(meta["parse_error"])
+            self.assertIsNone(meta["repo"])
+
+    def test_parse_repo_normalizes_outer_whitespace(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "repo-spaces.md",
+                    "dispatch: auto\n"
+                    "slice_id: repo-slice\n"
+                    "plan: docs/p.md\n"
+                    'repo: "  hamanpaul/paulsha-cortex  "\n'
+                    + _v1_verification_block(),
+                )
+            )
+            self.assertIsNone(meta["parse_error"])
+            self.assertEqual(meta["repo"], "hamanpaul/paulsha-cortex")
+
+    def test_parse_repo_invalid_shape_holds(self) -> None:
+        # 非法 shape → ContractValidationError → fail-closed 落 hold（比照 unknown key）。
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            for idx, bad in enumerate(
+                ["norepo", "a/b/c", "/x", "x/", "owner /repo", "owner/re po", 123]
+            ):
+                with self.subTest(repo=bad):
+                    meta = parse_spec_frontmatter(
+                        _write_spec(
+                            Path(d),
+                            f"bad-repo-{idx}.md",
+                            "dispatch: auto\n"
+                            "slice_id: bad-repo\n"
+                            "plan: docs/p.md\n"
+                            f"repo: {bad}\n" + _v1_verification_block(),
+                        )
+                    )
+                    self.assertEqual(meta["dispatch"], "hold")
+                    self.assertIsInstance(meta["parse_error"], dict)
+                    self.assertEqual(meta["parse_error"]["field"], "repo")
+
 
 # --------------------------------------------------------------------------- #
 # ScanTests
@@ -669,6 +745,52 @@ class FanoutTests(unittest.TestCase):
             self.assertEqual(len(jobs), 1)
             self.assertEqual(jobs[0]["executor"], "copilot")
             self.assertEqual(reg.get_job("slice-a-1")["pid"], 123)
+
+    def test_dispatch_ready_records_workflow_repo_from_spec(self) -> None:
+        # issue #469：spec frontmatter 顯式宣告 repo → builder job record 的
+        # workflow_repo 帶宣告值；未宣告 → None，不從路徑或 remote 推斷（#230/#349）。
+        from paulsha_cortex.coordinator.autonomy import dispatch_ready
+        from paulsha_cortex.coordinator.dispatcher import Dispatcher
+        from paulsha_cortex.coordinator.launcher import LaunchHandle
+        from paulsha_cortex.coordinator.registry import JobRegistry
+
+        class _FakeSender:
+            def send(self, pane_id, text):
+                raise AssertionError("launcher path must not send to pane")
+
+        class _FakeWt:
+            def create(self, branch):
+                return f"/fake/wt/{branch.replace('/', '-')}"
+
+        class _FakeLauncher:
+            def launch(self, *, slice_id, prompt, worktree, log_dir):
+                return LaunchHandle(
+                    executor="copilot", model_id=None, session_name=slice_id, pid=123,
+                    log_path=f"{log_dir}/x",
+                )
+
+        with tempfile.TemporaryDirectory() as d:
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            disp = Dispatcher(reg, _FakeSender(), _FakeWt())
+            declared = _meta("slice-repo", plan="docs/a.md")
+            declared["repo"] = "hamanpaul/paulsha-cortex"
+            undeclared = _meta("slice-norepo", plan="docs/b.md")
+            self.assertNotIn("repo", undeclared)  # 未宣告：meta 無鍵 → m.get 回 None
+
+            dispatch_ready(
+                [declared, undeclared],
+                is_satisfied=lambda _id: True,
+                dispatcher=disp,
+                persona="builder",
+                launcher=_FakeLauncher(),
+                git_runner=_fake_target_git_runner,
+            )
+
+            jobs_by_task = {job["task"]: job for job in reg.list_jobs()}
+            self.assertEqual(
+                jobs_by_task["slice-repo"]["workflow_repo"], "hamanpaul/paulsha-cortex"
+            )
+            self.assertIsNone(jobs_by_task["slice-norepo"]["workflow_repo"])
 
     def test_dispatch_ready_launcher_failure_does_not_block_other_slices(self) -> None:
         from paulsha_cortex.coordinator.autonomy import DispatchReadyError, dispatch_ready

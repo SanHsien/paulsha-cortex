@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 from paulsha_cortex.deck import cli as deck_cli
 
 CARDS_YAML = """\
@@ -204,6 +206,35 @@ def test_compile_emit_writes_hold_specs(tmp_path, monkeypatch):
     files = sorted(specs_root.glob("*.md"))
     assert files
     assert all("dispatch: hold" in path.read_text(encoding="utf-8") for path in files)
+
+
+def test_compile_emit_carries_explicit_work_item_repo(tmp_path, monkeypatch):
+    _seed_fixture(tmp_path / "deck", monkeypatch)
+    specs_root = tmp_path / "specs"
+    rc = deck_cli.main(
+        [
+            "compile",
+            "feature-oneshot",
+            "--task",
+            "demo task",
+            "--change",
+            "demo",
+            "--allow-external",
+            "--repo",
+            "hamanpaul/paulsha-cortex",
+            "--out",
+            str(specs_root),
+        ]
+    )
+
+    assert rc == 0
+    files = sorted(specs_root.glob("*.md"))
+    assert files
+    assert all(
+        yaml.safe_load(path.read_text(encoding="utf-8").split("---", 2)[1])["repo"]
+        == "hamanpaul/paulsha-cortex"
+        for path in files
+    )
 
 
 def test_compile_out_file_path_reports_error(tmp_path, capsys, monkeypatch):

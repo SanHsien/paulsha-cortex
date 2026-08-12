@@ -296,6 +296,70 @@ def test_compile_frontmatter_exact_keyset(tmp_path):
         assert set(yaml.safe_load(block)) == set(EMITTED_FRONTMATTER_FIELDS) - runtime_only
 
 
+def test_compile_frontmatter_carries_explicit_work_item_repo(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path)
+    result = compile_combo(
+        combo,
+        cards,
+        "示例 LED 功能",
+        change="demo",
+        allow_external=True,
+        repo="hamanpaul/paulsha-cortex",
+    )
+
+    for slice_doc in result.slices:
+        block = slice_doc.content.split("---\n")[1]
+        assert yaml.safe_load(block)["repo"] == "hamanpaul/paulsha-cortex"
+
+
+def test_compile_frontmatter_keeps_repo_null_without_declaration(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path)
+    result = compile_combo(
+        combo,
+        cards,
+        "示例 LED 功能",
+        change="demo",
+        allow_external=True,
+    )
+
+    for slice_doc in result.slices:
+        block = slice_doc.content.split("---\n")[1]
+        assert yaml.safe_load(block)["repo"] is None
+
+
+@pytest.mark.parametrize(
+    "repo",
+    ["owner", "owner/repo/extra", "/repo", "owner/", "owner /repo", "owner/re po", 123],
+)
+def test_compile_rejects_invalid_explicit_repo(tmp_path, repo):
+    cards, combo = _feature_oneshot(tmp_path)
+
+    with pytest.raises(DeckCompileError, match="owner/repo"):
+        compile_combo(
+            combo,
+            cards,
+            "示例 LED 功能",
+            change="demo",
+            allow_external=True,
+            repo=repo,
+        )
+
+
+def test_compile_normalizes_outer_repo_whitespace(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path)
+    result = compile_combo(
+        combo,
+        cards,
+        "示例 LED 功能",
+        change="demo",
+        allow_external=True,
+        repo="  hamanpaul/paulsha-cortex  ",
+    )
+
+    block = result.slices[0].content.split("---\n")[1]
+    assert yaml.safe_load(block)["repo"] == "hamanpaul/paulsha-cortex"
+
+
 def test_requires_uncovered_blocks_without_allow_external(tmp_path):
     cards, combo = _solo_adv(tmp_path)
     with pytest.raises(DeckCompileError, match="allow-external"):

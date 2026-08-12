@@ -64,7 +64,7 @@ def parse_spec_frontmatter(path) -> dict:
     """解析 superpowers spec 開頭 --- frontmatter。
 
     回 {path, dispatch, slice_id, plan, depends_on, target_branch, verification,
-    executor, model_id, parse_error}。
+    executor, model_id, repo, parse_error}。
     硬約束：dispatch 僅在字面值為 'auto' 時為 'auto'，其餘一律 'hold'（fail-safe）。
     容忍無 frontmatter（視為 hold），不 raise。
     """
@@ -82,6 +82,7 @@ def parse_spec_frontmatter(path) -> dict:
         "verification": None,
         "executor": None,
         "model_id": None,
+        "repo": None,
         "parse_error": None,
     }
     if block is None:
@@ -114,6 +115,7 @@ def parse_spec_frontmatter(path) -> dict:
         )
         meta["executor"] = data.get("executor") if isinstance(data.get("executor"), str) else None
         meta["model_id"] = data.get("model_id") if isinstance(data.get("model_id"), str) else None
+        meta["repo"] = data.get("repo") if isinstance(data.get("repo"), str) else None
         meta["parse_error"] = exc.as_payload()
         return meta
 
@@ -128,6 +130,7 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
         "verification",
         "executor",
         "model_id",
+        "repo",
         "parse_error",
     }
     extras = set(data) - allowed
@@ -147,6 +150,7 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
         "verification": None,
         "executor": None,
         "model_id": None,
+        "repo": None,
         "parse_error": None,
     }
     plan = data.get("plan")
@@ -199,6 +203,23 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
             data.get("model_id"),
             field="model_id",
         )
+    # #469：optional 顯式 repo 歸屬宣告（owner/repo）。派工時投影進 builder job
+    # 的 workflow_repo，終局 manifest / recent_done / slices 才有 repo 歸屬。
+    # 未宣告 → None：依 #230/#349 契約不從路徑或 git remote 推斷。
+    # shape 比照 completion.py 的 work_authority.repo：恰一個 '/' 且兩段非空。
+    repo_value = data.get("repo")
+    if repo_value is not None:
+        normalized_repo = repo_value.strip() if isinstance(repo_value, str) else None
+        if (
+            normalized_repo is None
+            or normalized_repo.count("/") != 1
+            or not all(normalized_repo.split("/"))
+            or any(char.isspace() for char in normalized_repo)
+        ):
+            raise verification.ContractValidationError(
+                "repo", "repo must be an explicit owner/repo string"
+            )
+        meta["repo"] = normalized_repo
     if data.get("parse_error") is not None:
         raise verification.ContractValidationError(
             "parse_error",
@@ -567,6 +588,10 @@ def dispatch_ready(
                 persona=persona,
                 worktree=worktree,
                 dispatch_head=dispatch_head,
+                # #469：spec frontmatter 顯式宣告的 repo 歸屬（未宣告 → None，
+                # 不推斷）；寫進 job record 既有 workflow_repo 欄，終局 manifest
+                # 與 slices/attention 讀取端（#465/#349）即可投影。
+                workflow_repo=m.get("repo"),
             )
             _mark_slice_building(
                 dispatcher=dispatcher,
@@ -670,6 +695,7 @@ def _record_launching_job(
     persona: str,
     worktree: str,
     dispatch_head: str | None = None,
+    workflow_repo: str | None = None,
 ) -> dict:
     """Persist the job row *before* launch (handle fields filled in later)."""
     registry = getattr(dispatcher, "_registry", None)
@@ -684,6 +710,7 @@ def _record_launching_job(
             "session_name": None,
             "pid": None,
             "log_path": None,
+            "workflow_repo": workflow_repo,
         }
     return registry.create_job(
         task=slice_id,
@@ -697,6 +724,9 @@ def _record_launching_job(
         session_name=None,
         pid=None,
         log_path=None,
+        # #469：slice-lane 的 repo 歸屬只來自 spec 顯式宣告；lane 判定看
+        # workflow_run_id（manager._is_workflow_lane_job），帶此欄不會誤判 lane。
+        workflow_repo=workflow_repo,
     )
 
 

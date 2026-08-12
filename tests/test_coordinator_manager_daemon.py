@@ -57,6 +57,7 @@ class FakeRegistry:
         spec_hash: str | None = None,
         plan_hash: str | None = None,
         verification_hash: str | None = None,
+        workflow_repo: str | None = None,
     ) -> dict:
         self._seq += 1
         job = {
@@ -80,6 +81,7 @@ class FakeRegistry:
             "spec_hash": spec_hash,
             "plan_hash": plan_hash,
             "verification_hash": verification_hash,
+            "workflow_repo": workflow_repo,
         }
         self._jobs.append(job)
         return dict(job)
@@ -1178,6 +1180,62 @@ def test_recent_done_provider_projects_gate_reason_job_id_branch(monkeypatch, tm
     assert entries["slice-sparse"]["job_id"] is None
     assert entries["slice-sparse"]["branch"] is None
     assert entries["slice-sparse"]["repo"] is None
+
+
+def test_recent_done_provider_projects_repo_from_workflow_repo(monkeypatch, tmp_path):
+    """#465：workflow-lane manifest 帶 workflow_repo 時 repo 投影該值；null 時維持 repo=None。"""
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    (handoff_dir / "wf-465-build-1.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "wf-465-build-1",
+                "gate_status": "workflow_gate",
+                "completed_at": "2026-07-03T09:03:00+00:00",
+                "workflow_repo": "hamanpaul/paulsha-cortex",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (handoff_dir / "slice-lane-null.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "slice-lane-null",
+                "gate_status": "passed",
+                "completed_at": "2026-07-03T09:01:00+00:00",
+                "workflow_repo": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    # #469：slice-lane（非 wf-* 命名）manifest 也帶 workflow_repo——spec frontmatter
+    # 顯式宣告 repo 經派工寫入 job、終局 manifest 落盤後，recent_done 同樣投影。
+    (handoff_dir / "slice-lane-declared.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "slice-lane-declared",
+                "gate_status": "needs_human",
+                "completed_at": "2026-07-03T09:02:00+00:00",
+                "workflow_repo": "hamanpaul/paulsha-cortex",
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=FakeRegistry(),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        scan_specs_fn=lambda specs_dir: [],
+        now_fn=lambda: "2026-07-03T09:10:00+00:00",
+    )
+
+    status = provider()
+    entries = {entry["slice_id"]: entry for entry in status["recent_done"]}
+
+    assert entries["wf-465-build-1"]["repo"] == "hamanpaul/paulsha-cortex"
+    assert entries["slice-lane-declared"]["repo"] == "hamanpaul/paulsha-cortex"
+    assert entries["slice-lane-null"]["repo"] is None
 
 
 def test_recent_done_provider_applies_recency_window(monkeypatch, tmp_path):
