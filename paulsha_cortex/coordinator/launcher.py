@@ -440,7 +440,7 @@ def resolve_claude_executable(
             raise ValueError(f"{CLAUDE_EXECUTABLE_ENV} is not executable")
         return str(resolved)
 
-    discovered = lookup("claude", path=source.get("PATH"))
+    discovered = lookup("claude", path=source.get("PATH", ""))
     if discovered is None:
         raise ValueError(
             "Claude executable not found; set PSC_CLAUDE_EXECUTABLE to an absolute path"

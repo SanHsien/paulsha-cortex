@@ -6304,6 +6304,25 @@ def _specialize_workflow_launcher(launcher, step):
 _EXECUTOR_AUTH_CACHE: dict[str, object] = {}
 
 
+def _executor_auth_cache_identity(provider_id: str) -> tuple[str, str | None]:
+    """Bind Claude auth freshness to the configured compatible executable."""
+
+    if provider_id != "claude":
+        return provider_id, None
+    from .launcher import CLAUDE_EXECUTABLE_ENV, resolve_claude_executable
+
+    configured = os.environ.get(CLAUDE_EXECUTABLE_ENV, "").strip()
+    if not configured:
+        return provider_id, None
+    try:
+        executable = resolve_claude_executable()
+    except ValueError:
+        # Keep an invalid explicit authority isolated from both the default CLI
+        # cache and any previous valid path; the live probe records the failure.
+        return f"{provider_id}:invalid:{configured}", None
+    return f"{provider_id}:{executable}", executable
+
+
 def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> object | None:
     from paulsha_cortex.monitor.work_models import parse_timestamp
 
@@ -6345,7 +6364,8 @@ def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
 
     from .runtime_preflight import ProviderFreshness
 
-    cached = _EXECUTOR_AUTH_CACHE.get(provider_id)
+    cache_key, _executable = _executor_auth_cache_identity(provider_id)
+    cached = _EXECUTOR_AUTH_CACHE.get(cache_key)
     if cached is not None:
         return cached
     from .executor_auth import EXECUTOR_AUTH_TTL_SECONDS
@@ -6363,8 +6383,9 @@ def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
 def _executor_auth_prober(provider_id: str) -> object | None:
     from .executor_auth import check_executor_auth
 
-    result = check_executor_auth(provider_id)
-    _EXECUTOR_AUTH_CACHE[provider_id] = result
+    cache_key, executable = _executor_auth_cache_identity(provider_id)
+    result = check_executor_auth(provider_id, executable=executable)
+    _EXECUTOR_AUTH_CACHE[cache_key] = result
     return result
 
 

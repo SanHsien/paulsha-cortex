@@ -19,6 +19,7 @@ Rate limit 訊號必須先於 login 訊號判定——這是 #369 真正修的�
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import time
@@ -116,6 +117,7 @@ _EXECUTOR_AUTH_ARGV: dict[str, tuple[str, ...]] = {
 def check_executor_auth(
     executor: str,
     *,
+    executable: str | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] = _default_runner,
     timeout_seconds: float = 20.0,
     now: Callable[[], float] = time.time,
@@ -131,7 +133,9 @@ def check_executor_auth(
     這是刻意簡化過的通用探測，不重現 `porcelain/bootstrap.py` 對 codex JSON
     body 的欄位級解析——那屬於 `cortex bootstrap` 一次性 preflight 的精確度，
     這裡是 dispatch 熱路徑上的輕量 best-effort 探測，靠 `classify_cli_output`
-    的 returncode/文字訊號即可正確區分 rate-limit／logged-out／ok。
+    的 returncode/文字訊號即可正確區分 rate-limit／logged-out／ok。Claude
+    可傳入已驗證的 exact executable；未傳但 process env 有明確 override 時，
+    本函式自行 fail-closed 解析，無效設定絕不退回字面 `claude`。
     """
 
     if executor not in EXECUTOR_CANDIDATES:
@@ -144,6 +148,23 @@ def check_executor_auth(
             reason=f"unsupported executor: {executor}",
         )
     argv = list(_EXECUTOR_AUTH_ARGV[executor])
+    if executor == "claude":
+        from .launcher import CLAUDE_EXECUTABLE_ENV, resolve_claude_executable
+
+        if executable is not None:
+            argv[0] = executable
+        elif os.environ.get(CLAUDE_EXECUTABLE_ENV, "").strip():
+            try:
+                argv[0] = resolve_claude_executable()
+            except ValueError as exc:
+                return ProviderFreshness(
+                    provider_id=executor,
+                    status="degraded",
+                    observed_at=now(),
+                    ttl_seconds=ttl_seconds,
+                    source="live-probe",
+                    reason=f"executor auth probe failed: {exc}",
+                )
     try:
         completed = runner(argv, timeout=timeout_seconds)
     except (OSError, subprocess.TimeoutExpired) as exc:

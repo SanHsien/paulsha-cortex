@@ -103,6 +103,41 @@ def test_check_executor_auth_ok():
     assert result.observed_at == 1234.0
 
 
+def test_check_executor_auth_uses_explicit_claude_executable():
+    calls = []
+
+    def _runner(argv, *, timeout):
+        calls.append(tuple(argv))
+        return _completed(0)
+
+    result = check_executor_auth(
+        "claude",
+        executable="/opt/cortex/bin/claude-compatible",
+        runner=_runner,
+        now=lambda: 1234.0,
+    )
+
+    assert result.status == "ok"
+    assert calls == [("/opt/cortex/bin/claude-compatible", "auth", "status")]
+
+
+def test_check_executor_auth_invalid_override_never_calls_path_fallback(monkeypatch):
+    monkeypatch.setenv("PSC_CLAUDE_EXECUTABLE", "claude-alias")
+    calls = []
+
+    def _runner(argv, *, timeout):
+        calls.append(tuple(argv))
+        return _completed(0)
+
+    result = check_executor_auth(
+        "claude", runner=_runner, now=lambda: 1234.0
+    )
+
+    assert result.status == "degraded"
+    assert "absolute path" in (result.reason or "")
+    assert calls == []
+
+
 def test_check_executor_auth_logged_out():
     def _runner(argv, *, timeout):
         return _completed(1, stderr="please run codex login")

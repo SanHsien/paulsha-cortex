@@ -5,6 +5,7 @@
 - Require an absolute, regular, non-symlink executable and fail closed instead
   of falling back to a different `claude` on PATH when an override is invalid.
 - Report the resolved path through bootstrap and doctor, persist it as each
-  launched Claude job's `executable_path`, and validate installed runtime envs.
+  launched Claude job's `executable_path`, validate installed runtime envs, and
+  bind the dispatch auth probe plus TTL cache identity to the same path.
 - Record the fork decision and future comparison boundary in the upstream
   ledger without making repo model overlays an arbitrary execution authority.

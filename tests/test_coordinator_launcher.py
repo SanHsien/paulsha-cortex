@@ -202,6 +202,14 @@ class ArgvTests(unittest.TestCase):
                     which=mock.Mock(return_value="/fallback/claude"),
                 )
 
+    def test_claude_path_lookup_does_not_inherit_host_path_from_mapping(self) -> None:
+        which = mock.Mock(return_value=None)
+
+        with self.assertRaisesRegex(ValueError, "not found"):
+            resolve_claude_executable({}, which=which)
+
+        which.assert_called_once_with("claude", path="")
+
     def test_claude_launch_binds_exact_executable_and_records_provenance(self) -> None:
         calls = []
 

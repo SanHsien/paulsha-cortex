@@ -27,7 +27,7 @@
 - 同步 upstream `#451` 的 v0.1.6 release metadata 與 tag 水位；下次 review watermark 推進到 `ea76673`。
 
 ### Fixed
-- Claude executor 可用 `PSC_CLAUDE_EXECUTABLE` fail-closed 綁定絕對、regular、非 symlink 的 compatible launcher；bootstrap／doctor 顯示 resolved path，job record 保存 `executable_path`，無效 override 不再靜默 fallback 到 PATH 上的其他 `claude`。
+- Claude executor 可用 `PSC_CLAUDE_EXECUTABLE` fail-closed 綁定絕對、regular、非 symlink 的 compatible launcher；bootstrap／doctor 與 dispatch auth gate 共用 resolved path，auth TTL cache 依路徑隔離，job record 保存 `executable_path`，無效 override 不再靜默 fallback 到 PATH 上的其他 `claude`。
 - Repo authority input 現在會正規化整體前後空白並拒絕 owner/repo 段內空白，避免 deck spec、job 與 manifest 寫入無法穩定比對的歸屬值。
 - Profile evidence 的耐久 run 目錄改以原子 `mkdir` 取得名稱，避免兩個同秒執行的 profile command 在 `exists()`／`mkdir()` 間撞名失敗。
 - 將 upstream v0.1.8 的 slow-chmod `0600` regression 限定於 POSIX；Windows ACL 不具等價 POSIX mode bits，仍由原生 monitor transport 測試驗證 readiness。

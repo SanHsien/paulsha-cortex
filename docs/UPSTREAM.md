@@ -163,6 +163,9 @@ Deck compile 現在接受顯式 `--repo owner/repo`，並把該 work item 已確
 - `cortex bootstrap` 與 doctor `review-sandbox` 回報 resolved executable；每個實際
   啟動的 Claude job 將同一路徑保存為 `executable_path`，使 `model_id` 與 provider
   launcher 可共同稽核。
+- ship-phase `provider:executor` auth gate 使用同一 resolved executable，TTL cache
+  key 也包含該路徑；自訂 launcher 不會先被 PATH 上另一個 `claude` 的登入態誤擋
+  或誤放行。
 - `cortex install service` 會驗證既有 instance／manager env，並可把目前 process env
   的合法 override 寫入該 instance；無效既有值不會在重裝時被掩蓋。
 

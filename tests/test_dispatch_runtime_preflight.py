@@ -1044,6 +1044,40 @@ def test_manager_wiring_probes_executor_auth_via_fake_runner(tmp_path, monkeypat
     )
 
 
+def test_manager_executor_auth_probe_and_cache_bind_custom_claude_path(
+    tmp_path, monkeypatch,
+):
+    import functools
+    import subprocess
+
+    from paulsha_cortex.coordinator import executor_auth, manager
+
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PSC_CLAUDE_EXECUTABLE", str(executable))
+    monkeypatch.setattr(manager, "_EXECUTOR_AUTH_CACHE", {})
+    calls = []
+
+    def _fake_runner(argv, *, timeout):
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        executor_auth,
+        "check_executor_auth",
+        functools.partial(executor_auth.check_executor_auth, runner=_fake_runner),
+    )
+
+    result = manager._executor_auth_prober("claude")
+
+    cache_key = f"claude:{executable.resolve()}"
+    assert result.status == "ok"
+    assert calls == [(str(executable.resolve()), "auth", "status")]
+    assert manager._EXECUTOR_AUTH_CACHE[cache_key] is result
+    assert manager._executor_auth_snapshot_lookup("claude") is result
+
+
 def test_manager_wiring_reroutes_when_executor_rate_limited(tmp_path, monkeypatch):
     """#442：首位 candidate 的 executor 探測回報限流（degraded）時，gate 依
     既有 candidate 順序 re-route 到下一位（codex），而非直接 needs_human——
