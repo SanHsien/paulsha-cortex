@@ -67,6 +67,42 @@ def test_install_writes_current_python_to_env_file(tmp_path, monkeypatch):
     assert f"PSC_PROJECT_CONFIG_ROOT={tmp_path / '.agents' / 'config' / 'paulsha'}" in env_lines
 
 
+def test_install_persists_resolved_claude_executable(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    home = tmp_path / "home"
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PSC_MANAGER_EXECUTOR", "claude")
+    monkeypatch.setenv("PSC_CLAUDE_EXECUTABLE", str(executable))
+
+    assert installer.main(
+        ["service", "--instance", "beta", "--repo-root", str(repo_root)]
+    ) == 0
+
+    env_lines = (
+        home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    ).read_text(encoding="utf-8").splitlines()
+    assert f"PSC_CLAUDE_EXECUTABLE={executable.resolve()}" in env_lines
+
+
+def test_install_rejects_relative_claude_executable_without_path_fallback(
+    tmp_path, monkeypatch,
+):
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PSC_CLAUDE_EXECUTABLE", "claude-alias")
+
+    with pytest.raises(ValueError, match="absolute path"):
+        installer.install_service_result("beta", 300, repo_root)
+
+
 def test_install_writes_git_repo_root_to_env_file(tmp_path, monkeypatch):
     from paulsha_cortex.deploy import installer
 

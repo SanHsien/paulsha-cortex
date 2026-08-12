@@ -9,7 +9,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol, Sequence, runtime_checkable
+from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from . import gate_ledger, terminal_contract
 
@@ -399,6 +399,56 @@ class LaunchHandle:
     session_name: str
     pid: int
     log_path: str
+    executable_path: str | None = None
+
+
+CLAUDE_EXECUTABLE_ENV = "PSC_CLAUDE_EXECUTABLE"
+
+
+def resolve_claude_executable(
+    env: Mapping[str, str] | None = None,
+    *,
+    which: Callable[..., str | None] | None = None,
+) -> str:
+    """Resolve the exact Claude-compatible CLI without alias or PATH ambiguity.
+
+    An explicit override is operator authority: it must be an absolute, regular,
+    non-symlink executable and is never allowed to fall back to PATH when invalid.
+    PATH lookup remains the backwards-compatible default when no override exists.
+    """
+
+    source = os.environ if env is None else env
+    lookup = shutil.which if which is None else which
+    override = source.get(CLAUDE_EXECUTABLE_ENV, "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError(f"{CLAUDE_EXECUTABLE_ENV} must be an absolute path")
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(
+                    f"{CLAUDE_EXECUTABLE_ENV} must be a regular non-symlink file"
+                )
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"{CLAUDE_EXECUTABLE_ENV} is unavailable") from exc
+        if candidate.absolute() != resolved:
+            raise ValueError(
+                f"{CLAUDE_EXECUTABLE_ENV} must not traverse symlinked path components"
+            )
+        if os.name != "nt" and not os.access(resolved, os.X_OK):
+            raise ValueError(f"{CLAUDE_EXECUTABLE_ENV} is not executable")
+        return str(resolved)
+
+    discovered = lookup("claude", path=source.get("PATH", ""))
+    if discovered is None:
+        raise ValueError(
+            "Claude executable not found; set PSC_CLAUDE_EXECUTABLE to an absolute path"
+        )
+    discovered_path = Path(discovered).expanduser()
+    # Real shutil.which results exist and are canonicalized for provenance. Unit
+    # probes may inject a synthetic cross-platform path, which should stay opaque.
+    return str(discovered_path.resolve()) if discovered_path.exists() else str(discovered)
 
 
 def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
@@ -1008,6 +1058,13 @@ class SubprocessLauncher:
         inner_argv = _ARGV_BUILDERS[self._executor](
             **builder_kwargs,
         )
+        executable_path = None
+        if self._executor == "claude":
+            # Alias expansion is intentionally impossible in the typed-argv launcher.
+            # Bind the operator-selected compatible CLI before the reviewer env is
+            # reduced, then keep the override itself out of the untrusted child env.
+            executable_path = resolve_claude_executable(_git_scope_env())
+            inner_argv[0] = executable_path
         # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
         # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
         # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。
@@ -1077,4 +1134,5 @@ class SubprocessLauncher:
             session_name=slice_id,
             pid=proc.pid,
             log_path=log_path,
+            executable_path=executable_path,
         )
