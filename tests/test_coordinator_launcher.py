@@ -1115,19 +1115,23 @@ class ArgvTests(unittest.TestCase):
         original = launcher_module.subprocess.Popen
         launcher_module.subprocess.Popen = _fake_popen
         try:
-            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
-                os.environ,
-                inherited_secrets,
-                clear=False,
-            ):
-                SubprocessLauncher("claude").as_review_only(
-                    terminal_kind="workflow-verification-result"
-                ).launch(
-                    slice_id="review",
-                    prompt="P",
-                    worktree=d,
-                    log_dir=str(Path(d) / "logs"),
-                )
+            with tempfile.TemporaryDirectory() as d:
+                executable = Path(d) / "claude-compatible"
+                executable.write_text("#!/bin/sh\n", encoding="utf-8")
+                executable.chmod(0o755)
+                environment = {
+                    **inherited_secrets,
+                    "PSC_CLAUDE_EXECUTABLE": str(executable),
+                }
+                with mock.patch.dict(os.environ, environment, clear=False):
+                    SubprocessLauncher("claude").as_review_only(
+                        terminal_kind="workflow-verification-result"
+                    ).launch(
+                        slice_id="review",
+                        prompt="P",
+                        worktree=d,
+                        log_dir=str(Path(d) / "logs"),
+                    )
         finally:
             launcher_module.subprocess.Popen = original
 
@@ -1330,13 +1334,23 @@ class ArgvTests(unittest.TestCase):
             )
 
             git_write_dirs = launcher_module._linked_worktree_git_write_dirs(str(linked))
+            executable = root / "claude-compatible"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
             original = launcher_module.subprocess.Popen
             launcher_module.subprocess.Popen = _fake_popen
             try:
-                with mock.patch.object(
-                    launcher_module,
-                    "_linked_worktree_git_write_dirs",
-                    return_value=git_write_dirs,
+                with (
+                    mock.patch.object(
+                        launcher_module,
+                        "_linked_worktree_git_write_dirs",
+                        return_value=git_write_dirs,
+                    ),
+                    mock.patch.dict(
+                        os.environ,
+                        {"PSC_CLAUDE_EXECUTABLE": str(executable)},
+                        clear=False,
+                    ),
                 ):
                     SubprocessLauncher("claude").as_commit_required().launch(
                         slice_id="s",
