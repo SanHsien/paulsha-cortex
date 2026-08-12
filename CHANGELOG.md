@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- Deck CLI 新增 `compile --policy-from <repo-relative-path>`、`compile --slug <slug>` 與 `deck list [combo]` membership 檢視；`ready` 可沿用 manager specs 預設目錄。
 - 同步 upstream v0.1.8 到 `dc8a968`，採用 workflow／slice repo 歸屬、patchmud profile drift 修正與 Stage 9 readiness regression；deck compile 新增 `--repo owner/repo`，可把 work item 的顯式 repo 宣告帶入輸出的 slice specs。
 - 同步 upstream v0.1.7 到 `cf791a2`，採用模型能力封套、patchmud profile、model roster 與 `provider:executor` ship gate 的正式上游版本。
 - 新增 Windows-first PowerShell 開發環境、LF checkout 契約、原生完整驗證入口、fork／開發／決策文件，以及 GitHub 協作、安全掃描與依賴維護骨架。
@@ -16,6 +17,8 @@
 - 追補 upstream `#450` 的 `retire-delivered` orphan-run 退休流程與限流時的窄化 last-known-good authority；同步把 `#449` 完成狀態及 `#451` release 決策寫入 upstream ledger。
 
 ### Changed
+- Deck emit 現在列出絕對 output directory 與每個輸出檔；CJK task 未指定 slug、或 compile 未指定 repo 時會明確警告。
+- `docs/UPSTREAM.md` 記錄 open Issue #474 的 fork 處置與不重複評估邊界。
 - `docs/UPSTREAM.md` 記錄 v0.1.8 的 5 個 merged PR、11 個 commit、Issues #464／#473 處置與下一輪 watermark。
 - `docs/UPSTREAM.md` 記錄 v0.1.7 的 7 個 merged PR、17 個 commit、Issue #464 處置與下一輪 watermark。
 - `docs/UPSTREAM.md` 記錄已檢查 PR、Issue #442 的採用／延後決策與下次 review watermark，避免重複處理。

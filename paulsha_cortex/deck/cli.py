@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from .compile import DeckCompileError, compile_combo, emit, specs_dir
@@ -24,11 +25,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("list", help="列出卡片與 combos")
+    list_parser = sub.add_parser("list", help="列出 combo 與其卡片成員")
+    list_parser.add_argument("combo", nargs="?", help="只列出指定 combo ID")
 
     compile_parser = sub.add_parser("compile", help="combo+task → slice specs（預設 dry-run）")
     compile_parser.add_argument("combo", help="combo ID（例如 feature-oneshot）")
     compile_parser.add_argument("--task", required=True, help="人類可讀的任務描述")
+    compile_parser.add_argument(
+        "--slug",
+        help="覆寫 task slug（最多 60 字元，僅允許小寫英數與連字號）",
+    )
     compile_parser.add_argument("--change", help="OpenSpec change ID；正式 emit 時依 combo 需求提供")
     compile_parser.add_argument("--with", dest="with_cards", action="append", default=[],
                                 metavar="CARD[:after=ID|:before=ID]")
@@ -38,6 +44,10 @@ def _build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument(
         "--repo",
         help="從 claim/work item 顯式帶入的 owner/repo；省略時 spec 維持 repo: null",
+    )
+    compile_parser.add_argument(
+        "--policy-from",
+        help="從 repo 內相對路徑讀取本次 compile 要採用的候選 project policy",
     )
     out_group = compile_parser.add_mutually_exclusive_group()
     out_group.add_argument("--out", help="寫入指定 spec 目錄；未設定時只 dry-run")
@@ -57,11 +67,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         cards = load_cards(DEFAULT_CARDS_PATH)
         if args.command == "list":
-            for combo_id, combo_file in iter_combo_files(package_dir=DEFAULT_COMBOS_DIR):
+            combo_files = (
+                [(args.combo, resolve_combo_path(args.combo, package_dir=DEFAULT_COMBOS_DIR))]
+                if args.combo
+                else list(iter_combo_files(package_dir=DEFAULT_COMBOS_DIR))
+            )
+            for _combo_id, combo_file in combo_files:
                 combo = load_combo(combo_file, cards)
-                print(f"{combo.id}\t(task_type={combo.task_type}, cards={len(combo.cards)})")
-            for card in cards.values():
-                print(f"  card: {card.id}\t[{card.type}/{card.card_class}]")
+                band_cards = len(combo.band_triggered.cards) if combo.band_triggered else 0
+                print(
+                    f"{combo.id}\t(task_type={combo.task_type}, "
+                    f"cards={len(combo.cards) + band_cards})"
+                )
+                for entry in combo.cards:
+                    card = cards[entry.ref]
+                    print(f"  card: {card.id}\t[{card.type}/{card.card_class}]")
+                if combo.band_triggered is not None:
+                    for entry in combo.band_triggered.cards:
+                        card = cards[entry.ref]
+                        print(
+                            f"  card: {card.id}\t[{card.type}/{card.card_class}; "
+                            f"band>={combo.band_triggered.trigger}]"
+                        )
+            if not args.combo:
+                print("available cards:")
+                for card in cards.values():
+                    print(f"  card: {card.id}\t[{card.type}/{card.card_class}]")
             return 0
 
         if args.command == "compile":
@@ -69,6 +100,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             effective_change = args.change
             if effective_change is None and not args.emit and not args.out:
                 effective_change = "dry-run"
+            if args.slug is None and any(not char.isascii() for char in args.task):
+                print(
+                    "deck compile: [WARNING] task 含非 ASCII 字元，自動 task-slug 可能失真；"
+                    "請用 --slug <branch-safe-slug> 明確指定",
+                    file=sys.stderr,
+                )
             result = compile_combo(
                 combo,
                 cards,
@@ -79,7 +116,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_external=args.allow_external,
                 plan_ref=args.plan_ref,
                 repo=args.repo,
+                policy_from=args.policy_from,
+                slug=args.slug,
             )
+            if args.repo is None and result.slices:
+                print(
+                    "deck compile: [WARNING] 未提供 --repo owner/repo；輸出 spec 會維持 repo: null，"
+                    "不得由目錄或 Git remote 推斷歸屬",
+                    file=sys.stderr,
+                )
             print(f"task-slug: {result.task_slug}")
             print("前置 checklist（interactive）：")
             for line in result.checklist:
@@ -91,7 +136,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.emit or args.out:
                 target = specs_dir() if args.emit else args.out
                 written = emit(result, target, force=args.force)
-                print(f"已寫入 {len(written)} 份 spec → {target}（dispatch: hold）")
+                resolved_target = Path(target).resolve()
+                print(f"已寫入 {len(written)} 份輸出（dispatch: hold）")
+                print(f"output-dir: {resolved_target}")
+                for path in written:
+                    print(f"  - {path.resolve()}")
                 print("翻 auto 前先跑：")
                 for command in result.verify_commands:
                     print(f"  - {command}")

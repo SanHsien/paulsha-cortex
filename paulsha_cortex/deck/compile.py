@@ -12,7 +12,11 @@ from typing import Mapping, Sequence
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator.workflow import WorkflowManifest, WorkflowStep
 from paulsha_cortex.lib.durability import fsync_directory
-from paulsha_cortex.project_policy import ProjectPolicyError, resolve_project_policy
+from paulsha_cortex.project_policy import (
+    ProjectPolicyError,
+    read_project_policy_file,
+    resolve_project_policy,
+)
 
 from .schema import BAND_LEVELS, BandTriggeredSpine, Card, Combo, ComboEntry
 
@@ -31,6 +35,14 @@ def slugify_task(task: str) -> str:
     slug = _SLUG_RE.sub("-", task.lower()).strip("-")[:60].strip("-")
     if not slug:
         raise DeckCompileError(f"task 無法正規化為 slug: {task!r}")
+    return slug
+
+
+def _validate_task_slug(slug: str) -> str:
+    if len(slug) > 60 or not _SLICE_ID_RE.fullmatch(slug):
+        raise DeckCompileError(
+            f"slug 不合法（最多 60 字元，僅允許 [a-z0-9-]，且不可含路徑分隔）: {slug!r}"
+        )
     return slug
 
 
@@ -80,15 +92,37 @@ _DEFAULT_POLICY_CHECK_TIMEOUT_SECONDS = 30
 _DEFAULT_TESTS_TIMEOUT_SECONDS = 60
 
 
-def _preflight_steps(repo_root: Path) -> list[dict[str, object]]:
+def _explicit_policy_payload(repo_root: Path, policy_from: str | Path) -> dict[str, object]:
+    relative = Path(policy_from)
+    if relative.anchor or relative.is_absolute():
+        raise DeckCompileError(f"--policy-from 必須是 repo 內相對路徑: {policy_from!r}")
+    candidate = repo_root / relative
+    try:
+        resolved_root = repo_root.resolve(strict=True)
+        resolved_candidate = candidate.resolve(strict=True)
+        resolved_candidate.relative_to(resolved_root)
+        return read_project_policy_file(candidate)
+    except (FileNotFoundError, OSError, ProjectPolicyError, ValueError) as exc:
+        raise DeckCompileError(
+            f"--policy-from 必須指向 repo 內可讀、非 symlink 的 YAML mapping: {policy_from!r}"
+        ) from exc
+
+
+def _preflight_steps(
+    repo_root: Path,
+    policy_from: str | Path | None = None,
+) -> list[dict[str, object]]:
     """讀 `.project-policy.yml` 的 `preflight.steps`（issue #380：verification 骨架不得
     寫死 pytest，須以此為導出來源）。任何解析問題都視為「偵測不到」，交給呼叫端走
     fail-closed placeholder，不在 compile 期整個炸掉。"""
-    try:
-        resolution = resolve_project_policy(repo_root)
-    except ProjectPolicyError:
-        return []
-    payload = resolution.payload
+    if policy_from is not None:
+        payload = _explicit_policy_payload(repo_root, policy_from)
+    else:
+        try:
+            resolution = resolve_project_policy(repo_root)
+        except ProjectPolicyError:
+            return []
+        payload = resolution.payload
     if not isinstance(payload, dict):
         return []
     preflight = payload.get("preflight")
@@ -137,13 +171,17 @@ def _warn_policy_undetected(kind: str, *, purpose: str) -> None:
     print(
         f"deck compile: [WARNING] 未偵測到 .project-policy.yml 的 preflight.steps(kind: {kind})，"
         f"verification.{purpose} 已改填 fail-closed placeholder；翻 dispatch: auto 前必須手動改成"
-        "真正的驗證指令（見 issue #380）",
+        "真正的驗證指令；若本工作才會建立 policy，請先人工落地該檔，或用 "
+        "--policy-from <repo-relative-path> 指向候選檔（見 issues #380/#474）",
         file=sys.stderr,
     )
 
 
-def _verification_skeleton(repo_root: Path) -> dict[str, object]:
-    steps = _preflight_steps(repo_root)
+def _verification_skeleton(
+    repo_root: Path,
+    policy_from: str | Path | None = None,
+) -> dict[str, object]:
+    steps = _preflight_steps(repo_root, policy_from)
     validation_step = _first_step_of_kind(steps, "validation")
     tests_step = _first_step_of_kind(steps, "tests")
 
@@ -616,11 +654,13 @@ def compile_combo(
     band: str | None = None,
     repo_root: str | Path | None = None,
     repo: str | None = None,
+    policy_from: str | Path | None = None,
+    slug: str | None = None,
 ) -> CompileResult:
     effective_repo_root = Path(repo_root) if repo_root is not None else paths.repo_root()
     if repo is not None:
         repo = _validate_repo(repo)
-    slug = slugify_task(task)
+    slug = _validate_task_slug(slug) if slug is not None else slugify_task(task)
     if change is not None:
         change = _validate_change_name(change)
     entries = _resolve_hand(combo, cards, with_cards, only)
@@ -660,7 +700,9 @@ def compile_combo(
     slice_groups = _group_slices(entries, cards, slug)
     # 只在真的要 emit 至少一份 slice 時才讀 .project-policy.yml；同一次 compile 對所有
     # slice 共用同一份骨架（單次讀檔、單次 warning，不因 slice 數量而重複列印）。
-    verification_skeleton = _verification_skeleton(effective_repo_root) if slice_groups else None
+    verification_skeleton = (
+        _verification_skeleton(effective_repo_root, policy_from) if slice_groups else None
+    )
 
     for slice_id, members in slice_groups:
         deps: list[str] = []

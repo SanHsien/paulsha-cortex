@@ -149,6 +149,10 @@ combo:
     - ref: subagent-build
     - ref: code-review
     - ref: verification
+  band_triggered:
+    trigger: yellow
+    cards:
+      - ref: adversarial-review
   gate_spine:
     - after: mcu-hw-evidence
       exists: ["docs/superpowers/specs/*<task-slug>*-hw-evidence.md"]
@@ -173,6 +177,20 @@ def test_list_shows_combos(tmp_path, capsys, monkeypatch):
     assert deck_cli.main(["list"]) == 0
     out = capsys.readouterr().out
     assert "feature-oneshot" in out and "mcu-feature" in out
+    assert "card: brainstorming" in out
+    assert "card: mcu-hw-evidence" in out
+    assert "mcu-feature\t(task_type=mcu-feature, cards=8)" in out
+    assert "card: adversarial-review\t[headless/core; band>=yellow]" in out
+
+
+def test_list_can_filter_one_combo_and_shows_only_its_members(tmp_path, capsys, monkeypatch):
+    _seed_fixture(tmp_path, monkeypatch)
+    assert deck_cli.main(["list", "mcu-feature"]) == 0
+    out = capsys.readouterr().out
+    assert "mcu-feature" in out
+    assert "card: mcu-hw-evidence" in out
+    assert "feature-oneshot" not in out
+    assert "card: brainstorming" not in out
 
 
 def test_compile_dry_run_writes_nothing(tmp_path, capsys, monkeypatch):
@@ -195,7 +213,7 @@ def test_compile_dry_run_without_change_still_loads_default_data(tmp_path, capsy
     assert "dispatch: hold" in out
 
 
-def test_compile_emit_writes_hold_specs(tmp_path, monkeypatch):
+def test_compile_emit_writes_hold_specs_and_reports_absolute_paths(tmp_path, capsys, monkeypatch):
     _seed_fixture(tmp_path / "deck", monkeypatch)
     specs_root = tmp_path / "specs"
     monkeypatch.setenv("PSC_MANAGER_SPECS_DIR", str(specs_root))
@@ -206,6 +224,64 @@ def test_compile_emit_writes_hold_specs(tmp_path, monkeypatch):
     files = sorted(specs_root.glob("*.md"))
     assert files
     assert all("dispatch: hold" in path.read_text(encoding="utf-8") for path in files)
+    captured = capsys.readouterr()
+    assert f"output-dir: {specs_root.resolve()}" in captured.out
+    assert all(str(path.resolve()) in captured.out for path in files)
+    assert "--repo owner/repo" in captured.err
+
+
+def test_compile_cjk_task_warns_and_explicit_slug_is_used(tmp_path, capsys, monkeypatch):
+    _seed_fixture(tmp_path / "deck", monkeypatch)
+    rc = deck_cli.main(
+        [
+            "compile",
+            "feature-oneshot",
+            "--task",
+            "Task 5 - 建立共用測試",
+            "--slug",
+            "shared-test-helper",
+            "--change",
+            "demo",
+            "--allow-external",
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "task-slug: shared-test-helper" in captured.out
+    assert "--slug" not in captured.err
+
+    rc = deck_cli.main(
+        [
+            "compile",
+            "feature-oneshot",
+            "--task",
+            "Task 5 - 建立共用測試",
+            "--change",
+            "demo",
+            "--allow-external",
+        ]
+    )
+    assert rc == 0
+    assert "--slug" in capsys.readouterr().err
+
+
+def test_compile_pure_cjk_task_failure_points_to_explicit_slug(tmp_path, capsys, monkeypatch):
+    _seed_fixture(tmp_path / "deck", monkeypatch)
+    rc = deck_cli.main(
+        [
+            "compile",
+            "feature-oneshot",
+            "--task",
+            "建立共用測試",
+            "--change",
+            "demo",
+            "--allow-external",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--slug" in err
+    assert "task 無法正規化" in err
 
 
 def test_compile_emit_carries_explicit_work_item_repo(tmp_path, monkeypatch):

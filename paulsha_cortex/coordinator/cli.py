@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
+
+from paulsha_cortex.config import paths
 
 from . import autonomy, broker_reaper, engineering_outcome
 from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
@@ -25,6 +28,10 @@ _REQUEST_TIMEOUTS: dict[str, float] = {
     "complete": 30.0,
     "work-action": 30.0,
 }
+
+
+def _default_specs_dir() -> str:
+    return os.environ.get("PSC_MANAGER_SPECS_DIR") or str(paths.specs_root())
 
 
 def _resolve_launcher(executor, injected, *, allow_unsafe, model):
@@ -139,7 +146,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
-    p_ready.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
+    p_ready.add_argument(
+        "--specs-dir",
+        default=None,
+        help="要掃描的 spec 目錄（預設：manager specs 目錄）",
+    )
 
     p_fanout = sub.add_parser("fanout", help="透過 manager daemon 派送目前 ready 的 slices")
     p_fanout.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
@@ -340,7 +351,12 @@ def main(
 
     if args.cmd == "ready":
         predicate = is_satisfied if is_satisfied is not None else autonomy.default_is_satisfied
-        metas = autonomy.scan_specs(args.specs_dir)
+        try:
+            specs_dir = args.specs_dir if args.specs_dir is not None else _default_specs_dir()
+        except ValueError as exc:
+            print(f"錯誤: {exc}", file=sys.stderr)
+            return 1
+        metas = autonomy.scan_specs(specs_dir)
         batch_ids = {
             slice_id
             for meta in metas

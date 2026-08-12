@@ -1029,6 +1029,37 @@ class CliTests(unittest.TestCase):
             payload = json.loads(out.getvalue())
             self.assertEqual([m["slice_id"] for m in payload], ["r"])
 
+    def test_main_ready_defaults_to_manager_specs_dir(self) -> None:
+        from paulsha_cortex.coordinator.cli import main
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+            "os.environ", {"PSC_MANAGER_SPECS_DIR": d}, clear=False
+        ):
+            _write_spec(
+                Path(d),
+                "r.md",
+                "dispatch: auto\nslice_id: r\nplan: docs/p.md\n" + _v1_verification_block(),
+            )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = main(["ready"], is_satisfied=lambda _id: True)
+            self.assertEqual(rc, 0)
+            self.assertEqual([m["slice_id"] for m in json.loads(out.getvalue())], ["r"])
+
+    def test_main_ready_explicit_dir_does_not_resolve_invalid_default(self) -> None:
+        from paulsha_cortex.coordinator.cli import main
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+            "os.environ",
+            {"PSC_MANAGER_SPECS_DIR": "", "PSC_SPECS_ROOT": "relative-is-invalid"},
+            clear=False,
+        ):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = main(["ready", "--specs-dir", d], is_satisfied=lambda _id: True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()), [])
+
     def test_main_fanout_with_fakes(self) -> None:
         from paulsha_cortex.coordinator.cli import main
         submitted: list[tuple[str, dict, str]] = []

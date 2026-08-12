@@ -47,6 +47,11 @@ def _read_mapping(path: Path) -> dict[str, object]:
     return payload
 
 
+def read_project_policy_file(path: str | Path) -> dict[str, object]:
+    """讀取一份明確指定的 policy candidate，沿用 canonical policy 的安全檢查。"""
+    return _read_mapping(Path(path))
+
+
 def resolve_project_policy(repo_root: str | Path) -> ProjectPolicyResolution:
     root = Path(repo_root)
     present: list[tuple[Path, dict[str, object]]] = []
