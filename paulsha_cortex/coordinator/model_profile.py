@@ -43,7 +43,8 @@ from .model_identities import (
 
 PROFILE_SCHEMA = "cortex-model-profile/v1"
 
-#: cortex 身分 → patchmud model spec。patchmud 支援 anthropic HTTP／claude CLI
+#: cortex 身分 → patchmud `--model` 參數值（短別名或完整 spec 皆可，patchmud
+#: 端會 normalize）。patchmud 支援 anthropic HTTP／claude CLI
 #: fallback（別名 sonnet/haiku/opus/fable）與 codex／agy OAuth headless CLI
 #: adapter（paulsha-patchmud#14）。約束（cortex#466 A-2）：CLI adapter 的
 #: reasoning effort 硬編 `high`，只有 high 檔位身分可對應；agy 用完整 spec
@@ -152,7 +153,13 @@ def _report_group_key(report: object) -> tuple[str, str]:
     for row in rows:
         if not isinstance(row, Mapping):
             raise ValueError(f"clear_rate row 必須是 mapping：{row!r}")
-        keys.add((str(row.get("model")), str(row.get("loadout"))))
+        model = row.get("model")
+        loadout = row.get("loadout")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(f"clear_rate row 缺非空 model：{row!r}")
+        if not isinstance(loadout, str) or not loadout.strip():
+            raise ValueError(f"clear_rate row 缺非空 loadout：{row!r}")
+        keys.add((model.strip(), loadout.strip()))
     if len(keys) != 1:
         raise ValueError(
             "profile report 應恰含一組 (model, loadout)，實得："

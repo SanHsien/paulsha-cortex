@@ -316,6 +316,31 @@ def test_report_with_multiple_groups_is_explicit_failure(
     assert fake_patchmud.registry.read_text(encoding="utf-8") == REGISTRY_V3
 
 
+def test_report_row_without_model_is_explicit_failure(
+    fake_patchmud: SimpleNamespace,
+) -> None:
+    """malformed row（缺 model）不得被 str(None) 誤當成合法聚合鍵（review）。"""
+    template = (
+        "schema_version: 1\n"
+        "runs_included: 8\n"
+        "runs_skipped: []\n"
+        "leaderboards:\n"
+        "  clear_rate:\n"
+        "    status: ok\n"
+        "    rows:\n"
+        "      - loadout: P0T0R0\n"
+        "        runs: 8\n"
+        "        clears: 6\n"
+    )
+    (fake_patchmud.tools / "report-template.yaml").write_text(template, encoding="utf-8")
+    result = mp.run_model_profile(_options(fake_patchmud, apply=True), sleep=lambda _s: None)
+    cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
+    assert cell["status"] == "failed"
+    assert cell["reason"] == "report-group-ambiguous"
+    assert "缺非空 model" in cell["detail"]
+    assert fake_patchmud.registry.read_text(encoding="utf-8") == REGISTRY_V3
+
+
 def test_deck_fingerprint_stable_across_timings_overwrite(
     fake_patchmud: SimpleNamespace,
 ) -> None:
