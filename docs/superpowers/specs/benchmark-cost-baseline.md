@@ -144,3 +144,19 @@ state-recovery 0/1），證明變體確實提供獨立訊號，不可抽掉。
   sonnet／opus 級成本會再降。
 - pilot-v1 只覆蓋 builder 維度；planner／reviewer 的成本要等
   `paulsha-patchmud#13` 題庫落地後才能實測。
+
+## 勘誤追記（2026-08-12，cortex#466）
+
+- **§4.3「同母題兩變體 clear 分歧證明變體提供獨立訊號」的證據不成立**：
+  paulsha-patchmud#21 的盤點顯示，本次實測 haiku 的 4 場失敗（含 input-validation
+  兩變體全敗）全是 unified diff 解析失敗（`production_loc: 0`），分歧反映的是
+  逐場的協定格式雜訊，不是變體設計出的獨立能力訊號。「8 關全跑」的定案維持
+  （成本差可忽略、變體對過擬合的偵測能力仍是真需求），但不得再引用本段當
+  變體有效性的實證。
+- **成本外推不受影響**：§2 的 token／wall-time／USD 是 billing facts，與失敗
+  原因無關。惟「haiku 4/8」不可再被引用為能力分佈的證據（同見
+  `envelope-mapping-spec.md` 勘誤追記）。
+- patchmud 已於 PR #15（08-12，本文件實測之後）落地 codex／agy OAuth headless
+  adapter：§3「近期可實測僅 builder 3 格」的前提改變，agy／codex 身分的 builder
+  格已可實測（效力範圍：effort 硬編 high 的檔位）；格數以 `#456` 矩陣的最新
+  狀態為準。

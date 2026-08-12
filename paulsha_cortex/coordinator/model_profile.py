@@ -25,7 +25,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,12 +43,16 @@ from .model_identities import (
 
 PROFILE_SCHEMA = "cortex-model-profile/v1"
 
-#: cortex 身分 → patchmud model 別名。誠實約束（#452 票面）：patchmud 目前
-#: 只有 anthropic adapter（別名 sonnet/haiku/opus/fable）；roster 內只有
-#: claude/sonnet 可被驅動，copilot/codex/agy/cg 一律 per-identity skip
-#: （adapter-unavailable）維持 default，禁止假造可跑。
+#: cortex 身分 → patchmud model spec。patchmud 支援 anthropic HTTP／claude CLI
+#: fallback（別名 sonnet/haiku/opus/fable）與 codex／agy OAuth headless CLI
+#: adapter（paulsha-patchmud#14）。約束（cortex#466 A-2）：CLI adapter 的
+#: reasoning effort 硬編 `high`，只有 high 檔位身分可對應；agy 用完整 spec
+#: 而非 patchmud 短別名（別名表會演進）。copilot／cg 無 patchmud adapter，
+#: 一律 per-identity skip（adapter-unavailable）維持 default，禁止假造可跑；
+#: codex 身分待 #456 R4 登錄後再補格。
 PATCHMUD_MODEL_ALIASES: Mapping[tuple[str, str], str] = {
     ("claude", "sonnet"): "sonnet",
+    ("agy", "gemini-3.1-pro-high"): "agy:gemini-3.1-pro",
 }
 
 #: deck 可量測的 persona 維度：pilot-v1 只量 builder（#456 R7 分期註記；
@@ -95,19 +98,67 @@ class ProfileOptions:
 
 
 def deck_content_sha256(deck_dir: Path) -> str:
-    """deck 目錄的 deterministic content hash（排序後逐檔 path+bytes）。"""
+    """deck 指紋＝聚合各 encounter `provenance.yaml` 的 `content_sha256`。
+
+    與 patchmud 的 encounter pin 同語意（card + repo/** + hidden/**，排除快取
+    與 reference_timings）。逐檔 rglob hash 會把 `patchmud validate-deck` 對
+    reference_timings 的例行覆寫誤判成 deck 內容變更、誤觸全量重評
+    （cortex#466 A-3）；provenance 缺漏 fail-closed。
+    """
 
     digest = hashlib.sha256()
-    for path in sorted(p for p in deck_dir.rglob("*") if p.is_file()):
-        digest.update(path.relative_to(deck_dir).as_posix().encode("utf-8"))
+    for encounter in _encounter_dirs(deck_dir):
+        provenance_path = encounter / "provenance.yaml"
+        try:
+            provenance = safe_load(provenance_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, YAMLError) as exc:
+            raise ValueError(
+                f"encounter provenance 不可讀：{provenance_path}（{type(exc).__name__}: {exc}）"
+            ) from exc
+        content_sha = (
+            provenance.get("content_sha256") if isinstance(provenance, Mapping) else None
+        )
+        if not isinstance(content_sha, str) or not content_sha.strip():
+            raise ValueError(f"encounter provenance 缺 content_sha256：{provenance_path}")
+        digest.update(encounter.name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(content_sha.strip().encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()
 
 
 def _encounter_dirs(deck_dir: Path) -> list[Path]:
     return sorted(p for p in deck_dir.iterdir() if p.is_dir())
+
+
+def _report_group_key(report: object) -> tuple[str, str]:
+    """profile report 的聚合鍵 (model, loadout)：從 report 本身取，不猜測。
+
+    patchmud PR #15 起 run.yaml 記 `normalize_model_spec()` 展開後的完整
+    model spec——不是 CLI 別名，且 anthropic↔claude CLI fallback 隨執行當下
+    憑證狀態浮動，別名查表必落空（cortex#466 A-1）。profile 的 runs_root 為
+    單一身分專用，report 內必恰一組聚合鍵；多於一組＝runs_root 被污染，
+    fail-closed。
+    """
+
+    if not isinstance(report, Mapping):
+        raise ValueError("report 必須是 mapping")
+    leaderboards = report.get("leaderboards")
+    board = leaderboards.get("clear_rate") if isinstance(leaderboards, Mapping) else None
+    rows = board.get("rows") if isinstance(board, Mapping) else None
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("report 缺 leaderboards.clear_rate.rows")
+    keys: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError(f"clear_rate row 必須是 mapping：{row!r}")
+        keys.add((str(row.get("model")), str(row.get("loadout"))))
+    if len(keys) != 1:
+        raise ValueError(
+            "profile report 應恰含一組 (model, loadout)，實得："
+            + "; ".join(f"{model}/{loadout}" for model, loadout in sorted(keys))
+        )
+    return next(iter(keys))
 
 
 def _emit_scalar(value: object) -> str:
@@ -349,9 +400,9 @@ def run_model_profile(
     current_text = render_registry_file(rows)
     cells: list[dict[str, object]] = []
     applied_any = False
-    timestamp = (now() if now is not None else datetime.now(timezone.utc)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    profiled_at = now() if now is not None else datetime.now(timezone.utc)
+    timestamp = profiled_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    run_stamp = profiled_at.strftime("%Y%m%dT%H%M%SZ")
 
     for identity, persona, persona_measurable in _profile_cells(registry, measured_personas):
         label = f"{identity.executor}/{identity.model_id}"
@@ -384,17 +435,32 @@ def run_model_profile(
             continue
         alias = PATCHMUD_MODEL_ALIASES.get((identity.executor, identity.model_id))
         if alias is None:
-            # 誠實約束：patchmud 僅 anthropic adapter，其餘 executor 不可驅動。
+            # 誠實約束：本身分沒有可驅動的 patchmud model spec 對應。
             cell["status"] = "skipped"
             cell["reason"] = "adapter-unavailable"
             cell["detail"] = (
-                "patchmud 僅 anthropic adapter（sonnet/haiku/opus/fable）；"
+                "PATCHMUD_MODEL_ALIASES 無此身分對應（copilot／cg 無 patchmud "
+                "adapter；CLI adapter effort 硬編 high，非 high 檔位不可對應）；"
                 "本身分維持 default 封套"
             )
             continue
 
-        runs_root = Path(tempfile.mkdtemp(prefix="cortex-model-profile-runs-"))
-        report_root = Path(tempfile.mkdtemp(prefix="cortex-model-profile-report-"))
+        # cortex#466 A-4：run 封存落耐久位置（比照 #455 實測慣例：patchmud
+        # repo runs/，不進版控），registry 的 provenance 才能回溯到 events／
+        # ledger／replay 證據；mkdtemp 用完即棄會讓封套值失去出處。
+        base_runs_root = (
+            Path(patchmud_root)
+            / "runs"
+            / f"profile-{identity.executor}-{identity.model_id}-{run_stamp}"
+        )
+        runs_root = base_runs_root
+        suffix = 1
+        while runs_root.exists():
+            suffix += 1
+            runs_root = base_runs_root.with_name(f"{base_runs_root.name}-{suffix}")
+        runs_root.mkdir(parents=True)
+        report_root = runs_root / "report"
+        cell["runs_root"] = str(runs_root)
         failures: list[str] = []
         for encounter_dir in encounters:
             ok, output = _run_encounter_with_backoff(
@@ -446,6 +512,15 @@ def run_model_profile(
             cell["detail"] = f"{type(exc).__name__}: {exc}"
             continue
         try:
+            # cortex#466 A-1：聚合鍵從 report 本身取（run.yaml 記 normalize
+            # 後的完整 spec，別名查表必落空且隨憑證狀態浮動）。
+            report_model, report_loadout = _report_group_key(report)
+        except ValueError as exc:
+            cell["status"] = "failed"
+            cell["reason"] = "report-group-ambiguous"
+            cell["detail"] = str(exc)
+            continue
+        try:
             mapping = map_report_to_envelope(
                 report,
                 executor=identity.executor,
@@ -453,8 +528,8 @@ def run_model_profile(
                 persona=persona,
                 deck=deck_info,
                 patchmud_version=patchmud_version,
-                report_model=alias,
-                report_loadout=options.loadout,
+                report_model=report_model,
+                report_loadout=report_loadout,
             )
         except EnvelopeMappingError as exc:
             cell["status"] = "failed"
@@ -462,7 +537,9 @@ def run_model_profile(
             cell["detail"] = str(exc)
             continue
         provenance = mapping["provenance"]
-        cell["observation"] = dict(provenance["observation"])
+        # A-4：觀測記錄帶 run 封存出處（observation 為自由欄，loader 不設鍵白名單）。
+        observation = {**dict(provenance["observation"]), "runs_root": str(runs_root)}
+        cell["observation"] = observation
         cell["mapping_reasons"] = dict(provenance["reasons"])
         if not provenance["registry_writable"]:
             # 空的實測 accepts_bands（below-green-floor）或全 default 結果不得
@@ -483,7 +560,7 @@ def run_model_profile(
             "fingerprint": dict(provenance["fingerprint"]),
             "source": dict(provenance["source"]),
             "reasons": dict(provenance["reasons"]),
-            "observation": dict(provenance["observation"]),
+            "observation": dict(observation),
             "profiled_at": timestamp,
         }
         proposed_text = render_registry_file(proposed_rows)

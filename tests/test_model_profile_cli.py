@@ -72,7 +72,12 @@ if __name__ == "__main__":
 """
 
 
-def _report_yaml(*, clears: int, runs: int = 8, model: str = "sonnet") -> str:
+def _report_yaml(
+    *, clears: int, runs: int = 8, model: str = "anthropic:claude-sonnet-5"
+) -> str:
+    # 聚合鍵 model 預設用 normalize 後的完整 spec（patchmud PR #15 起 run.yaml
+    # 即如此記錄）——與 CLI 別名 `sonnet` 不同，鎖住 #466 A-1「鍵值從 report
+    # 本身取」的修法。
     return (
         "schema_version: 1\n"
         f"runs_included: {runs}\n"
@@ -108,6 +113,10 @@ def fake_patchmud(tmp_path: Path) -> SimpleNamespace:
         encounter = deck / name
         encounter.mkdir(parents=True)
         (encounter / "card.yaml").write_text(f"id: {name}\n", encoding="utf-8")
+        # deck 指紋取自各 encounter 的 provenance pin（#466 A-3）。
+        (encounter / "provenance.yaml").write_text(
+            f"content_sha256: sha-{name}\n", encoding="utf-8"
+        )
     (root / "VERSION").write_text("0.0.1\n", encoding="utf-8")
     tools = tmp_path / "tools"
     tools.mkdir()
@@ -205,10 +214,10 @@ def test_profile_apply_writes_registry_and_fingerprint_skip_then_force(
     second = mp.run_model_profile(_options(fake_patchmud), sleep=lambda _s: None)
     assert _cells_by_key(second)[("claude", "sonnet", "builder")]["status"] == "already-profiled"
 
-    # deck 內容 pin 變更 → 指紋不同 → 重評。
-    (fake_patchmud.root / "decks" / "pilot-v1" / ENCOUNTERS[0] / "card.yaml").write_text(
-        "id: mutated\n", encoding="utf-8"
-    )
+    # deck 內容 pin 變更（encounter provenance 重 pin）→ 指紋不同 → 重評。
+    (
+        fake_patchmud.root / "decks" / "pilot-v1" / ENCOUNTERS[0] / "provenance.yaml"
+    ).write_text("content_sha256: sha-mutated\n", encoding="utf-8")
     changed = mp.run_model_profile(_options(fake_patchmud), sleep=lambda _s: None)
     assert _cells_by_key(changed)[("claude", "sonnet", "builder")]["status"] == "proposed"
 
@@ -273,6 +282,76 @@ def test_incomplete_deck_sample_falls_back_to_default(fake_patchmud: SimpleNames
     assert cell["status"] == "not-writable"
     assert cell["reason"] == "incomplete-deck-sample"
     assert fake_patchmud.registry.read_text(encoding="utf-8") == REGISTRY_V3
+
+
+def test_report_group_key_taken_from_report_not_alias(
+    fake_patchmud: SimpleNamespace,
+) -> None:
+    """#466 A-1：run.yaml 記 normalize 後的完整 spec，鍵值必須從 report 取。
+
+    fixture 模板的聚合鍵是 `anthropic:claude-sonnet-5`（≠ CLI 別名 `sonnet`）；
+    別名查表的舊實作在此必落 identity-not-in-report。"""
+    result = mp.run_model_profile(_options(fake_patchmud), sleep=lambda _s: None)
+    cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
+    assert cell["status"] == "proposed"
+    assert cell["observation"]["model"] == "anthropic:claude-sonnet-5"
+
+
+def test_report_with_multiple_groups_is_explicit_failure(
+    fake_patchmud: SimpleNamespace,
+) -> None:
+    """profile 的 runs_root 為單一身分專用：report 多於一組聚合鍵＝污染，
+    fail-closed 明確報錯，不得猜一組來映射。"""
+    template = _report_yaml(clears=6) + (
+        "      - model: agy:gemini-3.1-pro\n"
+        "        loadout: P0T0R0\n"
+        "        runs: 8\n"
+        "        clears: 8\n"
+    )
+    (fake_patchmud.tools / "report-template.yaml").write_text(template, encoding="utf-8")
+    result = mp.run_model_profile(_options(fake_patchmud, apply=True), sleep=lambda _s: None)
+    cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
+    assert cell["status"] == "failed"
+    assert cell["reason"] == "report-group-ambiguous"
+    assert fake_patchmud.registry.read_text(encoding="utf-8") == REGISTRY_V3
+
+
+def test_deck_fingerprint_stable_across_timings_overwrite(
+    fake_patchmud: SimpleNamespace,
+) -> None:
+    """#466 A-3：`patchmud validate-deck` 覆寫 reference_timings（或殘留快取）
+    不得使 deck 指紋漂移；指紋只跟 encounter provenance pin 走。"""
+    deck_dir = fake_patchmud.root / "decks" / "pilot-v1"
+    before = mp.deck_content_sha256(deck_dir)
+
+    hidden = deck_dir / ENCOUNTERS[0] / "hidden"
+    hidden.mkdir()
+    (hidden / "reference_timings.yaml").write_text(
+        "schema_version: 1\ntimings_ms: {}\n", encoding="utf-8"
+    )
+    assert mp.deck_content_sha256(deck_dir) == before
+
+    (deck_dir / ENCOUNTERS[0] / "provenance.yaml").write_text(
+        "content_sha256: sha-repinned\n", encoding="utf-8"
+    )
+    assert mp.deck_content_sha256(deck_dir) != before
+
+
+def test_profile_runs_archived_durably_and_traceable(
+    fake_patchmud: SimpleNamespace,
+) -> None:
+    """#466 A-4：run 封存落 patchmud runs/（耐久），registry provenance 的
+    observation.runs_root 可回溯到仍存在的封存目錄。"""
+    applied = mp.run_model_profile(_options(fake_patchmud, apply=True), sleep=lambda _s: None)
+    cell = _cells_by_key(applied)[("claude", "sonnet", "builder")]
+    runs_root = Path(cell["runs_root"])
+    assert runs_root.is_dir()
+    assert runs_root.parent == fake_patchmud.root / "runs"
+    assert (runs_root / f"profile-claude-sonnet-{ENCOUNTERS[0]}").is_dir()
+
+    registry = _load_model_identity_file(fake_patchmud.registry)
+    provenance = registry.require("claude", "sonnet").profile_provenance
+    assert provenance["observation"]["runs_root"] == str(runs_root)
 
 
 def test_porcelain_model_profile_text_output(fake_patchmud: SimpleNamespace, capsys) -> None:
