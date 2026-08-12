@@ -207,3 +207,22 @@ patchmud_version, report_model, report_loadout) -> dict`：
   `DefaultFallbackTests`（逐欄 source＋理由碼斷言）。
 - 門檻邊界案例：`ClearRateLadderTests`（3/4、1/4 邊界皆含測試，含非二進位分母的
   整數算術案例 9/12、8/12、3/12、2/12）。
+
+## 勘誤追記（2026-08-12，cortex#466）
+
+定案方向不變，但兩處推導依據經 patchmud 端盤點（paulsha-patchmud#21）證實有誤，
+更正如下，避免後人沿假錨點調整門檻：
+
+1. **R2.2 的合理性錨點「haiku 4/8＝0.5 落 `[green]`，廉價模型吃小工作」不成立**：
+   cost-smoke3 那 4 場失敗的 `maintainability_breakdown.production_loc` 全為 0——
+   events.jsonl 顯示是連續 unified diff 解析失敗後棄局，`claim` 文字證明修法
+   早已想對。clear-rate 在 pilot-v1 上對弱模型量到的是「會不會寫 diff」的協定
+   格式能力，對中高階模型則整體飽和（haiku 與 opus 同卡同拿 Power 97.0）。
+2. **結構性後果——pilot-v1 上映射只能把身分「往下降」**：`DEFAULT_ENVELOPE`
+   builder 的 `accepts_bands` 預設即 `[green, yellow]`，與 R2.2 階梯可授予的最高
+   值相同；實測最好情況與預設同值（僅 provenance 換字），唯一改變派工行為的
+   是降級，而降級訊號現階段由上述格式噪音主導。**R3 人工複核閘的操作指引因此
+   追記一條**：pilot-v1 來源的降級提案（`[green]` 或 below-green-floor），落地前
+   MUST 先查 run 封存的 `end_reason`／`protocol_failed`（paulsha-patchmud#24 落地
+   後可直接讀 report `runs[]` 的同名欄位）排除協定噪音；無法排除者維持 default，
+   或等 paulsha-patchmud#21 的 deck 難度改造後重評。
