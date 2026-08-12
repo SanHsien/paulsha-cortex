@@ -296,15 +296,15 @@ def _executor_preflight(*, instance: str) -> dict[str, Any]:
             f"bootstrap 目前會使用 {effective_executor}（來源：{source}），但 PATH 找不到該 CLI。",
             fix=fix,
         )
-    ok, status_detail, status_fix = _executor_status(
+    status = _executor_status(
         effective_executor, executable=executable
     )
     return _preflight_check(
         "executor",
-        ok,
+        status[0],
         f"{effective_executor} ({source}; executable {executable_source}: "
-        f"{executable or effective_executor}): {status_detail}",
-        fix=status_fix,
+        f"{executable or effective_executor}): {status[1]}",
+        fix=status[2],
     )
 
 
