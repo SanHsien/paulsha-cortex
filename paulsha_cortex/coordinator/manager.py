@@ -1068,6 +1068,10 @@ def _launch_foreign_review(
         spec_hash=slice_row["spec"]["hash"],
         plan_hash=slice_row["plan"]["hash"],
         verification_hash=slice_row["verification"]["hash"],
+        # #469：reviewer 繼承 builder 的 repo 歸屬——reviewer terminal 時終局
+        # manifest 讀的是 reviewer job，slice_status_entry 的 fallback 也
+        # reviewer-first，不繼承會落 null。
+        workflow_repo=builder_job.get("workflow_repo"),
     )
     try:
         authority_inputs = _slice_review_authority_inputs(
@@ -1973,8 +1977,9 @@ def complete_tick(
                     "branch": job.get("branch"),
                     # #465：workflow-lane job 派工時帶 workflow_repo（build 與
                     # review kind 皆有），寫進終局 manifest 讓讀取端
-                    # `_repo_from_manifest` 投影 repo 歸屬；slice-lane job 無此欄
-                    # 寫入 null，依 #230 契約缺值不從 branch 推斷。
+                    # `_repo_from_manifest` 投影 repo 歸屬；slice-lane job 自 spec
+                    # frontmatter 的顯式 `repo:` 宣告帶入（#469，reviewer 繼承
+                    # builder）；未宣告仍寫 null，依 #230 契約不從 branch 推斷。
                     "workflow_repo": job.get("workflow_repo"),
                     "gate_reason": gate_reason,
                     "gate_verdict": (

@@ -430,6 +430,7 @@ dispatch: auto
 slice_id: auth-hardening
 plan: docs/superpowers/plans/auth-hardening.md
 target_branch: main
+repo: hamanpaul/paulsha-cortex
 verification:
   docs_class: code
   required_artifacts:
@@ -453,6 +454,7 @@ verification:
 
 - v1 只支援 `tier: shareable`；非 shareable 會 fail-closed 到 `needs_human`。
 - verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
+- `repo` 為 optional 顯式歸屬宣告（`owner/repo`，#469）：宣告後派工會寫進 builder/reviewer job 的 `workflow_repo`，`recent_done`／`slices` 的 repo 歸屬即投影此值；未宣告維持 `null`，不從本機路徑或 git remote 推斷。非法 shape（不是恰一個 `/` 或任一段為空）會 fail-closed 落 `hold`。
 
 ### Runtime preflight（dispatch 前的 capability 與 provider 新鮮度，#262）
 

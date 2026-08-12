@@ -40,12 +40,14 @@ def _reg(tmp: str) -> JobRegistry:
     return JobRegistry(state_path=Path(tmp) / "jobs.json")
 
 
-def _make_job(reg: JobRegistry, slice_id: str, *, worktree: str | None = None, branch: str | None = None) -> dict:
+def _make_job(reg: JobRegistry, slice_id: str, *, worktree: str | None = None, branch: str | None = None,
+              workflow_repo: str | None = None) -> dict:
     return reg.create_job(
         task=slice_id, persona="builder", branch=branch or f"feature/{slice_id}",
         pane="", worktree=worktree or f"/wt/{slice_id}",
         executor="copilot", session_name=slice_id, pid=4242,
         log_path=f"/logs/{slice_id}.jsonl",
+        workflow_repo=workflow_repo,
     )
 
 
@@ -861,6 +863,22 @@ class CompleteTickWorkflowLaneGateTests(unittest.TestCase):
                 [{"slice_id": "slice-missing-proof", "gate_status": "needs_human"}],
             )
 
+    def test_slice_lane_manifest_carries_declared_repo(self) -> None:
+        # issue #469：spec frontmatter 顯式宣告 repo → 派工時寫進 builder job 的
+        # workflow_repo → 終局 manifest 帶該值（recent_done 讀取端 _repo_from_manifest
+        # 投影）。上面 test_slice_lane_job_missing_pinned_verification_contract_still_
+        # fails_closed 保留「未宣告 → null 不推斷」回歸釘。
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_job(reg, "slice-declared-repo", workflow_repo="hamanpaul/paulsha-cortex")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+
+            manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads((hdir / "slice-declared-repo.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["workflow_repo"], "hamanpaul/paulsha-cortex")
+
 
 class CompleteTickVerificationTests(unittest.TestCase):
     def test_verification_runner_exception_marks_needs_human(self) -> None:
@@ -996,7 +1014,10 @@ class CompleteTickVerificationTests(unittest.TestCase):
             root = Path(d)
             worktree = root / "candidate"
             worktree.mkdir()
-            job = _make_job(reg, "slice-g", worktree=str(worktree))
+            job = _make_job(
+                reg, "slice-g", worktree=str(worktree),
+                workflow_repo="hamanpaul/paulsha-cortex",  # issue #469：reviewer job 應繼承
+            )
             reg.attach_launch_handle(job["job_id"], executor="copilot", session_name="slice-g", pid=1, log_path="/log")
             reg._find_job(job["job_id"])["model_id"] = "claude-haiku-4.5"
             _create_slice(reg, root, job, docs_class="code")
@@ -1086,6 +1107,11 @@ class CompleteTickVerificationTests(unittest.TestCase):
             self.assertEqual(slice_row["gate_state"], "pending")
             self.assertFalse(manager.autonomy.default_is_satisfied("slice-g", handoff_dir=str(hdir)))
             self.assertEqual(summary["released"], [])
+            # issue #469：_launch_foreign_review 建出的 reviewer job 繼承 builder 的
+            # workflow_repo（否則 reviewer-terminal 的終局 manifest 落 null）。
+            reviewer_jobs = [j for j in reg.list_jobs() if j.get("kind") == "review"]
+            self.assertEqual(len(reviewer_jobs), 1)
+            self.assertEqual(reviewer_jobs[0]["workflow_repo"], "hamanpaul/paulsha-cortex")
 
     def test_review_required_slice_without_review_identity_becomes_absent(self) -> None:
         with tempfile.TemporaryDirectory() as d:
