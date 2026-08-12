@@ -466,6 +466,49 @@ def test_review_sandbox_probe_rejects_invalid_explicit_claude_without_path_fallb
     assert "absolute path" in result.detail
 
 
+def test_review_sandbox_dependencies_do_not_inherit_host_path(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 2\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: custom-reviewer\n"
+        "    independence_domain: custom\n"
+        "    capabilities: [review]\n",
+        encoding="utf-8",
+    )
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    calls = []
+
+    def which(name, path=None):
+        calls.append((name, path))
+        return None
+
+    monkeypatch.setattr("paulsha_cortex.doctor.shutil.which", which)
+
+    result = _review_sandbox_probe(
+        {
+            "PSC_PROJECT_CONFIG_ROOT": str(config),
+            "PSC_CLAUDE_EXECUTABLE": str(executable),
+        },
+        tmp_path,
+    )
+
+    assert result.status == "fail"
+    assert "bwrap" in result.detail
+    assert calls == [
+        ("bwrap", ""),
+        ("socat", ""),
+        ("srt", ""),
+        ("python3", ""),
+    ]
+
+
 def test_review_sandbox_probe_rejects_unsupported_claude_version(
     tmp_path: Path, monkeypatch,
 ) -> None:

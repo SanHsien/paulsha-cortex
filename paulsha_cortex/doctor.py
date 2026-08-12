@@ -317,7 +317,7 @@ def _review_sandbox_checks(
     runner: Runner,
     live: bool,
 ) -> ProbeResult:
-    search_path = env.get("PATH")
+    search_path = env.get("PATH", "")
     from .coordinator.launcher import resolve_claude_executable
 
     try:
