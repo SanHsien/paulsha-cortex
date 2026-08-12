@@ -209,15 +209,17 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
     # shape 比照 completion.py 的 work_authority.repo：恰一個 '/' 且兩段非空。
     repo_value = data.get("repo")
     if repo_value is not None:
+        normalized_repo = repo_value.strip() if isinstance(repo_value, str) else None
         if (
-            not isinstance(repo_value, str)
-            or repo_value.count("/") != 1
-            or not all(repo_value.split("/"))
+            normalized_repo is None
+            or normalized_repo.count("/") != 1
+            or not all(normalized_repo.split("/"))
+            or any(char.isspace() for char in normalized_repo)
         ):
             raise verification.ContractValidationError(
                 "repo", "repo must be an explicit owner/repo string"
             )
-        meta["repo"] = repo_value
+        meta["repo"] = normalized_repo
     if data.get("parse_error") is not None:
         raise verification.ContractValidationError(
             "parse_error",

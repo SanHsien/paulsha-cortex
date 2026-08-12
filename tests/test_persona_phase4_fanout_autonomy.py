@@ -377,12 +377,32 @@ class FrontmatterTests(unittest.TestCase):
             self.assertIsNone(meta["parse_error"])
             self.assertIsNone(meta["repo"])
 
+    def test_parse_repo_normalizes_outer_whitespace(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "repo-spaces.md",
+                    "dispatch: auto\n"
+                    "slice_id: repo-slice\n"
+                    "plan: docs/p.md\n"
+                    'repo: "  hamanpaul/paulsha-cortex  "\n'
+                    + _v1_verification_block(),
+                )
+            )
+            self.assertIsNone(meta["parse_error"])
+            self.assertEqual(meta["repo"], "hamanpaul/paulsha-cortex")
+
     def test_parse_repo_invalid_shape_holds(self) -> None:
         # 非法 shape → ContractValidationError → fail-closed 落 hold（比照 unknown key）。
         from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
 
         with tempfile.TemporaryDirectory() as d:
-            for idx, bad in enumerate(["norepo", "a/b/c", "/x", "x/", 123]):
+            for idx, bad in enumerate(
+                ["norepo", "a/b/c", "/x", "x/", "owner /repo", "owner/re po", 123]
+            ):
                 with self.subTest(repo=bad):
                     meta = parse_spec_frontmatter(
                         _write_spec(

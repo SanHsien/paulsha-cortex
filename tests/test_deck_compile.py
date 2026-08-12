@@ -327,7 +327,10 @@ def test_compile_frontmatter_keeps_repo_null_without_declaration(tmp_path):
         assert yaml.safe_load(block)["repo"] is None
 
 
-@pytest.mark.parametrize("repo", ["owner", "owner/repo/extra", "/repo", "owner/", 123])
+@pytest.mark.parametrize(
+    "repo",
+    ["owner", "owner/repo/extra", "/repo", "owner/", "owner /repo", "owner/re po", 123],
+)
 def test_compile_rejects_invalid_explicit_repo(tmp_path, repo):
     cards, combo = _feature_oneshot(tmp_path)
 
@@ -340,6 +343,21 @@ def test_compile_rejects_invalid_explicit_repo(tmp_path, repo):
             allow_external=True,
             repo=repo,
         )
+
+
+def test_compile_normalizes_outer_repo_whitespace(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path)
+    result = compile_combo(
+        combo,
+        cards,
+        "示例 LED 功能",
+        change="demo",
+        allow_external=True,
+        repo="  hamanpaul/paulsha-cortex  ",
+    )
+
+    block = result.slices[0].content.split("---\n")[1]
+    assert yaml.safe_load(block)["repo"] == "hamanpaul/paulsha-cortex"
 
 
 def test_requires_uncovered_blocks_without_allow_external(tmp_path):

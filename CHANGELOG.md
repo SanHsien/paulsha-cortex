@@ -23,6 +23,7 @@
 - 同步 upstream `#451` 的 v0.1.6 release metadata 與 tag 水位；下次 review watermark 推進到 `ea76673`。
 
 ### Fixed
+- Repo authority input 現在會正規化整體前後空白並拒絕 owner/repo 段內空白，避免 deck spec、job 與 manifest 寫入無法穩定比對的歸屬值。
 - Profile evidence 的耐久 run 目錄改以原子 `mkdir` 取得名稱，避免兩個同秒執行的 profile command 在 `exists()`／`mkdir()` 間撞名失敗。
 - 將 upstream v0.1.8 的 slow-chmod `0600` regression 限定於 POSIX；Windows ACL 不具等價 POSIX mode bits，仍由原生 monitor transport 測試驗證 readiness。
 - 修正 upstream Issue #464 的 socket 權限測試競態：測試改等候 server ready authority，不再只以 bind 時就出現的 socket path 當完成訊號；另讓新 model profile CLI 可在 Windows 從 PATH 找到並啟動 Python shebang 形式的 patchmud entry point。

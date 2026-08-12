@@ -49,9 +49,16 @@ def _validate_plan_ref(plan_ref: str) -> str:
 
 
 def _validate_repo(repo: object) -> str:
-    if not isinstance(repo, str) or repo.count("/") != 1 or not all(repo.split("/")):
+    if not isinstance(repo, str):
         raise DeckCompileError(f"repo 必須是顯式 owner/repo 字串: {repo!r}")
-    return repo
+    normalized = repo.strip()
+    if (
+        normalized.count("/") != 1
+        or not all(normalized.split("/"))
+        or any(char.isspace() for char in normalized)
+    ):
+        raise DeckCompileError(f"repo 必須是顯式 owner/repo 字串: {repo!r}")
+    return normalized
 
 
 def _infer_target_branch(task_slug: str, change: str | None) -> str:
