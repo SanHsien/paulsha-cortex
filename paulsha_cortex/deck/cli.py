@@ -74,7 +74,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             for _combo_id, combo_file in combo_files:
                 combo = load_combo(combo_file, cards)
-                print(f"{combo.id}\t(task_type={combo.task_type}, cards={len(combo.cards)})")
+                band_cards = len(combo.band_triggered.cards) if combo.band_triggered else 0
+                print(
+                    f"{combo.id}\t(task_type={combo.task_type}, "
+                    f"cards={len(combo.cards) + band_cards})"
+                )
                 for entry in combo.cards:
                     card = cards[entry.ref]
                     print(f"  card: {card.id}\t[{card.type}/{card.card_class}]")

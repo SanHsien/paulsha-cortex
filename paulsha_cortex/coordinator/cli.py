@@ -30,6 +30,10 @@ _REQUEST_TIMEOUTS: dict[str, float] = {
 }
 
 
+def _default_specs_dir() -> str:
+    return os.environ.get("PSC_MANAGER_SPECS_DIR") or str(paths.specs_root())
+
+
 def _resolve_launcher(executor, injected, *, allow_unsafe, model):
     """注入優先；否則僅在 executor 指定時建 SubprocessLauncher（帶 allow_unsafe/model）。"""
     if injected is not None:
@@ -144,7 +148,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
     p_ready.add_argument(
         "--specs-dir",
-        default=os.environ.get("PSC_MANAGER_SPECS_DIR") or str(paths.specs_root()),
+        default=None,
         help="要掃描的 spec 目錄（預設：manager specs 目錄）",
     )
 
@@ -347,7 +351,12 @@ def main(
 
     if args.cmd == "ready":
         predicate = is_satisfied if is_satisfied is not None else autonomy.default_is_satisfied
-        metas = autonomy.scan_specs(args.specs_dir)
+        try:
+            specs_dir = args.specs_dir if args.specs_dir is not None else _default_specs_dir()
+        except ValueError as exc:
+            print(f"錯誤: {exc}", file=sys.stderr)
+            return 1
+        metas = autonomy.scan_specs(specs_dir)
         batch_ids = {
             slice_id
             for meta in metas

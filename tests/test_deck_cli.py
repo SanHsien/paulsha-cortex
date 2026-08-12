@@ -149,6 +149,10 @@ combo:
     - ref: subagent-build
     - ref: code-review
     - ref: verification
+  band_triggered:
+    trigger: yellow
+    cards:
+      - ref: adversarial-review
   gate_spine:
     - after: mcu-hw-evidence
       exists: ["docs/superpowers/specs/*<task-slug>*-hw-evidence.md"]
@@ -175,6 +179,8 @@ def test_list_shows_combos(tmp_path, capsys, monkeypatch):
     assert "feature-oneshot" in out and "mcu-feature" in out
     assert "card: brainstorming" in out
     assert "card: mcu-hw-evidence" in out
+    assert "mcu-feature\t(task_type=mcu-feature, cards=8)" in out
+    assert "card: adversarial-review\t[headless/core; band>=yellow]" in out
 
 
 def test_list_can_filter_one_combo_and_shows_only_its_members(tmp_path, capsys, monkeypatch):
