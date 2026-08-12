@@ -265,6 +265,25 @@ def test_compile_cjk_task_warns_and_explicit_slug_is_used(tmp_path, capsys, monk
     assert "--slug" in capsys.readouterr().err
 
 
+def test_compile_pure_cjk_task_failure_points_to_explicit_slug(tmp_path, capsys, monkeypatch):
+    _seed_fixture(tmp_path / "deck", monkeypatch)
+    rc = deck_cli.main(
+        [
+            "compile",
+            "feature-oneshot",
+            "--task",
+            "建立共用測試",
+            "--change",
+            "demo",
+            "--allow-external",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--slug" in err
+    assert "task 無法正規化" in err
+
+
 def test_compile_emit_carries_explicit_work_item_repo(tmp_path, monkeypatch):
     _seed_fixture(tmp_path / "deck", monkeypatch)
     specs_root = tmp_path / "specs"

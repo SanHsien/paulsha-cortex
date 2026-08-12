@@ -100,6 +100,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             effective_change = args.change
             if effective_change is None and not args.emit and not args.out:
                 effective_change = "dry-run"
+            if args.slug is None and any(not char.isascii() for char in args.task):
+                print(
+                    "deck compile: [WARNING] task 含非 ASCII 字元，自動 task-slug 可能失真；"
+                    "請用 --slug <branch-safe-slug> 明確指定",
+                    file=sys.stderr,
+                )
             result = compile_combo(
                 combo,
                 cards,
@@ -113,12 +119,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 policy_from=args.policy_from,
                 slug=args.slug,
             )
-            if args.slug is None and any(not char.isascii() for char in args.task):
-                print(
-                    "deck compile: [WARNING] task 含非 ASCII 字元，自動 task-slug 可能失真；"
-                    "請用 --slug <branch-safe-slug> 明確指定",
-                    file=sys.stderr,
-                )
             if args.repo is None and result.slices:
                 print(
                     "deck compile: [WARNING] 未提供 --repo owner/repo；輸出 spec 會維持 repo: null，"
