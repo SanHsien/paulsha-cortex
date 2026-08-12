@@ -771,6 +771,7 @@ class CompleteTickWorkflowLaneGateTests(unittest.TestCase):
             self.assertNotEqual(manifest["gate_reason"], "missing-slice-proof")
             self.assertEqual(manifest["gate_status"], manager.WORKFLOW_LANE_GATE_STATUS)
             self.assertEqual(manifest["gate_reason"], manager.WORKFLOW_LANE_GATE_REASON)
+            self.assertEqual(manifest["workflow_repo"], "owner/repo")  # issue #465
             self.assertEqual(
                 summary["completed"],
                 [{"slice_id": "wf-c81b4d82a7-build-1", "gate_status": manager.WORKFLOW_LANE_GATE_STATUS}],
@@ -795,6 +796,27 @@ class CompleteTickWorkflowLaneGateTests(unittest.TestCase):
             self.assertNotEqual(manifest["gate_reason"], "missing-slice-proof")
             self.assertEqual(manifest["gate_status"], manager.WORKFLOW_LANE_GATE_STATUS)
             self.assertEqual(manifest["gate_reason"], manager.WORKFLOW_LANE_GATE_REASON)
+            self.assertEqual(manifest["workflow_repo"], "owner/repo")  # issue #465
+
+    def test_workflow_lane_manifest_carries_workflow_repo(self) -> None:
+        # issue #465：workflow-lane job（build 與 review kind）派工時帶 workflow_repo，
+        # 終局 manifest 必須寫入該欄，讓 recent_done 讀取端（_repo_from_manifest）
+        # 投影 repo 歸屬，不再恆 repo=null。
+        for kind, phase, slice_id in (
+            ("build", "build", "wf-465-build-1"),
+            ("review", "adversarial-review", "wf-465-adversarial-review-1"),
+        ):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as d:
+                    reg = _reg(d)
+                    job = _make_workflow_job(reg, slice_id, kind=kind, phase=phase)
+                    disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+                    hdir = Path(d) / "handoff"
+
+                    manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+                    manifest = json.loads((hdir / f"{slice_id}.json").read_text(encoding="utf-8"))
+                    self.assertEqual(manifest["workflow_repo"], "owner/repo")
 
     def test_workflow_review_phase_job_failed_is_failed_not_missing_slice_proof(self) -> None:
         # workflow lane 的 review kind job 失敗時：fail closed 為 failed，不是 needs_human/
@@ -831,6 +853,9 @@ class CompleteTickWorkflowLaneGateTests(unittest.TestCase):
             manifest = json.loads((hdir / "slice-missing-proof.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["gate_status"], "needs_human")
             self.assertEqual(manifest["gate_reason"], "missing-slice-proof")
+            # issue #465：slice-lane job record 無 workflow_repo → manifest 落 null，
+            # 釘住不從 branch 推斷（#230 契約）。
+            self.assertIsNone(manifest["workflow_repo"])
             self.assertEqual(
                 summary["completed"],
                 [{"slice_id": "slice-missing-proof", "gate_status": "needs_human"}],

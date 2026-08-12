@@ -1971,6 +1971,11 @@ def complete_tick(
                     "completion": status,
                     "exit_code": job.get("exit_code"),
                     "branch": job.get("branch"),
+                    # #465：workflow-lane job 派工時帶 workflow_repo（build 與
+                    # review kind 皆有），寫進終局 manifest 讓讀取端
+                    # `_repo_from_manifest` 投影 repo 歸屬；slice-lane job 無此欄
+                    # 寫入 null，依 #230 契約缺值不從 branch 推斷。
+                    "workflow_repo": job.get("workflow_repo"),
                     "gate_reason": gate_reason,
                     "gate_verdict": (
                         evaluation["payload"]
