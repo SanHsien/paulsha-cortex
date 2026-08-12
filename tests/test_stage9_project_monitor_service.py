@@ -458,13 +458,16 @@ class Stage9ServerTests(unittest.TestCase):
             target=self.server.serve_forever, daemon=True
         )
         self.server_thread.start()
-        # wait for socket to appear
-        for _ in range(50):
-            if self.socket_path.exists():
-                break
-            time.sleep(0.02)
+        # Readiness gate (#464): the socket *path* exists as soon as bind()
+        # returns, but its mode is only tightened to 0o600 by the os.chmod()
+        # that follows — polling for path existence lets tests observe the
+        # bind-default mode (0o777 & ~umask) whenever the server thread is
+        # scheduled out between bind() and chmod(). wait_until_ready() blocks
+        # on _ready_event, which is set strictly after chmod()+listen(), so
+        # it is the deterministic happens-before gate, not a timing tweak.
         self.assertTrue(
-            self.socket_path.exists(), msg="server socket did not bind in time"
+            self.server.wait_until_ready(timeout=2.0),
+            msg="server did not become ready (bind+chmod+listen) in time",
         )
         self.addCleanup(self._cleanup)
 
@@ -544,6 +547,71 @@ class Stage9ServerTests(unittest.TestCase):
     def test_server_socket_has_0600_permission(self) -> None:
         mode = stat.S_IMODE(self.socket_path.stat().st_mode)
         self.assertEqual(mode, 0o600)
+
+    def test_wait_until_ready_blocks_until_socket_mode_tightened(self) -> None:
+        """Regression for #464: the socket *path* exists as soon as bind()
+        returns, but the mode is only tightened to 0o600 by the os.chmod()
+        that follows — so "path exists" is a strictly weaker readiness gate
+        than wait_until_ready(). The old setUp polled for path existence and
+        would occasionally stat the bind-default mode (0o777 & ~umask, e.g.
+        0o755 on CI) whenever the server thread was scheduled out between
+        bind() and chmod().
+
+        Like `_slow_bind` below (#439), this interposes on os.chmod to park
+        the server thread deterministically *inside* the bind→chmod window
+        and proves: (1) the path already exists there, (2) wait_until_ready()
+        correctly refuses to report ready, (3) once chmod proceeds, ready
+        flips True and the mode is 0o600. This is also the guard rail against
+        a future refactor moving _ready_event.set() before chmod().
+        """
+        real_chmod = os.chmod
+        chmod_entered = threading.Event()
+        release_chmod = threading.Event()
+
+        def _slow_chmod(path, mode, **kwargs):
+            chmod_entered.set()
+            release_chmod.wait(timeout=2.0)
+            return real_chmod(path, mode, **kwargs)
+
+        other_socket_path = self.tmp / "chmod-race.sock"
+        server = MonitorServer(store=self.store, socket_path=other_socket_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        try:
+            with mock.patch(
+                "paulsha_cortex.monitor.server.os.chmod",
+                side_effect=_slow_chmod,
+            ):
+                thread.start()
+                self.assertTrue(
+                    chmod_entered.wait(timeout=2.0),
+                    msg="serve_forever never reached os.chmod()",
+                )
+                # Server thread is now parked inside the bind→chmod window:
+                # the path is visible but the mode is still the bind default
+                # (its exact value depends on the ambient umask, so it is
+                # deliberately not asserted here).
+                self.assertTrue(
+                    other_socket_path.exists(),
+                    msg="socket path should exist right after bind()",
+                )
+                self.assertFalse(
+                    server.wait_until_ready(timeout=0.2),
+                    msg=(
+                        "wait_until_ready() must not report ready inside the "
+                        "bind→chmod window — path existence is a weaker gate"
+                    ),
+                )
+                release_chmod.set()
+                self.assertTrue(
+                    server.wait_until_ready(timeout=2.0),
+                    msg="server did not become ready after chmod was released",
+                )
+                mode = stat.S_IMODE(other_socket_path.stat().st_mode)
+                self.assertEqual(mode, 0o600)
+        finally:
+            release_chmod.set()
+            server.stop()
+            thread.join(timeout=2.0)
 
     def test_serve_forever_does_not_touch_process_umask(self) -> None:
         """Regression for #439: `serve_forever()` must rely solely on the
