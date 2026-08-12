@@ -48,6 +48,12 @@ def _validate_plan_ref(plan_ref: str) -> str:
     return plan_ref
 
 
+def _validate_repo(repo: object) -> str:
+    if not isinstance(repo, str) or repo.count("/") != 1 or not all(repo.split("/")):
+        raise DeckCompileError(f"repo 必須是顯式 owner/repo 字串: {repo!r}")
+    return repo
+
+
 def _infer_target_branch(task_slug: str, change: str | None) -> str:
     if change and change != "dry-run":
         return f"feature/{change}"
@@ -381,6 +387,7 @@ def _render_frontmatter(
     plan_ref: str,
     deps: Sequence[str],
     target_branch: str,
+    repo: str | None,
     verification: dict[str, object],
 ) -> str:
     depends_on = "[" + ", ".join(deps) + "]" if deps else "[]"
@@ -391,6 +398,9 @@ def _render_frontmatter(
         f"plan: {json.dumps(plan_ref, ensure_ascii=False)}",
         f"depends_on: {depends_on}",
         f"target_branch: {json.dumps(target_branch, ensure_ascii=False)}",
+        # #469/#473：repo 歸屬只接受 claim/work item 的顯式宣告；沒有宣告時
+        # 維持 null，不從 repo_root 路徑或 git remote 推導。
+        f"repo: {_format_scalar(repo)}",
     ]
     lines.append("verification:")
     lines.append(f"  docs_class: {_format_scalar(verification.get('docs_class'))}")
@@ -598,8 +608,11 @@ def compile_combo(
     plan_ref: str | None = None,
     band: str | None = None,
     repo_root: str | Path | None = None,
+    repo: str | None = None,
 ) -> CompileResult:
     effective_repo_root = Path(repo_root) if repo_root is not None else paths.repo_root()
+    if repo is not None:
+        repo = _validate_repo(repo)
     slug = slugify_task(task)
     if change is not None:
         change = _validate_change_name(change)
@@ -670,6 +683,7 @@ def compile_combo(
                 plan_ref,
                 deps,
                 target_branch,
+                repo,
                 verification_skeleton,
             )
             + "\n"

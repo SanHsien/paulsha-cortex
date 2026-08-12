@@ -342,7 +342,7 @@ class _FakeRegistry:
     def create_job(self, *, task, persona, branch, pane, worktree, dispatch_head=None, executor=None,
                     session_name=None, pid=None, log_path=None, exit_code=None, kind="build",
                     model_id=None, independence_domain=None, subject_head=None, spec_hash=None,
-                    plan_hash=None, verification_hash=None) -> dict:
+                    plan_hash=None, verification_hash=None, workflow_repo=None) -> dict:
         self._seq += 1
         job = {
             "job_id": f"{task}-{self._seq}", "task": task, "persona": persona, "kind": kind,
@@ -351,6 +351,7 @@ class _FakeRegistry:
             "independence_domain": independence_domain, "session_name": session_name, "pid": pid,
             "log_path": log_path, "exit_code": exit_code, "subject_head": subject_head,
             "spec_hash": spec_hash, "plan_hash": plan_hash, "verification_hash": verification_hash,
+            "workflow_repo": workflow_repo,
         }
         self._jobs.append(job)
         return dict(job)

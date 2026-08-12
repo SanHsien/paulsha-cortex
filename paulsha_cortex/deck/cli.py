@@ -35,6 +35,10 @@ def _build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--only", nargs="+", default=[])
     compile_parser.add_argument("--allow-external", action="store_true", help="允許 combo 宣告的外部前置輸入")
     compile_parser.add_argument("--plan", dest="plan_ref", help="覆寫產生 spec 的 plan reference")
+    compile_parser.add_argument(
+        "--repo",
+        help="從 claim/work item 顯式帶入的 owner/repo；省略時 spec 維持 repo: null",
+    )
     out_group = compile_parser.add_mutually_exclusive_group()
     out_group.add_argument("--out", help="寫入指定 spec 目錄；未設定時只 dry-run")
     out_group.add_argument("--emit", action="store_true", help="寫入預設 specs 目錄；未設定時只 dry-run")
@@ -74,6 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 only=tuple(args.only),
                 allow_external=args.allow_external,
                 plan_ref=args.plan_ref,
+                repo=args.repo,
             )
             print(f"task-slug: {result.task_slug}")
             print("前置 checklist（interactive）：")

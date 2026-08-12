@@ -162,6 +162,7 @@ class FakeRegistry:
         spec_hash: str | None = None,
         plan_hash: str | None = None,
         verification_hash: str | None = None,
+        workflow_repo: str | None = None,
     ) -> dict:
         self._seq += 1
         job = {
@@ -185,6 +186,7 @@ class FakeRegistry:
             "spec_hash": spec_hash,
             "plan_hash": plan_hash,
             "verification_hash": verification_hash,
+            "workflow_repo": workflow_repo,
         }
         self._jobs.append(job)
         return dict(job)

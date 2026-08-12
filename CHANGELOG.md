@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- 同步 upstream v0.1.8 到 `dc8a968`，採用 workflow／slice repo 歸屬、patchmud profile drift 修正與 Stage 9 readiness regression；deck compile 新增 `--repo owner/repo`，可把 work item 的顯式 repo 宣告帶入輸出的 slice specs。
 - 同步 upstream v0.1.7 到 `cf791a2`，採用模型能力封套、patchmud profile、model roster 與 `provider:executor` ship gate 的正式上游版本。
 - 新增 Windows-first PowerShell 開發環境、LF checkout 契約、原生完整驗證入口、fork／開發／決策文件，以及 GitHub 協作、安全掃描與依賴維護骨架。
 - Windows-first runtime：原生 process wrapper、TCP monitor transport、per-user Startup service backend、PowerShell bootstrap/full gate 與 Windows CI。
@@ -15,18 +16,56 @@
 - 追補 upstream `#450` 的 `retire-delivered` orphan-run 退休流程與限流時的窄化 last-known-good authority；同步把 `#449` 完成狀態及 `#451` release 決策寫入 upstream ledger。
 
 ### Changed
+- `docs/UPSTREAM.md` 記錄 v0.1.8 的 5 個 merged PR、11 個 commit、Issues #464／#473 處置與下一輪 watermark。
 - `docs/UPSTREAM.md` 記錄 v0.1.7 的 7 個 merged PR、17 個 commit、Issue #464 處置與下一輪 watermark。
 - `docs/UPSTREAM.md` 記錄已檢查 PR、Issue #442 的採用／延後決策與下次 review watermark，避免重複處理。
 - Windows launcher 在載入跨平台 wrapper 時保留 operator 原有的 `PYTHONPATH`；review-only 環境仍只暴露 repo package root。
 - 同步 upstream `#451` 的 v0.1.6 release metadata 與 tag 水位；下次 review watermark 推進到 `ea76673`。
 
 ### Fixed
+- Profile evidence 的耐久 run 目錄改以原子 `mkdir` 取得名稱，避免兩個同秒執行的 profile command 在 `exists()`／`mkdir()` 間撞名失敗。
+- 將 upstream v0.1.8 的 slow-chmod `0600` regression 限定於 POSIX；Windows ACL 不具等價 POSIX mode bits，仍由原生 monitor transport 測試驗證 readiness。
 - 修正 upstream Issue #464 的 socket 權限測試競態：測試改等候 server ready authority，不再只以 bind 時就出現的 socket path 當完成訊號；另讓新 model profile CLI 可在 Windows 從 PATH 找到並啟動 Python shebang 形式的 patchmud entry point。
 - 修復 Windows 上會送 signal 的 PID probe、POSIX-only imports/durability、CRLF evidence identity、hardlink immutability、cross-host absolute path/mode semantics、monitor scan race 與 registry backup cleanup。
 - 修正 upstream 合併後的 Windows-only 回歸：POSIX service 測試分流、planning fixture newline authority、Windows mode 語意、hermetic home 隔離、PowerShell PID probe decoding，以及 digest delivery command 的反斜線 argv 解析。
 - `cg` prompt 改走真正的 OS stdin pipe，不再進入 wrapper command line，避開 Windows `CreateProcess` 長度上限與 prompt 洩漏。
 - Windows bootstrap 依 `.python-version` 優先使用 uv-managed Python，並拒絕超出 package 上限的 Python 3.14。
 - 強化 `retire-delivered`：GitHub PR lifecycle 的 merged timestamp／state 組合必須一致，且首次寫入與重入共用 evidence 大小上限。
+
+## [0.1.8] - 2026-08-12
+
+### Fixed
+- **Issue #465：workflow-lane handoff manifest 未寫 repo 歸屬，recent_done 永遠 repo=null**：complete_tick 終局 manifest dict 補 `workflow_repo` 欄（值取自 job record 派工時的 `workflow_repo`），讀取端 `_repo_from_manifest`（#230／PR #349 契約）現成接住；slice-lane 寫 `null`、舊 manifest 缺鍵維持 `repo=null` 不推斷；下游 paulshaclaw cockpit 不需改動。詳見 `changelog.d/workflow-lane-manifest-repo.md`。
+- **Issue #466：profile 巷道對 patchmud main（PR #15 後）的 drift 修正**
+  （`paulsha_cortex/coordinator/model_profile.py`）：
+  - **A-1 report 聚合鍵改從 report 本身取**：patchmud PR #15 起 `run.yaml` 記
+    `normalize_model_spec()` 展開後的完整 model spec（非 CLI 別名，且
+    anthropic↔claude CLI fallback 隨憑證狀態浮動），舊實作以別名查
+    `clear_rate` 榜必落 `identity-not-in-report`、巷道永遠產不出實測封套。
+    新增 `_report_group_key()`：profile 的 runs_root 為單一身分專用，report 內
+    必恰一組 `(model, loadout)`，多組即 `report-group-ambiguous` fail-closed。
+  - **A-2 adapter 別名表更新**：patchmud 已落地 codex／agy OAuth headless
+    adapter（paulsha-patchmud#14），「僅 anthropic adapter」的誠實約束註解過時；
+    補 `("agy", "gemini-3.1-pro-high") → "agy:gemini-3.1-pro"` 對應（完整 spec、
+    不用短別名），明寫 CLI adapter effort 硬編 `high` 的對應限制；codex 身分
+    待 #456 R4 登錄後補格。
+  - **A-3 deck 指紋改聚合 encounter provenance pin**：原 rglob 全檔 hash 會把
+    `patchmud validate-deck` 對 `reference_timings` 的例行覆寫誤判成 deck 變更、
+    誤觸全量重評；改為聚合各 encounter `provenance.yaml` 的 `content_sha256`
+    （與 patchmud `encounter_content_sha256` pin 同語意，#452 D 票面原意），
+    provenance 缺漏 fail-closed。
+  - **A-4 run 封存耐久化**：runs_root 從 `mkdtemp` 改落 patchmud repo
+    `runs/profile-<executor>-<model_id>-<stamp>/`（比照 #455 實測慣例，不進
+    版控），registry 的 `profile_provenance.observation.runs_root` 記出處——
+    落進 registry 的封套值可回溯到 events／ledger／replay 證據。
+- **spec 勘誤追記**（`envelope-mapping-spec.md`、`benchmark-cost-baseline.md`）：
+  paulsha-patchmud#21 證實「haiku 4/8」與「同母題變體 clear 分歧」兩個定案錨點
+  實為 unified diff 協定噪音（非能力／變體訊號）；定案方向不變，但 R3 人工閘
+  追記「pilot-v1 來源的降級提案 MUST 先以 `end_reason`／`protocol_failed`
+  排除協定噪音」（paulsha-patchmud#24 落地後可直接讀 report `runs[]`）。
+- **Issue #464：`test_server_socket_has_0600_permission` 於 Python 3.13 CI 偶發 `0o755≠0o600`——研判更正：非 #439 umask footgun 復發，而是測試 setUp readiness gate 的 bind→chmod 競態窗**：票上原研判「socket 建立當下 umask(0o177) 沒生效」不成立——umask dance 已由 PR #444（merge `d78d1d9`）移除，且失敗 run 31520253693 的 headSha `cf791a2` 已包含該修復（ancestor 關係經 git 驗證），`test_serve_forever_does_not_touch_process_umask` 亦保證 `serve_forever()` 不呼叫 `os.umask`。真因：`Stage9ServerTests.setUp` 以「socket path 存在」輪詢為就緒條件，但 path 在 `listener.bind()`（`server.py:166`）當下即存在、`os.chmod(0o600)`（`:168`）在其後才收斂——CI runner 忙碌時 server thread 於兩行之間被排程延遲，main thread 見 path 即放行，測試 stat 到 bind 預設 mode `0o777 & ~umask(0o022) = 0o755`（即觀測值 493）。修法：setUp 改用既有 `wait_until_ready(timeout=2.0)`（`_ready_event` 於 `server.py:183` set，嚴格 happens-after chmod 與 listen，threading.Event 提供確定性 happens-before）取代 exists-poll；`test_server_socket_has_0600_permission` 斷言本體不動（拒絕「測試側先 chmod 再斷言」——會讓驗證 server 自行收斂 0600 的斷言空洞化）。新增回歸測試 `test_wait_until_ready_blocks_until_socket_mode_tightened`：slow-chmod interposition（仿 #439 `_slow_bind` 手法）把 server thread 釘在 bind→chmod 窗口內，斷言窗口內 path 已存在但 `wait_until_ready(0.2)` 為 False、放行後為 True 且 mode 為 `0o600`。權限窗口安全評估：窗口內 `listen()` 未執行（connect 必 ECONNREFUSED）、production 父目錄先被 `_prepare_run_dir` 收斂 `0o700`（`service.py:98-101`）、窗口位於 `_SOCKET_PATH_LOCK` 臨界區——非安全邊界，`server.py` 免改。RED/GREEN：以 bind/chmod 間暫插 `time.sleep(0.05)` mutation 在舊 setUp 下確定性重現 `0o755≠0o600`、新 setUp 下同 mutation 轉 GREEN（mutation 已還原）；`Stage9ServerTests` 重複 50 次無 flaky；CI 為 serial pytest（無 xdist/randomly），修法為 happens-before 關窗而非 timing 調參。
+- **Issue #469：slice-lane job 不帶 `workflow_repo`，`recent_done`/`slices` 的 repo 歸屬仍為 `null`（#465 follow-up）**：#465 補了終局 manifest 寫入端（`"workflow_repo": job.get("workflow_repo")`）、#349 補了讀取端（`_repo_from_manifest` 三鍵投影與 `slice_status_entry` 的 builder/reviewer job fallback），但 slice-lane 派工路徑（`autonomy.dispatch_ready` → `_record_launching_job` → `registry.create_job`）從不寫 `workflow_repo`，兩端都只等資料。修法為顯式宣告制：spec frontmatter 新增 optional `repo: owner/repo` 欄（shape 驗證 fail-closed），派工時寫進 builder job record 既有 `workflow_repo` 欄，`_launch_foreign_review` 的 reviewer job 繼承 builder 的值——終局 manifest、`recent_done`、`slices`/`attention` 的 repo 歸屬全鏈打通，覆蓋所有終局狀態。未宣告的 spec 維持 `repo=null`：不從 repo_root 路徑推導、不從 git remote 推導（#230/#349「missing 回 null 不推斷」契約；與 workflow lane `run.repo` 來自 work item 顯式宣告同構）。否決 issue 案 2（自 completion record 投影 `work_authority.repo`）：slice-lane completion record 從不含 `work_authority`（僅 workflow-lane delivery 會寫），且 completion record 僅存在於 passed/candidate-merged 終局，failed/needs_human/verified 依舊拿不到歸屬。deck 契約表同步：`EMITTED_FRONTMATTER_FIELDS` 加 `repo`、deck emit 出 `repo: null` 佔位（三個 exact-keyset 對齊測試強制 meta/emit 同步；自動帶入 claim/work item 的 repo 為 follow-up）。新增回歸測試：frontmatter `repo` 宣告解析與非法 shape fail-closed、`dispatch_ready` 寫入 job `workflow_repo`、slice-lane 終局 manifest 帶宣告 repo／無宣告維持 null、`recent_done` 投影、reviewer job 繼承。
+
 ## [0.1.7] - 2026-08-12
 
 ### Added
