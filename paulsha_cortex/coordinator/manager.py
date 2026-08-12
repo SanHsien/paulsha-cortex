@@ -1118,6 +1118,7 @@ def _launch_foreign_review(
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
+            executable_path=handle.executable_path,
         )
         registry.update_slice(slice_id, reviewer_job_id=reviewer_job["job_id"], candidate=candidate)
         registry.record_action(
@@ -7384,6 +7385,7 @@ def _dispatch_workflow_card(
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
+            executable_path=handle.executable_path,
         )
     except BaseException as launch_exc:
         registry.update_headless_result(str(job["job_id"]), status="failed", exit_code=1)

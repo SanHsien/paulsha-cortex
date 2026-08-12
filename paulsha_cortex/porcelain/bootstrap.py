@@ -103,7 +103,9 @@ def _git_repo_root(repo_root: Path) -> tuple[bool, str]:
     return True, (result.stdout.strip() or str(repo_root))
 
 
-def _executor_status(name: str) -> tuple[bool, str, str | None]:
+def _executor_status(
+    name: str, *, executable: str | None = None
+) -> tuple[bool, str, str | None]:
     if name == "copilot":
         argv = [
             "copilot",
@@ -118,7 +120,7 @@ def _executor_status(name: str) -> tuple[bool, str, str | None]:
         success_detail = "copilot prompt auth ok"
         login_fix = "請先執行 `copilot login`，或設定 COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN。"
     elif name == "claude":
-        argv = ["claude", "auth", "status"]
+        argv = [executable or "claude", "auth", "status"]
         success_detail = "claude auth status ok"
         failure_detail = "claude 已安裝，但尚未登入。"
         failure_fix = "請先執行 `claude auth login`。"
@@ -222,6 +224,37 @@ def _effective_executor(instance: str) -> tuple[str, str]:
     return manager_daemon.DEFAULT_EXECUTOR, "default"
 
 
+def _effective_claude_executable(instance: str) -> tuple[str, str]:
+    from paulsha_cortex.coordinator.launcher import resolve_claude_executable
+
+    managed = _read_runtime_env_strict(service_family._runtime_env_path(instance))
+    runtime = _read_runtime_env_strict(_instance_runtime_env_path(instance))
+    configured = (
+        ("installed-manager-env", managed.get("PSC_CLAUDE_EXECUTABLE", "").strip()),
+        ("installed-instance-env", runtime.get("PSC_CLAUDE_EXECUTABLE", "").strip()),
+    )
+    for source, value in configured:
+        if value:
+            resolve_claude_executable(
+                {
+                    "PSC_CLAUDE_EXECUTABLE": value,
+                    "PATH": os.environ.get("PATH", ""),
+                }
+            )
+    process_override = os.environ.get("PSC_CLAUDE_EXECUTABLE", "").strip()
+    if process_override:
+        return resolve_claude_executable(os.environ), "process-env"
+    for source, value in configured:
+        if value:
+            return resolve_claude_executable(
+                {
+                    "PSC_CLAUDE_EXECUTABLE": value,
+                    "PATH": os.environ.get("PATH", ""),
+                }
+            ), source
+    return resolve_claude_executable(os.environ), "PATH"
+
+
 def _executor_preflight(*, instance: str) -> dict[str, Any]:
     try:
         effective_executor, source = _effective_executor(instance)
@@ -239,7 +272,19 @@ def _executor_preflight(*, instance: str) -> dict[str, Any]:
             f"bootstrap 目前會使用不支援的 executor：{effective_executor}",
             fix="請執行 `export PSC_MANAGER_EXECUTOR=claude`（或 `codex` / `copilot`）後再重跑 `cortex bootstrap`。",
         )
-    if shutil.which(effective_executor) is None:
+    executable = None
+    executable_source = "PATH"
+    if effective_executor == "claude":
+        try:
+            executable, executable_source = _effective_claude_executable(instance)
+        except ValueError as exc:
+            return _preflight_check(
+                "executor",
+                False,
+                f"Claude executable 設定無效：{exc}",
+                fix="請將 PSC_CLAUDE_EXECUTABLE 設為 Claude-compatible CLI 的絕對、非 symlink 可執行檔路徑。",
+            )
+    elif shutil.which(effective_executor) is None:
         fix = f"請安裝並登入 `{effective_executor}`。"
         if source == "default":
             fix += " 或先執行 `export PSC_MANAGER_EXECUTOR=claude`（或 `codex`）後再重跑 `cortex bootstrap`。"
@@ -251,11 +296,11 @@ def _executor_preflight(*, instance: str) -> dict[str, Any]:
             f"bootstrap 目前會使用 {effective_executor}（來源：{source}），但 PATH 找不到該 CLI。",
             fix=fix,
         )
-    ok, detail, fix = _executor_status(effective_executor)
+    ok, detail, fix = _executor_status(effective_executor, executable=executable)
     return _preflight_check(
         "executor",
         ok,
-        f"{effective_executor} ({source}): {detail}",
+        f"{effective_executor} ({source}; executable {executable_source}: {executable or effective_executor}): {detail}",
         fix=fix,
     )
 

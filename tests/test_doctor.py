@@ -12,6 +12,7 @@ import pytest
 
 from paulsha_cortex import cli
 from paulsha_cortex.doctor import (
+    _claude_executable_probe,
     DoctorReport,
     ProbeResult,
     _identity_probe,
@@ -304,7 +305,9 @@ def test_review_sandbox_probe_requires_dependencies_only_for_claude_reviewer(
     )
     monkeypatch.setattr(
         "paulsha_cortex.doctor.shutil.which",
-        lambda name, path=None: "/usr/bin/bwrap" if name == "bwrap" else None,
+        lambda name, path=None: (
+            f"/usr/bin/{name}" if name in {"claude", "bwrap"} else None
+        ),
     )
     result = _review_sandbox_probe(
         {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/usr/bin"}, tmp_path
@@ -319,6 +322,45 @@ def test_review_sandbox_probe_requires_dependencies_only_for_claude_reviewer(
     )
     assert optional.status == "warn"
     assert optional.required is False
+
+
+def test_claude_executable_probe_reports_custom_launcher_without_review_identity(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    result = _claude_executable_probe(
+        {
+            "PSC_MANAGER_EXECUTOR": "claude",
+            "PSC_CLAUDE_EXECUTABLE": str(executable),
+            "PATH": "",
+        }
+    )
+
+    assert result.status == "pass"
+    assert result.required is True
+    assert str(executable.resolve()) in result.detail
+
+
+def test_claude_executable_probe_fails_closed_for_invalid_override(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: "/tools/claude",
+    )
+
+    result = _claude_executable_probe(
+        {
+            "PSC_MANAGER_EXECUTOR": "claude",
+            "PSC_CLAUDE_EXECUTABLE": "claude-alias",
+            "PATH": "/tools",
+        }
+    )
+
+    assert result.status == "fail"
+    assert result.required is True
+    assert "absolute path" in result.detail
 
 
 def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
@@ -376,6 +418,7 @@ def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
     )
 
     assert result.status == "pass"
+    assert "executable: /tools/claude" in result.detail
     assert ["/tools/bwrap", "--version"] in calls
     assert ["/tools/socat", "-V"] in calls
     assert ["/tools/srt", "--version"] in calls
@@ -388,6 +431,39 @@ def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
         str(Path(value).resolve())
         for value in ("/run/user", "/run/docker.sock", "/var/run/docker.sock")
     }.issubset(set(configured_sandbox["filesystem"]["denyRead"]))
+
+
+def test_review_sandbox_probe_rejects_invalid_explicit_claude_without_path_fallback(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 2\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: custom-reviewer\n"
+        "    independence_domain: custom\n"
+        "    capabilities: [review]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: f"/tools/{name}",
+    )
+
+    result = _review_sandbox_probe(
+        {
+            "PSC_PROJECT_CONFIG_ROOT": str(config),
+            "PSC_CLAUDE_EXECUTABLE": "claude-alias",
+            "PATH": "/tools",
+        },
+        tmp_path,
+    )
+
+    assert result.status == "fail"
+    assert result.required is True
+    assert "absolute path" in result.detail
 
 
 def test_review_sandbox_probe_rejects_unsupported_claude_version(

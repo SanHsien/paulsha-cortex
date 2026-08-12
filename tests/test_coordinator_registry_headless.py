@@ -869,6 +869,32 @@ class UsageTrackingTests(unittest.TestCase):
             self.assertIsNotNone(updated["exited_at"])
             self.assertGreaterEqual(updated["exited_at"], updated["started_at"])
 
+    def test_launch_handle_persists_resolved_executable_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            reg = JobRegistry(state_path=state)
+            created = reg.create_job(
+                task="slice-a",
+                persona="builder",
+                branch="feature/slice-a",
+                pane="",
+                worktree="/wt/slice-a",
+            )
+
+            attached = reg.attach_launch_handle(
+                created["job_id"],
+                executor="claude",
+                model_id="gemma4-26b-a4b-nvfp4",
+                session_name="slice-a",
+                pid=475,
+                log_path="/logs/slice-a.jsonl",
+                executable_path="/opt/claude-gemma4",
+            )
+
+            self.assertEqual(attached["executable_path"], "/opt/claude-gemma4")
+            reloaded = JobRegistry(state_path=state).get_job(created["job_id"])
+            self.assertEqual(reloaded["executable_path"], "/opt/claude-gemma4")
+
 
 if __name__ == "__main__":
     unittest.main()

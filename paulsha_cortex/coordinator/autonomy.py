@@ -815,20 +815,28 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
     """Fill in the launch handle on the pre-launch job row."""
     registry = getattr(dispatcher, "_registry", None)
     if registry is None or "job_id" not in job:
-        return {
+        attached = {
             **job,
             "executor": handle.executor,
             "session_name": handle.session_name,
             "pid": handle.pid,
             "log_path": handle.log_path,
         }
+        if handle.executable_path is not None:
+            attached["executable_path"] = handle.executable_path
+        return attached
+    launch_kwargs = {
+        "executor": handle.executor,
+        "model_id": handle.model_id,
+        "session_name": handle.session_name,
+        "pid": handle.pid,
+        "log_path": handle.log_path,
+    }
+    if handle.executable_path is not None:
+        launch_kwargs["executable_path"] = handle.executable_path
     return registry.attach_launch_handle(
         job["job_id"],
-        executor=handle.executor,
-        model_id=handle.model_id,
-        session_name=handle.session_name,
-        pid=handle.pid,
-        log_path=handle.log_path,
+        **launch_kwargs,
     )
 
 

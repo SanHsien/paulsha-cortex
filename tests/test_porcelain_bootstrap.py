@@ -454,6 +454,53 @@ def test_bootstrap_preflight_uses_installed_instance_executor_config(
     assert "service install" in captured.out
 
 
+def test_bootstrap_resolves_installed_claude_executable_and_uses_it_for_auth(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from paulsha_cortex.porcelain import bootstrap
+
+    custom = bootstrap_runtime["outside_root"] / "claude-compatible"
+    custom.write_text("#!/bin/sh\n", encoding="utf-8")
+    custom.chmod(0o755)
+    runtime_dir = bootstrap_runtime["home"] / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "beta-manager.env").write_text(
+        f"PSC_MANAGER_EXECUTOR=claude\nPSC_CLAUDE_EXECUTABLE={custom}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("PSC_CLAUDE_EXECUTABLE", raising=False)
+    monkeypatch.delenv("PSC_MANAGER_EXECUTOR", raising=False)
+    seen = {}
+
+    def status(name, *, executable=None):
+        seen.update(name=name, executable=executable)
+        return True, "compatible auth ok", None
+
+    monkeypatch.setattr(bootstrap, "_executor_status", status)
+
+    result = bootstrap._executor_preflight(instance="beta")
+
+    assert result["ok"] is True
+    assert seen == {"name": "claude", "executable": str(custom.resolve())}
+    assert str(custom.resolve()) in result["detail"]
+
+
+def test_bootstrap_rejects_invalid_claude_override_without_path_fallback(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from paulsha_cortex.porcelain import bootstrap
+
+    monkeypatch.setenv("PSC_MANAGER_EXECUTOR", "claude")
+    monkeypatch.setenv("PSC_CLAUDE_EXECUTABLE", "claude-alias")
+
+    result = bootstrap._executor_preflight(instance="beta")
+
+    assert result["ok"] is False
+    assert "absolute path" in result["detail"]
+
+
 def test_service_install_rejects_unsupported_executor_override(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -504,7 +504,7 @@ class JobRegistry:
         if "kind" in job and job.get("kind") not in {None, "build", "review"}:
             raise ValueError(f"coordinator 狀態檔 job kind 非法（fail-closed）: {self._state_path}")
         for field in (
-            "executor", "session_name", "log_path", "model_id", "independence_domain",
+            "executor", "session_name", "log_path", "executable_path", "model_id", "independence_domain",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
@@ -985,6 +985,7 @@ class JobRegistry:
         session_name: str | None = None,
         pid: int | None = None,
         log_path: str | None = None,
+        executable_path: str | None = None,
     ) -> dict[str, Any]:
         job = self._find_job(job_id)
         if job["status"] not in ACTIVE_JOB_STATUSES:
@@ -995,6 +996,8 @@ class JobRegistry:
         job["session_name"] = session_name
         job["pid"] = pid
         job["log_path"] = log_path
+        if executable_path is not None:
+            job["executable_path"] = executable_path
         job["started_at"] = _now_iso()
         self._persist()
         return _deepcopy_json(job)

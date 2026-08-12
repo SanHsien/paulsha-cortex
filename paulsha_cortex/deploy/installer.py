@@ -284,6 +284,22 @@ def install_service_result(
     instance_executor = instance_env.get("PSC_MANAGER_EXECUTOR", "").strip()
     if instance_executor and instance_executor not in _SUPPORTED_EXECUTORS:
         raise ValueError("既有 instance PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
+    from paulsha_cortex.coordinator.launcher import resolve_claude_executable
+
+    for source_name, configured_path in (
+        ("既有 manager env", existing.get("PSC_CLAUDE_EXECUTABLE", "").strip()),
+        ("既有 instance env", instance_env.get("PSC_CLAUDE_EXECUTABLE", "").strip()),
+    ):
+        if configured_path:
+            try:
+                resolve_claude_executable(
+                    {
+                        "PSC_CLAUDE_EXECUTABLE": configured_path,
+                        "PATH": os.environ.get("PATH", ""),
+                    }
+                )
+            except ValueError as exc:
+                raise ValueError(f"{source_name} PSC_CLAUDE_EXECUTABLE 無效：{exc}") from exc
     agents_root = _resolve_agents_root(existing.get("PSC_AGENTS_ROOT"))
     if agents_root is None:
         agents_root = _resolve_agents_root(os.environ.get("PSC_AGENTS_ROOT", ""))
@@ -329,6 +345,9 @@ def install_service_result(
         if executor_override not in _SUPPORTED_EXECUTORS:
             raise ValueError("PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
         managed_env["PSC_MANAGER_EXECUTOR"] = executor_override
+    claude_executable_override = os.environ.get("PSC_CLAUDE_EXECUTABLE", "").strip()
+    if claude_executable_override:
+        managed_env["PSC_CLAUDE_EXECUTABLE"] = resolve_claude_executable(os.environ)
     _write_managed_env(
         env_file,
         managed_env,

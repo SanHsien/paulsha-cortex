@@ -112,6 +112,20 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS=86400
    ```
 
+   若 `claude` executor 要綁定 Claude Code-compatible 的自訂 launcher，請使用
+   instance/process env 的絕對路徑；interactive shell alias 不會也不應被展開：
+
+   ```dotenv
+   PSC_MANAGER_EXECUTOR=claude
+   PSC_CLAUDE_EXECUTABLE=/home/operator/.local/bin/claude-gemma4
+   ```
+
+   `PSC_CLAUDE_EXECUTABLE` 只接受絕對、regular、非 symlink 的可執行檔；明確
+   設定無效時會直接停止，不會 fallback 到 PATH 上的標準 `claude`。`cortex
+   bootstrap`／`doctor` 會顯示 resolved executable，啟動後的 job record 也會保存
+   `executable_path` provenance。重跑 `cortex install service` 可將 process env 的
+   設定寫入該 instance 的 manager env。
+
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
    ```bash

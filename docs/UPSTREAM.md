@@ -16,8 +16,8 @@
 | merge 前 origin main | `b4fe5c7bee7c1651daaf6f07fe4de734b6b66320` |
 | 首輪 review 範圍 | watermark 後 104 commits、41 merged PR、0 open PR、1 open issue |
 | 前輪增量 | `ea76673..cf791a2`：17 commits、7 merged PR、0 open PR、1 open issue |
-| 本輪增量 | `cf791a2..dc8a968`：11 commits、5 merged PR、0 open PR；後續新增 2 open issues |
-| 本輪決策 | 採用 `#467`、`#468`、`#470`–`#472` 與 upstream v0.1.8；保留 fork Windows adapters，並在 fork 處理 open Issues `#473`／`#474` |
+| 本輪增量 | `cf791a2..dc8a968`：11 commits、5 merged PR、0 open PR；後續新增 3 open issues |
+| 本輪決策 | 採用 `#467`、`#468`、`#470`–`#472` 與 upstream v0.1.8；保留 fork Windows adapters，並在 fork 處理 open Issues `#473`／`#474`／`#475` |
 
 ## 2026-08-12 v0.1.8 PR review ledger
 
@@ -149,6 +149,26 @@ Deck compile 現在接受顯式 `--repo owner/repo`，並把該 work item 已確
   不從 cwd 或 Git remote 推斷 project authority。
 
 後續只比較 upstream 是否落地等價或更嚴格的介面／驗收，不重做上述方案。
+
+### `hamanpaul/paulsha-cortex#475`，fork 已處理，upstream open
+
+採用 issue 揭露的模型身分誤綁風險，並選擇 instance-scoped operator authority，
+不在 repo-controlled `model-identities.yaml` 增加任意 executable 欄位：
+
+- `PSC_CLAUDE_EXECUTABLE=/absolute/path/compatible-launcher` 可綁定 Claude
+  Code-compatible launcher。只接受絕對、regular、非 symlink 的可執行檔；明確
+  override 無效時 fail-closed，絕不 fallback 到 PATH 上的標準 `claude`。
+- typed-argv launcher 不展開 interactive alias。未設定 override 時才解析 PATH 上的
+  `claude`，並在啟動前把 argv[0] 固定為 resolved path。
+- `cortex bootstrap` 與 doctor `review-sandbox` 回報 resolved executable；每個實際
+  啟動的 Claude job 將同一路徑保存為 `executable_path`，使 `model_id` 與 provider
+  launcher 可共同稽核。
+- `cortex install service` 會驗證既有 instance／manager env，並可把目前 process env
+  的合法 override 寫入該 instance；無效既有值不會在重裝時被掩蓋。
+
+後續只比較 upstream 是否落地等價或更嚴格的 operator authority、fail-closed 驗證
+與 provenance；不要改回 alias expansion，也不要把 repo model overlay 變成任意
+程式執行入口。
 
 ## 同步規則
 

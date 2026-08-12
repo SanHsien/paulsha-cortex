@@ -18,6 +18,7 @@ from paulsha_cortex.coordinator.launcher import (
     build_claude_argv,
     build_codex_argv,
     build_cg_argv,
+    resolve_claude_executable,
 )
 from paulsha_cortex.lib.processes import pid_exists
 
@@ -170,6 +171,71 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("slice-a", argv)
         self.assertIn("--permission-mode", argv)
         self.assertIn("acceptEdits", argv)
+
+    def test_explicit_claude_executable_is_absolute_regular_and_never_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            executable = Path(d) / "claude-compatible"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            which = mock.Mock(return_value="/fallback/claude")
+
+            resolved = resolve_claude_executable(
+                {"PSC_CLAUDE_EXECUTABLE": str(executable), "PATH": "/fallback"},
+                which=which,
+            )
+
+            self.assertEqual(resolved, str(executable.resolve()))
+            which.assert_not_called()
+
+            with self.assertRaisesRegex(ValueError, "absolute path"):
+                resolve_claude_executable(
+                    {"PSC_CLAUDE_EXECUTABLE": "claude-alias", "PATH": "/fallback"},
+                    which=which,
+                )
+            which.assert_not_called()
+
+    def test_explicit_claude_executable_rejects_non_regular_path(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(ValueError, "regular non-symlink"):
+                resolve_claude_executable(
+                    {"PSC_CLAUDE_EXECUTABLE": str(Path(d).resolve()), "PATH": ""},
+                    which=mock.Mock(return_value="/fallback/claude"),
+                )
+
+    def test_claude_launch_binds_exact_executable_and_records_provenance(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 475
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                executable = Path(d) / "claude-compatible"
+                executable.write_text("#!/bin/sh\n", encoding="utf-8")
+                executable.chmod(0o755)
+                with mock.patch.dict(
+                    os.environ,
+                    {"PSC_CLAUDE_EXECUTABLE": str(executable)},
+                    clear=False,
+                ):
+                    handle = SubprocessLauncher("claude").launch(
+                        slice_id="slice-custom",
+                        prompt="PROMPT",
+                        worktree=d,
+                        log_dir=str(Path(d) / "logs"),
+                    )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        inner = calls[0]["argv"][calls[0]["argv"].index("--") + 1 :]
+        self.assertEqual(inner[0], str(executable.resolve()))
+        self.assertEqual(handle.executable_path, str(executable.resolve()))
 
     def test_claude_builder_commit_required_grants_linked_worktree_git_metadata(self) -> None:
         # #396 item 3：claude builder 完成後 sandbox 對 git add/commit 回 requires

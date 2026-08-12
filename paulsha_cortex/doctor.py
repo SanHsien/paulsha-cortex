@@ -291,6 +291,26 @@ def _review_sandbox_probe(
     return result
 
 
+def _claude_executable_probe(env: Mapping[str, str]) -> ProbeResult:
+    """Report the launcher authority even when Claude is not a reviewer."""
+
+    configured = bool(env.get("PSC_CLAUDE_EXECUTABLE", "").strip())
+    selected = env.get("PSC_MANAGER_EXECUTOR", "").strip() == "claude"
+    if not configured and not selected:
+        return ProbeResult(
+            "claude-executable", "warn", "Claude executor is not selected", False
+        )
+    from .coordinator.launcher import resolve_claude_executable
+
+    try:
+        executable = resolve_claude_executable(env, which=shutil.which)
+    except ValueError as exc:
+        return ProbeResult("claude-executable", "fail", str(exc), True)
+    return ProbeResult(
+        "claude-executable", "pass", f"resolved executable: {executable}", True
+    )
+
+
 def _review_sandbox_checks(
     env: Mapping[str, str],
     *,
@@ -298,9 +318,15 @@ def _review_sandbox_checks(
     live: bool,
 ) -> ProbeResult:
     search_path = env.get("PATH")
+    from .coordinator.launcher import resolve_claude_executable
+
+    try:
+        claude = resolve_claude_executable(env, which=shutil.which)
+    except ValueError as exc:
+        return ProbeResult("review-sandbox", "fail", str(exc), True)
     executables = {
         name: shutil.which(name, path=search_path)
-        for name in ("claude", "bwrap", "socat", "srt", "python3")
+        for name in ("bwrap", "socat", "srt", "python3")
     }
     missing = [name for name, path in executables.items() if path is None]
     if missing:
@@ -310,7 +336,6 @@ def _review_sandbox_checks(
             f"missing required executable(s): {','.join(missing)}",
             True,
         )
-    claude = str(executables["claude"])
     bwrap = str(executables["bwrap"])
     socat = str(executables["socat"])
     srt = str(executables["srt"])
@@ -410,7 +435,10 @@ def _review_sandbox_checks(
                 "review-sandbox", "fail", "configured reviewer sandbox smoke failed", True
             )
     return ProbeResult(
-        "review-sandbox", "pass", "Claude native Bash sandbox runtime ready", True
+        "review-sandbox",
+        "pass",
+        f"Claude native Bash sandbox runtime ready (executable: {claude})",
+        True,
     )
 
 
@@ -858,6 +886,7 @@ def run_doctor(
     probes: list[ProbeResult] = [
         _preflight_probe(effective),
         _identity_probe(effective, agents_root),
+        _claude_executable_probe(effective),
         _review_sandbox_probe(
             effective,
             agents_root,
