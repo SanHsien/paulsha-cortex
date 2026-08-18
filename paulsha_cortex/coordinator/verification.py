@@ -160,6 +160,33 @@ def normalize_required_artifacts(value: object, *, repo_root: Path) -> list[dict
     return artifacts
 
 
+def match_allowed_path(path: str, pattern: str) -> bool:
+    # `*`/`?`/字元集只在單一路徑層級內比對，`**` 才跨層級；fnmatch 會讓 `*` 穿越
+    # `/`，使 slice scope 比 spec 宣告的 bounded glob 更寬（#490）。
+    path_parts = path.replace("\\", "/").split("/")
+    pattern_parts = pattern.split("/")
+
+    def _match(p_idx: int, s_idx: int) -> bool:
+        while p_idx < len(pattern_parts):
+            part = pattern_parts[p_idx]
+            if part == "**":
+                if p_idx + 1 == len(pattern_parts):
+                    return True
+                return any(
+                    _match(p_idx + 1, tail)
+                    for tail in range(s_idx, len(path_parts) + 1)
+                )
+            if s_idx >= len(path_parts):
+                return False
+            if not fnmatch.fnmatchcase(path_parts[s_idx], part):
+                return False
+            p_idx += 1
+            s_idx += 1
+        return s_idx == len(path_parts)
+
+    return _match(0, 0)
+
+
 def normalize_allowed_paths(value: object) -> list[str]:
     if not isinstance(value, list) or not value:
         raise ContractValidationError(
@@ -903,7 +930,7 @@ def run_result_verification(
                 "reason": f"path {path} is outside slice allowed_paths",
             }
             for path in changed_paths
-            if not any(fnmatch.fnmatchcase(path, pattern) for pattern in allowed_paths)
+            if not any(match_allowed_path(path, pattern) for pattern in allowed_paths)
         ]
     violations = [*verdict["violations"], *slice_violations]
     details["scope"] = {

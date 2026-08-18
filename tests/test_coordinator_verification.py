@@ -39,6 +39,32 @@ class VerificationContractFrontmatterTests(unittest.TestCase):
 
             self.assertEqual(meta["verification"]["allowed_paths"], ["src/a.py", "tests/**"])
 
+    def test_single_star_does_not_cross_directory_separator(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        self.assertTrue(verification.match_allowed_path("src/a.py", "src/*.py"))
+        self.assertFalse(verification.match_allowed_path("src/nested/a.py", "src/*.py"))
+        self.assertFalse(verification.match_allowed_path("src/a/b/deep.py", "src/*.py"))
+
+    def test_double_star_crosses_directory_separator(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        for path in ("tests/a.py", "tests/nested/a.py", "tests/x/y/z.py"):
+            with self.subTest(path=path):
+                self.assertTrue(verification.match_allowed_path(path, "tests/**"))
+
+        self.assertTrue(verification.match_allowed_path("src/a/b.py", "src/**/b.py"))
+        self.assertTrue(verification.match_allowed_path("src/b.py", "src/**/b.py"))
+        self.assertFalse(verification.match_allowed_path("other/b.py", "src/**/b.py"))
+
+    def test_exact_and_boundary_matches(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        self.assertTrue(verification.match_allowed_path("src/a.py", "src/a.py"))
+        self.assertFalse(verification.match_allowed_path("src/a.py", "src"))
+        self.assertFalse(verification.match_allowed_path("src", "src/a.py"))
+        self.assertFalse(verification.match_allowed_path("srcx/a.py", "src/*.py"))
+
     def test_parser_rejects_unbounded_or_escaping_slice_paths(self) -> None:
         from paulsha_cortex.coordinator import verification
 

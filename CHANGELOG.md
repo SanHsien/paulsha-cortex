@@ -28,6 +28,7 @@
 - 同步 upstream `#451` 的 v0.1.6 release metadata 與 tag 水位；下次 review watermark 推進到 `ea76673`。
 
 ### Fixed
+- `verification.allowed_paths` 比對改用 path-aware glob：`*`、`?` 與字元集只在單一路徑層級內比對，`**` 才跨層級。先前直接用 `fnmatch` 會讓 `src/*.py` 意外涵蓋 `src/nested/a.py`，使 slice scope 比 spec 宣告的 bounded glob 更寬而靜默放行越界改動。
 - Claude executor 可用 `PSC_CLAUDE_EXECUTABLE` fail-closed 綁定絕對、regular、非 symlink 的 compatible launcher；bootstrap／doctor 與 dispatch auth gate 共用 resolved path，auth TTL cache 依路徑隔離，job record 保存 `executable_path`，無效 override 不再靜默 fallback 到 PATH 上的其他 `claude`。
 - Repo authority input 現在會正規化整體前後空白並拒絕 owner/repo 段內空白，避免 deck spec、job 與 manifest 寫入無法穩定比對的歸屬值。
 - Profile evidence 的耐久 run 目錄改以原子 `mkdir` 取得名稱，避免兩個同秒執行的 profile command 在 `exists()`／`mkdir()` 間撞名失敗。
