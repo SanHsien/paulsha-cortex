@@ -13,6 +13,68 @@ def _write_spec(dirpath: Path, name: str, frontmatter: str, body: str = "body") 
 
 
 class VerificationContractFrontmatterTests(unittest.TestCase):
+    def test_parser_accepts_bounded_slice_allowed_paths(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "bounded.md",
+                    "dispatch: hold\n"
+                    "slice_id: bounded\n"
+                    "verification:\n"
+                    "  docs_class: code\n"
+                    "  allowed_paths: [src/a.py, tests/**]\n"
+                    "  required_artifacts: []\n"
+                    "  checks: []\n"
+                    "  tests: []\n"
+                    "  full_suite:\n"
+                    "    argv: [python3, -m, pytest, -q]\n"
+                    "    cwd: .\n"
+                    "    timeout_seconds: 30\n"
+                    "    baseline: no-regression",
+                )
+            )
+
+            self.assertEqual(meta["verification"]["allowed_paths"], ["src/a.py", "tests/**"])
+
+    def test_single_star_does_not_cross_directory_separator(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        self.assertTrue(verification.match_allowed_path("src/a.py", "src/*.py"))
+        self.assertFalse(verification.match_allowed_path("src/nested/a.py", "src/*.py"))
+        self.assertFalse(verification.match_allowed_path("src/a/b/deep.py", "src/*.py"))
+
+    def test_double_star_crosses_directory_separator(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        for path in ("tests/a.py", "tests/nested/a.py", "tests/x/y/z.py"):
+            with self.subTest(path=path):
+                self.assertTrue(verification.match_allowed_path(path, "tests/**"))
+
+        self.assertTrue(verification.match_allowed_path("src/a/b.py", "src/**/b.py"))
+        self.assertTrue(verification.match_allowed_path("src/b.py", "src/**/b.py"))
+        self.assertFalse(verification.match_allowed_path("other/b.py", "src/**/b.py"))
+
+    def test_exact_and_boundary_matches(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        self.assertTrue(verification.match_allowed_path("src/a.py", "src/a.py"))
+        self.assertFalse(verification.match_allowed_path("src/a.py", "src"))
+        self.assertFalse(verification.match_allowed_path("src", "src/a.py"))
+        self.assertFalse(verification.match_allowed_path("srcx/a.py", "src/*.py"))
+
+    def test_parser_rejects_unbounded_or_escaping_slice_paths(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        with tempfile.TemporaryDirectory() as d:
+            for value in (["**"], ["../outside.py"], []):
+                with self.subTest(value=value), self.assertRaises(
+                    verification.ContractValidationError
+                ):
+                    verification.normalize_allowed_paths(value)
+
     def test_parser_rejects_non_string_target_branch_even_for_hold_specs(self) -> None:
         from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
 

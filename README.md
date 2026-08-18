@@ -153,7 +153,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
      --review-model "<reviewer-model-id>"
    ```
 
-5. Project Monitor 是選配功能。啟動前先建立 `$HOME/.agents/config/paulsha/project-cortex.yaml`；workspace path 應指向「包含各 repo 的父目錄」：
+5. Project Monitor 是選配功能。`cortex service install --repo-root ...` 會在 instance-local config root 缺檔時建立只監看該 repo 的最小 `project-cortex.yaml`，既有檔案則在 enable service 前驗證並於無效時 fail-fast。若要監看多個 repo，可再把 workspace path 改成包含各 repo 的父目錄：
 
    ```yaml
    workspaces:
@@ -240,6 +240,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    ```
 
    Windows status 會回報 `mode=windows-startup`、manager/monitor PID 與 log path；stop/restart 只會終止 command line 能驗證為同 instance/component 的 PID。Linux status 讀 systemd units，fallback 才讀前景 manager lock。Windows 若要持續追蹤 log，可使用 PowerShell `Get-Content <log> -Wait`。
+   `cortex service install` 也會建立或驗證 `$PSC_PROJECT_CONFIG_ROOT/project-cortex.yaml`；既有設定若為 symlink、格式錯誤或沒有合法 workspace，會在 enable/start 之前停止，不會留下必然 restart-loop 的 monitor unit。
    `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 落檔位置、重試 command（`systemctl --user ...`），並明確指出「unit 已寫入但僅 reload/enable 尚未完成」，不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
 
 10. 用 `run` 家族提交高階 mutation；不加 `--wait` 時會回傳 request ID 並以 exit 3 表示 accepted-pending：
@@ -400,7 +401,7 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 
 - `ready`：已滿足派工條件。
 - `held`：尚未可派工，並列出 `no-plan`、`dispatch-hold` 或未滿足的 dependency。
-- `in_flight`：正在執行的 Job。
+- `in_flight`：正在執行的 Job。正常工作維持既有三欄；超過無 log 進展（預設 900 秒）、總執行時間（預設 14400 秒），或最近 64 KiB log 累積至少 3 次 `InputValidationError: JSON parse failed` 時，另標 `progress_state=stale-in-flight` 與原因，並在 `attention` 提示。門檻可用 `PSC_HEADLESS_STALE_AFTER_SECONDS`、`PSC_HEADLESS_MAX_RUNTIME_SECONDS`、`PSC_HEADLESS_REPEATED_TOOL_ERROR_THRESHOLD` 覆寫；此訊號只讀、不會自動終止 process。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
 - `attention`：全部 `needs_human` 項目，包含 reason 與當下合法的 `next_actions`。
 - `recent_done`：最近完成或進入 terminal gate 的 slice 摘要，含 `slice_id`、`gate_status`、`at`、`gate_reason`、`job_id`、`branch`、明確的 `repo` project 歸屬（manifest 缺該欄時為 `null`）。`attention`／`slices` 也只接受明確的 slice 或 workflow job repo；不從 branch、worktree 或 path 猜測 project。只回溯 `--recent-done-window-seconds`（預設 86400 秒／24 小時，可用 `PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS` 覆寫）內完成的 handoff manifest；window 內沒有資料時回空陣列，不會回退撈更舊的紀錄，過期 manifest 檔案本身的清理屬於 #178 program teardown GC 的範圍，不在 `recent_done` provider 職責內。
@@ -615,6 +616,7 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
 
 - `slice-action` 一律透過 control request queue，由 daemon/manager 單一 writer 消費。
 - status snapshot 會一次列出所有 `needs_human` 事項（`attention`），包含 reason、evidence refs、ancestry 摘要與 `next_actions`，不需逐筆互動追問。
+- Slice spec 可在 `verification.allowed_paths` 宣告 bounded repo-relative glob；Candidate changed paths 必須同時通過 persona `write_paths` 與此 slice 範圍。未宣告的舊 spec 仍可執行，但 evidence 的 `scope.status` 為 `persona-only`，不宣稱已驗證 task-level path boundary。
 
 ### Broker cleanup（best-effort）
 
@@ -712,8 +714,8 @@ export PSC_DIGEST_DELIVERY_CMD='/path/to/relay-script --channel ops'
 
 | 面向 | 現況 |
 | --- | --- |
-| persona enforcement | standalone PR workflow（`persona-scope.yml`）由 `personas.yaml` 的 `enforcement` 驅動，現為 `enforce`（#135；切換前以 `python -m paulsha_cortex.persona.replay` 回放近期已合併 PR 驗證零誤殺，見 `docs/persona-scope-enforcement.md`）；coordinator verification 的 `persona-scope` 為 fail-closed gate |
-| manager service install | `cortex install service` 會 render / copy / enable，但不會 start；systemd 不可用時只落檔 |
+| persona enforcement | standalone PR workflow（`persona-scope.yml`）由 `personas.yaml` 的 `enforcement` 驅動，現為 `enforce`（#135；切換前以 `python -m paulsha_cortex.persona.replay` 回放近期已合併 PR 驗證零誤殺，見 `docs/persona-scope-enforcement.md`）；coordinator verification 的 persona layer 為 fail-closed，另可用 `verification.allowed_paths` 加上 per-slice changed-path 邊界；未宣告時 scope 證據標為 `persona-only` |
+| manager service install | `cortex install service` 會建立／驗證 instance-local `project-cortex.yaml`，再 render / copy / enable，但不會 start；systemd 不可用時只落檔 |
 | coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` / `work` 走 control queue；舊低階 `dispatch` 已停用 |
 | deck 驗證 | compile 只產生 `dispatch: hold` 骨架；verify 只檢查 `produces` glob 存在性，不驗內容 |
 | monitor registry | `project-cortex.yaml` ⊍ `project-hippo.yaml`，realpath 去重且 manual 優先 |

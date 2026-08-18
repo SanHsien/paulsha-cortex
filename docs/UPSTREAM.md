@@ -16,8 +16,31 @@
 | merge 前 origin main | `b4fe5c7bee7c1651daaf6f07fe4de734b6b66320` |
 | 首輪 review 範圍 | watermark 後 104 commits、41 merged PR、0 open PR、1 open issue |
 | 前輪增量 | `ea76673..cf791a2`：17 commits、7 merged PR、0 open PR、1 open issue |
-| 本輪增量 | `cf791a2..dc8a968`：11 commits、5 merged PR、0 open PR；後續新增 3 open issues |
-| 本輪決策 | 採用 `#467`、`#468`、`#470`–`#472` 與 upstream v0.1.8；保留 fork Windows adapters，並在 fork 處理 open Issues `#473`／`#474`／`#475` |
+| 本輪增量 | `cf791a2..dc8a968`：11 commits、5 merged PR；最新複核為 watermark 後 0 commit、0 open PR、17 open issues |
+| 本輪決策 | 採用 `#467`、`#468`、`#470`–`#472` 與 upstream v0.1.8；保留 fork Windows adapters，並在 fork 處理 open Issues `#473`–`#489` |
+
+## 2026-08-12 Issues 476–489 review ledger
+
+檢查時 upstream main 仍為 `dc8a968742ce587fba0ec013232a8a9ff1597596`，沒有新 commit 或 open PR。下列新 issue 均有可重現的 production seam，且修正能維持或加強 fail-closed，因此全數採用；upstream issue 本身仍為 open，不以 fork 完成誤報 upstream closure。
+
+| Issue | 決策與 fork 處置 |
+| --- | --- |
+| [476](https://github.com/hamanpaul/paulsha-cortex/issues/476) | 採用。service install 在 enable 前以 no-clobber 建立最小 instance-local monitor config，或驗證既有設定；symlink／無效 workspace 直接失敗。 |
+| [477](https://github.com/hamanpaul/paulsha-cortex/issues/477) | 採用。dispatch 在 worktree 建立後組 prompt，帶入 resolved authoritative root、base checkout 禁止與 denied path 重新解析指引，不改 sandbox。 |
+| [478](https://github.com/hamanpaul/paulsha-cortex/issues/478) | 採用。recovery 使用 production Git seam 移除並重讀 worktree registry；只有未註冊普通目錄才直接清理，任何殘留都 fail-closed。 |
+| [479](https://github.com/hamanpaul/paulsha-cortex/issues/479) | 採用。`retry-build` 透傳 initial fanout 同一 identity registry／launcher factory；其他 slice actions 不額外載入 builder identity。 |
+| [480](https://github.com/hamanpaul/paulsha-cortex/issues/480) | 採用。Claude safe builder 將 persona tools 映成封閉 `--allowedTools` 規則，只放行 unittest、Edit 與指定 Git read/add/commit 子命令；不含 push/reset/clean 或任意 Bash。 |
+| [481](https://github.com/hamanpaul/paulsha-cortex/issues/481) | 採用。只有 slice 當前綁定的 builder/reviewer 可改 current state；recovery 明確清除 binding、Candidate 與 current refs，舊 terminal jobs 僅供 audit。 |
+| [482](https://github.com/hamanpaul/paulsha-cortex/issues/482) | 採用。pre-launch absent evidence path 納入 reason＋launch identity 的 canonical request hash，保留 immutable history 並維持同請求冪等。 |
+| [483](https://github.com/hamanpaul/paulsha-cortex/issues/483) | 採用。Codex 指定 model 時固定顯式 reasoning effort（預設 medium），只接受 low／medium／high／xhigh，不繼承 ambient max。 |
+| [484](https://github.com/hamanpaul/paulsha-cortex/issues/484) | 採用。所有 slice foreign review 共用 `as_review_only()`；Candidate 保持 read-only，verdict 改由受控 terminal JSON 回收，舊注入 launcher 的檔案 verdict 只作相容 fallback。 |
+| [485](https://github.com/hamanpaul/paulsha-cortex/issues/485) | 採用。Codex adapter 只容許第一個 content line 的精確 stdin banner；其餘非 JSON、非 object、missing/failed terminal event 仍拒絕。 |
+| [486](https://github.com/hamanpaul/paulsha-cortex/issues/486) | 採用。review prompt 直接從 validator 常數列出 category／severity enum，避免 example 與 closed schema 漂移。 |
+| [487](https://github.com/hamanpaul/paulsha-cortex/issues/487) | 採用。OAuth auth signal 改採 word boundary，`doc-coauthoring` 不再誤命中，真實 OAuth 訊號維持既有分類。 |
+| [488](https://github.com/hamanpaul/paulsha-cortex/issues/488) | 採用只讀可觀測性。status 以 bounded tail、無進展時間、總 runtime 與重複 validation errors 顯示 stale attention；不自動 kill、retry 或改 lifecycle。 |
+| [489](https://github.com/hamanpaul/paulsha-cortex/issues/489) | 採用。新增 optional `verification.allowed_paths`；有宣告時與 persona scope 取交集，額外路徑 fail-closed；未宣告的舊 spec evidence 改標 `persona-only`，不誤稱完整 task scope。 |
+
+本節 issue 水位已檢查到 `#489`（含各票截至表列檢查時的最新內容）。下一輪只評估 `dc8a968742ce587fba0ec013232a8a9ff1597596..upstream/main`、新 open PR，以及 `#489` 之後新建或上述 issue 更新後的增量；不要重做本表取捨。
 
 ## 2026-08-12 v0.1.8 PR review ledger
 
@@ -35,9 +58,9 @@ transport。上游 v0.1.8 annotated tag 已驗證 dereference 到本輪 watermar
 
 完整 PR 邊界為：`#467`、`#468`、`#470`、`#471`、`#472`。Issue `#473`
 在 upstream 仍 open；本 fork 本輪先補 deck compile 的顯式 `--repo owner/repo` 傳遞，
-不從目錄或 remote 推導。下次只評估
-`dc8a968742ce587fba0ec013232a8a9ff1597596..upstream/main` 與之後新建／更新的
-PR 或 Issue；不要重做本節取捨。
+不從目錄或 remote 推導。Commit watermark 仍為
+`dc8a968742ce587fba0ec013232a8a9ff1597596`；更新後的 issue 水位與下一輪邊界以
+上方「Issues 476–489 review ledger」為準。
 
 ## 2026-08-12 v0.1.7 PR review ledger
 

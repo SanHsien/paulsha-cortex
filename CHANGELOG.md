@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- 處理 upstream Issues 476–489 的 deployment、dispatch、recovery、review 與 scope reliability：service install 建立／驗證 monitor config；prompt 錨定 resolved worktree；Git worktree recovery、retry identity 與 terminal replay 收斂；Claude persona tools、Codex effort／read-only terminal verdict、JSONL 正規化與 validator enums 落地；provider auth 誤判修正；status 提供只讀 stale-progress attention；slice 可用 `verification.allowed_paths` 驗證 task-level changed-path 邊界。
 - Deck CLI 新增 `compile --policy-from <repo-relative-path>`、`compile --slug <slug>` 與 `deck list [combo]` membership 檢視；`ready` 可沿用 manager specs 預設目錄。
 - 同步 upstream v0.1.8 到 `dc8a968`，採用 workflow／slice repo 歸屬、patchmud profile drift 修正與 Stage 9 readiness regression；deck compile 新增 `--repo owner/repo`，可把 work item 的顯式 repo 宣告帶入輸出的 slice specs。
 - 同步 upstream v0.1.7 到 `cf791a2`，採用模型能力封套、patchmud profile、model roster 與 `provider:executor` ship gate 的正式上游版本。
@@ -27,6 +28,7 @@
 - 同步 upstream `#451` 的 v0.1.6 release metadata 與 tag 水位；下次 review watermark 推進到 `ea76673`。
 
 ### Fixed
+- `verification.allowed_paths` 比對改用 path-aware glob：`*`、`?` 與字元集只在單一路徑層級內比對，`**` 才跨層級。先前直接用 `fnmatch` 會讓 `src/*.py` 意外涵蓋 `src/nested/a.py`，使 slice scope 比 spec 宣告的 bounded glob 更寬而靜默放行越界改動。
 - Claude executor 可用 `PSC_CLAUDE_EXECUTABLE` fail-closed 綁定絕對、regular、非 symlink 的 compatible launcher；bootstrap／doctor 與 dispatch auth gate 共用 resolved path，auth TTL cache 依路徑隔離，job record 保存 `executable_path`，無效 override 不再靜默 fallback 到 PATH 上的其他 `claude`。
 - Repo authority input 現在會正規化整體前後空白並拒絕 owner/repo 段內空白，避免 deck spec、job 與 manifest 寫入無法穩定比對的歸屬值。
 - Profile evidence 的耐久 run 目錄改以原子 `mkdir` 取得名稱，避免兩個同秒執行的 profile command 在 `exists()`／`mkdir()` 間撞名失敗。

@@ -881,6 +881,66 @@ class CompleteTickWorkflowLaneGateTests(unittest.TestCase):
 
 
 class CompleteTickVerificationTests(unittest.TestCase):
+    def test_only_current_terminal_attempt_can_mutate_manifest_after_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            jobs = []
+            for _ in range(3):
+                job = _make_job(reg, "slice-attempts", worktree=str(root / "missing-wt"))
+                reg.update_headless_result(job["job_id"], status="failed", exit_code=1)
+                jobs.append(job)
+            reg.create_slice(
+                slice_id="slice-attempts",
+                spec_path=str(root / "spec.md"),
+                spec_hash="spec-hash",
+                plan_path=str(root / "plan.md"),
+                plan_hash="plan-hash",
+                target_branch="main",
+                builder_job_id=jobs[-1]["job_id"],
+                candidate=None,
+            )
+            reg.update_slice("slice-attempts", state="needs_human", gate_state="needs_human")
+            disp = FakeDispatcher(reg, poll_map={})
+            hdir = root / "handoff"
+
+            manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+            first_manifest = (hdir / "slice-attempts.json").read_bytes()
+            first_actions = len(reg.get_slice("slice-attempts")["actions"])
+            manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T1")
+            self.assertEqual((hdir / "slice-attempts.json").read_bytes(), first_manifest)
+            self.assertEqual(len(reg.get_slice("slice-attempts")["actions"]), first_actions)
+
+            # The default verification seam manufactures an all-zero placeholder
+            # candidate for a failed job. Model the reported pre-candidate operator
+            # case by clearing that non-authoritative placeholder first.
+            reg.update_slice(
+                "slice-attempts",
+                clear_candidate=True,
+                current_evidence_refs=[],
+            )
+            current = reg.get_slice("slice-attempts")
+            self.assertIn(
+                "recover-pre-candidate",
+                manager.allowed_slice_actions(reg, current),
+                msg=current,
+            )
+            manager.apply_slice_action(
+                disp,
+                slice_id="slice-attempts",
+                action="recover-pre-candidate",
+                actor="operator",
+                specs_dir=str(root / "specs"),
+                handoff_dir=str(hdir),
+                git_runner=lambda args: "",
+            )
+            recovered_manifest = (hdir / "slice-attempts.json").read_bytes()
+            recovered_actions = len(reg.get_slice("slice-attempts")["actions"])
+            manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T2")
+            self.assertEqual((hdir / "slice-attempts.json").read_bytes(), recovered_manifest)
+            self.assertEqual(len(reg.get_slice("slice-attempts")["actions"]), recovered_actions)
+            self.assertEqual(reg.get_slice("slice-attempts")["state"], "pending")
+
     def test_verification_runner_exception_marks_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
@@ -1073,6 +1133,13 @@ class CompleteTickVerificationTests(unittest.TestCase):
                 return _proc_ok()
 
             class _ReviewLauncher:
+                def __init__(self) -> None:
+                    self.review_terminal_kinds: list[str] = []
+
+                def as_review_only(self, *, terminal_kind):
+                    self.review_terminal_kinds.append(terminal_kind)
+                    return self
+
                 def launch(self, *, slice_id, prompt, worktree, log_dir):
                     from paulsha_cortex.coordinator.launcher import LaunchHandle
 
@@ -1084,6 +1151,7 @@ class CompleteTickVerificationTests(unittest.TestCase):
                         log_path=f"{log_dir}/{slice_id}.jsonl",
                     )
 
+            review_launcher = _ReviewLauncher()
             with mock.patch.dict("os.environ", {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}, clear=False):
                 summary = manager.complete_tick(
                     disp,
@@ -1095,7 +1163,7 @@ class CompleteTickVerificationTests(unittest.TestCase):
                     clock=lambda: "T0",
                     git_runner=_GitRunner(),
                     subprocess_runner=proc_runner,
-                    review_launcher=_ReviewLauncher(),
+                    review_launcher=review_launcher,
                     review_executor="codex",
                     review_model="gpt-5.4",
                 )
@@ -1112,6 +1180,7 @@ class CompleteTickVerificationTests(unittest.TestCase):
             reviewer_jobs = [j for j in reg.list_jobs() if j.get("kind") == "review"]
             self.assertEqual(len(reviewer_jobs), 1)
             self.assertEqual(reviewer_jobs[0]["workflow_repo"], "hamanpaul/paulsha-cortex")
+            self.assertEqual(review_launcher.review_terminal_kinds, ["workflow-review-result"])
 
     def test_review_required_slice_without_review_identity_becomes_absent(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1287,7 +1356,7 @@ class CompleteTickVerificationTests(unittest.TestCase):
                 verification_hash="old-verification",
             )
             reg.update_status(reviewer["job_id"], "exited")
-            slice_row = reg.create_slice(
+            reg.create_slice(
                 slice_id="slice-stale-review",
                 spec_path=str(root / "spec.md"),
                 spec_hash="new-spec",
@@ -1375,6 +1444,127 @@ class CompleteTickVerificationTests(unittest.TestCase):
             self.assertEqual(manifest["gate_status"], "needs_human")
             self.assertEqual(manifest["gate_verdict"]["reason"], "invalid-process-output")
             self.assertEqual(summary["completed"], [{"slice_id": "slice-review-output", "gate_status": "needs_human"}])
+
+    def test_codex_stdin_banner_with_completed_jsonl_is_valid_process_output(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "review.jsonl"
+            log.write_text(
+                "Reading additional input from stdin...\n"
+                '{"type":"thread.started"}\n'
+                '{"type":"turn.completed","usage":{}}\n',
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                manager._review_log_has_only_json_lines(log, executor="codex")
+            )
+
+    def test_read_only_codex_review_uses_terminal_json_without_candidate_write(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            candidate = "b" * 40
+            builder = _make_job(reg, "slice-review-terminal", worktree=str(root / "candidate"))
+            reg.attach_launch_handle(
+                builder["job_id"],
+                executor="copilot",
+                model_id="claude-haiku-4.5",
+                session_name="slice-review-terminal",
+                pid=1,
+                log_path="/builder-log",
+            )
+            review_worktree = root / "review"
+            review_worktree.mkdir()
+            terminal = {
+                "schema_version": 1,
+                "kind": "workflow-review-result",
+                "reason": "accepted",
+                "findings": [],
+                "reports": [{"path": "review-summary.md", "body": "No findings."}],
+            }
+            reviewer_log = root / "review.jsonl"
+            reviewer_log.write_text(
+                "Reading additional input from stdin...\n"
+                + json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": json.dumps(terminal)},
+                    }
+                )
+                + "\n"
+                + json.dumps({"type": "turn.completed", "usage": {}})
+                + "\n",
+                encoding="utf-8",
+            )
+            reviewer = reg.create_job(
+                task="slice-review-terminal",
+                persona="reviewer",
+                kind="review",
+                branch="feature/slice-review-terminal",
+                pane="",
+                worktree=str(review_worktree),
+                executor="codex",
+                model_id="gpt-5.4",
+                independence_domain="openai",
+                session_name="slice-review-terminal-2",
+                pid=2,
+                log_path=str(reviewer_log),
+                subject_head=candidate,
+                spec_hash="spec",
+                plan_hash="plan",
+                verification_hash="verification",
+            )
+            reg.update_status(reviewer["job_id"], "exited")
+            reg.create_slice(
+                slice_id="slice-review-terminal",
+                spec_path=str(root / "spec.md"),
+                spec_hash="spec",
+                plan_path=str(root / "plan.md"),
+                plan_hash="plan",
+                target_branch="main",
+                target_remote="origin",
+                verification_hash="verification",
+                verification={"docs_class": "code", "review_policy": "required"},
+                dispatch_base="a" * 40,
+                builder_job_id=builder["job_id"],
+                reviewer_job_id=reviewer["job_id"],
+                candidate=candidate,
+            )
+            reg.update_slice("slice-review-terminal", state="building", candidate=candidate)
+            slice_row = reg.update_slice(
+                "slice-review-terminal", state="reviewing", candidate=candidate
+            )
+
+            evaluation, gate_status, reason = manager._finalize_review_job(
+                registry=reg,
+                slice_row=slice_row,
+                review_job=reg.get_job(reviewer["job_id"]),
+                coordinator_root=root,
+                identity_registry={
+                    ("copilot", "claude-haiku-4.5"): {
+                        "executor": "copilot",
+                        "model_id": "claude-haiku-4.5",
+                        "independence_domain": "anthropic",
+                    }
+                },
+                git_runner=lambda args: _git_ok(candidate),
+            )
+
+            self.assertEqual(gate_status, "passed")
+            self.assertEqual(reason, "accepted")
+            self.assertEqual(evaluation["payload"]["state"], "passed")
+            self.assertFalse((review_worktree / ".psc-review-verdict.json").exists())
+
+    def test_codex_review_log_still_rejects_unknown_banner_or_missing_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "review.jsonl"
+            log.write_text("unexpected banner\n{\"type\":\"turn.completed\"}\n", encoding="utf-8")
+            self.assertFalse(manager._review_log_has_only_json_lines(log, executor="codex"))
+            log.write_text(
+                "Reading additional input from stdin...\n{\"type\":\"turn.started\"}\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(manager._review_log_has_only_json_lines(log, executor="codex"))
 
     def test_foreign_review_launch_avoids_registry_private_mutation(self) -> None:
         source = inspect.getsource(manager._launch_foreign_review)

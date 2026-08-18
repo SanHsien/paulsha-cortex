@@ -449,6 +449,11 @@ def _render_frontmatter(
     ]
     lines.append("verification:")
     lines.append(f"  docs_class: {_format_scalar(verification.get('docs_class'))}")
+    allowed_paths = verification.get("allowed_paths")
+    if isinstance(allowed_paths, list):
+        lines.append("  allowed_paths:")
+        for pattern in allowed_paths:
+            lines.append("    - " + _format_scalar(pattern))
     required_artifacts = verification.get("required_artifacts")
     if not required_artifacts:
         lines.append("  required_artifacts: []")

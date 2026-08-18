@@ -8,6 +8,7 @@ import pytest
 from paulsha_cortex.coordinator import manager, manager_daemon, verification
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
+from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 
 
@@ -200,6 +201,67 @@ def test_retry_build_dispatches_new_builder_and_clears_current_refs(tmp_path):
     assert slice_row["actions"][-1]["actor"] == "operator"
     assert slice_row["actions"][-1]["result"] == "ok"
     assert launcher.calls and launcher.calls[0]["slice_id"] == "slice-a"
+
+
+def test_retry_build_reuses_registered_explicit_identity_factory(tmp_path):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    registry = JobRegistry(state_path=tmp_path / "runtime" / "coordinator" / "jobs.json")
+    _create_slice_in_needs_human(registry, repo_root=repo_root, slice_id="slice-model")
+    spec_path = repo_root / "specs" / "slice-model.md"
+    spec_path.write_text(
+        spec_path.read_text(encoding="utf-8").replace(
+            "target_branch: main\n",
+            "target_branch: main\nexecutor: claude\nmodel_id: custom-claude\n",
+        ),
+        encoding="utf-8",
+    )
+    dispatcher = Dispatcher(
+        registry=registry,
+        pane_sender=_PaneSender(),
+        worktree_creator=_WorktreeCreator(tmp_path / "worktrees"),
+        git_runner=_git_runner,
+    )
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "custom-claude",
+                "independence_domain": "anthropic",
+            }
+        ],
+        schema_version=1,
+    )
+    launched: list[object] = []
+
+    class _IdentityLauncher(_Launcher):
+        def launch(self, *, slice_id: str, prompt: str, worktree: str, log_dir: str) -> LaunchHandle:
+            launched.append((slice_id, prompt, worktree))
+            return LaunchHandle(
+                executor="claude",
+                model_id="custom-claude",
+                session_name=f"session-{slice_id}",
+                pid=4321,
+                log_path=f"{log_dir}/{slice_id}.jsonl",
+            )
+
+    result = manager.apply_slice_action(
+        dispatcher,
+        slice_id="slice-model",
+        action="retry-build",
+        actor="operator",
+        specs_dir=str(repo_root / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=_Launcher(),
+        identity_registry=identities,
+        launcher_factory=lambda identity: _IdentityLauncher(),
+        git_runner=_git_runner,
+    )
+
+    job = registry.get_job(result["job_id"])
+    assert job["executor"] == "claude"
+    assert job["model_id"] == "custom-claude"
+    assert len(launched) == 1
 
 
 def test_retry_review_rejected_without_verified_evidence(tmp_path):

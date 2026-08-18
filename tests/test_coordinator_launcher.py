@@ -107,6 +107,34 @@ class ArgvTests(unittest.TestCase):
                 ],
             )
 
+    def test_claude_builder_maps_only_declared_persona_tools_to_narrow_grants(self) -> None:
+        argv = build_claude_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            commit_required=True,
+            allowed_tools=(
+                "python -m unittest",
+                "rg",
+                "edit",
+                "git add",
+                "git commit",
+                "git status",
+                "unknown-tool",
+            ),
+        )
+
+        grants = argv[argv.index("--allowedTools") + 1]
+        self.assertIn("Bash(python -m unittest *)", grants)
+        self.assertIn("Bash(git add *)", grants)
+        self.assertIn("Bash(git commit *)", grants)
+        self.assertIn("Bash(git status)", grants)
+        self.assertIn("Edit", grants)
+        self.assertNotIn("Bash(git *)", grants)
+        self.assertNotIn("push", grants)
+        self.assertNotIn("reset", grants)
+        self.assertNotIn("unknown-tool", grants)
+
     def test_copilot_builder_commit_required_rejects_incompatible_modes(self) -> None:
         for kwargs in (
             {"read_only": True},
@@ -371,6 +399,30 @@ class ArgvTests(unittest.TestCase):
         # 預設（allow_unsafe 未開）不得帶 --dangerously-bypass-approvals-and-sandbox（高風險）
         argv = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg")
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_codex_model_pins_compatible_reasoning_effort_over_ambient_config(self) -> None:
+        argv = build_codex_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            model="gpt-5.3-codex-spark",
+        )
+
+        self.assertIn("-c", argv)
+        self.assertEqual(
+            argv[argv.index("-c") + 1],
+            'model_reasoning_effort="medium"',
+        )
+
+    def test_codex_rejects_unsupported_explicit_reasoning_effort(self) -> None:
+        with self.assertRaisesRegex(ValueError, "reasoning effort"):
+            build_codex_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir="/lg",
+                model="gpt-5.3-codex-spark",
+                effort="max",
+            )
 
     def test_planner_read_only_argv_never_uses_edit_permissions(self) -> None:
         claude = build_claude_argv(

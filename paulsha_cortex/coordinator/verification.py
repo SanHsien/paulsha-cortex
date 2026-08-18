@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import fnmatch
 import json
 import os
 import re
@@ -159,6 +160,57 @@ def normalize_required_artifacts(value: object, *, repo_root: Path) -> list[dict
     return artifacts
 
 
+def match_allowed_path(path: str, pattern: str) -> bool:
+    # `*`/`?`/字元集只在單一路徑層級內比對，`**` 才跨層級；fnmatch 會讓 `*` 穿越
+    # `/`，使 slice scope 比 spec 宣告的 bounded glob 更寬（#490）。
+    path_parts = path.replace("\\", "/").split("/")
+    pattern_parts = pattern.split("/")
+
+    def _match(p_idx: int, s_idx: int) -> bool:
+        while p_idx < len(pattern_parts):
+            part = pattern_parts[p_idx]
+            if part == "**":
+                if p_idx + 1 == len(pattern_parts):
+                    return True
+                return any(
+                    _match(p_idx + 1, tail)
+                    for tail in range(s_idx, len(path_parts) + 1)
+                )
+            if s_idx >= len(path_parts):
+                return False
+            if not fnmatch.fnmatchcase(path_parts[s_idx], part):
+                return False
+            p_idx += 1
+            s_idx += 1
+        return s_idx == len(path_parts)
+
+    return _match(0, 0)
+
+
+def normalize_allowed_paths(value: object) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ContractValidationError(
+            "verification.allowed_paths", "allowed_paths must be a non-empty list"
+        )
+    normalized: list[str] = []
+    for index, raw in enumerate(value):
+        field = f"verification.allowed_paths[{index}]"
+        if not isinstance(raw, str) or not raw.strip():
+            raise ContractValidationError(field, "allowed path must be a non-empty string")
+        pattern = raw.strip().replace("\\", "/")
+        parts = pattern.split("/")
+        if (
+            pattern.startswith("/")
+            or pattern in {".", "**"}
+            or any(part in {"", ".", ".."} for part in parts)
+            or ":" in parts[0]
+        ):
+            raise ContractValidationError(field, "allowed path must be a bounded repo-relative glob")
+        if pattern not in normalized:
+            normalized.append(pattern)
+    return normalized
+
+
 def normalize_command_like(
     value: object,
     *,
@@ -212,7 +264,15 @@ def validate_verification_contract(
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ContractValidationError("verification", "verification must be an object")
-    allowed = {"docs_class", "review_policy", "required_artifacts", "checks", "tests", "full_suite"}
+    allowed = {
+        "docs_class",
+        "review_policy",
+        "allowed_paths",
+        "required_artifacts",
+        "checks",
+        "tests",
+        "full_suite",
+    }
     extras = set(value) - allowed
     if extras:
         extra = sorted(extras)[0]
@@ -292,7 +352,7 @@ def validate_verification_contract(
                 "verification.checks",
                 "auto dispatch requires at least one named policy command check",
             )
-    return {
+    normalized_contract = {
         "docs_class": docs_class,
         "review_policy": derived_review_policy,
         "required_artifacts": normalize_required_artifacts(value.get("required_artifacts"), repo_root=repo_root),
@@ -300,6 +360,9 @@ def validate_verification_contract(
         "tests": tests,
         "full_suite": full_suite,
     }
+    if "allowed_paths" in value:
+        normalized_contract["allowed_paths"] = normalize_allowed_paths(value["allowed_paths"])
+    return normalized_contract
 
 
 def evidence_path(
@@ -857,13 +920,41 @@ def run_result_verification(
         return _finish("needs_human", "persona-scope-error")
     changed_paths = [line for line in scope_diff["stdout"].splitlines() if line.strip()]
     verdict = gate.build_verdict(role="builder", changed_paths=changed_paths, manifest_ok=True, catalog=catalog)
+    allowed_paths = contract.get("allowed_paths")
+    slice_violations = []
+    if isinstance(allowed_paths, list):
+        slice_violations = [
+            {
+                "path": path,
+                "rule_id": "slice-scope",
+                "reason": f"path {path} is outside slice allowed_paths",
+            }
+            for path in changed_paths
+            if not any(match_allowed_path(path, pattern) for pattern in allowed_paths)
+        ]
+    violations = [*verdict["violations"], *slice_violations]
     details["scope"] = {
-        "status": "passed" if verdict["ok"] else "violated",
+        "status": (
+            "violated"
+            if violations
+            else "passed"
+            if isinstance(allowed_paths, list)
+            else "persona-only"
+        ),
+        "persona_status": "passed" if verdict["ok"] else "violated",
+        "slice_status": (
+            "passed" if isinstance(allowed_paths, list) and not slice_violations
+            else "violated" if slice_violations
+            else "not-declared"
+        ),
+        "allowed_paths": list(allowed_paths) if isinstance(allowed_paths, list) else None,
         "changed_paths": changed_paths,
-        "violations": verdict["violations"],
+        "violations": violations,
     }
     if not verdict["ok"]:
         return _finish("needs_human", "persona-scope-violation")
+    if slice_violations:
+        return _finish("needs_human", "slice-scope-violation")
 
     env = _sanitized_env()
     for check in contract["checks"]:

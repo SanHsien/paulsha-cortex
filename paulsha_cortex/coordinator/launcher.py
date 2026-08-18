@@ -43,6 +43,36 @@ _CREDENTIAL_ENV_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CODEX_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_CODEX_DEFAULT_REASONING_EFFORT = "medium"
+
+_CLAUDE_PERSONA_TOOL_RULES: Mapping[str, tuple[str, ...]] = {
+    "edit": ("Edit",),
+    "rg": ("Bash(rg *)",),
+    "python -m unittest": (
+        "Bash(python -m unittest)",
+        "Bash(python -m unittest *)",
+    ),
+    "python3 -m unittest": (
+        "Bash(python3 -m unittest)",
+        "Bash(python3 -m unittest *)",
+    ),
+    "git add": ("Bash(git add *)",),
+    "git commit": ("Bash(git commit *)",),
+    "git status": ("Bash(git status)", "Bash(git status *)"),
+    "git diff": ("Bash(git diff)", "Bash(git diff *)"),
+    "git log": ("Bash(git log)", "Bash(git log *)"),
+}
+
+
+def _claude_persona_allowed_tools(tools: Sequence[str]) -> str | None:
+    rules: list[str] = []
+    for tool in tools:
+        for rule in _CLAUDE_PERSONA_TOOL_RULES.get(str(tool).strip().lower(), ()):
+            if rule not in rules:
+                rules.append(rule)
+    return " ".join(rules) if rules else None
+
 
 def _claude_review_json_schema(kind: str) -> str:
     """Bind Claude StructuredOutput to the Manager terminal contract."""
@@ -598,6 +628,7 @@ def build_claude_argv(
     review_only: bool = False,
     review_terminal_kind: str | None = None,
     commit_required: bool = False,
+    allowed_tools: Sequence[str] = (),
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude launcher cannot bypass permissions")
@@ -657,6 +688,10 @@ def build_claude_argv(
             "--no-chrome",
             "--no-session-persistence",
         ]
+    elif not read_only and not allow_unsafe:
+        rendered_allowed_tools = _claude_persona_allowed_tools(allowed_tools)
+        if rendered_allowed_tools:
+            argv += ["--allowedTools", rendered_allowed_tools]
     if model is not None:
         argv += ["--model", model]
     if worktree is not None and not review_only:
@@ -686,6 +721,7 @@ def build_codex_argv(
     read_only: bool = False,
     review_only: bool = False,
     commit_required: bool = False,
+    effort: str | None = None,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Codex planning cannot bypass sandbox")
@@ -718,6 +754,12 @@ def build_codex_argv(
                 argv += ["--add-dir", git_write_dir]
     if model is not None:
         argv += ["--model", model]
+        effective_effort = effort or _CODEX_DEFAULT_REASONING_EFFORT
+        if effective_effort not in _CODEX_REASONING_EFFORTS:
+            raise ValueError(
+                f"Codex reasoning effort must be one of {sorted(_CODEX_REASONING_EFFORTS)}"
+            )
+        argv += ["-c", f"model_reasoning_effort={json.dumps(effective_effort)}"]
     argv.extend(["-o", str(Path(log_dir) / "last.json")])
     if worktree is not None:
         argv.extend(["-C", worktree])
@@ -865,6 +907,7 @@ class SubprocessLauncher:
         commit_required: bool = False,
         review_terminal_kind: str | None = None,
         effort: str | None = None,
+        allowed_tools: Sequence[str] = (),
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
@@ -903,11 +946,10 @@ class SubprocessLauncher:
         self._review_only = review_only
         self._commit_required = commit_required
         self._review_terminal_kind = review_terminal_kind
-        # cg-only：`--effort low|medium|high|xhigh`。其餘 executor 沒有對應概念
-        # （不同於 `model`，本 repo 目前沒有既有的「effort 來源」可直接映射），
-        # 存下不驗證——合法值集合在 `build_cg_argv` 驗證，未指定時落地預設
-        # `_CG_DEFAULT_EFFORT`；非 cg 的 executor 忽略此欄位。
+        # codex/cg 共用受限的 reasoning effort 語意；合法值由各 argv builder
+        # 驗證。未指定時兩者都固定採 medium，避免 reviewer 繼承環境中的不相容值。
         self._effort = effort
+        self._allowed_tools = tuple(str(tool) for tool in allowed_tools)
 
     @property
     def executor(self) -> str:
@@ -932,6 +974,7 @@ class SubprocessLauncher:
             review_only=False,
             commit_required=False,
             effort=self._effort,
+            allowed_tools=self._allowed_tools,
         )
 
     def as_review_only(self, *, terminal_kind: str) -> "SubprocessLauncher":
@@ -948,6 +991,7 @@ class SubprocessLauncher:
             commit_required=False,
             review_terminal_kind=terminal_kind,
             effort=self._effort,
+            allowed_tools=self._allowed_tools,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
@@ -967,6 +1011,27 @@ class SubprocessLauncher:
             review_only=False,
             commit_required=True,
             effort=self._effort,
+            allowed_tools=self._allowed_tools,
+        )
+
+    def with_persona_tools(self, tools: Sequence[str]) -> "SubprocessLauncher":
+        """Bind the structured persona allowlist without granting undeclared commands."""
+
+        normalized = tuple(str(tool).strip() for tool in tools if str(tool).strip())
+        if normalized == self._allowed_tools:
+            return self
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=self._allow_unsafe,
+            model=self._model,
+            read_only=self._read_only,
+            review_only=self._review_only,
+            commit_required=self._commit_required,
+            review_terminal_kind=self._review_terminal_kind,
+            effort=self._effort,
+            allowed_tools=normalized,
         )
 
     def _should_run_gates(self, env: Mapping[str, str]) -> bool:
@@ -1053,7 +1118,8 @@ class SubprocessLauncher:
             builder_kwargs["commit_required"] = self._commit_required
         if self._executor == "claude":
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
-        if self._executor == "cg":
+            builder_kwargs["allowed_tools"] = self._allowed_tools
+        if self._executor in {"codex", "cg"}:
             builder_kwargs["effort"] = self._effort
         inner_argv = _ARGV_BUILDERS[self._executor](
             **builder_kwargs,

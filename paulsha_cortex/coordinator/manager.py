@@ -813,8 +813,11 @@ def _completion_candidate_ref(
     return "passed", "candidate-merged", record
 
 
-def _review_log_has_only_json_lines(log_path: object) -> bool:
-    if not isinstance(log_path, str) or not log_path:
+_CODEX_STDIN_BANNER = "Reading additional input from stdin..."
+
+
+def _review_log_has_only_json_lines(log_path: object, *, executor: object = None) -> bool:
+    if not isinstance(log_path, (str, os.PathLike)) or not str(log_path):
         return True
     path = Path(log_path)
     if not path.is_file():
@@ -823,13 +826,28 @@ def _review_log_has_only_json_lines(log_path: object) -> bool:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return False
+    events: list[dict[str, object]] = []
+    content_index = 0
     for line in lines:
         if not line.strip():
             continue
+        if executor == "codex" and content_index == 0 and line.strip() == _CODEX_STDIN_BANNER:
+            content_index += 1
+            continue
         try:
-            json.loads(line)
+            parsed = json.loads(line)
         except json.JSONDecodeError:
             return False
+        if executor == "codex" and not isinstance(parsed, dict):
+            return False
+        if isinstance(parsed, dict):
+            events.append(parsed)
+        content_index += 1
+    if executor == "codex" and events:
+        event_types = {event.get("type") for event in events}
+        if "turn.failed" in event_types or "error" in event_types:
+            return False
+        return "turn.completed" in event_types
     return True
 
 
@@ -1104,8 +1122,15 @@ def _launch_foreign_review(
             reviewer_job_id=reviewer_job["job_id"],
             candidate=candidate,
             launch_identity=reviewer_identity,
+            output_mode="terminal-json",
         )
-        handle = review_launcher.launch(
+        active_review_launcher = review_launcher
+        review_only_factory = getattr(review_launcher, "as_review_only", None)
+        if callable(review_only_factory):
+            active_review_launcher = review_only_factory(
+                terminal_kind="workflow-review-result"
+            )
+        handle = active_review_launcher.launch(
             slice_id=reviewer_job["job_id"],
             prompt=prompt,
             worktree=str(review_worktree),
@@ -1226,7 +1251,9 @@ def _finalize_review_job(
         )
         _apply_review_evaluation(registry, slice_id, evaluation)
         return evaluation, "needs_human", "foreign-review-absent"
-    if not _review_log_has_only_json_lines(review_job.get("log_path")):
+    if not _review_log_has_only_json_lines(
+        review_job.get("log_path"), executor=review_job.get("executor")
+    ):
         evaluation = _write_gate_evaluation(
             slice_id=slice_id,
             state="absent",
@@ -1242,29 +1269,55 @@ def _finalize_review_job(
         _apply_review_evaluation(registry, slice_id, evaluation)
         return evaluation, "needs_human", "foreign-review-absent"
     verdict_path = foreign_review.review_verdict_path(worktree)
-    if not verdict_path.is_file():
-        evaluation = _write_gate_evaluation(
-            slice_id=slice_id,
-            state="absent",
-            reason="verdict-missing",
-            builder_job_id=builder_job["job_id"],
-            reviewer_job_id=review_job["job_id"],
-            candidate=candidate,
-            builder_identity=builder_identity,
-            reviewer_identity=reviewer_identity,
-            findings=[],
-            coordinator_root=coordinator_root,
-        )
-        _apply_review_evaluation(registry, slice_id, evaluation)
-        return evaluation, "needs_human", "foreign-review-absent"
     try:
-        verdict = foreign_review.read_review_verdict_file(
-            verdict_path,
-            builder_job_id=builder_job["job_id"],
-            reviewer_job_id=review_job["job_id"],
-            candidate=candidate,
-            launch_identity=reviewer_identity,
-        )
+        if verdict_path.is_file():
+            # Backward compatibility for injected/legacy launchers. Production
+            # reviewers use terminal JSON so their Candidate sandbox stays read-only.
+            verdict = foreign_review.read_review_verdict_file(
+                verdict_path,
+                builder_job_id=builder_job["job_id"],
+                reviewer_job_id=review_job["job_id"],
+                candidate=candidate,
+                launch_identity=reviewer_identity,
+            )
+        else:
+            terminal = _extract_terminal_json(review_job.get("log_path"))
+            if terminal.get("status") in terminal_contract.NON_PASSING_STATUSES:
+                raise ValueError("review terminal reported non-passing status")
+            allowed_keys = {"schema_version", "kind", "reason", "findings", "reports"}
+            if terminal.get("status") == "passed":
+                allowed_keys.add("status")
+            if (
+                set(terminal) != allowed_keys
+                or terminal.get("schema_version") != 1
+                or terminal.get("kind") != "workflow-review-result"
+                or not isinstance(terminal.get("reason"), str)
+                or not str(terminal["reason"]).strip()
+                or not isinstance(terminal.get("findings"), list)
+                or not isinstance(terminal.get("reports"), list)
+                or not terminal["reports"]
+                or any(
+                    not isinstance(report, dict)
+                    or set(report) != {"path", "body"}
+                    or not all(isinstance(report.get(key), str) and report[key] for key in ("path", "body"))
+                    for report in terminal["reports"]
+                )
+            ):
+                raise ValueError("review terminal schema invalid")
+            verdict = foreign_review.validate_review_verdict(
+                {
+                    "schema_version": foreign_review.REVIEW_SCHEMA_VERSION,
+                    "builder_job_id": builder_job["job_id"],
+                    "reviewer_job_id": review_job["job_id"],
+                    "candidate": candidate,
+                    "launch_identity": reviewer_identity,
+                    "findings": terminal["findings"],
+                },
+                builder_job_id=builder_job["job_id"],
+                reviewer_job_id=review_job["job_id"],
+                candidate=candidate,
+                launch_identity=reviewer_identity,
+            )
     except Exception:
         evaluation = _write_gate_evaluation(
             slice_id=slice_id,
@@ -1307,6 +1360,8 @@ def apply_slice_action(
     specs_dir: str,
     handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
     launcher=None,
+    identity_registry=None,
+    launcher_factory=None,
     review_launcher=None,
     persona: str = "builder",
     review_executor: str | None = None,
@@ -1333,7 +1388,7 @@ def apply_slice_action(
         raise ValueError(f"action-not-allowed:{action}")
 
     requested_at = clock()
-    runner = git_runner or getattr(dispatcher, "_git_runner", None)
+    runner = git_runner or getattr(dispatcher, "_git_runner", None) or autonomy._default_git_runner
     verification_runner = verification_runner or verification.run_result_verification
 
     if action == "abandon":
@@ -1400,15 +1455,41 @@ def apply_slice_action(
 
         if wt_path and isinstance(wt_path, (str, Path)):
             target_wt = Path(wt_path)
+            if target_wt.is_symlink():
+                raise RuntimeError("recover-pre-candidate refuses symlink worktree path")
+
+            def _worktree_listing() -> str:
+                raw = runner(["worktree", "list", "--porcelain"])
+                if isinstance(raw, str):
+                    return raw
+                returncode = getattr(raw, "returncode", None)
+                stdout = getattr(raw, "stdout", None)
+                stderr = getattr(raw, "stderr", "")
+                if returncode != 0 or not isinstance(stdout, str):
+                    raise RuntimeError(
+                        f"git worktree list failed: {str(stderr).strip()}"
+                    )
+                return stdout
+
+            target_resolved = target_wt.resolve(strict=False)
+
+            def _is_registered(listing: str) -> bool:
+                for line in listing.splitlines():
+                    if not line.startswith("worktree "):
+                        continue
+                    if Path(line.removeprefix("worktree ")).resolve(strict=False) == target_resolved:
+                        return True
+                return False
+
+            registered = _is_registered(_worktree_listing())
+            if registered:
+                runner(["worktree", "remove", "--force", str(target_wt)])
+                if _is_registered(_worktree_listing()):
+                    raise RuntimeError("git worktree registry entry remains after recovery")
+            elif target_wt.exists():
+                remove_tree(target_wt)
             if target_wt.exists() or target_wt.is_symlink():
-                if runner is not None:
-                    try:
-                        runner(["git", "worktree", "remove", "--force", str(target_wt)])
-                    except Exception:
-                        pass
-                if target_wt.exists() or target_wt.is_symlink():
-                    import shutil
-                    shutil.rmtree(target_wt, ignore_errors=True)
+                raise RuntimeError("pre-candidate worktree cleanup incomplete")
 
         consumed_at = clock()
         registry.record_action(
@@ -1425,8 +1506,11 @@ def apply_slice_action(
             slice_id,
             state="pending",
             gate_state="pending",
-            builder_job_id=None,
-            candidate=None,
+            clear_builder_job_id=True,
+            clear_reviewer_job_id=True,
+            clear_candidate=True,
+            current_evidence_refs=[],
+            current_evaluation_refs=[],
         )
         _supersede_handoff_manifest(
             handoff_dir=handoff_dir,
@@ -1467,6 +1551,8 @@ def apply_slice_action(
             launcher=launcher,
             handoff_dir=handoff_dir,
             git_runner=runner,
+            identity_registry=identity_registry,
+            launcher_factory=launcher_factory,
         )
         if not dispatched:
             raise RuntimeError("retry-build-dispatch-failed")
@@ -1751,6 +1837,24 @@ def complete_tick(
             if not _is_safe_slice_id(slice_id):
                 errors.append({"job_id": job_id, "error": f"job 缺合法/安全 task/slice_id: {slice_id!r}"})
                 continue
+            if job.get("kind") == "review":
+                slice_row = _slice_for_reviewer_job(registry, slice_id, job_id)
+            else:
+                slice_row = _slice_for_job(registry, slice_id, job_id)
+
+            # A registered slice may accumulate multiple terminal attempts. Only the
+            # currently bound builder/reviewer is allowed to mutate current state or
+            # the single current handoff manifest; older attempts remain registry
+            # audit evidence. A later operator recovery clears the current binding,
+            # which is therefore also a monotonic replay fence.
+            if slice_row is None and not _is_workflow_lane_job(job):
+                try:
+                    registered_slice = registry.get_slice(slice_id)
+                except KeyError:
+                    registered_slice = None
+                if registered_slice is not None:
+                    continue
+
             manifest_path = hdir / f"{slice_id}.json"
             if manifest_path.is_symlink():
                 # 單檔 symlink 檢查：防預置 symlink 讓 write_manifest 寫出界（不誤殺部署上層 symlink）。
@@ -1761,12 +1865,8 @@ def complete_tick(
             if _existing_manifest_job_id(manifest_path) == job_id:
                 continue  # 真冪等：同一個 terminal job 已落盤（同 job_id → skip；異 job_id/壞檔 → overwrite）
 
-            if job.get("kind") == "review":
-                slice_row = _slice_for_reviewer_job(registry, slice_id, job_id)
-            else:
-                slice_row = _slice_for_job(registry, slice_id, job_id)
-                if slice_row is not None and slice_row.get("reviewer_job_id"):
-                    continue
+            if job.get("kind") != "review" and slice_row is not None and slice_row.get("reviewer_job_id"):
+                continue
             repo_root = (
                 autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
                 if slice_row is not None

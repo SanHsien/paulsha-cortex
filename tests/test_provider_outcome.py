@@ -135,6 +135,14 @@ def test_no_signal_classifies_as_unknown_hint_and_not_retryable():
     assert result.retryable is False
 
 
+def test_doc_coauthoring_skill_name_is_not_misclassified_as_oauth():
+    result = classify_provider_failure(
+        exit_code=1,
+        output='{"skills":["copilot-sdk","doc-coauthoring","docx"]}',
+    )
+    assert result.outcome is ProviderOutcome.UNKNOWN
+
+
 def test_none_output_does_not_raise():
     result = classify_provider_failure(exit_code=1, output=None)
     assert result.outcome is ProviderOutcome.UNKNOWN

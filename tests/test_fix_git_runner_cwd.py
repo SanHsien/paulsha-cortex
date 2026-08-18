@@ -11,8 +11,8 @@ from paulsha_cortex.deploy.installer import render_units
 def test_default_git_runner_prefixes_arguments_with_repo_root(monkeypatch, tmp_path):
     calls: list[tuple] = []
 
-    def fake_run(argv, capture_output=True, text=True):
-        calls.append((argv, capture_output, text))
+    def fake_run(argv, capture_output=True, text=True, encoding=None, errors=None):
+        calls.append((argv, capture_output, text, encoding, errors))
         return SimpleNamespace(returncode=0, stdout="abc\n", stderr="")
 
     monkeypatch.setattr(paths, "repo_root", lambda: tmp_path)
@@ -20,11 +20,19 @@ def test_default_git_runner_prefixes_arguments_with_repo_root(monkeypatch, tmp_p
 
     out = dispatcher._default_git_runner(["rev-parse", "--show-toplevel"])
     assert out == "abc"
-    assert calls == [(["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"], True, True)]
+    assert calls == [
+        (
+            ["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"],
+            True,
+            True,
+            "utf-8",
+            "replace",
+        )
+    ]
 
 
 def test_default_git_runner_failure_includes_repo_root_and_stderr(monkeypatch, tmp_path):
-    def fake_run(argv, capture_output=True, text=True):
+    def fake_run(argv, capture_output=True, text=True, encoding=None, errors=None):
         return SimpleNamespace(returncode=128, stdout="", stderr="fatal: not a git repository")
 
     monkeypatch.setattr(paths, "repo_root", lambda: tmp_path)

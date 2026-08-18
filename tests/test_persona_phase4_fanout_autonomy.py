@@ -653,10 +653,15 @@ class FanoutTests(unittest.TestCase):
         launcher = _RecordingLauncher()
         metas = [_meta("bad-role-slice", plan="docs/a.md"), _meta("ok-slice", plan="docs/b.md")]
 
-        def _build(persona, *, task, plan_path):
+        def _build(persona, *, task, plan_path, worktree_root=None):
             if task == "bad-role-slice":
                 raise ValueError("unknown persona role: bogus")
-            return _real_build(persona, task=task, plan_path=plan_path)
+            return _real_build(
+                persona,
+                task=task,
+                plan_path=plan_path,
+                worktree_root=worktree_root,
+            )
 
         original = autonomy_mod.build_dispatch_prompt
         autonomy_mod.build_dispatch_prompt = _build

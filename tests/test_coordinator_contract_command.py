@@ -28,6 +28,19 @@ class BuildDispatchPromptTests(unittest.TestCase):
         p = build_dispatch_prompt("builder", task="t", plan_path="/nope/x.md")
         self.assertIn("/nope/x.md", p)
 
+    def test_resolved_worktree_is_authoritative_without_shell_interpolation(self) -> None:
+        root = r"C:\work trees\feature $(not-a-shell)"
+        p = build_dispatch_prompt(
+            "builder",
+            task="t",
+            plan_path="p.md",
+            worktree_root=root,
+        )
+
+        self.assertIn(f"repository_root: {root}", p)
+        self.assertIn("operator/base checkout 不在本次 scope", p)
+        self.assertIn("不得重試被拒絕的絕對路徑", p)
+
 
 if __name__ == "__main__":
     unittest.main()
