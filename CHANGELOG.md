@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- 新增依賴與上游的排程檢查：`dependency-freshness` 每月比對 `pyproject.toml` 宣告與 PyPI 現行版本（以宣告精度比較，`>=6` 不會被 6.0.3 誤報），`upstream-check` 每週比對上游 main 與 `tools/upstream_baseline.json` 的 `reviewed_through`；兩者只讀不寫，並附離線契約測試。
 - 處理 upstream Issues 476–489 的 deployment、dispatch、recovery、review 與 scope reliability：service install 建立／驗證 monitor config；prompt 錨定 resolved worktree；Git worktree recovery、retry identity 與 terminal replay 收斂；Claude persona tools、Codex effort／read-only terminal verdict、JSONL 正規化與 validator enums 落地；provider auth 誤判修正；status 提供只讀 stale-progress attention；slice 可用 `verification.allowed_paths` 驗證 task-level changed-path 邊界。
 - Deck CLI 新增 `compile --policy-from <repo-relative-path>`、`compile --slug <slug>` 與 `deck list [combo]` membership 檢視；`ready` 可沿用 manager specs 預設目錄。
 - 同步 upstream v0.1.8 到 `dc8a968`，採用 workflow／slice repo 歸屬、patchmud profile drift 修正與 Stage 9 readiness regression；deck compile 新增 `--repo owner/repo`，可把 work item 的顯式 repo 宣告帶入輸出的 slice specs。
