@@ -2,6 +2,12 @@
 
 最後檢查：2026-08-12
 
+自 2026-08-21 起，`.github/workflows/upstream-check.yml` 每週一 11:00（Asia/Taipei）自動比對
+上游 `main` 與 `tools/upstream_baseline.json` 的 `reviewed_through`（目前為 `dc8a968`），有未審
+commit 就讓 workflow 失敗並在 summary 列出 commit 與其變動檔案。審完把決策寫進本檔，再推進
+baseline——先驗證，後推進；不要為了讓紅燈消失直接改 SHA。手動執行：
+`python tools/check_upstream_updates.py`。
+
 | 欄位 | 值 |
 | --- | --- |
 | fork | `SanHsien/paulsha-cortex` |

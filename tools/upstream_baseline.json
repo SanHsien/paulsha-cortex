@@ -1,0 +1,8 @@
+{
+  "repo": "https://github.com/hamanpaul/paulsha-cortex.git",
+  "branch": "main",
+  "reviewed_through": "dc8a968742ce587fba0ec013232a8a9ff1597596",
+  "reviewed_date": "2026-08-12",
+  "decision_log": "docs/UPSTREAM.md",
+  "notes": "Upstream v0.1.8. Per-PR and per-issue decisions for this watermark are recorded in docs/UPSTREAM.md; advance this file only after the next round is reviewed and verified."
+}
