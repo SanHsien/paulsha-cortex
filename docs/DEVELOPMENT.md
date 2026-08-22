@@ -84,3 +84,14 @@ Stop/restart 在送出 `taskkill` 前會用 process command line 驗證 PID 確�
 4. 執行 `pwsh -File tools/dev_check.ps1`。
 5. 依 `CLAUDE.md` 帶完整 PR context 執行 policy check。
 6. Review 必須綁定最新 Candidate；process exit 0 或 agent 自報通過不能取代 evidence。
+
+## 依賴新鮮度：紅燈的兩條正當出口
+
+每月的檢查比對**宣告**與 PyPI 現行版。當某個下限**不該**跟著現行版走時，只有兩種留下理由的做法：
+
+- **維持宣告**：宣告那一行加 `# freshness-hold: <理由>`（長期政策，例如「這個下限就是我們要的」）。
+- **已延後**：`.github/dependency-deferrals.json` 加
+  `{"deferredLatest": "<當時看到的版本>", "reason": "<為什麼這次不升>"}`；PyPI 一超過該版本，
+  延後自動失效、報告恢復提醒。沒有 `deferredLatest` 的條目直接忽略——那等於永久靜音，不是延後。
+
+**不要用調高下限的方式讓紅燈消失**：宣告是相容性承諾，不是消音鍵。

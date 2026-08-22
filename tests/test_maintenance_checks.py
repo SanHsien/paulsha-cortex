@@ -285,3 +285,63 @@ def test_a_fork_status_failure_does_not_masquerade_as_a_measurement() -> None:
     assert "無法計算" in report
     assert "git rev-list failed" in report
     assert "ahead" not in report.split("## Fork status")[1]
+
+
+# 紅燈的兩條正當出口：長期政策用 hold，這次不升用 deferral。
+# 宣告是相容性承諾，不是消音鍵——調高下限讓報告變綠是被禁止的第三條路。
+
+
+def test_hold_marker_binds_to_the_package_on_that_line() -> None:
+    holds = freshness.parse_holds(
+        'dependencies = ["PyYAML>=6"]  # freshness-hold: 6.x 就是我們要的下限\n'
+        'other = ["pytest>=9.1"]\n'
+    )
+
+    assert holds == {"pyyaml": "6.x 就是我們要的下限"}
+
+
+def test_a_comment_without_the_marker_is_not_a_hold() -> None:
+    assert freshness.parse_holds('x = ["pytest>=9.1"]  # 一般註解\n') == {}
+
+
+def test_deferral_without_a_reviewed_release_is_ignored(tmp_path: Path) -> None:
+    # 沒有 deferredLatest 的條目等於永久靜音，不是延後，直接忽略。
+    path = tmp_path / "deferrals.json"
+    path.write_text(json.dumps({"deferrals": {"pytest": {"reason": "later"}}}), encoding="utf-8")
+
+    assert freshness.load_deferrals(path) == {}
+
+
+def test_deferral_with_a_reviewed_release_is_read(tmp_path: Path) -> None:
+    path = tmp_path / "deferrals.json"
+    path.write_text(
+        json.dumps({"deferrals": {"pytest": {"deferredLatest": "9.1.1", "reason": "等 Windows gate"}}}),
+        encoding="utf-8",
+    )
+
+    assert freshness.load_deferrals(path) == {"pytest": ("9.1.1", "等 Windows gate")}
+
+
+def test_missing_deferrals_file_defers_nothing(tmp_path: Path) -> None:
+    assert freshness.load_deferrals(tmp_path / "absent.json") == {}
+
+
+def test_aged_floor_needs_review_unless_held_or_deferred() -> None:
+    assert freshness.needs_review({"outdated": True, "hold": "", "deferred_reason": ""})
+    assert not freshness.needs_review({"outdated": True, "hold": "政策", "deferred_reason": ""})
+    assert not freshness.needs_review(
+        {"outdated": True, "hold": "", "deferred_reason": "已評估，等下一輪"}
+    )
+
+
+def test_a_deferral_expires_once_pypi_moves_past_the_reviewed_release() -> None:
+    deferrals = {"pytest": ("9.1.1", "等 Windows gate")}
+    package = {"name": "pytest", "minimum": "9.0", "requirement": "pytest>=9.0", "group": "extra:test", "hold": ""}
+
+    reviewed_release = freshness.is_newer_version("9.1.1", "9.1.1")
+    next_release = freshness.is_newer_version("9.2.0", "9.1.1")
+
+    assert not reviewed_release  # 停在被審視的那一版：延後仍然生效
+    assert next_release  # 一往前推：延後失效，報告重新問
+    assert deferrals["pytest"][1] == "等 Windows gate"
+    assert package["hold"] == ""
