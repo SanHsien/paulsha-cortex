@@ -1,22 +1,37 @@
 # Fork 維護說明
 
-最後評估：2026-08-09
+最後評估：2026-08-22
 
-本 repository 是 [`hamanpaul/paulsha-cortex`](https://github.com/hamanpaul/paulsha-cortex) 的 GitHub fork。定位是研究、開發與驗證 agent 工程治理，不宣稱已可直接承載 production 自主循環。
+本 repository 是 [`hamanpaul/paulsha-cortex`](https://github.com/hamanpaul/paulsha-cortex) 的 GitHub fork。定位是 **Windows-first development fork**：用於研究、開發與驗證多 Agent 工程治理，不宣稱已可直接承載 production 自主循環。
 
 ## 為什麼保留這個 fork
 
-- Candidate、Verification、Independent Review、Merge Result 與 CompletionRecord 的一致性模型，直接對應多 agent／worktree／retry 情境的治理缺口。
+- Candidate、Verification、Independent Review、Delivery 與 CompletionRecord 的一致性模型，直接對應多 agent／worktree／retry 情境最容易失真的治理缺口。
 - upstream 有實際 Python runtime、GitHub delivery、manager daemon、monitor、persona 與大量 regression tests，不是概念展示。
-- upstream 在 2026-08-08 發布 v0.1.4，維護與修正節奏活躍。
-- 本 fork 已把核心 runtime、service lifecycle、monitor transport、process launcher 與完整 pytest 移植為原生 Windows-first，同時保留 Linux/systemd 相容性。
+- 本 fork 已把核心 runtime、service lifecycle、monitor transport、process launcher 與完整 pytest 補成原生 Windows-first 路徑，同時保留 Linux/systemd 相容性。
+- fork 另維護 Windows service backend、loopback TCP monitor transport、process / file durability、PowerShell bootstrap、Windows regression coverage、CodeQL、dependency freshness 與 upstream tracking。
 
 ## 採用限制
 
-- 評估時 upstream 根目錄沒有 LICENSE。GitHub fork 機制不等於取得一般性的再散布、改作或套件發布授權；在 upstream 明確補授權前，不把衍生套件發佈到 GitHub 以外，也不聲稱本專案是已確認授權的開源發行版。
-- foreign-review 的 bubblewrap 隔離仍需 Linux；Windows 會明確略過這個 POSIX-only sandbox，不把它誤報為已驗證。
-- 最新公開 issues 包含 verification evidence 可被 rigged、自報測試與實測背離、retry dead-end、handoff 殘留與 GitHub rate-limit 協調問題。production 採用前必須逐項重新評估，不能只看 CI 綠燈。
-- 目前主要 commit 歷史集中於單一維護者，fork 需保有獨立復原與上游追蹤能力。
+- **授權仍未明確**：截至 2026-08-22，upstream 根目錄仍沒有 `LICENSE`。GitHub fork 機制不等於取得一般性的再散布、改作或套件發布授權；在 upstream 明確補授權前，不把衍生 wheel／sdist 發佈到 GitHub 以外，也不聲稱本 fork 是已確認授權的開源發行版。
+- **不是 production-ready 宣稱**：CI 綠燈只證明目前測試契約成立，不等於多 Agent 自主循環已具 production 保證。
+- **Windows / Linux 能力不完全對稱**：foreign-review 的 bubblewrap 隔離仍需 Linux；Windows 會明確略過這個 POSIX-only sandbox，不把它誤報為已驗證。
+- **upstream 仍快速演進**：本 fork 採選擇性同步，不能把 upstream `main` 整批 merge 當作例行更新。
+- 目前主要 commit 歷史仍集中於少數維護者；fork 必須保有獨立復原、CI 與 upstream ledger。
+
+## 目前 fork 差異
+
+相對共同 baseline，本 fork 的主要增量包括：
+
+- Windows 11 per-user Startup service backend。
+- loopback TCP monitor transport。
+- Windows process wrapper、PID / lock / durability / path safety 修補。
+- PowerShell bootstrap 與 canonical development gate。
+- Windows-specific regression tests 與 GitHub Actions / CodeQL。
+- dependency freshness 與 upstream release tracking。
+- 多項 executor auth、retry / recovery、deck DX 與 verification reliability 修補。
+
+完整技術差異仍以 Git history、tests 與 [`docs/UPSTREAM.md`](UPSTREAM.md) 為準；本文件只維護採用邊界，不複製完整 changelog。
 
 ## Remote 契約
 
@@ -34,13 +49,24 @@ gh issue list --repo hamanpaul/paulsha-cortex --state open --limit 20
 gh pr list --repo hamanpaul/paulsha-cortex --state all --limit 20
 ```
 
-逐項標記採用、部分採用、延後或不採用並記錄理由；不要把 upstream 整批變更直接併入有本 fork 差異的 `main`。同步後執行完整 gate，並更新 `docs/DECISIONS.md` 的水位。
+逐項標記採用、部分採用、延後或不採用並記錄理由；不要把 upstream 整批變更直接併入有本 fork 差異的 `main`。同步後執行完整 gate，並更新 [`docs/UPSTREAM.md`](UPSTREAM.md) 的 review watermark。
 
-## 初始水位
+## 2026-08-22 水位快照
 
 | 項目 | 值 |
 | --- | --- |
-| upstream tip | `b868760` |
-| release | `v0.1.4` |
-| 評估日期 | 2026-08-09 |
-| 決策 | 值得維護為 Windows-first development fork；授權與 Linux-only sandbox 邊界收斂前不列為 production-ready |
+| fork source version | `0.1.8` |
+| upstream source version | `0.1.8` |
+| 已同步共同 baseline | `dc8a968` |
+| upstream `main` snapshot | `13366c0` |
+| GitHub compare | fork `ahead 44` / `behind 202` |
+| 維護策略 | 202 個 post-v0.1.8 upstream commits 已批次檢視；等待下一個 upstream tag 再整批評估 |
+| 決策 | 繼續維護 Windows-first development fork；授權與 Linux-only sandbox 邊界收斂前不列為 production-ready |
+
+這些數字是日期快照，不是 README 的永久產品敘述。後續判斷時三種資料來源各有不同責任：
+
+- [`docs/UPSTREAM.md`](UPSTREAM.md)：人工 review ledger，記錄已看過哪些 release / PR / issue、採用或延後理由與下一個 review watermark。
+- `tools/upstream_baseline.json`：供自動 upstream-check 使用的 **reviewed-through / common baseline 記錄**；它不是即時 `upstream/main` snapshot，也不要求與本頁日期快照逐次同步。
+- GitHub compare / `git fetch upstream`：查當下 fork 與 upstream `main` 的即時 ahead / behind 與 commit 差異。
+
+不要把其中任一來源單獨解讀成完整的 upstream truth。
