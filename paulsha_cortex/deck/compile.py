@@ -662,7 +662,11 @@ def compile_combo(
     policy_from: str | Path | None = None,
     slug: str | None = None,
 ) -> CompileResult:
-    effective_repo_root = Path(repo_root) if repo_root is not None else paths.repo_root()
+    # `cortex deck compile` 是 operator 手動 CLI，未帶 repo_root 時「以當下工作
+    # 目錄為準」是它本來的語意（只讀設定產 skeleton，不做 git mutation）。
+    effective_repo_root = (
+        Path(repo_root) if repo_root is not None else paths.repo_root(allow_cwd=True)
+    )
     if repo is not None:
         repo = _validate_repo(repo)
     slug = _validate_task_slug(slug) if slug is not None else slugify_task(task)

@@ -500,7 +500,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    repo_root = Path(args.repo_root).resolve() if args.repo_root else default_repo_root()
+    # `cortex work gc` 是 operator 手動 CLI，「在哪個 repo 裡跑就治理哪個」是它
+    # 本來的語意，因此 cwd 退路在這裡顯式表態，而不是靠預設值默默生效。
+    repo_root = (
+        Path(args.repo_root).resolve() if args.repo_root else default_repo_root(allow_cwd=True)
+    )
 
     report = run_gc(
         repo_root, apply=args.apply, pr_status_provider=default_pr_status_provider

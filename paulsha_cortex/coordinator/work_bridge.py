@@ -127,7 +127,11 @@ def resolve_trusted_repo_root(repo: str, *, explicit: object = None) -> Path:
                 "explicit repo root must be the canonical git top-level and its remote must match owner/name"
             )
         return root
-    candidates.append(paths.repo_root())
+    # 候選只收「顯式宣告的」repo 根：沒宣告就不進候選，由下方「必須恰好命中
+    # 一個」的檢查 fail-closed，而不是把 cwd 混進來當答案（上游 #612）。
+    configured = paths.configured_repo_root()
+    if configured is not None:
+        candidates.append(configured)
     try:
         from paulsha_cortex.monitor.config import load_config
 
