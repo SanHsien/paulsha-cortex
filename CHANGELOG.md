@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- 依賴新鮮度檢查補上「已評估但不該升」的兩條正當出口：宣告行上的 `# freshness-hold: <理由>`，以及 `.github/dependency-deferrals.json` 的 `deferredLatest` + `reason`（PyPI 超過該版本即自動失效）。沒有出口時，下一個人只剩「永遠紅」或「調高下限壓下去」，而後者是把相容性宣告當消音鍵。
 - `.cursor/rules/no-upstream-pr.mdc`：Cursor 規則是 per-project 的，補上「對外只打本 fork」，與 `docs/FORK.md` 及 Codex／Antigravity 的全域規則同一套判準。
 
 ### Changed
