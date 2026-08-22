@@ -51,6 +51,29 @@ gh pr list --repo hamanpaul/paulsha-cortex --state all --limit 20
 
 逐項標記採用、部分採用、延後或不採用並記錄理由；不要把 upstream 整批變更直接併入有本 fork 差異的 `main`。同步後執行完整 gate，並更新 [`docs/UPSTREAM.md`](UPSTREAM.md) 的 review watermark。
 
+### PR 只打本 fork
+
+**PR、push、release 一律指向 `SanHsien/paulsha-cortex`。** 對 `hamanpaul/paulsha-cortex` 開 PR、
+push 或發 release，需要主人在當次對話明確同意回貢；「fork 一份」「建開發環境」「比照其他 repo」
+都不是同意。
+
+根因是機制不是粗心：`gh` 在 fork clone 的**預設 repo 就是上游**——本 repo 的 clone 原本
+`gh repo set-default --view` 回的就是 `hamanpaul/paulsha-cortex`，所以裸跑 `gh pr create` 必然打上去。
+
+```powershell
+gh repo set-default SanHsien/paulsha-cortex   # 每個 clone 先跑一次
+gh repo set-default --view                    # 必須回 SanHsien/paulsha-cortex
+gh pr create --repo SanHsien/paulsha-cortex --base main --head feature/<slug>
+```
+
+建完**讀輸出的 URL**，owner 必須是 `SanHsien`；不是就立刻 `gh pr close` 留言道歉說明開錯 repo，
+再對 origin 重開。2026-08-22 就是在這裡誤開了 `hamanpaul/paulsha-cortex#787`（同日另一個工作階段
+也在別的 fork 誤開一次）。批次跑多個 repo 時最容易略過確認，而那正是出事的場合。
+
+**本 repo 是「日常直推 main」的例外**：其他 repo 的維護變更直接推 `origin/main`，但本 repo 的
+policy CI 會檢查分支名 `feature/<slug>`、`changelog.d/<slug>.md` fragment 與 PR template checklist，
+所以這裡仍走 branch → PR → CI → merge，只是 base 一定是 `SanHsien/paulsha-cortex`。
+
 ## 2026-08-22 水位快照
 
 | 項目 | 值 |
