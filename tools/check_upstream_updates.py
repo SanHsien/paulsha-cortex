@@ -128,6 +128,44 @@ def fetch_upstream_release(baseline: dict, repo_dir: Path, tag: str) -> str:
     return ref
 
 
+def fork_status(baseline: dict, repo_dir: Path, upstream_ref: str) -> dict:
+    """How far this fork has moved from the reviewed baseline, and upstream too.
+
+    These counts change with every commit on either side, so they are computed
+    when the report is read rather than written into a document, where they
+    would be wrong by the time anyone looked. The baseline SHA in
+    `upstream_baseline.json` is the part that is a decision and does belong in
+    version control.
+    """
+    reviewed = baseline["reviewed_through"]
+
+    def count(rev_range: str) -> int:
+        return int(run_git(["rev-list", "--count", rev_range], repo_dir).strip())
+
+    return {
+        "baseline": reviewed[:7],
+        "fork_head": run_git(["rev-parse", "--short", "HEAD"], repo_dir).strip(),
+        "upstream_tip": run_git(["rev-parse", "--short", upstream_ref], repo_dir).strip(),
+        "ahead": count(f"{reviewed}..HEAD"),
+        "behind": count(f"{reviewed}..{upstream_ref}"),
+    }
+
+
+def render_fork_status(status: dict | None, error: str | None = None) -> list[str]:
+    if status is None:
+        return ["## Fork status", "", f"無法計算：{error or 'unknown'}", ""]
+    return [
+        "## Fork status",
+        "",
+        f"- 共同 baseline：`{status['baseline']}`（已審視至此）",
+        f"- 本 fork `HEAD`：`{status['fork_head']}`，baseline 之後 **ahead {status['ahead']}**",
+        f"- upstream tip：`{status['upstream_tip']}`，baseline 之後 **behind {status['behind']}**",
+        "",
+        "這兩個數字每次 commit 都會變，所以由本檢查當場算出，不寫進文件。",
+        "",
+    ]
+
+
 def collect_new_commits(baseline: dict, repo_dir: Path, ref: str) -> list[dict]:
     reviewed = baseline["reviewed_through"]
     raw = run_git(
@@ -169,6 +207,8 @@ def render_markdown(
     commits: list[dict],
     error: str | None = None,
     release: str | None = None,
+    status: dict | None = None,
+    status_error: str | None = None,
 ) -> str:
     decision_log = baseline.get("decision_log", DEFAULT_DECISION_LOG)
     track = baseline.get("track", "release")
@@ -192,6 +232,7 @@ def render_markdown(
             else "No new upstream commits. Nothing to review."
         )
         lines.extend(["## Result", "", clean, ""])
+        lines.extend(render_fork_status(status, status_error))
         return "\n".join(lines)
 
     headline = (
@@ -226,6 +267,7 @@ def render_markdown(
             "",
         ]
     )
+    lines.extend(render_fork_status(status, status_error))
     return "\n".join(lines)
 
 
@@ -267,7 +309,19 @@ def main() -> int:
             "reviewed_date": "unknown",
         }
 
-    report = render_markdown(baseline, commits, error, release)
+    status: dict | None = None
+    status_error: str | None = None
+    if error is None:
+        # Informational only: a fork-status failure must not turn the review
+        # check red, because it says nothing about whether upstream moved.
+        try:
+            status = fork_status(
+                baseline, args.repo_dir, fetch_upstream(baseline, args.repo_dir)
+            )
+        except UpstreamCheckError as exc:
+            status_error = str(exc)
+
+    report = render_markdown(baseline, commits, error, release, status, status_error)
     output = Path(args.output)
     output.write_text(report, encoding="utf-8")
     print(report)

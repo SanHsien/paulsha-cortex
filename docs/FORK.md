@@ -59,7 +59,7 @@ gh pr list --repo hamanpaul/paulsha-cortex --state all --limit 20
 | upstream source version | `0.1.8` |
 | 已同步共同 baseline | `dc8a968` |
 | upstream `main` snapshot | `13366c0` |
-| GitHub compare | fork `ahead 44` / `behind 202` |
+| fork 與 upstream 的分岔量 | 不寫在這裡：每次 commit 都會變。由 `upstream-check` 每週跑出來（見 workflow run summary 的 **Fork status**），或本機跑 `python tools/check_upstream_updates.py` |
 | 維護策略 | 202 個 post-v0.1.8 upstream commits 已批次檢視；等待下一個 upstream tag 再整批評估 |
 | 決策 | 繼續維護 Windows-first development fork；授權與 Linux-only sandbox 邊界收斂前不列為 production-ready |
 
@@ -67,6 +67,6 @@ gh pr list --repo hamanpaul/paulsha-cortex --state all --limit 20
 
 - [`docs/UPSTREAM.md`](UPSTREAM.md)：人工 review ledger，記錄已看過哪些 release / PR / issue、採用或延後理由與下一個 review watermark。
 - `tools/upstream_baseline.json`：供自動 upstream-check 使用的 **reviewed-through / common baseline 記錄**；它不是即時 `upstream/main` snapshot，也不要求與本頁日期快照逐次同步。
-- GitHub compare / `git fetch upstream`：查當下 fork 與 upstream `main` 的即時 ahead / behind 與 commit 差異。
+- `upstream-check` 的 **Fork status**（每週一自動跑，也可本機執行 `python tools/check_upstream_updates.py`）／GitHub compare：查當下 fork 與 upstream `main` 的即時 ahead / behind 與 commit 差異。**這類數字不進文件**——它隨每次 commit 變動，寫下的當下就開始過期；本頁只保留穩定的 SHA 與決策。
 
 不要把其中任一來源單獨解讀成完整的 upstream truth。
