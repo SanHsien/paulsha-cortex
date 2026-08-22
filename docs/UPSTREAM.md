@@ -272,3 +272,44 @@ squash merge，squash 出來的 commit 與分支上的原始 commit 不同物件
 
 - PR：已看到 **#764**；issue：已看到 **#781**；分支：盤點日 2026-08-22。
 - 記在 `tools/upstream_baseline.json` 的 `reviewed_pr_through` / `reviewed_issue_through`。
+
+## 2026-08-23：修正「以 release 為單位」的盲點，並引用一支 fail-closed 修正
+
+前一輪的結論是「本 fork 以 release tag 為取用點，未打 tag 的 202 個 commit 整批等下一個
+tag」。**那個結論漏掉一件事**：等 tag 的期間，上游已經修好的 bug 在本 fork 仍然是活的。
+判準因此補一條：**上游 `main` 上的修正，只要對照本 fork 程式碼確認「這個缺陷本 fork 也有」，
+就不等 tag，直接選擇性移植。**
+
+### 已引用：`59a7a9b` — repo root 解析 fail-closed
+
+- **對照證據**：本 fork 的 `paulsha_cortex/config/paths.py` 仍是
+  `_resolve_root("PSC_REPO_ROOT", Path.cwd())`。
+- **為什麼本 fork 會痛**：本線以 Windows service 執行，服務的工作目錄正是 operator 的真實
+  checkout。於是「解析不出目標 repo」不是失敗，而是把 `git fetch`／`rev-parse`／worktree
+  建立打在 operator 的工作區——上游記錄的實網事故就是 `git -C <真 checkout> fetch origin main`。
+- **移植範圍**：核心 `configured_repo_root()` / `repo_root(allow_cwd=False)` /
+  `RepoRootUnresolvedError` 照抄；五個呼叫端按上游的分類處理（operator 手動 CLI 顯式
+  `allow_cwd=True`，daemon 側一律 fail-closed）。**`autonomy` 那段沒有照抄**：上游版依賴本
+  fork 還沒有的 `DiagnosticReason`（上游 570／527），改用等價的「沒宣告就走 `.git` 祖先搜尋」。
+- **移植時揭露的既有風險**：把 `PSC_REPO_ROOT` 比照 `PSC_AGENTS_ROOT` 指向 per-test 暫存路徑後，
+  三個 `recover-pre-candidate` 測試與 `init-sample` 測試立刻失敗——它們以前是在 operator 的
+  **真 checkout** 上跑 `git worktree list --porcelain`（再走一步就是 `git worktree remove --force`
+  這種寫入動作），並讀真的 `.project-policy.yml`。已改為自備 fixture repo 與最小 policy。
+- 驗證：2545 passed / 63 skipped、`tools/dev_check.ps1` 全綠、PR 全部 check 綠。
+
+### 同批掃過但不引用的（逐條看過主旨與檔案）
+
+| commit | 內容 | 結論 |
+| --- | --- | --- |
+| `6b44624` | `fix(trust-root): job 的 PATH 兩層都補、fail-closed` | 值得，但它改的是 trust-root job 執行面，本 fork 落後 202 個 commit，該區塊已被上游重寫多輪；硬移植等於自行改寫。**觸發條件**：本線實際跑 trust-root job，或該修正隨下一個 tag 進來。 |
+| `416da1d` | `fix(coordinator): retry-card evidence 寫入接 resolved_state_path` | 依賴上游 752 系列的 state path 重構，本 fork 沒有那條路徑。 |
+| 其餘約 199 筆 | slice-lane、reviewer sandbox、tdd-red、work-item 流程等 coordinator 內部語意 | 屬上游施工中的產品內部；本 fork 的取用點仍是 tag。 |
+
+### 判準（下次照這個做）
+
+1. `git log <baseline>..upstream/main` 過濾 `fix(`，先挑：路徑／編碼／Windows、fail-closed、
+   安全性。
+2. **對照本 fork 程式碼確認缺陷仍在**（grep 實際的函式，不要只看 commit 訊息）。
+3. 確認相依：上游修正若引用本 fork 沒有的模組，就移植其**設計**而不是 diff，並在文件寫明
+   哪一段沒照抄、為什麼。
+4. 落地後在本檔記下引用的 commit、對照證據與驗證數字。
