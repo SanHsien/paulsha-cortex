@@ -6,5 +6,7 @@
   "decision_log": "docs/UPSTREAM.md",
   "notes": "以 release 為追蹤單位：本 fork 的四次同步（v0.1.5／v0.1.6／v0.1.7／v0.1.8）都錨定在上游的 tag，上游 main 則每天多次變動。2026-08-22 檢視過 dc8a968（v0.1.8）之後累積的 202 個 commit／約 50 個 PR、420 個檔案、+124k 行——上游尚未打新 tag，屬開發中狀態，依既有做法等下一個 release 再整批評估。逐項決策記錄在 docs/UPSTREAM.md。",
   "track": "release",
-  "reviewed_release": "v0.1.8"
+  "reviewed_release": "v0.1.8",
+  "reviewed_pr_through": 764,
+  "reviewed_issue_through": 781
 }
