@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- `CLAUDE.md` 的 claim-done checklist 新增「按下 merge 前必須讀過完整 diff（含 Dependabot PR）」；CI 綠燈不等於審查過。
 - 上游檢查改以 release 為追蹤單位（`track: "release"`）：只有上游發出未審的 tag 才失敗，不再每週回報 200 多個進行中的 commit。2026-08-22 已批次檢視 v0.1.8 之後的 202 個 commit／50 個 PR，決定等下一個 tag 再整批評估，理由記在 `docs/UPSTREAM.md`。依賴宣告下限同步對齊 CI 實際解析的版本。
 
 ### Added

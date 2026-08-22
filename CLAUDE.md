@@ -43,6 +43,7 @@ policy_version: 1.0.15
 - [ ] MAJOR bump 需使用者明確核可
 
 ## 完成任務（claim done）前
+- [ ] **按下 merge 前已讀過完整 diff**（`gh pr diff <編號>`），包含 Dependabot 開的。CI 綠燈證明的是「測試沒紅」，不是「改了什麼、該不該進 main」——lockfile 的連鎖升級、transitive major、跨出宣告範圍的變更，只有讀 diff 看得到。核准或合併訊息要寫出讀到什麼、為什麼可接受。
 - [ ] `changelog.d/<slug>.md` fragment 已新增且已 commit（或 PR 標 `skip-changelog` + 理由）
 - [ ] `CHANGELOG.md [Unreleased]` 有對應 entry
 - [ ] `VERSION` 內容與意圖一致（release label PR 才可偏離 latest tag）
