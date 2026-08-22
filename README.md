@@ -90,7 +90,7 @@ python -m pip install .
 
 1. [Quickstart](docs/onboarding/quickstart.md) — 從安裝、preflight、`cortex bootstrap` 到第一個 workflow。
 2. [Concepts](docs/onboarding/concepts.md) — `spec`、`job`、`slice`、`work` 名詞與 lifecycle。
-3. [Admin](docs/onboarding/admin.md) — `cortex service`、`cortex inspect`、`cortex request` 日常維運。
+3. [Admin](docs/onboarding/admin.md) — `cortex service`、`cortex inspect`、`cortex request` 與 model profiling 日常維運。
 4. [Runbook](docs/onboarding/runbook.md) — manager degraded、timeout、executor 與 recovery SOP。
 5. [Troubleshooting](docs/onboarding/troubleshooting.md) — 常見故障快速對照。
 6. [Upgrade](docs/onboarding/upgrade.md) — 升級與 pipx snapshot 更新。
@@ -115,7 +115,9 @@ cortex bootstrap --instance cortex --repo-root (git rev-parse --show-toplevel)
 cortex init-sample --task "example feature" --change example-feature
 ```
 
-檢查 readiness 與 runtime：
+先檢查產出的 spec，將 glob plan 改成確切路徑，補齊 `target_branch` 與 `verification`；確認無誤後，**明確把 `dispatch: hold` 改成 `dispatch: auto`**。只有 `dispatch: auto` 且必要欄位完整的 slice 才會進入 ready set。
+
+接著檢查 readiness 與 runtime：
 
 ```powershell
 cortex ready --specs-dir "$HOME/.agents/specs"
@@ -124,7 +126,7 @@ cortex inspect doctor --json
 cortex service status --instance cortex --json
 ```
 
-完成 spec 的確切 path plan、target branch 與 verification 後，再明確指定 builder / reviewer 執行完整 tick：
+再明確指定 builder / reviewer 執行完整 tick：
 
 ```powershell
 cortex tick `
@@ -158,7 +160,7 @@ cortex inspect work <work-id> --repo owner/repo
 | --- | --- |
 | 第一次建立 workflow | [Quickstart](docs/onboarding/quickstart.md) |
 | 名詞：spec / job / slice / work | [Concepts](docs/onboarding/concepts.md) |
-| service / inspect / request 維運 | [Admin](docs/onboarding/admin.md) |
+| service / inspect / request / model profiling 維運 | [Admin](docs/onboarding/admin.md) |
 | 常見事故與 recovery | [Runbook](docs/onboarding/runbook.md) |
 | 升級 | [Upgrade](docs/onboarding/upgrade.md) |
 | 回退 | [Rollback](docs/onboarding/rollback.md) |
@@ -168,7 +170,7 @@ cortex inspect work <work-id> --repo owner/repo
 | upstream 評估水位 | [Upstream ledger](docs/UPSTREAM.md) |
 | 現行工程決策 | [Decisions](docs/DECISIONS.md) |
 
-完整 lifecycle、delivery、model profiling、monitor 與 migration 細節已在上述文件維護；README 不再作為第二份 admin / architecture manual。
+完整 lifecycle、delivery、model profiling、monitor 與 migration 細節由上述 active 文件分工維護；README 不再作為第二份 admin / architecture manual。
 
 ## 安全與目前邊界
 
