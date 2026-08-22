@@ -233,3 +233,42 @@ gh issue list --repo hamanpaul/paulsha-cortex --state open --limit 100
 逐筆記錄 upstream commit／PR 的採用、部分採用、延後或不採用理由。不要在有
 fork-specific Windows adapters 時做無審查的整批 merge。同步後必須跑原生
 Windows full gate，Linux CI 則守住 systemd、Bash 與 sandbox 相容面。
+
+## 2026-08-22：上游 PR、issue、分支的分流規則（一次評估，之後只看增量）
+
+盤點當時上游有 **1 個 open PR、97 個 open issue、274 個分支**。本 fork 以 release tag 為追蹤單位
+（`track: "release"`），下面把另外三個面向也定案，之後不必重新推導。
+
+### 分支：`ahead` 不等於「沒合併」
+
+274 個分支中，有 **66 個相對 `upstream/main` 帶著獨佔 commit**。乍看像是「有 66 條沒併回去的
+工作」，實際比對三條最舊的（`feature/99-fix-git-runner-cwd`、`feature/100-fix-dispatch-exception-detail`、
+`feature/152-fix-mutation-request-timeout`）後發現：**三條的修正都已經在 `main` 裡**，只是上游用
+squash merge，squash 出來的 commit 與分支上的原始 commit 不同物件，所以 `rev-list main..branch`
+永遠不會歸零。本 fork 也已經有那些測試檔（`tests/test_fix_git_runner_cwd.py` 等）。
+
+其餘 61 條的最後提交集中在 2026-08（`feature/phase2-*`、`feature/718-*` 這類），是上游**正在進行中**
+的工作分支——它們的產物會走 PR → `main` → release tag，那才是本 fork 的取用點。
+
+**規則**：不逐條追分支。要判斷某條分支是否真的有未合併的東西，先用主旨或 issue 編號到 `main`
+搜一次（`git log --oneline upstream/main --grep="#<編號>"`），有命中就是 squash 假象。
+
+### PR：不逐筆追
+
+上游 PR 走 `main`，合併後即進 release 線；本 fork 的取用點是 tag。當時唯一的 open PR
+（[#764](https://github.com/hamanpaul/paulsha-cortex/pull/764) fix-read-repo-tier-fail-closed）
+即屬此類，不單獨引用。
+
+### Issue：只追會改變「本 fork 要驗什麼」的
+
+97 個 open issue 幾乎都是上游自己的 work item（`fix(trust-root)`、`fix(planner)`、`fix(gate)`
+這種，用 issue 當任務單）。這些是上游的施工中狀態，不是給下游取用的成品。
+
+值得留意但不追的一筆：[#781](https://github.com/hamanpaul/paulsha-cortex/issues/781)
+（多 instance 常駐輪詢造成 I/O 放大）——症狀出現在 WSL2/SSHFS，本 fork 是 Windows 原生、
+且未啟用多 instance 常駐，暫不適用；若日後本線啟用 daemon 再回頭看。
+
+### 水位
+
+- PR：已看到 **#764**；issue：已看到 **#781**；分支：盤點日 2026-08-22。
+- 記在 `tools/upstream_baseline.json` 的 `reviewed_pr_through` / `reviewed_issue_through`。
