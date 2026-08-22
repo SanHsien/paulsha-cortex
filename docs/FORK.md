@@ -63,4 +63,10 @@ gh pr list --repo hamanpaul/paulsha-cortex --state all --limit 20
 | 維護策略 | 202 個 post-v0.1.8 upstream commits 已批次檢視；等待下一個 upstream tag 再整批評估 |
 | 決策 | 繼續維護 Windows-first development fork；授權與 Linux-only sandbox 邊界收斂前不列為 production-ready |
 
-這些數字是日期快照，不是 README 的永久產品敘述；後續水位以 [`docs/UPSTREAM.md`](UPSTREAM.md)、`tools/upstream_baseline.json` 與即時 GitHub compare 為準。
+這些數字是日期快照，不是 README 的永久產品敘述。後續判斷時三種資料來源各有不同責任：
+
+- [`docs/UPSTREAM.md`](UPSTREAM.md)：人工 review ledger，記錄已看過哪些 release / PR / issue、採用或延後理由與下一個 review watermark。
+- `tools/upstream_baseline.json`：供自動 upstream-check 使用的 **reviewed-through / common baseline 記錄**；它不是即時 `upstream/main` snapshot，也不要求與本頁日期快照逐次同步。
+- GitHub compare / `git fetch upstream`：查當下 fork 與 upstream `main` 的即時 ahead / behind 與 commit 差異。
+
+不要把其中任一來源單獨解讀成完整的 upstream truth。
