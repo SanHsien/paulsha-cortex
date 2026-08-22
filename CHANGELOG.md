@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- Dependabot 的 `github-actions` 區塊新增 `codeql-action` 群組：`init` 與 `analyze` 必須跑同一個版本，拆成兩個 PR 各自升版會讓兩邊都紅（`Loaded a configuration file for version X, but running version Y`）。同一批 repo 的 chatgpt-sidebar 今天出現實例。
 - fork 與 upstream 的 ahead／behind 改由 `upstream-check` 每次執行當場計算並寫進報告，`docs/FORK.md` 不再寫死這組數字；隨每次 commit 變動的量測不該存進文件，該存的是 baseline SHA 與決策。
 - `CLAUDE.md` 的 claim-done checklist 新增「按下 merge 前必須讀過完整 diff（含 Dependabot PR）」；CI 綠燈不等於審查過。
 - 上游檢查改以 release 為追蹤單位（`track: "release"`）：只有上游發出未審的 tag 才失敗，不再每週回報 200 多個進行中的 commit。2026-08-22 已批次檢視 v0.1.8 之後的 202 個 commit／50 個 PR，決定等下一個 tag 再整批評估，理由記在 `docs/UPSTREAM.md`。依賴宣告下限同步對齊 CI 實際解析的版本。
