@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=84"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -18,11 +18,11 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=9.1"]
 dev = [
-    "build>=1.2",
-    "pytest>=8",
-    "twine>=6",
+    "build>=1.5",
+    "pytest>=9.1",
+    "twine>=7",
 ]
 
 [project.scripts]

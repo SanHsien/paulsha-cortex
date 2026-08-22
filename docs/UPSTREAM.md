@@ -1,12 +1,30 @@
 # Upstream tracking
 
-最後檢查：2026-08-12
+最後檢查：2026-08-22（批次檢視；已審 release 仍為 v0.1.8＝`dc8a968`）
 
-自 2026-08-21 起，`.github/workflows/upstream-check.yml` 每週一 11:00（Asia/Taipei）自動比對
-上游 `main` 與 `tools/upstream_baseline.json` 的 `reviewed_through`（目前為 `dc8a968`），有未審
-commit 就讓 workflow 失敗並在 summary 列出 commit 與其變動檔案。審完把決策寫進本檔，再推進
-baseline——先驗證，後推進；不要為了讓紅燈消失直接改 SHA。手動執行：
-`python tools/check_upstream_updates.py`。
+自 2026-08-22 起，`.github/workflows/upstream-check.yml` 每週一 11:00（Asia/Taipei）比對的是**上游的 release
+tag**，不是 `main`。`tools/upstream_baseline.json` 的 `track: "release"` 決定這個行為：檢查器問「上游有沒有發出
+我們還沒審的 release」，有才失敗並列出該 release 相對 baseline 的 commit。手動執行：
+`python tools/check_upstream_updates.py`；要改看每一個 commit 就把 `track` 設成 `"commit"`。
+
+改追 release 的理由記在這裡，不是為了讓紅燈消失：本 fork 至今四次同步（v0.1.5、v0.1.6、v0.1.7、v0.1.8）
+全部錨定在上游的 tag，而上游 `main` 每天變動多次。追 `main` 會讓每週檢查永遠是紅的、而且列出的目標在讀到報告
+時就已經過期——一個永遠紅的檢查等於沒有檢查。審完把決策寫進本檔，再推進 baseline；先驗證，後推進。
+
+## 2026-08-22 批次檢視：v0.1.8 之後的上游開發中變更
+
+| 欄位 | 值 |
+| --- | --- |
+| 檢視時上游 `main` | `13366c0`（2026-08-22） |
+| 相對 baseline `dc8a968`（v0.1.8） | 202 個 commit、50 個 merged PR、420 個檔案、+123,960／−2,342 行 |
+| 上游最新 tag | 仍為 `v0.1.8`（`dc8a968`）——**這批尚未發版** |
+| 主要落點 | `tests`（158）、`changelog.d`（142）、`paulsha_cortex/coordinator`（39）、`docs`（30）、`monitor`（12）、`trust_root`（8） |
+| 決策 | **不現在同步**，等上游打出下一個 tag 再整批評估 |
+
+理由：這批是上游進行中的開發（trust-root 階段性落地、builder sandbox、event spool、shadow telemetry、
+coordinator 重構等仍在連續變動），沒有任何 release 邊界可以錨定；本 fork 相對同一 base 也有 150 個檔案的
+Windows-first 改動，在上游收斂前併入等於對移動中的目標做一次會被重做的合併。等 tag 出現後依既有流程逐 PR
+評估、記錄決策、再推進 baseline。
 
 | 欄位 | 值 |
 | --- | --- |

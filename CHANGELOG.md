@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Changed
+- 上游檢查改以 release 為追蹤單位（`track: "release"`）：只有上游發出未審的 tag 才失敗，不再每週回報 200 多個進行中的 commit。2026-08-22 已批次檢視 v0.1.8 之後的 202 個 commit／50 個 PR，決定等下一個 tag 再整批評估，理由記在 `docs/UPSTREAM.md`。依賴宣告下限同步對齊 CI 實際解析的版本。
+
 ### Added
 - 新增依賴與上游的排程檢查：`dependency-freshness` 每月比對 `pyproject.toml` 宣告與 PyPI 現行版本（以宣告精度比較，`>=6` 不會被 6.0.3 誤報），`upstream-check` 每週比對上游 main 與 `tools/upstream_baseline.json` 的 `reviewed_through`；兩者只讀不寫，並附離線契約測試。
 - 處理 upstream Issues 476–489 的 deployment、dispatch、recovery、review 與 scope reliability：service install 建立／驗證 monitor config；prompt 錨定 resolved worktree；Git worktree recovery、retry identity 與 terminal replay 收斂；Claude persona tools、Codex effort／read-only terminal verdict、JSONL 正規化與 validator enums 落地；provider auth 誤判修正；status 提供只讀 stale-progress attention；slice 可用 `verification.allowed_paths` 驗證 task-level changed-path 邊界。

@@ -68,10 +68,12 @@ def test_load_baseline_requires_a_full_sha(tmp_path: Path) -> None:
 
 
 def test_upstream_report_states_clean_and_failed_runs() -> None:
-    clean = upstream.render_markdown(sample_baseline(), [])
-    failed = upstream.render_markdown(sample_baseline(), [], error="fetch failed")
+    commit_mode = {**sample_baseline(), "track": "commit"}
+    clean = upstream.render_markdown(commit_mode, [])
+    failed = upstream.render_markdown(commit_mode, [], error="fetch failed")
 
     assert "No new upstream commits" in clean
+    assert "Tracking: commit" in clean
     assert "Check failed" in failed
     assert "fetch failed" in failed
 
@@ -166,3 +168,71 @@ def test_freshness_report_marks_each_status_and_reports_errors() -> None:
     assert "| OK |" in report
     assert "檢查失敗" in failed
     assert "cannot read pyproject.toml" in failed
+
+
+def test_parse_tag_refs_prefers_the_peeled_commit_and_sorts_by_version() -> None:
+    raw = "\n".join(
+        [
+            "aaa\trefs/tags/v0.1.7",
+            "bbb\trefs/tags/v0.1.7^{}",
+            "ccc\trefs/tags/v0.1.10",
+            "ddd\trefs/tags/v0.1.10^{}",
+            "eee\trefs/tags/nightly-2026-08-22",
+            "not-a-ref-line",
+        ]
+    )
+
+    tags = upstream.parse_tag_refs(raw)
+
+    # Annotated tags list the tag object first; the peeled line carries the commit.
+    assert tags[0] == ((0, 1, 7), "v0.1.7", "bbb")
+    # 0.1.10 outranks 0.1.7, which string sorting would get backwards.
+    assert tags[-1] == ((0, 1, 10), "v0.1.10", "ddd")
+    assert all("nightly" not in name for _, name, _ in tags)
+
+
+def test_parse_tag_refs_tolerates_an_empty_listing() -> None:
+    assert upstream.parse_tag_refs("") == []
+
+
+def test_baseline_tracks_releases_because_this_fork_syncs_per_release() -> None:
+    baseline = upstream.load_baseline()
+
+    assert baseline["track"] == "release"
+    assert baseline["reviewed_release"] == "v0.1.8"
+
+
+def test_load_baseline_rejects_an_unknown_track_mode(tmp_path: Path) -> None:
+    baseline = sample_baseline()
+    baseline["track"] = "branch"
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps(baseline), encoding="utf-8")
+
+    with pytest.raises(upstream.UpstreamCheckError, match="track must be one of"):
+        upstream.load_baseline(path)
+
+
+def test_release_mode_report_distinguishes_quiet_from_a_new_release() -> None:
+    baseline = sample_baseline()
+    baseline["track"] = "release"
+    baseline["reviewed_release"] = "v0.1.8"
+
+    quiet = upstream.render_markdown(baseline, [])
+    fired = upstream.render_markdown(
+        baseline,
+        [
+            {
+                "sha": "b" * 40,
+                "short": "bbbbbbb",
+                "date": "2026-09-01",
+                "subject": "feat: something",
+                "files": ["paulsha_cortex/cli.py"],
+            }
+        ],
+        release="v0.1.9",
+    )
+
+    assert "No upstream release past the reviewed one" in quiet
+    assert "Tracking: release" in quiet
+    assert "(v0.1.8)" in quiet
+    assert "Upstream released v0.1.9" in fired

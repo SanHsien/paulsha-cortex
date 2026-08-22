@@ -1,9 +1,26 @@
-"""Report upstream commits that have not yet been reviewed by this fork."""
+"""Report upstream work that has not yet been reviewed by this fork.
+
+Two tracking modes, selected by ``track`` in the baseline:
+
+``commit``
+    Everything on the upstream branch past ``reviewed_through``.
+
+``release`` (default here)
+    Only what upstream has actually tagged. This fork syncs at release
+    granularity -- v0.1.5, v0.1.6, v0.1.7, v0.1.8 each landed as one reviewed
+    batch -- while upstream `main` moves several times a day. Tracking the
+    branch would mean a permanently failing weekly check reporting a couple of
+    hundred in-flight commits against a target that has already moved, and a
+    check that is always red is a check nobody reads. Tracking tags asks the
+    question this fork actually acts on: has upstream shipped a release we have
+    not reviewed?
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -12,6 +29,8 @@ REPO_ROOT = SCRIPT_DIR.parent
 BASELINE_PATH = SCRIPT_DIR / "upstream_baseline.json"
 UPSTREAM_REF_PREFIX = "refs/upstream-check"
 DEFAULT_DECISION_LOG = "docs/DECISIONS.md"
+TRACK_MODES = ("release", "commit")
+_SEMVER_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 
 class UpstreamCheckError(RuntimeError):
@@ -31,7 +50,49 @@ def load_baseline(path: Path = BASELINE_PATH) -> dict:
         raise UpstreamCheckError(f"baseline missing fields: {', '.join(missing)}")
     if len(baseline["reviewed_through"]) != 40:
         raise UpstreamCheckError("reviewed_through must be a full 40-character SHA")
+    track = baseline.get("track", "release")
+    if track not in TRACK_MODES:
+        raise UpstreamCheckError(f"track must be one of {', '.join(TRACK_MODES)}, not {track!r}")
     return baseline
+
+
+def parse_tag_refs(raw: str) -> list[tuple[tuple[int, int, int], str, str]]:
+    """Parse ``git ls-remote --tags`` output into sorted (version, tag, sha).
+
+    Annotated tags appear twice: the tag object, then the peeled ``^{}`` line
+    carrying the commit. The peeled line wins, because the commit is what the
+    baseline records.
+    """
+    commits: dict[str, str] = {}
+    for line in raw.splitlines():
+        if "\t" not in line:
+            continue
+        sha, ref = line.split("\t", 1)
+        name = ref.strip().removeprefix("refs/tags/")
+        peeled = name.endswith("^{}")
+        name = name.removesuffix("^{}")
+        if not _SEMVER_TAG_RE.match(name):
+            continue
+        if peeled or name not in commits:
+            commits[name] = sha.strip()
+
+    parsed = []
+    for name, sha in commits.items():
+        match = _SEMVER_TAG_RE.match(name)
+        if match is None:  # pragma: no cover - filtered above
+            continue
+        parsed.append((tuple(int(part) for part in match.groups()), name, sha))
+    return sorted(parsed)
+
+
+def latest_upstream_release(baseline: dict, repo_dir: Path) -> tuple[str, str] | None:
+    """Return the highest semver tag upstream publishes, as (tag, commit sha)."""
+    raw = run_git(["ls-remote", "--tags", baseline["repo"]], repo_dir)
+    tags = parse_tag_refs(raw)
+    if not tags:
+        return None
+    _, name, sha = tags[-1]
+    return name, sha
 
 
 def run_git(args: list[str], repo_dir: Path) -> str:
@@ -53,6 +114,15 @@ def fetch_upstream(baseline: dict, repo_dir: Path) -> str:
     ref = f"{UPSTREAM_REF_PREFIX}/{branch}"
     run_git(
         ["fetch", "--quiet", baseline["repo"], f"+refs/heads/{branch}:{ref}"],
+        repo_dir,
+    )
+    return ref
+
+
+def fetch_upstream_release(baseline: dict, repo_dir: Path, tag: str) -> str:
+    ref = f"{UPSTREAM_REF_PREFIX}/tags/{tag}"
+    run_git(
+        ["fetch", "--quiet", baseline["repo"], f"+refs/tags/{tag}:{ref}"],
         repo_dir,
     )
     return ref
@@ -98,13 +168,17 @@ def render_markdown(
     baseline: dict,
     commits: list[dict],
     error: str | None = None,
+    release: str | None = None,
 ) -> str:
     decision_log = baseline.get("decision_log", DEFAULT_DECISION_LOG)
+    track = baseline.get("track", "release")
     lines = [
         "# Upstream review report",
         "",
         f"- Upstream: `{baseline['repo']}` (`{baseline['branch']}`)",
-        f"- Reviewed through: `{baseline['reviewed_through'][:7]}`",
+        f"- Tracking: {track}",
+        f"- Reviewed through: `{baseline['reviewed_through'][:7]}`"
+        + (f" ({baseline['reviewed_release']})" if baseline.get("reviewed_release") else ""),
         f"- Last review date: {baseline['reviewed_date']}",
         "",
     ]
@@ -112,16 +186,24 @@ def render_markdown(
         lines.extend(["## Check failed", "", f"```text\n{error}\n```", ""])
         return "\n".join(lines)
     if not commits:
-        lines.extend(
-            ["## Result", "", "No new upstream commits. Nothing to review.", ""]
+        clean = (
+            "No upstream release past the reviewed one. Nothing to review."
+            if track == "release"
+            else "No new upstream commits. Nothing to review."
         )
+        lines.extend(["## Result", "", clean, ""])
         return "\n".join(lines)
 
+    headline = (
+        f"Upstream released {release}: {len(commits)} commit(s) require review."
+        if track == "release" and release
+        else f"{len(commits)} upstream commit(s) require review."
+    )
     lines.extend(
         [
             "## Result",
             "",
-            f"{len(commits)} upstream commit(s) require review.",
+            headline,
             "",
             "| Commit | Date | Subject | Files |",
             "| --- | --- | --- | --- |",
@@ -161,10 +243,21 @@ def main() -> int:
     baseline: dict
     commits: list[dict] = []
     error: str | None = None
+    release: str | None = None
     try:
         baseline = load_baseline()
-        ref = fetch_upstream(baseline, args.repo_dir)
-        commits = collect_new_commits(baseline, args.repo_dir, ref)
+        if baseline.get("track", "release") == "release":
+            newest = latest_upstream_release(baseline, args.repo_dir)
+            if newest is None:
+                raise UpstreamCheckError("upstream publishes no semver tags to track")
+            tag, sha = newest
+            if sha != baseline["reviewed_through"]:
+                release = tag
+                ref = fetch_upstream_release(baseline, args.repo_dir, tag)
+                commits = collect_new_commits(baseline, args.repo_dir, ref)
+        else:
+            ref = fetch_upstream(baseline, args.repo_dir)
+            commits = collect_new_commits(baseline, args.repo_dir, ref)
     except UpstreamCheckError as exc:
         error = str(exc)
         baseline = {
@@ -174,7 +267,7 @@ def main() -> int:
             "reviewed_date": "unknown",
         }
 
-    report = render_markdown(baseline, commits, error)
+    report = render_markdown(baseline, commits, error, release)
     output = Path(args.output)
     output.write_text(report, encoding="utf-8")
     print(report)
