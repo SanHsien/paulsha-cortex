@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- `docs/FORK.md` 新增「PR 只打本 fork」：2026-08-22 誤開 `hamanpaul/paulsha-cortex#787`，根因是 `gh` 在 fork clone 的預設 repo 就是上游。每個 clone 先 `gh repo set-default SanHsien/paulsha-cortex`，開 PR 明寫 `--repo/--base/--head` 並確認輸出 URL 的 owner；回貢上游需要主人當次對話明確同意。同時寫明本 repo 因 policy CI 仍走 branch → PR → CI，是「日常直推 main」的例外。
 - Dependabot 的 `github-actions` 區塊新增 `codeql-action` 群組：`init` 與 `analyze` 必須跑同一個版本，拆成兩個 PR 各自升版會讓兩邊都紅（`Loaded a configuration file for version X, but running version Y`）。同一批 repo 的 chatgpt-sidebar 今天出現實例。
 - fork 與 upstream 的 ahead／behind 改由 `upstream-check` 每次執行當場計算並寫進報告，`docs/FORK.md` 不再寫死這組數字；隨每次 commit 變動的量測不該存進文件，該存的是 baseline SHA 與決策。
 - `CLAUDE.md` 的 claim-done checklist 新增「按下 merge 前必須讀過完整 diff（含 Dependabot PR）」；CI 綠燈不等於審查過。
