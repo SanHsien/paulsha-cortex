@@ -25,11 +25,36 @@ def test_env_override_wins(monkeypatch, tmp_path):
     assert paths.control_root() == tmp_path / "ctl"
 
 
-def test_repo_root_env_then_cwd(monkeypatch, tmp_path):
+def test_repo_root_uses_env_and_fails_closed_without_it(monkeypatch, tmp_path):
+    """`PSC_REPO_ROOT` 未宣告時**不得**退回 cwd，必須 fail-closed。
+
+    舊契約是 `repo_root() == Path.cwd()`。Windows service 的工作目錄正是 operator
+    的真實 checkout，所以那個預設值等同「解析不出目標就打在 operator 的樹上」
+    ——不是失敗，是靜默落在錯的 repo。取自上游 59a7a9b（#612）。
+    """
     monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path))
     assert paths.repo_root() == tmp_path
+
     monkeypatch.delenv("PSC_REPO_ROOT")
-    assert paths.repo_root() == Path.cwd()
+    with pytest.raises(paths.RepoRootUnresolvedError):
+        paths.repo_root()
+
+
+def test_repo_root_cwd_requires_explicit_opt_in(monkeypatch, tmp_path):
+    """cwd 語意仍可用，但必須由呼叫端**顯式**表態（operator 手動 CLI）。"""
+    monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    assert paths.repo_root(allow_cwd=True) == Path.cwd()
+
+
+def test_configured_repo_root_reports_whether_it_was_declared(monkeypatch, tmp_path):
+    """「沒宣告」與「宣告成 cwd」必須分得出來，呼叫端才有辦法 fail-closed。"""
+    monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
+    assert paths.configured_repo_root() is None
+
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path))
+    assert paths.configured_repo_root() == tmp_path
 
 
 def test_worktree_root_is_repo_sibling(monkeypatch, tmp_path):

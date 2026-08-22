@@ -11,6 +11,32 @@ from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.registry import JobRegistry
 
 
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+
+def _seed_repo(tmp_path: Path) -> Path:
+    """建一個有一次 commit 的本機 repo，回傳其根。
+
+    `recover-pre-candidate` 會走 `worktree_reclaim`，而它的預設 git runner 是
+    `paths.repo_root()`——這個修正之前那個預設是 `Path.cwd()`，也就是 operator 的
+    **真實 checkout**，於是這些測試實際上在真 repo 上跑
+    `git worktree list --porcelain`（同一條路徑再走一步就是
+    `git worktree remove --force` / `git worktree prune` 這種**寫入**動作）。
+    測試必須自備目標 repo 並顯式 `PSC_REPO_ROOT`。取自上游 59a7a9b（#612）。
+    """
+    repo = tmp_path / "target-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "recover@example.invalid")
+    _git(repo, "config", "user.name", "recover-test")
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-qm", "init")
+    return repo
+
+
 def test_allowed_slice_actions_when_candidate_is_null(tmp_path: Path) -> None:
     state_path = tmp_path / "jobs.json"
     reg = JobRegistry(state_path=state_path)
@@ -41,7 +67,9 @@ def test_allowed_slice_actions_when_candidate_is_null(tmp_path: Path) -> None:
     assert "retry-build" not in actions
 
 
-def test_recover_pre_candidate_removes_worktree_and_resets_slice(tmp_path: Path) -> None:
+def test_recover_pre_candidate_removes_worktree_and_resets_slice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 目標 repo 顯式指定（見 `_seed_repo`），不再靠 `repo_root()` 的 cwd 預設。
+    monkeypatch.setenv("PSC_REPO_ROOT", str(_seed_repo(tmp_path)))
     state_path = tmp_path / "jobs.json"
     reg = JobRegistry(state_path=state_path)
     wt_dir = tmp_path / "wt" / "feature-slice-3a"
@@ -151,7 +179,9 @@ def test_recover_pre_candidate_cleans_real_git_registry_and_branch_is_reusable(t
     assert replacement.is_dir()
 
 
-def test_recover_pre_candidate_supersedes_stale_handoff_manifest(tmp_path: Path) -> None:
+def test_recover_pre_candidate_supersedes_stale_handoff_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 目標 repo 顯式指定（見 `_seed_repo`），不再靠 `repo_root()` 的 cwd 預設。
+    monkeypatch.setenv("PSC_REPO_ROOT", str(_seed_repo(tmp_path)))
     # issue #383：recover-pre-candidate 撥回 pending 之後，殘留的舊終局 handoff
     # manifest 應被標記 superseded（稽核可見性）——run_tick 的放行判定本身已改成
     # 跟 registry 現況對帳（不依賴這個標記，見 dispatch_gate_scan/

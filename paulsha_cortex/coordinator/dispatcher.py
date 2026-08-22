@@ -23,6 +23,8 @@ PidAlive = Callable[[int], bool]
 
 
 def _default_git_runner(args: list[str]) -> str:
+    # daemon 側：不帶 allow_cwd。未宣告 PSC_REPO_ROOT 時寧可 fail-closed，
+    # 也不要讓 git 指令落到 operator 的工作區（上游 #612）。
     repo_root = paths.repo_root()
     proc = subprocess.run(
         ["git", "-C", str(repo_root), *args],

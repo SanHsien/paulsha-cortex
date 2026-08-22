@@ -238,14 +238,31 @@ def _normalize_depends_on(value: object) -> list[str]:
 
 
 def _infer_repo_root(spec_path: Path) -> Path:
-    configured = paths.repo_root().resolve()
+    # 只有「顯式宣告的」才算 configured。舊實作用 paths.repo_root()，未宣告
+    # PSC_REPO_ROOT 時它會退回 cwd——daemon 的 cwd 就是 operator 的真實
+    # checkout，於是 spec 會被「推斷」到一個沒人指定過的樹（上游 #612）。
+    # 沒宣告就走下面的 .git 祖先搜尋，那條路徑本來就有明確的判準。
+    configured_root = paths.configured_repo_root()
+    configured = configured_root.resolve() if configured_root is not None else None
     resolved_spec = spec_path.resolve()
+    if configured is None:
+        return _infer_repo_root_from_ancestors(resolved_spec)
     try:
         resolved_spec.relative_to(configured)
         return configured
     except ValueError:
         pass
 
+    return _infer_repo_root_from_ancestors(resolved_spec, configured)
+
+
+def _infer_repo_root_from_ancestors(
+    resolved_spec: Path, configured: Path | None = None
+) -> Path:
+    """從 spec 路徑往上找 `.git`；找不到才退回 spec 所在目錄。
+
+    `~/.agents` 底下的 git 樹是 agent 契約區，不是被治理的目標 repo，所以跳過。
+    """
     agents_dir = Path.home() / ".agents"
     for parent in [resolved_spec, *resolved_spec.parents]:
         if (parent / ".git").exists():
@@ -253,7 +270,7 @@ def _infer_repo_root(spec_path: Path) -> Path:
                 continue
             return parent
 
-    if os.getenv("PSC_REPO_ROOT"):
+    if configured is not None:
         return configured
     return resolved_spec.parent
 

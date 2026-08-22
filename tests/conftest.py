@@ -37,6 +37,14 @@ def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     unset_root = tmp_path / "unset-psc-root-guard"
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(unset_root / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(unset_root / "config"))
+    # PSC_REPO_ROOT 是同一類洩漏，只是目標不同：`paths.repo_root()` 的舊實作未
+    # 宣告時退回 `Path.cwd()`，而跑測試的 cwd 就是 operator 的**真實 checkout**，
+    # 於是任何忘了指定目標 repo 的測試都在真 repo 上跑 git——worktree 相關的
+    # `git worktree remove --force` 更是寫入動作。production 側現在 fail-closed
+    # （未宣告即 `RepoRootUnresolvedError`），測試側比照 PSC_AGENTS_ROOT 指向
+    # per-test 暫存路徑：需要真 repo 的測試自行 setenv／建 fixture repo 覆寫，
+    # 需要驗「未宣告」行為的測試自行 delenv。取自上游 59a7a9b（#612）。
+    monkeypatch.setenv("PSC_REPO_ROOT", str(unset_root / "repo"))
 
 
 @pytest.fixture(autouse=True)
