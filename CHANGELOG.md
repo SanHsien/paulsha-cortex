@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Added
+- `.cursor/rules/no-upstream-pr.mdc`：Cursor 規則是 per-project 的，補上「對外只打本 fork」，與 `docs/FORK.md` 及 Codex／Antigravity 的全域規則同一套判準。
+
 ### Changed
 - `docs/FORK.md` 新增「PR 只打本 fork」：2026-08-22 誤開 `hamanpaul/paulsha-cortex#787`，根因是 `gh` 在 fork clone 的預設 repo 就是上游。每個 clone 先 `gh repo set-default SanHsien/paulsha-cortex`，開 PR 明寫 `--repo/--base/--head` 並確認輸出 URL 的 owner；回貢上游需要主人當次對話明確同意。同時寫明本 repo 因 policy CI 仍走 branch → PR → CI，是「日常直推 main」的例外。
 - Dependabot 的 `github-actions` 區塊新增 `codeql-action` 群組：`init` 與 `analyze` 必須跑同一個版本，拆成兩個 PR 各自升版會讓兩邊都紅（`Loaded a configuration file for version X, but running version Y`）。同一批 repo 的 chatgpt-sidebar 今天出現實例。
