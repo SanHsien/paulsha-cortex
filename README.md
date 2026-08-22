@@ -84,6 +84,20 @@ python -m pip install .
 
 本 fork 目前不發布 wheel / sdist。upstream 根目錄尚無 LICENSE；GitHub fork 關係本身不等於取得一般性的再散布或改作授權。在 upstream 明確授權前，本 fork 不把衍生套件對外再發布。
 
+## 新手上手
+
+第一次接觸 Cortex，建議依序閱讀下列文件；這個區段是 onboarding 契約的穩定索引，README 本身不複製完整操作手冊：
+
+1. [Quickstart](docs/onboarding/quickstart.md) — 從安裝、preflight、`cortex bootstrap` 到第一個 workflow。
+2. [Concepts](docs/onboarding/concepts.md) — `spec`、`job`、`slice`、`work` 名詞與 lifecycle。
+3. [Admin](docs/onboarding/admin.md) — `cortex service`、`cortex inspect`、`cortex request` 日常維運。
+4. [Runbook](docs/onboarding/runbook.md) — manager degraded、timeout、executor 與 recovery SOP。
+5. [Troubleshooting](docs/onboarding/troubleshooting.md) — 常見故障快速對照。
+6. [Upgrade](docs/onboarding/upgrade.md) — 升級與 pipx snapshot 更新。
+7. [Rollback](docs/onboarding/rollback.md) — 回到上一個已知可用版本。
+
+延伸閱讀：[Development](docs/DEVELOPMENT.md)、[Fork maintenance](docs/FORK.md)、[Upstream ledger](docs/UPSTREAM.md)、[Decisions](docs/DECISIONS.md)。
+
 ## Usage
 
 ### 最短上手路徑
@@ -138,7 +152,7 @@ cortex inspect work <work-id> --repo owner/repo
 
 遇到 `needs_human` 時，先讀 `cortex status` 的 `attention[].next_actions`，再使用對應 operator action；不要直接修改 `jobs.json` 或其他 runtime authority files。
 
-### 先讀哪份文件？
+### 文件地圖
 
 | 需求 | 文件 |
 | --- | --- |
