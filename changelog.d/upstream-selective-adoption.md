@@ -1,0 +1,1 @@
+- docs(upstream)：追蹤判準補上「不等 tag 的例外」——上游 `main` 上的修正若對照本 fork 程式碼確認缺陷仍在，即選擇性移植。記錄首次引用（`59a7a9b` repo root fail-closed）的對照證據，以及同批 202 個 commit 中不引用者的理由與觸發條件，避免下次重作評估。

@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Changed
+- 上游追蹤判準補上「不等 tag 的例外」：上游 `main` 上的修正若對照本 fork 程式碼確認缺陷仍在，即選擇性移植，不再整批等下一個 release tag。首次引用（`59a7a9b`）的對照證據、同批 202 個 commit 中不引用者的理由與觸發條件，逐項記在 `docs/UPSTREAM.md`，避免下次重作評估。
+
 ### Fixed
 - repo root 解析 fail-closed：未宣告 `PSC_REPO_ROOT` 時不再退回 `Path.cwd()`，避免 daemon 把 git 動作打在 operator 的真實 checkout 上（取自上游 #612／#630）。
 
