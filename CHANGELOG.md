@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- 上游 PR 盤點補查 `--state all`：原本只查 open，看不到未合併就關閉的 PR——而那正是「上游拒收、但可能對本 fork 有價值」的一類。5 筆逐條查過皆不需動作，`reviewed_pr_through` 推進到 #787。
 - 上游追蹤判準補上「不等 tag 的例外」：上游 `main` 上的修正若對照本 fork 程式碼確認缺陷仍在，即選擇性移植，不再整批等下一個 release tag。首次引用（`59a7a9b`）的對照證據、同批 202 個 commit 中不引用者的理由與觸發條件，逐項記在 `docs/UPSTREAM.md`，避免下次重作評估。
 
 ### Fixed

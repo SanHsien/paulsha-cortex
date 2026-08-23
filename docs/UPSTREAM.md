@@ -313,3 +313,29 @@ tag」。**那個結論漏掉一件事**：等 tag 的期間，上游已經修�
 3. 確認相依：上游修正若引用本 fork 沒有的模組，就移植其**設計**而不是 diff，並在文件寫明
    哪一段沒照抄、為什麼。
 4. 落地後在本檔記下引用的 commit、對照證據與驗證數字。
+
+## 2026-08-23（補）：PR 那一欄只查了 open，補查 `--state all`
+
+上一輪的 PR 盤點寫「當時唯一的 open PR（#764）即屬此類，不單獨引用」。那句話沒錯，但**問錯了
+問題**：只查 `--state open` 看不到已關閉的項目。`--state all` 一查，上游有 **400 個 PR**
+（394 merged、5 closed、1 open）。
+
+已合併的 394 筆都會變成 `main` 的 commit，落在 commit 稽核範圍（`dc8a968..upstream/main` 的
+202 筆已於本輪逐條掃過）。真正只有查 PR 才看得到的是**未合併就關閉**的 5 筆：
+
+| PR | 實查結果 |
+| --- | --- |
+| #787 `chore(deps): 讓 codeql-action 的升版走同一個 PR` | **不是上游的變更**：本 fork 端誤開到上游後立刻關閉的那一個（見 `docs/FORK.md` 的「只對本 fork 開 PR」）。 |
+| #239／#236／#233 `feat(coordinator/work_actions): retry 分類` | **已被上游自己取代**：同主題由 PR #240（`feature/216-retry-invalidation`）合併進 `main`，`git log upstream/main --grep="retry 分類"` 命中 `ec68e4c`。內容已在 commit 稽核範圍內。 |
+| #171 `feat(workflow): 完成 release-pipeline` | **已被上游自己取代**：由 PR #174（`feature/95-release-pipeline-land`）合併，`9820327`／`45f2d94` 可查。 |
+
+**結論：5 筆都不需要動作**，但這是查過之後的結論。
+
+### 水位
+
+- PR：**#787**（`reviewed_pr_through` 764 → 787）
+- issue：仍是 **#781**
+- commit：仍是 `dc8a968`（追蹤單位為 release tag，選擇性移植的判準見本檔前段）
+
+**判準補一條**：PR 與 issue 一律用 `--state all` 查。未合併就關閉的 PR 永遠不會出現在 commit
+清單裡，而那正是「上游拒收、但可能對本 fork 有價值」的那一類。
