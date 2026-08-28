@@ -1,0 +1,1204 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
+
+from . import gate_ledger, terminal_contract
+
+
+_GIT_REPOSITORY_ENV_KEYS = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_NAMESPACE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    }
+)
+
+_CREDENTIAL_ENV_RE = re.compile(
+    r"(?:^|_)(?:API_?KEY|AUTH|COOKIE|CREDENTIALS?|PASSWORD|PRIVATE_?KEY|SECRET|TOKEN)(?:$|_)",
+    re.IGNORECASE,
+)
+
+_CODEX_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_CODEX_DEFAULT_REASONING_EFFORT = "medium"
+
+_CLAUDE_PERSONA_TOOL_RULES: Mapping[str, tuple[str, ...]] = {
+    "edit": ("Edit",),
+    "rg": ("Bash(rg *)",),
+    "python -m unittest": (
+        "Bash(python -m unittest)",
+        "Bash(python -m unittest *)",
+    ),
+    "python3 -m unittest": (
+        "Bash(python3 -m unittest)",
+        "Bash(python3 -m unittest *)",
+    ),
+    "git add": ("Bash(git add *)",),
+    "git commit": ("Bash(git commit *)",),
+    "git status": ("Bash(git status)", "Bash(git status *)"),
+    "git diff": ("Bash(git diff)", "Bash(git diff *)"),
+    "git log": ("Bash(git log)", "Bash(git log *)"),
+}
+
+
+def _claude_persona_allowed_tools(tools: Sequence[str]) -> str | None:
+    rules: list[str] = []
+    for tool in tools:
+        for rule in _CLAUDE_PERSONA_TOOL_RULES.get(str(tool).strip().lower(), ()):
+            if rule not in rules:
+                rules.append(rule)
+    return " ".join(rules) if rules else None
+
+
+def _claude_review_json_schema(kind: str) -> str:
+    """Bind Claude StructuredOutput to the Manager terminal contract."""
+
+    report = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["path", "body"],
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "body": {"type": "string", "minLength": 1},
+        },
+    }
+    common = {
+        "type": "object",
+        "additionalProperties": False,
+    }
+    if kind == "workflow-verification-result":
+        schema = {
+            **common,
+            "required": [
+                "schema_version", "kind", "status", "summary", "details", "reports",
+            ],
+            "properties": {
+                "schema_version": {"type": "integer", "enum": [1]},
+                "kind": {"type": "string", "enum": [kind]},
+                # #261 R1：三種終局狀態在契約上對等可達。只允許成功形狀會逼模型
+                # 在 gate 已失敗時仍輸出成功 card（fail-open）；非通過狀態由
+                # manager.terminalize_workflow_job fail closed 為可操作錯誤。
+                "status": {
+                    "type": "string",
+                    "enum": ["verified", "failed", "needs_human"],
+                },
+                "summary": {"type": "string", "minLength": 1},
+                "details": {"type": "object"},
+                "reports": {"type": "array", "minItems": 1, "items": report},
+            },
+        }
+    elif kind == "workflow-review-result":
+        evidence = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["path", "line", "detail"],
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "line": {"type": ["integer", "null"], "minimum": 1},
+                "detail": {"type": "string", "minLength": 1},
+            },
+        }
+        finding = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["category", "severity", "summary", "evidence", "recommendation"],
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": (
+                        "Use blocking categories only for defects in the Candidate or its "
+                        "acceptance. A report-only wording or enumeration inaccuracy that does "
+                        "not change the Candidate verdict is style; correct it in this report."
+                    ),
+                    "enum": [
+                        "acceptance", "correctness", "data-loss", "pre-existing-out-of-scope",
+                        "race", "scope-bypass", "security", "style", "verification-bypass",
+                    ],
+                },
+                "severity": {"type": "string", "enum": ["critical", "important", "minor"]},
+                "summary": {"type": "string", "minLength": 1},
+                "evidence": {"type": "array", "items": evidence},
+                "recommendation": {"type": "string", "minLength": 1},
+            },
+        }
+        schema = {
+            **common,
+            "required": ["schema_version", "kind", "reason", "findings", "reports"],
+            "properties": {
+                "schema_version": {"type": "integer", "enum": [1]},
+                "kind": {"type": "string", "enum": [kind]},
+                # #261 R1：選填的終局狀態欄位。review verdict 本身仍由 findings
+                # 決定；status 讓 reviewer 能誠實表達「這張 card 自己沒跑完」。
+                "status": {
+                    "type": "string",
+                    "enum": ["passed", "failed", "needs_human"],
+                },
+                "reason": {"type": "string", "minLength": 1},
+                "findings": {"type": "array", "items": finding},
+                "reports": {"type": "array", "minItems": 1, "items": report},
+                # #315 補遺 3（#219 attestation 缺口）：manager 驗證器在 input
+                # snapshot 含 planning-authority 列時「要求」authority_hashes，
+                # 但本工具 schema additionalProperties:false 之前沒有此屬性——
+                # 模型再遵循 prompt 也交不出來（工具層拒收），review terminal
+                # 恆 schema invalid。是否必填由 manager 依 context 驗證，工具
+                # schema 僅開放屬性。
+                "authority_hashes": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                    },
+                },
+            },
+        }
+    else:
+        raise ValueError("Claude reviewer terminal contract kind invalid")
+    return json.dumps(schema, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def build_wrapper_script(
+    *,
+    inner_argv: Sequence[str],
+    sentinel: str,
+    ledger: str,
+    worktree: str,
+    repo_root: str | None,
+    run_gates: bool,
+    stdin_prompt: str | None = None,
+) -> str:
+    """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
+
+    三段皆以 ``;`` 串接，因此模型失敗時 sentinel 與 ledger 仍會產生：
+
+    1. 模型 argv；
+    2. 把 ``$?`` 寫入 exit sentinel（跨進程 durable 完成判定，早於 gate 階段，
+       確保 gate 執行時間不會被算進模型的 exit code）；
+    3. 由 manager 掌控的 gate ledger writer。
+
+    gate 階段的 stdout/stderr 一律導向 /dev/null：JSONL log 是 terminal evidence 的
+    來源，混入 gate 輸出會讓 ``_extract_terminal_json`` 讀到非 terminal 的內容。
+
+    ``stdin_prompt``（issue #442）：既有 copilot/claude/codex/agy 皆把 prompt 當作
+    argv 的一個元素；`cg`（見 `build_cg_argv`）改走「prompt 經 stdin」的介面
+    （`cg --headless --stdin`），argv 本身不含 prompt。非 None 時改以
+    ``printf %s <prompt> | <inner argv>`` 組出管線，把 prompt 經標準輸入餵給內層
+    命令；``$?``（bash 未開 pipefail 時）取自管線最後一個命令，即內層命令本身，
+    語意與既有「$? 為模型 exit code」不變。內層命令顯式 ``2>/dev/null``：cg 的
+    stderr 是人類可讀 summary banner（非 terminal evidence），Popen 層雖以
+    ``stderr=STDOUT`` 併入同一份 log fd，但那只重導向這個 bash 進程自己的 fd 2；
+    管線內命令的顯式重導向可覆寫，藉此讓 banner 不混入 JSONL log（下游
+    `_extract_terminal_json` 只能安全解析乾淨 stdout）。
+    """
+
+    if stdin_prompt is None:
+        command = shlex.join(inner_argv)
+    else:
+        command = (
+            f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
+        )
+    script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
+    if not run_gates or not repo_root:
+        return script
+    gate_argv = [
+        "python3",
+        "-m",
+        "paulsha_cortex.coordinator.gate_ledger",
+        "--out",
+        ledger,
+        "--worktree",
+        worktree,
+    ]
+    # PYTHONPATH 指向 repo root，讓 wrapper 在 worktree cwd 下仍能 import 套件。
+    return (
+        f"{script}; PYTHONPATH={shlex.quote(repo_root)} "
+        f"{shlex.join(gate_argv)} >/dev/null 2>&1"
+    )
+
+
+def _srt_runtime_root() -> Path | None:
+    """Resolve only the installed official sandbox-runtime package root."""
+
+    executable = shutil.which("srt")
+    if executable is None:
+        return None
+    resolved = Path(executable).resolve()
+    for parent in resolved.parents:
+        metadata = parent / "package.json"
+        if not metadata.is_file() or metadata.is_symlink():
+            continue
+        try:
+            payload = json.loads(metadata.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if payload.get("name") == "@anthropic-ai/sandbox-runtime":
+            return parent
+    return None
+
+
+def _claude_review_settings(worktree: str) -> str:
+    """Build a CLI-only sandbox policy for a headless Claude reviewer."""
+
+    candidate = (Path(worktree).resolve() / "candidate").resolve()
+    home = Path.home().resolve()
+    runtime_paths = tuple(
+        dict.fromkeys(
+            path.resolve()
+            for path in (
+                Path("/run/user"),
+                Path("/run/docker.sock"),
+                Path("/var/run/docker.sock"),
+            )
+        )
+    )
+    credential_paths = (
+        home / ".aws",
+        home / ".claude",
+        home / ".claude.json",
+        home / ".config" / "gh",
+        home / ".config" / "gcloud",
+        home / ".kube",
+        home / ".ssh",
+        *runtime_paths,
+    )
+    credential_env = sorted(
+        name for name in os.environ if _CREDENTIAL_ENV_RE.search(name) is not None
+    )
+    tool_read_paths = [candidate]
+    tool_read_paths.extend(
+        path.resolve()
+        for path in sorted(home.glob(".local/lib/python*/site-packages"))
+        if path.is_dir() and not path.is_symlink()
+    )
+    srt_root = _srt_runtime_root()
+    if srt_root is not None:
+        tool_read_paths.append(srt_root)
+    read_denials = [
+        f"Read(/{path.as_posix()}{'/**' if path.suffix == '' else ''})"
+        for path in credential_paths
+    ]
+    settings = {
+        "permissions": {"deny": read_denials},
+        "sandbox": {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "autoAllowBashIfSandboxed": True,
+            "allowUnsandboxedCommands": False,
+            "filesystem": {
+                "denyWrite": [str(candidate)],
+                "denyRead": [str(home), *(str(path) for path in runtime_paths)],
+                "allowRead": [str(path) for path in tool_read_paths],
+            },
+            "credentials": {
+                "files": [
+                    {"path": str(path), "mode": "deny"}
+                    for path in credential_paths
+                ],
+                "envVars": [
+                    {"name": name, "mode": "deny"}
+                    for name in credential_env
+                ],
+            },
+        },
+    }
+    return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _git_scope_env() -> dict[str, str]:
+    """Drop inherited Git repository/config selectors before scope binding."""
+
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _GIT_REPOSITORY_ENV_KEYS and not key.startswith("GIT_CONFIG_")
+    }
+
+
+def _prepend_wrapper_pythonpath(env: dict[str, str]) -> None:
+    """Make the source wrapper importable without dropping operator paths."""
+
+    package_root = str(Path(__file__).resolve().parents[2])
+    inherited = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        os.pathsep.join((package_root, inherited)) if inherited else package_root
+    )
+
+
+# #396 item 2(b)：copilot executor 的 credential 注入契約——依優先序列出 copilot
+# CLI 認得的既有 env var 名稱（見 porcelain/bootstrap.py `_executor_status` 的
+# login_fix 訊息："請設定 COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN"）。
+_COPILOT_TOKEN_ENV_VARS: tuple[str, ...] = (
+    "COPILOT_GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+def _copilot_credential_env(env: Mapping[str, str]) -> dict[str, str]:
+    """把既有可設定來源的 token 正規化成 copilot CLI 優先讀取的 env var。
+
+    背景（issue #396 item 2）：copilot builder job 派出即失敗，因為 job env 沒有
+    COPILOT_GITHUB_TOKEN／GH_TOKEN，唯一有效 token 只在 gh CLI 的 OS keyring
+    ——headless daemon 本就讀不到桌面 keyring，此函式刻意不去碰它，避免多一個
+    平台相依的失敗模式。
+
+    這裡只做「這個 process 的 env 裡已經有的三個候選名稱之一，正規化成
+    copilot CLI 優先序最高的那個」；至於 token 怎麼進到 process env——沿用本
+    repo 既有的可設定來源（daemon 自身的 systemd EnvironmentFile／
+    `~/.agents/core/runtime/<instance>.env`，與 porcelain/bootstrap.py
+    `_instance_runtime_env_path` 同一份機制，PSC_MANAGER_EXECUTOR 也是這樣佈署
+    的）——留給 operator 決定，不是本函式的責任。
+
+    COPILOT_GITHUB_TOKEN 已存在時視為 operator 明確指定，不覆寫；三個候選皆缺
+    （或皆為空字串）時回傳空 dict，呼叫端不改動 env（fail-soft：沒有 token 不
+    是這個函式該擋的錯，讓 job 依現行行為派出、由 copilot CLI 自己的登入態訊息
+    或 #369 的 executor_auth 探測回報）。
+    """
+
+    if env.get("COPILOT_GITHUB_TOKEN"):
+        return {}
+    token = next(
+        (env[name] for name in _COPILOT_TOKEN_ENV_VARS[1:] if env.get(name)),
+        None,
+    )
+    if token is None:
+        return {}
+    return {"COPILOT_GITHUB_TOKEN": token}
+
+
+def _review_scope_env() -> dict[str, str]:
+    """Keep only non-secret process basics for an untrusted read-only reviewer."""
+
+    allowed = {
+        "HOME",
+        "LANG",
+        "LC_ADDRESS",
+        "LC_ALL",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_IDENTIFICATION",
+        "LC_MEASUREMENT",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NAME",
+        "LC_NUMERIC",
+        "LC_PAPER",
+        "LC_TELEPHONE",
+        "LC_TIME",
+        "LOGNAME",
+        "PATH",
+        "SHELL",
+        "TMPDIR",
+        "USER",
+        "VIRTUAL_ENV",
+    }
+    return {
+        key: value
+        for key, value in _git_scope_env().items()
+        if key in allowed
+    }
+
+
+@dataclass(frozen=True)
+class LaunchHandle:
+    executor: str
+    model_id: str | None
+    session_name: str
+    pid: int
+    log_path: str
+    executable_path: str | None = None
+
+
+CLAUDE_EXECUTABLE_ENV = "PSC_CLAUDE_EXECUTABLE"
+
+
+def resolve_claude_executable(
+    env: Mapping[str, str] | None = None,
+    *,
+    which: Callable[..., str | None] | None = None,
+) -> str:
+    """Resolve the exact Claude-compatible CLI without alias or PATH ambiguity.
+
+    An explicit override is operator authority: it must be an absolute, regular,
+    non-symlink executable and is never allowed to fall back to PATH when invalid.
+    PATH lookup remains the backwards-compatible default when no override exists.
+    """
+
+    source = os.environ if env is None else env
+    lookup = shutil.which if which is None else which
+    override = source.get(CLAUDE_EXECUTABLE_ENV, "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError(f"{CLAUDE_EXECUTABLE_ENV} must be an absolute path")
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(
+                    f"{CLAUDE_EXECUTABLE_ENV} must be a regular non-symlink file"
+                )
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"{CLAUDE_EXECUTABLE_ENV} is unavailable") from exc
+        if candidate.absolute() != resolved:
+            raise ValueError(
+                f"{CLAUDE_EXECUTABLE_ENV} must not traverse symlinked path components"
+            )
+        if os.name != "nt" and not os.access(resolved, os.X_OK):
+            raise ValueError(f"{CLAUDE_EXECUTABLE_ENV} is not executable")
+        return str(resolved)
+
+    discovered = lookup("claude", path=source.get("PATH", ""))
+    if discovered is None:
+        raise ValueError(
+            "Claude executable not found; set PSC_CLAUDE_EXECUTABLE to an absolute path"
+        )
+    discovered_path = Path(discovered).expanduser()
+    # Real shutil.which results exist and are canonicalized for provenance. Unit
+    # probes may inject a synthetic cross-platform path, which should stay opaque.
+    return str(discovered_path.resolve()) if discovered_path.exists() else str(discovered)
+
+
+def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
+    """Resolve only the external Git directories required for a branch commit."""
+
+    if worktree is None:
+        return ()
+    root = Path(worktree).resolve()
+    marker = root / ".git"
+    if marker.is_symlink():
+        raise ValueError("worktree .git marker must not be a symlink")
+    if not marker.exists():
+        return ()
+    if not marker.is_file() and not marker.is_dir():
+        raise ValueError("worktree .git marker must be a regular file or directory")
+    if marker.is_dir():
+        return ()
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--path-format=absolute",
+                "--absolute-git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+                "--symbolic-full-name",
+                "HEAD",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_git_scope_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("linked worktree git metadata is unavailable") from exc
+    rows = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode != 0 or len(rows) != 4:
+        raise ValueError("linked worktree git metadata is invalid")
+    unresolved_git_dir = Path(rows[0])
+    unresolved_common_dir = Path(rows[1])
+    unresolved_toplevel = Path(rows[2])
+    branch_ref = rows[3]
+    if (
+        unresolved_git_dir.is_symlink()
+        or not unresolved_git_dir.is_dir()
+        or unresolved_common_dir.is_symlink()
+        or not unresolved_common_dir.is_dir()
+        or unresolved_git_dir.absolute() != unresolved_git_dir.resolve()
+        or unresolved_common_dir.absolute() != unresolved_common_dir.resolve()
+    ):
+        raise ValueError("linked worktree git metadata is invalid")
+    git_dir = unresolved_git_dir.resolve()
+    common_dir = unresolved_common_dir.resolve()
+    if (
+        unresolved_toplevel.resolve() != root
+        or git_dir.parent != common_dir / "worktrees"
+        or not branch_ref.startswith("refs/heads/")
+    ):
+        raise ValueError("linked worktree gitdir escapes common metadata root")
+    relative_ref = Path(branch_ref)
+    if relative_ref.is_absolute() or ".." in relative_ref.parts:
+        raise ValueError("linked worktree branch ref is invalid")
+
+    objects_dir = common_dir / "objects"
+    refs_root = common_dir / "refs" / "heads"
+    logs_root = common_dir / "logs" / "refs" / "heads"
+    ref_parent = (common_dir / relative_ref).parent
+    reflog_parent = (common_dir / "logs" / relative_ref).parent
+    required = (git_dir, objects_dir, ref_parent, reflog_parent)
+    if any(
+        path.is_symlink()
+        or not path.is_dir()
+        or path.absolute() != path.resolve()
+        for path in required
+    ):
+        raise ValueError("linked worktree required git write directory is invalid")
+    try:
+        objects_dir.resolve().relative_to(common_dir)
+        ref_parent.resolve().relative_to(refs_root)
+        reflog_parent.resolve().relative_to(logs_root)
+    except ValueError as exc:
+        raise ValueError("linked worktree git write directory escapes branch scope") from exc
+    return tuple(dict.fromkeys(str(path.resolve()) for path in required))
+
+
+def build_copilot_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = None,
+    allow_unsafe: bool = False,
+    model: str | None = None,
+    read_only: bool = False,
+    review_only: bool = False,
+    commit_required: bool = False,
+) -> list[str]:
+    if commit_required and (read_only or review_only or allow_unsafe):
+        raise ValueError("commit-required Copilot builder requires enforced workspace-write")
+    if read_only or review_only:
+        raise ValueError("copilot executor has no enforced read-only planning mode")
+    if commit_required:
+        if worktree is None:
+            raise ValueError("commit-required Copilot builder requires a worktree")
+        worktree = str(Path(worktree).resolve())
+    # allow_unsafe（明確 opt-in）才放開 copilot 的全自動授權 --allow-all；
+    # 預設關閉 → 由 executor 自身的互動授權把關（manager 自主派工請設 allow_unsafe=True）。
+    argv = [
+        "copilot",
+        "-p",
+        prompt,
+        "--remote",
+        "--name",
+        slice_id,
+        "--log-dir",
+        log_dir,
+        "--output-format",
+        "json",
+    ]
+    if model is not None:
+        argv += ["--model", model]
+    if commit_required:
+        argv.append("--allow-all-tools")
+        argv += ["--add-dir", worktree]
+        for git_write_dir in _linked_worktree_git_write_dirs(worktree):
+            argv += ["--add-dir", git_write_dir]
+    elif allow_unsafe:
+        argv.append("--allow-all")
+    return argv
+
+
+def build_claude_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = None,
+    allow_unsafe: bool = False,
+    model: str | None = None,
+    read_only: bool = False,
+    review_only: bool = False,
+    review_terminal_kind: str | None = None,
+    commit_required: bool = False,
+    allowed_tools: Sequence[str] = (),
+) -> list[str]:
+    if (read_only or review_only) and allow_unsafe:
+        raise ValueError("read-only Claude launcher cannot bypass permissions")
+    if commit_required and (read_only or review_only or allow_unsafe):
+        raise ValueError("commit-required Claude builder requires enforced workspace-write")
+    if review_only and worktree is None:
+        raise ValueError("read-only Claude reviewer requires a Candidate checkout")
+    if review_only:
+        if review_terminal_kind is None:
+            raise ValueError("Claude reviewer terminal contract kind missing")
+        review_schema = _claude_review_json_schema(review_terminal_kind)
+    else:
+        if review_terminal_kind is not None:
+            raise ValueError("Claude terminal contract requires reviewer mode")
+        review_schema = None
+    # allow_unsafe（明確 opt-in）→ bypassPermissions（不再逐筆授權）；
+    # 預設用 acceptEdits（仍受權限模式把關，最小放權）。
+    argv = [
+        "claude",
+        "-p",
+        prompt,
+        "--output-format",
+        "stream-json",
+        "--verbose",  # smoke 實證：claude -p + --output-format stream-json 必須帶 --verbose
+        "--name",
+        slice_id,
+        "--permission-mode",
+        (
+            "plan"
+            if read_only
+            else (
+                "dontAsk"
+                if review_only
+                else ("bypassPermissions" if allow_unsafe else "acceptEdits")
+            )
+        ),
+    ]
+    if not review_only:
+        argv.append("--remote-control")
+    if read_only:
+        argv += ["--tools", ""]
+    elif review_only:
+        argv += [
+            "--tools",
+            "Bash",
+            "--setting-sources",
+            "",
+            "--settings",
+            _claude_review_settings(worktree),
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--strict-mcp-config",
+            "--json-schema",
+            str(review_schema),
+            "--safe-mode",
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--no-session-persistence",
+        ]
+    elif not read_only and not allow_unsafe:
+        rendered_allowed_tools = _claude_persona_allowed_tools(allowed_tools)
+        if rendered_allowed_tools:
+            argv += ["--allowedTools", rendered_allowed_tools]
+    if model is not None:
+        argv += ["--model", model]
+    if worktree is not None and not review_only:
+        argv.extend(["--add-dir", worktree])
+        # #396 item 3：linked worktree 的 .git 只是個指向 repo 外部（objects／
+        # refs／index）的檔案；builder 完成後對這些外部路徑 git add/commit 若不在
+        # sandbox 的放行清單內，會被擋下回 requires approval（headless 無人可
+        # approve）→ candidate-worktree-dirty。比照 build_copilot_argv／
+        # build_codex_argv 既有的 commit_required 分支，把同一份 linked-worktree
+        # git 寫入目錄透過 --add-dir 放行；非 commit-required（例如 planner）維持
+        # 原行為不放寬。
+        if commit_required:
+            for git_write_dir in _linked_worktree_git_write_dirs(worktree):
+                argv += ["--add-dir", git_write_dir]
+    return argv
+
+
+def build_codex_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = "psc",
+    allow_unsafe: bool = False,
+    model: str | None = None,
+    read_only: bool = False,
+    review_only: bool = False,
+    commit_required: bool = False,
+    effort: str | None = None,
+) -> list[str]:
+    if (read_only or review_only) and allow_unsafe:
+        raise ValueError("read-only Codex planning cannot bypass sandbox")
+    if commit_required and (read_only or review_only or allow_unsafe):
+        raise ValueError("commit-required Codex builder requires enforced workspace-write")
+    if worktree is not None:
+        worktree = str(Path(worktree).resolve())
+    # smoke 實證：`codex exec` 不接受 `--remote`（unexpected argument）。codex 的 remote
+    # 是獨立的 `remote-control` 子命令/app-server，非 exec 旗標；故 headless exec 不帶 remote。
+    argv = [
+        "codex",
+        "exec",
+        prompt,
+        "--json",
+    ]
+    # 高風險：--dangerously-bypass-approvals-and-sandbox 同時關掉核可「與」沙箱。
+    # 僅在明確 opt-in（allow_unsafe=True，例如 manager 自主全自動派工）時才加入；
+    # 預設關閉，讓 codex 自身的核可/沙箱機制把關。
+    if allow_unsafe:
+        argv.append("--dangerously-bypass-approvals-and-sandbox")
+        # smoke 實證：headless codex exec 帶（未持久信任的）relay hook 時，會卡在 hook
+        # 信任閘等待輸入 → timeout。autonomous 派工須一併 bypass hook trust 才不會掛住。
+        argv.append("--dangerously-bypass-hook-trust")
+    elif read_only or review_only:
+        argv += ["--sandbox", "read-only", "--skip-git-repo-check"]
+    else:
+        argv += ["--sandbox", "workspace-write"]
+        if commit_required:
+            for git_write_dir in _linked_worktree_git_write_dirs(worktree):
+                argv += ["--add-dir", git_write_dir]
+    if model is not None:
+        argv += ["--model", model]
+        effective_effort = effort or _CODEX_DEFAULT_REASONING_EFFORT
+        if effective_effort not in _CODEX_REASONING_EFFORTS:
+            raise ValueError(
+                f"Codex reasoning effort must be one of {sorted(_CODEX_REASONING_EFFORTS)}"
+            )
+        argv += ["-c", f"model_reasoning_effort={json.dumps(effective_effort)}"]
+    argv.extend(["-o", str(Path(log_dir) / "last.json")])
+    if worktree is not None:
+        argv.extend(["-C", worktree])
+    return argv
+
+
+def build_agy_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = None,
+    allow_unsafe: bool = False,
+    model: str | None = None,
+    read_only: bool = False,
+    review_only: bool = False,
+) -> list[str]:
+    """Build the only supported Antigravity invocation: headless plan+sandbox.
+
+    Antigravity exposes ``--dangerously-skip-permissions`` but cortex never
+    emits it.  The planner peer is evidence-only, so it has no reason to run
+    with write permissions even when another executor was explicitly granted
+    unsafe mode.
+    """
+    if allow_unsafe:
+        raise ValueError("agy executor does not support unsafe mode")
+    argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
+    if model is not None:
+        argv.extend(["--model", model])
+    return argv
+
+
+# cg（copilot API／glm-5.2 經 llm-share 巷道）的預設身分——operator 的
+# `$HOME/.local/bin/cg` thin wrapper 已固定 `HIPPO_COPILOT_ENV_FILE` 指向
+# llm-share env（含 `COPILOT_MODEL=glm-5.2`），這裡的常數只是 argv 沒收到明確
+# `model` 時的落地預設，實際身分仍由 operator 的 env file 決定。
+_CG_DEFAULT_MODEL = "glm-5.2"
+_CG_VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_CG_DEFAULT_EFFORT = "medium"
+
+
+def build_cg_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = None,
+    allow_unsafe: bool = False,
+    model: str | None = None,
+    read_only: bool = False,
+    review_only: bool = False,
+    commit_required: bool = False,
+    effort: str | None = None,
+) -> list[str]:
+    """Build the headless `cg`（copilot API／glm-5.2 via llm-share）invocation.
+
+    Operator-provided、smoke-verified 契約（issue #442）：
+    ``cg --model {MODEL} --effort {low|medium|high|xhigh} --headless --stdin``
+    ——prompt 經 stdin 傳入（不是 argv 參數，見 `SubprocessLauncher.launch` 的
+    stdin plumbing）、乾淨 response 寫到 stdout、summary banner 寫到 stderr、
+    exit 0 表示成功。`cg` wrapper 自帶 ``--available-tools=__none__`` ＋
+    ``--disable-builtin-mcps`` ＋ throwaway HOME：zero-tool，不能跑任何 tool、
+    不能寫檔、不能 commit。因此 cg 只能服務 read-only 的 planner／reviewer
+    persona，絕不可當 builder——``prompt``／``slice_id``／``log_dir``／
+    ``worktree``／``remote`` 是為了滿足與其餘 builder 共用的呼叫介面而接收，
+    實際不會進入回傳的 argv（prompt 由呼叫端經 stdin 餵入）。
+
+    比照 `build_agy_argv` 對 `allow_unsafe` 的拒絕模式：agy 與 cg 都是 read-only
+    planner，這裡同樣 fail-closed，而非靜默降級成安全形狀——commit_required／
+    unsafe／非 read-only-或-review-only 的「builder 語境」一律 raise，讓誤用在
+    建構期就顯性失敗，不會把一個從未被授權寫入的 executor 悄悄放進 builder 角色。
+    """
+    if allow_unsafe:
+        raise ValueError("cg executor does not support unsafe mode")
+    if commit_required:
+        raise ValueError("cg executor is zero-tool and cannot commit")
+    if not (read_only or review_only):
+        raise ValueError("cg executor requires read-only or review-only mode")
+    resolved_effort = effort or _CG_DEFAULT_EFFORT
+    if resolved_effort not in _CG_VALID_EFFORTS:
+        raise ValueError(
+            f"cg executor effort must be one of {sorted(_CG_VALID_EFFORTS)}, got {resolved_effort!r}"
+        )
+    return [
+        "cg",
+        "--model",
+        model or _CG_DEFAULT_MODEL,
+        "--effort",
+        resolved_effort,
+        "--headless",
+        "--stdin",
+    ]
+
+
+@runtime_checkable
+class AgentLauncher(Protocol):
+    def launch(
+        self,
+        *,
+        slice_id: str,
+        prompt: str,
+        worktree: str,
+        log_dir: str,
+    ) -> LaunchHandle: ...
+
+
+# 目前支援的 headless executor 家族——這是唯一真相來源：`cli.py` 的
+# `--executor`/`--review-executor` choices 與 `SubprocessLauncher.__init__` 的
+# 建構驗證都直接消費這個字典的 key（不重複列舉），新增一筆即兩處自動同步。
+#
+# 新增 executor 前的必要條件：先確認其 CLI 介面（prompt 怎麼傳、輸出格式、
+# sandbox/approval 旗標怎麼關），寫一個對應的 `build_<executor>_argv`，仿照本檔
+# 其餘 builder 附近散落的「smoke 實證」註解方式留下驗證依據，再加進這個字典。
+#
+# `cg`（copilot API／glm-5.2 巷道）自 issue #442 起已支援：#396 item 1 當時找不到
+# CLI 介面文件或 smoke 紀錄而刻意 out-of-scope；operator 已提供並 smoke 驗證介面
+# 契約（見 `build_cg_argv` docstring），故補上 `build_cg_argv` 並在此登記。cg 是
+# zero-tool（無法跑任何 tool／寫檔／commit），`build_cg_argv` 與
+# `SubprocessLauncher.__init__` 對 commit_required／allow_unsafe／非
+# read-only-或-review-only 的建構請求一律 raise，只服務 planner／reviewer 角色。
+_ARGV_BUILDERS = {
+    "copilot": build_copilot_argv,
+    "claude": build_claude_argv,
+    "codex": build_codex_argv,
+    "agy": build_agy_argv,
+    "cg": build_cg_argv,
+}
+
+
+class SubprocessLauncher:
+    """真實作：headless subprocess 啟動。測試 MUST 注入 fake，不實體化。"""
+
+    def __init__(
+        self,
+        executor: str = "copilot",
+        *,
+        relay_target: str | None = None,
+        codex_remote: str = "psc",
+        allow_unsafe: bool = False,
+        model: str | None = None,
+        read_only: bool = False,
+        review_only: bool = False,
+        commit_required: bool = False,
+        review_terminal_kind: str | None = None,
+        effort: str | None = None,
+        allowed_tools: Sequence[str] = (),
+    ) -> None:
+        if executor not in _ARGV_BUILDERS:
+            raise ValueError(f"unknown executor: {executor}")
+        if executor == "agy" and allow_unsafe:
+            raise ValueError("agy executor refuses unsafe mode")
+        if executor == "cg" and allow_unsafe:
+            raise ValueError("cg executor refuses unsafe mode")
+        if (read_only or review_only) and executor == "copilot":
+            raise ValueError("copilot executor has no enforced read-only planning mode")
+        # cg 是 zero-tool（見 build_cg_argv docstring）：與 copilot 相反，這裡要求
+        # 而非禁止 read-only/review-only——builder 語境（both False）在建構期即
+        # 顯性拒絕，不留給呼叫端在 launch() 時才踩空。
+        if executor == "cg" and not (read_only or review_only):
+            raise ValueError("cg executor requires read-only or review-only mode")
+        if read_only and review_only:
+            raise ValueError("launcher cannot be both planner-read-only and reviewer-read-only")
+        if (read_only or review_only) and allow_unsafe:
+            raise ValueError("read-only launcher cannot enable unsafe mode")
+        if commit_required and (read_only or review_only or allow_unsafe):
+            raise ValueError("commit-required launcher requires enforced workspace-write")
+        if review_only and review_terminal_kind not in {
+            "workflow-verification-result", "workflow-review-result",
+        }:
+            raise ValueError("reviewer launcher terminal contract kind invalid")
+        if not review_only and review_terminal_kind is not None:
+            raise ValueError("reviewer terminal contract requires reviewer mode")
+        self._executor = executor
+        self._relay_target = relay_target
+        self._codex_remote = codex_remote
+        # allow_unsafe（明確 opt-in）：放開各 executor 的全自動授權/沙箱旁路旗標
+        # （codex --dangerously-bypass-approvals-and-sandbox、copilot --allow-all、
+        # claude bypassPermissions）。預設 False，採最小放權，避免無意間關掉沙箱。
+        self._allow_unsafe = allow_unsafe
+        self._model = model
+        self._read_only = read_only
+        self._review_only = review_only
+        self._commit_required = commit_required
+        self._review_terminal_kind = review_terminal_kind
+        # codex/cg 共用受限的 reasoning effort 語意；合法值由各 argv builder
+        # 驗證。未指定時兩者都固定採 medium，避免 reviewer 繼承環境中的不相容值。
+        self._effort = effort
+        self._allowed_tools = tuple(str(tool) for tool in allowed_tools)
+
+    @property
+    def executor(self) -> str:
+        """公開 executor CLI 家族（copilot/claude/codex/agy/cg）。
+
+        #381：spawn admission limiter 需要在啟動前依 provider 分桶節流；
+        沒有 per-slice identity 可查時，這是唯一能從已注入的 launcher
+        自報「實際會是哪個 provider」的管道（見 spawn_admission.resolve_provider）。
+        """
+        return self._executor
+
+    def as_read_only(self) -> "SubprocessLauncher":
+        """Return an equivalent launcher with the executor's strict planning contract."""
+
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=False,
+            model=self._model,
+            read_only=True,
+            review_only=False,
+            commit_required=False,
+            effort=self._effort,
+            allowed_tools=self._allowed_tools,
+        )
+
+    def as_review_only(self, *, terminal_kind: str) -> "SubprocessLauncher":
+        """Return a launcher that can inspect, but cannot mutate, a Candidate checkout."""
+
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=False,
+            model=self._model,
+            read_only=False,
+            review_only=True,
+            commit_required=False,
+            review_terminal_kind=terminal_kind,
+            effort=self._effort,
+            allowed_tools=self._allowed_tools,
+        )
+
+    def as_commit_required(self) -> "SubprocessLauncher":
+        """Return a builder launcher explicitly allowed to update linked Git metadata."""
+
+        if self._read_only or self._review_only:
+            raise ValueError("commit-required launcher requires enforced workspace-write")
+        if self._allow_unsafe or self._commit_required:
+            return self
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=False,
+            model=self._model,
+            read_only=False,
+            review_only=False,
+            commit_required=True,
+            effort=self._effort,
+            allowed_tools=self._allowed_tools,
+        )
+
+    def with_persona_tools(self, tools: Sequence[str]) -> "SubprocessLauncher":
+        """Bind the structured persona allowlist without granting undeclared commands."""
+
+        normalized = tuple(str(tool).strip() for tool in tools if str(tool).strip())
+        if normalized == self._allowed_tools:
+            return self
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=self._allow_unsafe,
+            model=self._model,
+            read_only=self._read_only,
+            review_only=self._review_only,
+            commit_required=self._commit_required,
+            review_terminal_kind=self._review_terminal_kind,
+            effort=self._effort,
+            allowed_tools=normalized,
+        )
+
+    def _should_run_gates(self, env: Mapping[str, str]) -> bool:
+        """#261：只有會改動 candidate 的可寫入 card 才在 wrapper 內跑確定性 gate。
+
+        read-only／review-only 的 reviewer 不改 candidate，也刻意在最小 env 下執行，
+        不應在它的 sandbox 內跑 gate；operator 未宣告任何 ``PSC_GATE_CMD_*`` 時仍會
+        寫出一份 ``gates: []`` 的 ledger，讓 harvest 能區分「沒宣告 gate」與
+        「wrapper 根本沒跑完」。
+        """
+
+        if self._review_only or self._read_only:
+            return False
+        return env.get("PSC_REPO_ROOT") is not None
+
+    def executor_environment(self, *, slice_id: str = "preflight"):
+        """#262 D2：回報正式 job 會實際看到的 executor 環境。
+
+        env 由與 `launch()` 相同的 `_review_scope_env()`／`_git_scope_env()` 產生，
+        因此 preflight 檢查的 PATH／HOME／sandbox policy 與正式 job 一致；
+        若在此另建一份 env，preflight 就只是安慰劑（見 design D2）。
+        """
+
+        from .runtime_preflight import ExecutorEnvironment
+
+        if self._review_only:
+            env = _review_scope_env()
+        else:
+            env = {
+                **_git_scope_env(),
+                "PSC_SLICE_ID": slice_id,
+                "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
+            }
+            if self._relay_target is not None:
+                env["PSC_RELAY_TARGET"] = self._relay_target
+        _prepend_wrapper_pythonpath(env)
+        # interpreter：job wrapper 使用目前的 Python；gate/model 的可執行檔仍由
+        # executor env 的 PATH 解析，避免 Windows 依賴 Bash。
+        interpreter = shutil.which("python3", path=env.get("PATH", "")) or shutil.which(
+            "python", path=env.get("PATH", "")
+        )
+        if self._review_only:
+            mode = "review-only"
+        elif self._read_only:
+            mode = "read-only"
+        else:
+            mode = "workspace-write"
+        return ExecutorEnvironment(
+            name=f"{self._executor}:{mode}",
+            interpreter=(interpreter,) if interpreter else (sys.executable,),
+            path=env.get("PATH", ""),
+            home=env.get("HOME", ""),
+            provider_identity=f"{self._executor}/{self._model}" if self._model else self._executor,
+        )
+
+    def launch(self, *, slice_id: str, prompt: str, worktree: str, log_dir: str) -> LaunchHandle:
+        resolved_worktree = Path(worktree).resolve(strict=True)
+        if not resolved_worktree.is_dir():
+            raise ValueError("launcher worktree must be a directory")
+        worktree = str(resolved_worktree)
+        # log_dir resolve 成絕對：sentinel 由子進程的 bash wrapper 以 cwd=worktree 寫入，
+        # 相對路徑會落到 worktree（poller 在他處找不到）→ 完成偵測對 worktree dispatch 失效。
+        # 絕對化後 JSONL / sentinel / 回傳 log_path 皆與 cwd 無關，跨進程 poll 一致。
+        log_dir = str(Path(log_dir).resolve())
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        builder_kwargs = {
+            "prompt": prompt,
+            "slice_id": slice_id,
+            "log_dir": log_dir,
+            "worktree": worktree,
+            "remote": self._codex_remote,
+            "allow_unsafe": self._allow_unsafe,
+            "model": self._model,
+            "read_only": self._read_only,
+            "review_only": self._review_only,
+        }
+        # #396 item 3：claude 併入 commit_required 傳遞——builder-persona 的
+        # as_commit_required() 轉換（autonomy.dispatch_ready）對三個 executor
+        # 一視同仁，build_claude_argv 缺這個 kwarg 會讓轉換對 claude 變 no-op。
+        # cg 併入同一份 kwarg（issue #442）：self._commit_required 對任何成功建構
+        # 的 cg launcher 恆為 False（見 __init__ 的 cg 專屬不變量），這裡顯式傳遞
+        # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
+        if self._executor in {"codex", "copilot", "claude", "cg"}:
+            builder_kwargs["commit_required"] = self._commit_required
+        if self._executor == "claude":
+            builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
+            builder_kwargs["allowed_tools"] = self._allowed_tools
+        if self._executor in {"codex", "cg"}:
+            builder_kwargs["effort"] = self._effort
+        inner_argv = _ARGV_BUILDERS[self._executor](
+            **builder_kwargs,
+        )
+        executable_path = None
+        if self._executor == "claude":
+            # Alias expansion is intentionally impossible in the typed-argv launcher.
+            # Bind the operator-selected compatible CLI before the reviewer env is
+            # reduced, then keep the override itself out of the untrusted child env.
+            executable_path = resolve_claude_executable(_git_scope_env())
+            inner_argv[0] = executable_path
+        # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
+        # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
+        # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。
+        if self._review_only:
+            env = _review_scope_env()
+        else:
+            env = {
+                **_git_scope_env(),
+                "PSC_SLICE_ID": slice_id,
+                "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
+            }
+            if self._relay_target is not None:
+                env["PSC_RELAY_TARGET"] = self._relay_target
+            if self._executor == "copilot":
+                env.update(_copilot_credential_env(env))
+        _prepend_wrapper_pythonpath(env)
+        log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
+        # 跨進程 durable 完成判定由 typed-argv Python wrapper 寫入 exit sentinel；
+        # 不經 shell，prompt 含換行／空白仍維持單一 token。
+        sentinel = str(Path(log_dir) / f"{slice_id}.exit")
+        # 重跑同一 slice_id 前先清掉上一輪殘留：移除舊 exit sentinel、log 以 wb 截斷。
+        # 否則 poll_headless_done 會讀到上一輪的 sentinel / 末筆 JSONL，
+        # 誤判「還沒開始就已完成」（fail-closed：每輪從乾淨狀態起跑）。
+        Path(sentinel).unlink(missing_ok=True)
+        # #261：同理清掉上一輪的 gate ledger，避免 harvest 讀到前一次的 gate 結果。
+        ledger = terminal_contract.gate_ledger_path(log_path)
+        Path(ledger).unlink(missing_ok=True)
+        argv = [
+            sys.executable,
+            "-m",
+            "paulsha_cortex.coordinator.process_wrapper",
+            "--sentinel",
+            sentinel,
+            "--ledger",
+            str(ledger),
+            "--worktree",
+            worktree,
+        ]
+        if self._should_run_gates(env):
+            argv.append("--run-gates")
+        # cg（issue #442）以 stdin 傳 prompt，並丟棄只供人讀的 stderr banner；
+        # 仍走 typed-argv Python wrapper，因此 Windows 不需要 Bash。
+        if self._executor == "cg":
+            argv.extend(["--forward-stdin", "--discard-child-stderr"])
+        argv.extend(["--", *inner_argv])
+        with open(log_path, "wb") as logf:
+            popen_options: dict[str, object] = {
+                "cwd": worktree,
+                "env": env,
+                "stdout": logf,
+                "stderr": subprocess.STDOUT,
+            }
+            if self._executor == "cg":
+                popen_options["stdin"] = subprocess.PIPE
+            proc = subprocess.Popen(argv, **popen_options)
+            if self._executor == "cg":
+                assert proc.stdin is not None
+                try:
+                    proc.stdin.write(prompt.encode("utf-8"))
+                except (BrokenPipeError, OSError):
+                    pass
+                finally:
+                    proc.stdin.close()
+        return LaunchHandle(
+            executor=self._executor,
+            model_id=self._model,
+            session_name=slice_id,
+            pid=proc.pid,
+            log_path=log_path,
+            executable_path=executable_path,
+        )

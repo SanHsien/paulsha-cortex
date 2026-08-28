@@ -1,0 +1,1710 @@
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import paulsha_cortex.coordinator.launcher as launcher_module
+from paulsha_cortex.coordinator.launcher import (
+    SubprocessLauncher,
+    build_copilot_argv,
+    build_claude_argv,
+    build_codex_argv,
+    build_cg_argv,
+    resolve_claude_executable,
+)
+from paulsha_cortex.lib.processes import pid_exists
+
+
+def _wait_for_child_exit(pid: int, *, timeout: float = 10.0) -> bool:
+    """Bounded cross-platform wait that also reaps POSIX zombies."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.name != "nt":
+            try:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return not pid_exists(pid)
+            if waited_pid == pid:
+                return True
+        elif not pid_exists(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class ArgvTests(unittest.TestCase):
+    def test_copilot_argv(self) -> None:
+        argv = build_copilot_argv(prompt="PROMPT", slice_id="slice-a", log_dir="/lg")
+        self.assertEqual(argv[0], "copilot")
+        self.assertIn("-p", argv)
+        self.assertIn("PROMPT", argv)                 # prompt 為單一元素
+        self.assertIn("--remote", argv)
+        self.assertIn("--name", argv)
+        self.assertIn("slice-a", argv)
+        self.assertIn("--output-format", argv)
+        self.assertIn("json", argv)
+
+    def test_copilot_builder_commit_required_scopes_tool_and_git_write_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/copilot-scope", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+
+            argv = build_copilot_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+                commit_required=True,
+            )
+
+            self.assertIn("--allow-all-tools", argv)
+            self.assertNotIn("--allow-all", argv)
+            add_dirs = [
+                argv[index + 1]
+                for index, value in enumerate(argv)
+                if value == "--add-dir"
+            ]
+            self.assertEqual(
+                add_dirs,
+                [
+                    str(linked.resolve()),
+                    str((repo / ".git" / "worktrees" / "linked").resolve()),
+                    str((repo / ".git" / "objects").resolve()),
+                    str((repo / ".git" / "refs" / "heads" / "feature").resolve()),
+                    str((repo / ".git" / "logs" / "refs" / "heads" / "feature").resolve()),
+                ],
+            )
+
+    def test_claude_builder_maps_only_declared_persona_tools_to_narrow_grants(self) -> None:
+        argv = build_claude_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            commit_required=True,
+            allowed_tools=(
+                "python -m unittest",
+                "rg",
+                "edit",
+                "git add",
+                "git commit",
+                "git status",
+                "unknown-tool",
+            ),
+        )
+
+        grants = argv[argv.index("--allowedTools") + 1]
+        self.assertIn("Bash(python -m unittest *)", grants)
+        self.assertIn("Bash(git add *)", grants)
+        self.assertIn("Bash(git commit *)", grants)
+        self.assertIn("Bash(git status)", grants)
+        self.assertIn("Edit", grants)
+        self.assertNotIn("Bash(git *)", grants)
+        self.assertNotIn("push", grants)
+        self.assertNotIn("reset", grants)
+        self.assertNotIn("unknown-tool", grants)
+
+    def test_copilot_builder_commit_required_rejects_incompatible_modes(self) -> None:
+        for kwargs in (
+            {"read_only": True},
+            {"review_only": True},
+            {"allow_unsafe": True},
+        ):
+            with self.assertRaisesRegex(ValueError, "enforced workspace-write"):
+                build_copilot_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir="/lg",
+                    worktree="/wt/slice-a",
+                    commit_required=True,
+                    **kwargs,
+                )
+        with self.assertRaisesRegex(ValueError, "requires a worktree"):
+            build_copilot_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir="/lg",
+                commit_required=True,
+            )
+
+    def test_copilot_builder_commit_required_false_preserves_existing_argv(self) -> None:
+        baseline = build_copilot_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            worktree="/wt/slice-a",
+            model="claude-haiku-4.5",
+            allow_unsafe=True,
+        )
+        argv = build_copilot_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            worktree="/wt/slice-a",
+            model="claude-haiku-4.5",
+            allow_unsafe=True,
+            commit_required=False,
+        )
+
+        self.assertEqual(argv, baseline)
+
+    def test_claude_argv(self) -> None:
+        argv = build_claude_argv(
+            prompt="PROMPT",
+            slice_id="slice-a",
+            log_dir="/lg",
+            worktree="/wt/slice-a",
+        )
+        self.assertEqual(argv[0], "claude")
+        self.assertIn("-p", argv)
+        self.assertIn("PROMPT", argv)
+        self.assertIn("--remote-control", argv)
+        self.assertIn("--add-dir", argv)
+        self.assertIn("/wt/slice-a", argv)
+        self.assertIn("--output-format", argv)
+        self.assertIn("stream-json", argv)
+        self.assertIn("--verbose", argv)  # smoke: -p+stream-json 必須帶 --verbose
+        self.assertIn("--name", argv)
+        self.assertIn("slice-a", argv)
+        self.assertIn("--permission-mode", argv)
+        self.assertIn("acceptEdits", argv)
+
+    def test_explicit_claude_executable_is_absolute_regular_and_never_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            executable = Path(d) / "claude-compatible"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            which = mock.Mock(return_value="/fallback/claude")
+
+            resolved = resolve_claude_executable(
+                {"PSC_CLAUDE_EXECUTABLE": str(executable), "PATH": "/fallback"},
+                which=which,
+            )
+
+            self.assertEqual(resolved, str(executable.resolve()))
+            which.assert_not_called()
+
+            with self.assertRaisesRegex(ValueError, "absolute path"):
+                resolve_claude_executable(
+                    {"PSC_CLAUDE_EXECUTABLE": "claude-alias", "PATH": "/fallback"},
+                    which=which,
+                )
+            which.assert_not_called()
+
+    def test_explicit_claude_executable_rejects_non_regular_path(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(ValueError, "regular non-symlink"):
+                resolve_claude_executable(
+                    {"PSC_CLAUDE_EXECUTABLE": str(Path(d).resolve()), "PATH": ""},
+                    which=mock.Mock(return_value="/fallback/claude"),
+                )
+
+    def test_claude_path_lookup_does_not_inherit_host_path_from_mapping(self) -> None:
+        which = mock.Mock(return_value=None)
+
+        with self.assertRaisesRegex(ValueError, "not found"):
+            resolve_claude_executable({}, which=which)
+
+        which.assert_called_once_with("claude", path="")
+
+    def test_claude_launch_binds_exact_executable_and_records_provenance(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 475
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                executable = Path(d) / "claude-compatible"
+                executable.write_text("#!/bin/sh\n", encoding="utf-8")
+                executable.chmod(0o755)
+                with mock.patch.dict(
+                    os.environ,
+                    {"PSC_CLAUDE_EXECUTABLE": str(executable)},
+                    clear=False,
+                ):
+                    handle = SubprocessLauncher("claude").launch(
+                        slice_id="slice-custom",
+                        prompt="PROMPT",
+                        worktree=d,
+                        log_dir=str(Path(d) / "logs"),
+                    )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        inner = calls[0]["argv"][calls[0]["argv"].index("--") + 1 :]
+        self.assertEqual(inner[0], str(executable.resolve()))
+        self.assertEqual(handle.executable_path, str(executable.resolve()))
+
+    def test_claude_builder_commit_required_grants_linked_worktree_git_metadata(self) -> None:
+        # #396 item 3：claude builder 完成後 sandbox 對 git add/commit 回 requires
+        # approval（headless 無人可 approve）→ candidate-worktree-dirty。root cause：
+        # build_copilot_argv／build_codex_argv 的 commit_required 分支都會把 linked
+        # worktree 的外部 git 目錄（.git/worktrees/<name>、objects、refs、logs）透過
+        # --add-dir 放行，唯獨 build_claude_argv 從未接這條路徑——worktree 的 .git
+        # 只是個指向 repo 外部的檔案，實際 index/objects/refs 都在 --add-dir worktree
+        # 範圍之外，sandbox 因此擋下 git add/commit。這裡驗證 claude 現在比照
+        # copilot/codex 補齊同一份 --add-dir 清單。
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/claude-scope", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+
+            argv = build_claude_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+                commit_required=True,
+            )
+
+            add_dirs = [
+                argv[index + 1]
+                for index, value in enumerate(argv)
+                if value == "--add-dir"
+            ]
+            self.assertEqual(
+                add_dirs,
+                [
+                    str(linked.resolve()),
+                    str((repo / ".git" / "worktrees" / "linked").resolve()),
+                    str((repo / ".git" / "objects").resolve()),
+                    str((repo / ".git" / "refs" / "heads" / "feature").resolve()),
+                    str((repo / ".git" / "logs" / "refs" / "heads" / "feature").resolve()),
+                ],
+            )
+
+    def test_claude_builder_commit_required_false_preserves_existing_argv(self) -> None:
+        baseline = build_claude_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            worktree="/wt/slice-a",
+            model="opus",
+        )
+        argv = build_claude_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            worktree="/wt/slice-a",
+            model="opus",
+            commit_required=False,
+        )
+
+        self.assertEqual(argv, baseline)
+
+    def test_claude_builder_commit_required_rejects_incompatible_modes(self) -> None:
+        for kwargs in (
+            {"read_only": True},
+            {"allow_unsafe": True},
+        ):
+            with self.assertRaisesRegex(ValueError, "enforced workspace-write"):
+                build_claude_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir="/lg",
+                    worktree="/wt/slice-a",
+                    commit_required=True,
+                    **kwargs,
+                )
+        with self.assertRaisesRegex(ValueError, "enforced workspace-write"):
+            build_claude_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir="/lg",
+                worktree="/wt/reviewer",
+                review_only=True,
+                review_terminal_kind="workflow-verification-result",
+                commit_required=True,
+            )
+
+    def test_codex_argv(self) -> None:
+        argv = build_codex_argv(
+            prompt="PROMPT",
+            slice_id="slice-a",
+            log_dir="/lg",
+            worktree="/wt/slice-a",
+            remote="unix:/tmp/psc.sock",
+        )
+        self.assertEqual(argv[0], "codex")
+        self.assertIn("exec", argv)
+        self.assertIn("PROMPT", argv)
+        self.assertNotIn("--remote", argv)  # smoke: codex exec 不吃 --remote（unexpected argument）
+        self.assertNotIn("unix:/tmp/psc.sock", argv)
+        self.assertIn("-C", argv)
+        self.assertIn(str(Path("/wt/slice-a").resolve()), argv)
+        self.assertIn("--json", argv)
+        self.assertIn("-o", argv)
+
+    def test_codex_argv_default_has_no_sandbox_bypass(self) -> None:
+        # 預設（allow_unsafe 未開）不得帶 --dangerously-bypass-approvals-and-sandbox（高風險）
+        argv = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg")
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_codex_model_pins_compatible_reasoning_effort_over_ambient_config(self) -> None:
+        argv = build_codex_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            model="gpt-5.3-codex-spark",
+        )
+
+        self.assertIn("-c", argv)
+        self.assertEqual(
+            argv[argv.index("-c") + 1],
+            'model_reasoning_effort="medium"',
+        )
+
+    def test_codex_rejects_unsupported_explicit_reasoning_effort(self) -> None:
+        with self.assertRaisesRegex(ValueError, "reasoning effort"):
+            build_codex_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir="/lg",
+                model="gpt-5.3-codex-spark",
+                effort="max",
+            )
+
+    def test_planner_read_only_argv_never_uses_edit_permissions(self) -> None:
+        claude = build_claude_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=True
+        )
+        codex = build_codex_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=True
+        )
+
+        self.assertEqual(claude[claude.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("acceptEdits", claude)
+        self.assertEqual(claude[claude.index("--tools") + 1], "")
+        self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
+        self.assertIn("--skip-git-repo-check", codex)
+
+    def test_reviewer_read_only_argv_allows_inspection_but_never_edit_permissions(self) -> None:
+        with mock.patch.object(
+            launcher_module,
+            "_srt_runtime_root",
+            return_value=Path("/tools/sandbox-runtime"),
+        ):
+            claude = build_claude_argv(
+                prompt="P", slice_id="s", log_dir="/lg",
+                worktree="/wt/reviewer", review_only=True,
+                review_terminal_kind="workflow-verification-result",
+            )
+        codex = build_codex_argv(
+            prompt="P", slice_id="s", log_dir="/lg", review_only=True
+        )
+
+        self.assertEqual(claude[claude.index("--permission-mode") + 1], "dontAsk")
+        self.assertNotIn("acceptEdits", claude)
+        self.assertNotIn("--remote-control", claude)
+        self.assertNotIn("--add-dir", claude)
+        self.assertEqual(claude[claude.index("--tools") + 1], "Bash")
+        self.assertNotIn("--allowedTools", claude)
+        self.assertEqual(claude[claude.index("--setting-sources") + 1], "")
+        settings = json.loads(claude[claude.index("--settings") + 1])
+        self.assertTrue(settings["sandbox"]["enabled"])
+        self.assertTrue(settings["sandbox"]["failIfUnavailable"])
+        self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
+        self.assertEqual(
+            settings["sandbox"]["filesystem"]["denyWrite"],
+            [str(Path("/wt/reviewer/candidate").resolve())],
+        )
+        self.assertEqual(
+            settings["sandbox"]["filesystem"]["allowRead"][0],
+            str(Path("/wt/reviewer/candidate").resolve()),
+        )
+        self.assertIn(
+            str(Path("/tools/sandbox-runtime")),
+            settings["sandbox"]["filesystem"]["allowRead"],
+        )
+        self.assertEqual(
+            settings["sandbox"]["filesystem"]["denyRead"],
+            [
+                str(Path.home().resolve()),
+                *[
+                    str(path)
+                    for path in dict.fromkeys(
+                        Path(value).resolve()
+                        for value in ("/run/user", "/run/docker.sock", "/var/run/docker.sock")
+                    )
+                ],
+            ],
+        )
+        protected_files = {
+            row["path"] for row in settings["sandbox"]["credentials"]["files"]
+        }
+        for value in ("/run/user", "/run/docker.sock", "/var/run/docker.sock"):
+            self.assertIn(str(Path(value).resolve()), protected_files)
+        self.assertIn("--strict-mcp-config", claude)
+        schema = json.loads(claude[claude.index("--json-schema") + 1])
+        self.assertEqual(
+            schema["required"],
+            ["schema_version", "kind", "status", "summary", "details", "reports"],
+        )
+        self.assertEqual(
+            schema["properties"]["kind"]["enum"], ["workflow-verification-result"]
+        )
+        # #261 R1：三種終局狀態對等可達；只允許成功形狀會逼 verifier fail-open。
+        self.assertEqual(
+            schema["properties"]["status"]["enum"],
+            ["verified", "failed", "needs_human"],
+        )
+        review = build_claude_argv(
+            prompt="P",
+            slice_id="review", log_dir="/lg", worktree="/wt/reviewer", review_only=True,
+            review_terminal_kind="workflow-review-result",
+        )
+        review_schema = json.loads(review[review.index("--json-schema") + 1])
+        self.assertEqual(
+            review_schema["required"],
+            ["schema_version", "kind", "reason", "findings", "reports"],
+        )
+        self.assertEqual(
+            review_schema["properties"]["kind"]["enum"], ["workflow-review-result"]
+        )
+        self.assertIn(
+            "report-only",
+            review_schema["properties"]["findings"]["items"]["properties"]
+            ["category"]["description"],
+        )
+        self.assertIn("--safe-mode", claude)
+        self.assertIn("--no-session-persistence", claude)
+        self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
+        self.assertIn("--skip-git-repo-check", codex)
+        with self.assertRaisesRegex(ValueError, "Candidate checkout"):
+            build_claude_argv(
+                prompt="P", slice_id="s", log_dir="/lg", review_only=True
+            )
+        with self.assertRaisesRegex(ValueError, "terminal contract kind"):
+            build_claude_argv(
+                prompt="P", slice_id="s", log_dir="/lg",
+                worktree="/wt/reviewer", review_only=True,
+            )
+        with self.assertRaisesRegex(ValueError, "read-only"):
+            build_copilot_argv(prompt="P", slice_id="s", log_dir="/lg", review_only=True)
+
+    def test_codex_builder_keeps_git_trust_check(self) -> None:
+        argv = build_codex_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=False
+        )
+
+        self.assertNotIn("--skip-git-repo-check", argv)
+
+    def test_codex_builder_grants_only_linked_worktree_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/launcher-test", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+
+            builder = build_codex_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+                commit_required=True,
+            )
+            planner = build_codex_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+                read_only=True,
+            )
+
+            self.assertEqual(builder[builder.index("--sandbox") + 1], "workspace-write")
+            add_dirs = [
+                builder[index + 1]
+                for index, value in enumerate(builder)
+                if value == "--add-dir"
+            ]
+            self.assertEqual(
+                add_dirs,
+                [
+                    str((repo / ".git" / "worktrees" / "linked").resolve()),
+                    str((repo / ".git" / "objects").resolve()),
+                    str((repo / ".git" / "refs" / "heads" / "feature").resolve()),
+                    str((repo / ".git" / "logs" / "refs" / "heads" / "feature").resolve()),
+                ],
+            )
+            self.assertNotIn("--add-dir", planner)
+
+    def test_codex_builder_rejects_detached_linked_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(linked)],
+                check=True,
+            )
+
+            reviewer = build_codex_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+            )
+            self.assertNotIn("--add-dir", reviewer)
+
+            with self.assertRaisesRegex(ValueError, "gitdir escapes"):
+                build_codex_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir=str(root / "logs"),
+                    worktree=str(linked),
+                    commit_required=True,
+                )
+
+    def test_codex_builder_ignores_inherited_git_repository_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            decoy = root / "decoy"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "fixture"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "Launcher Test",
+                    "GIT_AUTHOR_EMAIL": "launcher@example.invalid",
+                    "GIT_COMMITTER_NAME": "Launcher Test",
+                    "GIT_COMMITTER_EMAIL": "launcher@example.invalid",
+                },
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/scope-test", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+            subprocess.run(["git", "init", "-q", str(decoy)], check=True)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(decoy / ".git"),
+                    "GIT_WORK_TREE": str(linked),
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.worktree",
+                    "GIT_CONFIG_VALUE_0": str(linked),
+                },
+                clear=False,
+            ):
+                argv = build_codex_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir=str(root / "logs"),
+                    worktree=str(linked),
+                    commit_required=True,
+                )
+
+            add_dirs = [
+                argv[index + 1]
+                for index, value in enumerate(argv)
+                if value == "--add-dir"
+            ]
+            self.assertEqual(add_dirs[0], str(repo / ".git" / "worktrees" / "linked"))
+            self.assertNotIn(str(decoy / ".git"), add_dirs)
+
+    def test_codex_builder_rejects_symlink_git_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            metadata = root / "metadata"
+            metadata.mkdir()
+            (root / ".git").symlink_to(metadata, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                build_codex_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir=str(root / "logs"),
+                    worktree=str(root),
+                    commit_required=True,
+                )
+
+    def test_codex_commit_required_rejects_sandbox_bypass(self) -> None:
+        with self.assertRaisesRegex(ValueError, "enforced workspace-write"):
+            build_codex_argv(
+                prompt="P", slice_id="s", log_dir="/lg",
+                allow_unsafe=True, commit_required=True,
+            )
+
+    def test_subprocess_launcher_commit_capability_is_explicit(self) -> None:
+        base = SubprocessLauncher("codex")
+        builder = base.as_commit_required()
+
+        self.assertFalse(base._commit_required)
+        self.assertTrue(builder._commit_required)
+        self.assertFalse(builder._allow_unsafe)
+
+    def test_cg_executor_is_supported_and_review_only(self) -> None:
+        # issue #442：改寫 #396 item 1 釘住的「cg 刻意未支援」——operator 已提供並
+        # smoke 驗證 cg 的 CLI 契約，cg 現已登記進 _ARGV_BUILDERS。cg 是 zero-tool
+        # （見 build_cg_argv docstring），只服務 read-only 的 planner／reviewer；
+        # 這裡改釘「cg 支援，但 builder 語境（既非 read_only 也非 review_only）
+        # 建構期即拒絕」。
+        self.assertIn("cg", launcher_module._ARGV_BUILDERS)
+        with self.assertRaisesRegex(ValueError, "cg executor requires read-only or review-only"):
+            SubprocessLauncher("cg")
+        # read-only planner 與 review-only reviewer 兩種合法角色都能正常建構。
+        SubprocessLauncher("cg", read_only=True)
+        SubprocessLauncher(
+            "cg", review_only=True, review_terminal_kind="workflow-review-result",
+        )
+
+    def test_cg_argv_default_model_and_effort(self) -> None:
+        argv = build_cg_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=True,
+        )
+        self.assertEqual(
+            argv,
+            ["cg", "--model", "glm-5.2", "--effort", "medium", "--headless", "--stdin"],
+        )
+
+    def test_cg_argv_explicit_model_and_effort(self) -> None:
+        argv = build_cg_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=True,
+            model="glm-5.3", effort="xhigh",
+        )
+        self.assertEqual(
+            argv,
+            ["cg", "--model", "glm-5.3", "--effort", "xhigh", "--headless", "--stdin"],
+        )
+
+    def test_cg_argv_never_embeds_prompt(self) -> None:
+        # 契約核心差異：其餘 builder 把 prompt 放進 argv（見
+        # test_prompt_is_single_element）；cg 的 prompt 走 stdin，argv 本身完全
+        # 不含 prompt 字面值。
+        argv = build_cg_argv(
+            prompt="SECRET-PROMPT-TOKEN", slice_id="s", log_dir="/lg", read_only=True,
+        )
+        self.assertNotIn("SECRET-PROMPT-TOKEN", argv)
+
+    def test_cg_argv_rejects_invalid_effort(self) -> None:
+        with self.assertRaisesRegex(ValueError, "effort must be one of"):
+            build_cg_argv(
+                prompt="P", slice_id="s", log_dir="/lg", read_only=True, effort="ultra",
+            )
+
+    def test_cg_argv_rejects_unsafe_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not support unsafe mode"):
+            build_cg_argv(
+                prompt="P", slice_id="s", log_dir="/lg", read_only=True, allow_unsafe=True,
+            )
+
+    def test_cg_argv_rejects_commit_required(self) -> None:
+        with self.assertRaisesRegex(ValueError, "zero-tool and cannot commit"):
+            build_cg_argv(
+                prompt="P", slice_id="s", log_dir="/lg", commit_required=True,
+            )
+
+    def test_cg_argv_rejects_builder_context(self) -> None:
+        # 既非 read_only 也非 review_only：這是「builder 語境」，cg 的 zero-tool
+        # 契約下永遠無法真正建置任何東西，必須在建構期就顯性失敗。
+        with self.assertRaisesRegex(ValueError, "requires read-only or review-only"):
+            build_cg_argv(prompt="P", slice_id="s", log_dir="/lg")
+
+    def test_subprocess_launcher_cg_refuses_unsafe_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cg executor refuses unsafe mode"):
+            SubprocessLauncher("cg", read_only=True, allow_unsafe=True)
+
+    def test_subprocess_launcher_cg_as_commit_required_rejected(self) -> None:
+        # cg 只能是 read_only 或 review_only；as_commit_required() 對兩者皆既有的
+        # 「commit-required 需要 enforced workspace-write」守衛一律拒絕——cg 永遠
+        # 無法被轉換成 builder-persona 的 commit-required launcher。
+        base = SubprocessLauncher("cg", read_only=True)
+        with self.assertRaisesRegex(ValueError, "enforced workspace-write"):
+            base.as_commit_required()
+
+    def test_launch_cg_pipes_prompt_via_stdin_not_argv(self) -> None:
+        # prompt 必須走 OS pipe，不得放進 wrapper 或 child argv；這同時避免
+        # Windows CreateProcess 長度上限與 process command-line 洩露。
+        calls = []
+        written: list[bytes] = []
+
+        class _FakeStdin:
+            def write(self, data):
+                written.append(data)
+
+            def close(self):
+                pass
+
+        class _FakeProc:
+            pid = 999
+            stdin = _FakeStdin()
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, stdin):
+            calls.append({"argv": argv, "stdin": stdin})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                long_prompt = "長" * 40_000
+                SubprocessLauncher("cg", read_only=True).launch(
+                    slice_id="slice-cg",
+                    prompt=long_prompt,
+                    worktree=d,
+                    log_dir=str(Path(d) / "logs"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        wrapper_argv = calls[0]["argv"]
+        separator = wrapper_argv.index("--")
+        inner_argv = wrapper_argv[separator + 1 :]
+        self.assertEqual(
+            inner_argv,
+            ["cg", "--model", "glm-5.2", "--effort", "medium", "--headless", "--stdin"],
+        )
+        self.assertNotIn(long_prompt, wrapper_argv)
+        self.assertEqual(written, [long_prompt.encode("utf-8")])
+        self.assertEqual(calls[0]["stdin"], subprocess.PIPE)
+        self.assertIn("--forward-stdin", wrapper_argv[:separator])
+        self.assertIn("--discard-child-stderr", wrapper_argv[:separator])
+
+    def test_launch_cg_end_to_end_stdin_delivers_prompt_to_process(self) -> None:
+        # 以跨平台 Python 子命令取代真 cg，原樣回顯 stdin，端到端驗證 prompt
+        # 經 stdin（而非內層 argv）抵達 executor。
+        orig_builders = dict(launcher_module._ARGV_BUILDERS)
+        launcher_module._ARGV_BUILDERS["cg"] = lambda **_kw: [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+        ]
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                log_dir = Path(d) / "logs"
+                handle = SubprocessLauncher("cg", read_only=True).launch(
+                    slice_id="slice-cg-e2e",
+                    prompt="HELLO-FROM-STDIN",
+                    worktree=d,
+                    log_dir=str(log_dir),
+                )
+                self.assertTrue(
+                    _wait_for_child_exit(handle.pid), "cg wrapper should exit"
+                )
+                self.assertEqual(
+                    Path(handle.log_path).read_text(encoding="utf-8"), "HELLO-FROM-STDIN",
+                )
+        finally:
+            launcher_module._ARGV_BUILDERS.clear()
+            launcher_module._ARGV_BUILDERS.update(orig_builders)
+
+    def test_subprocess_launcher_passes_effort_to_cg_argv(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 741
+            stdin = mock.Mock()
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, stdin):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                SubprocessLauncher("cg", read_only=True, effort="high").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "logs"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        wrapper_argv = calls[0]["argv"]
+        inner_argv = wrapper_argv[wrapper_argv.index("--") + 1 :]
+        self.assertEqual(inner_argv[inner_argv.index("--effort") + 1], "high")
+
+    def test_codex_argv_allow_unsafe_adds_sandbox_bypass(self) -> None:
+        # 明確 opt-in allow_unsafe=True 才加入 sandbox bypass flag
+        argv = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg", allow_unsafe=True)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_codex_argv_default_no_hook_trust_bypass(self) -> None:
+        argv = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg")
+        self.assertNotIn("--dangerously-bypass-hook-trust", argv)
+
+    def test_codex_argv_allow_unsafe_adds_hook_trust_bypass(self) -> None:
+        # smoke 實證：headless codex 帶 relay hook 時，未過信任閘會卡死 timeout。
+        # autonomous（allow_unsafe）派工須一併 bypass hook trust。
+        argv = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg", allow_unsafe=True)
+        self.assertIn("--dangerously-bypass-hook-trust", argv)
+
+    def test_launch_sets_repo_root_env_for_relay_hook(self) -> None:
+        # 相對 relay 路徑在 cwd=worktree(≠repo) 不可解；launcher 注入 PSC_REPO_ROOT
+        # 讓已安裝 hook 的 ${PSC_REPO_ROOT}/scripts/... 可解。
+        calls = []
+
+        class _FakeProc:
+            pid = 222
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                SubprocessLauncher("copilot").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        env = calls[0]["env"]
+        self.assertIn("PSC_REPO_ROOT", env)
+        self.assertTrue(env["PSC_REPO_ROOT"])
+
+    def test_launch_removes_inherited_git_repository_selection_env(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 223
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": "/tmp/decoy.git",
+                    "GIT_COMMON_DIR": "/tmp/decoy-common",
+                    "GIT_WORK_TREE": "/tmp/decoy-worktree",
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.worktree",
+                    "GIT_CONFIG_VALUE_0": "/tmp/decoy-worktree",
+                },
+                clear=False,
+            ):
+                SubprocessLauncher("copilot").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        env = calls[0]["env"]
+        for key in (
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+        ):
+            self.assertNotIn(key, env)
+
+    def test_launch_copilot_normalizes_credential_env_from_gh_token(self) -> None:
+        # #396 item 2(b)：copilot executor 的 credential 注入契約——job env 沒有
+        # COPILOT_GITHUB_TOKEN 時，從既有可設定來源（daemon 自身 process env 已有
+        # 的 GH_TOKEN／GITHUB_TOKEN，例如 operator 佈署進
+        # ~/.agents/core/runtime/<instance>.env 的 systemd EnvironmentFile）補上，
+        # 不觸碰 OS keyring。
+        calls = []
+
+        class _FakeProc:
+            pid = 231
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ, {"GH_TOKEN": "gh-token-value"}, clear=False
+            ):
+                SubprocessLauncher("copilot").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        env = calls[0]["env"]
+        self.assertEqual(env["COPILOT_GITHUB_TOKEN"], "gh-token-value")
+
+    def test_launch_copilot_prefers_explicit_copilot_token_over_gh_token(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 232
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ,
+                {"COPILOT_GITHUB_TOKEN": "explicit-value", "GH_TOKEN": "gh-token-value"},
+                clear=False,
+            ):
+                SubprocessLauncher("copilot").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        env = calls[0]["env"]
+        self.assertEqual(env["COPILOT_GITHUB_TOKEN"], "explicit-value")
+
+    def test_launch_copilot_falls_back_to_github_token(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 233
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ, {"GITHUB_TOKEN": "github-token-value"}, clear=False
+            ):
+                SubprocessLauncher("copilot").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        env = calls[0]["env"]
+        self.assertEqual(env["COPILOT_GITHUB_TOKEN"], "github-token-value")
+
+    def test_launch_copilot_no_token_present_leaves_env_untouched(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 234
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ, {}, clear=False
+            ):
+                for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+                    os.environ.pop(name, None)
+                SubprocessLauncher("copilot").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        env = calls[0]["env"]
+        self.assertNotIn("COPILOT_GITHUB_TOKEN", env)
+
+    def test_launch_non_copilot_executor_does_not_inject_copilot_token(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 235
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ, {"GH_TOKEN": "gh-token-value"}, clear=False
+            ):
+                SubprocessLauncher("codex").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        env = calls[0]["env"]
+        # codex 不做 copilot 的 credential 正規化；GH_TOKEN 本身仍照既有 passthrough
+        # 行為原樣傳遞（_git_scope_env 只過濾 GIT_* key），但不會被複寫成
+        # COPILOT_GITHUB_TOKEN。
+        self.assertNotIn("COPILOT_GITHUB_TOKEN", env)
+        self.assertEqual(env["GH_TOKEN"], "gh-token-value")
+
+    def test_launch_prepends_wrapper_root_without_dropping_operator_pythonpath(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 226
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ, {"PYTHONPATH": "operator-extra"}, clear=False
+            ):
+                SubprocessLauncher("codex").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        paths = calls[0]["env"]["PYTHONPATH"].split(os.pathsep)
+        self.assertEqual(paths[0], str(Path(launcher_module.__file__).resolve().parents[2]))
+        self.assertIn("operator-extra", paths[1:])
+
+    def test_reviewer_launch_uses_minimal_env_and_non_login_shell(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 225
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "env": env})
+            return _FakeProc()
+
+        inherited_secrets = {
+            "PGPASSWORD": "postgres-secret",
+            "MYSQL_PWD": "mysql-secret",
+            "DATABASE_URL": "postgres://secret@example.invalid/db",
+            "GITHUB_PAT": "github-secret",
+            "BASH_ENV": "/tmp/credential-exporter",
+            "LC_SECRET": "locale-shaped-secret",
+        }
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                executable = Path(d) / "claude-compatible"
+                executable.write_text("#!/bin/sh\n", encoding="utf-8")
+                executable.chmod(0o755)
+                environment = {
+                    **inherited_secrets,
+                    "PSC_CLAUDE_EXECUTABLE": str(executable),
+                }
+                with mock.patch.dict(os.environ, environment, clear=False):
+                    SubprocessLauncher("claude").as_review_only(
+                        terminal_kind="workflow-verification-result"
+                    ).launch(
+                        slice_id="review",
+                        prompt="P",
+                        worktree=d,
+                        log_dir=str(Path(d) / "logs"),
+                    )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        self.assertEqual(calls[0]["argv"][:3], [sys.executable, "-m", "paulsha_cortex.coordinator.process_wrapper"])
+        for key in inherited_secrets:
+            self.assertNotIn(key, calls[0]["env"])
+        self.assertNotIn("PSC_REPO_ROOT", calls[0]["env"])
+        self.assertNotIn("PSC_RELAY_TARGET", calls[0]["env"])
+        self.assertLessEqual(
+            set(calls[0]["env"]),
+            {
+                "HOME", "LANG", "LC_ADDRESS", "LC_ALL", "LC_COLLATE", "LC_CTYPE",
+                "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_MESSAGES", "LC_MONETARY",
+                "LC_NAME", "LC_NUMERIC", "LC_PAPER", "LC_TELEPHONE", "LC_TIME",
+                "LOGNAME", "PATH", "PYTHONPATH", "SHELL", "TMPDIR", "USER", "VIRTUAL_ENV",
+            },
+        )
+
+    def test_launch_resolves_worktree_before_argv_and_popen(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 224
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "cwd": cwd})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                actual = root / "actual"
+                alias = root / "alias"
+                actual.mkdir()
+                alias.symlink_to(actual, target_is_directory=True)
+                SubprocessLauncher("codex").launch(
+                    slice_id="s",
+                    prompt="P",
+                    worktree=str(alias),
+                    log_dir=str(root / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        self.assertEqual(calls[0]["cwd"], str(actual.resolve()))
+        argv = calls[0]["argv"]
+        inner_argv = argv[argv.index("--") + 1 :]
+        worktree_flag = inner_argv.index("-C")
+        self.assertEqual(inner_argv[worktree_flag + 1], str(actual.resolve()))
+        self.assertNotIn(str(alias), inner_argv)
+
+    def test_subprocess_launcher_codex_default_no_sandbox_bypass(self) -> None:
+        import shlex
+
+        calls = []
+
+        class _FakeProc:
+            pid = 111
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                SubprocessLauncher("codex").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        script = calls[0]["argv"][2]
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", script)
+
+    def test_subprocess_launcher_codex_allow_unsafe_adds_sandbox_bypass(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 222
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                SubprocessLauncher("codex", allow_unsafe=True).launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        argv = calls[0]["argv"]
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_subprocess_launcher_copilot_commit_required_adds_scoped_permissions(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 226
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/copilot-launch", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+
+            git_write_dirs = launcher_module._linked_worktree_git_write_dirs(str(linked))
+            original = launcher_module.subprocess.Popen
+            launcher_module.subprocess.Popen = _fake_popen
+            try:
+                with mock.patch.object(
+                    launcher_module,
+                    "_linked_worktree_git_write_dirs",
+                    return_value=git_write_dirs,
+                ):
+                    SubprocessLauncher("copilot").as_commit_required().launch(
+                        slice_id="s",
+                        prompt="P",
+                        worktree=str(linked),
+                        log_dir=str(root / "lg"),
+                    )
+            finally:
+                launcher_module.subprocess.Popen = original
+
+            inner_argv = calls[0]["argv"][calls[0]["argv"].index("--") + 1 :]
+            self.assertIn("--allow-all-tools", inner_argv)
+            self.assertIn(str(linked.resolve()), inner_argv)
+            self.assertIn(git_write_dirs[0], inner_argv)
+            self.assertNotIn("--allow-all", inner_argv)
+
+    def test_subprocess_launcher_claude_commit_required_adds_git_write_dirs(self) -> None:
+        # #396 item 3：SubprocessLauncher 端也要把 commit_required 接進 claude
+        # builder_kwargs（先前只接了 codex/copilot），否則 as_commit_required()
+        # 這個既有的 builder-persona 轉換（autonomy.dispatch_ready）對 claude 是
+        # no-op，實際派工時 argv 仍缺 --add-dir。
+        calls = []
+
+        class _FakeProc:
+            pid = 227
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/claude-launch", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+
+            git_write_dirs = launcher_module._linked_worktree_git_write_dirs(str(linked))
+            executable = root / "claude-compatible"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            original = launcher_module.subprocess.Popen
+            launcher_module.subprocess.Popen = _fake_popen
+            try:
+                with (
+                    mock.patch.object(
+                        launcher_module,
+                        "_linked_worktree_git_write_dirs",
+                        return_value=git_write_dirs,
+                    ),
+                    mock.patch.dict(
+                        os.environ,
+                        {"PSC_CLAUDE_EXECUTABLE": str(executable)},
+                        clear=False,
+                    ),
+                ):
+                    SubprocessLauncher("claude").as_commit_required().launch(
+                        slice_id="s",
+                        prompt="P",
+                        worktree=str(linked),
+                        log_dir=str(root / "lg"),
+                    )
+            finally:
+                launcher_module.subprocess.Popen = original
+
+            wrapper_argv = calls[0]["argv"]
+            inner_argv = wrapper_argv[wrapper_argv.index("--") + 1 :]
+            add_dirs = [
+                inner_argv[index + 1]
+                for index, value in enumerate(inner_argv)
+                if value == "--add-dir"
+            ]
+            self.assertIn(str(linked.resolve()), add_dirs)
+            self.assertIn(git_write_dirs[0], add_dirs)
+
+    def test_prompt_is_single_element(self) -> None:
+        # prompt 含換行也是單一 argv 元素（headless 的核心保證）
+        argv = build_copilot_argv(prompt="line1\nline2", slice_id="s", log_dir="/lg")
+        self.assertIn("line1\nline2", argv)
+
+    def test_subprocess_launcher_injects_slice_and_relay_target_env(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 456
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "cwd": cwd, "env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                log_dir = Path(d) / "logs"
+                handle = SubprocessLauncher(
+                    "copilot",
+                    relay_target="/tmp/relay.out",
+                ).launch(
+                    slice_id="slice-a",
+                    prompt="PROMPT",
+                    worktree=d,
+                    log_dir=str(log_dir),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        self.assertEqual(handle.pid, 456)
+        self.assertEqual(calls[0]["env"]["PSC_SLICE_ID"], "slice-a")
+        self.assertEqual(calls[0]["env"]["PSC_RELAY_TARGET"], "/tmp/relay.out")
+
+    def test_subprocess_launcher_wraps_with_exit_sentinel(self) -> None:
+        from paulsha_cortex.coordinator.dispatcher import exit_sentinel_path
+
+        calls = []
+
+        class _FakeProc:
+            pid = 789
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                log_dir = Path(d) / "logs"
+                handle = SubprocessLauncher("copilot").launch(
+                    slice_id="slice-a",
+                    prompt="PROMPT",
+                    worktree=d,
+                    log_dir=str(log_dir),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        argv = calls[0]["argv"]
+        self.assertEqual(argv[:3], [sys.executable, "-m", "paulsha_cortex.coordinator.process_wrapper"])
+        sentinel = str(exit_sentinel_path(handle.log_path))
+        self.assertEqual(argv[argv.index("--sentinel") + 1], sentinel)
+        separator = argv.index("--")
+        self.assertEqual(argv[separator + 1 : separator + 4], ["copilot", "-p", "PROMPT"])
+
+    def test_subprocess_launcher_clears_stale_sentinel_and_truncates_log(self) -> None:
+        # 同一 slice_id 重跑：上一輪殘留的 .exit/.jsonl 必須在 launch 前清掉，
+        # 否則 poll_headless_done 會讀到舊 sentinel → 誤判「還沒開始就完成了」。
+        from paulsha_cortex.coordinator.dispatcher import exit_sentinel_path
+
+        class _FakeProc:
+            pid = 333
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                log_dir = Path(d) / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                stale_log = log_dir / "slice-a.jsonl"
+                stale_exit = log_dir / "slice-a.exit"
+                stale_log.write_text("STALE-PREV-ROUND\n", encoding="utf-8")
+                stale_exit.write_text("0", encoding="utf-8")
+
+                handle = SubprocessLauncher("copilot").launch(
+                    slice_id="slice-a",
+                    prompt="PROMPT",
+                    worktree=d,
+                    log_dir=str(log_dir),
+                )
+
+                # 舊 sentinel 在 launch 當下/前已被移除（fail-closed 防誤判完成）
+                self.assertFalse(
+                    exit_sentinel_path(handle.log_path).is_file(),
+                    "stale .exit sentinel must be cleared before launch",
+                )
+                # log 以 wb 開啟（truncate）→ 不含上一輪內容
+                self.assertNotIn("STALE-PREV-ROUND", Path(handle.log_path).read_text())
+        finally:
+            launcher_module.subprocess.Popen = original
+
+    def test_subprocess_launcher_sentinel_records_real_exit_code(self) -> None:
+        # 真跑跨平台 Python 包裝，但內層 argv 覆寫成無害的 exit 7，
+        # 驗證 sentinel 確實寫下內層命令的真實 exit code（跨進程 durable 機制端到端）。
+        from paulsha_cortex.coordinator.dispatcher import exit_sentinel_path
+
+        orig_builders = dict(launcher_module._ARGV_BUILDERS)
+        launcher_module._ARGV_BUILDERS["copilot"] = (
+            lambda **_kw: [sys.executable, "-c", "raise SystemExit(7)"]
+        )
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                log_dir = Path(d) / "logs"
+                handle = SubprocessLauncher("copilot").launch(
+                    slice_id="slice-z",
+                    prompt="PROMPT",
+                    worktree=d,
+                    log_dir=str(log_dir),
+                )
+                sentinel = exit_sentinel_path(handle.log_path)
+                # 根治 flaky：等包裝子進程「真正結束」再斷言，不靠固定輪詢預算（原本
+                # 50×0.05s=2.5s 在 CI 高負載下會超時 → flaky）。bash 包裝在退出前必已
+                # 寫出 sentinel（launcher：`<inner>; printf %s "$?" > <sentinel>`），故子
+                # 進程一被 reap，sentinel 必然就緒；os.waitpid 同時回收 zombie（消除
+                # 先前的 `subprocess still running` ResourceWarning）。test 進程即 spawn
+                # 該子進程的父進程，故可 waitpid。
+                deadline = time.monotonic() + 10
+                while not sentinel.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                # 斷言 MUST 在 with 內（tmpdir 尚未清除）
+                self.assertTrue(sentinel.is_file(), "sentinel exit 檔應由跨平台包裝寫出")
+                self.assertEqual(sentinel.read_text().strip(), "7")
+                self.assertTrue(
+                    _wait_for_child_exit(handle.pid), "process wrapper should exit"
+                )
+        finally:
+            launcher_module._ARGV_BUILDERS.clear()
+            launcher_module._ARGV_BUILDERS.update(orig_builders)
+
+
+    def test_copilot_argv_model(self) -> None:
+        argv = build_copilot_argv(prompt="P", slice_id="s", log_dir="/lg", model="claude-haiku-4.5")
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-haiku-4.5")
+
+    def test_argv_no_model_when_unset(self) -> None:
+        for build in (build_copilot_argv, build_claude_argv, build_codex_argv):
+            argv = build(prompt="P", slice_id="s", log_dir="/lg")
+            self.assertNotIn("--model", argv, msg=build.__name__)
+
+    def test_launch_handle_records_explicit_model_id(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 654
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                handle = SubprocessLauncher("codex", model="gpt-5.4").launch(
+                    slice_id="slice-review",
+                    prompt="PROMPT",
+                    worktree=d,
+                    log_dir=str(Path(d) / "logs"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        self.assertEqual(handle.executor, "codex")
+        self.assertEqual(handle.model_id, "gpt-5.4")
+        self.assertEqual(calls[0]["env"]["PSC_SLICE_ID"], "slice-review")
+
+    def test_claude_codex_argv_model(self) -> None:
+        ca = build_claude_argv(prompt="P", slice_id="s", log_dir="/lg", model="opus")
+        self.assertEqual(ca[ca.index("--model") + 1], "opus")
+        xa = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg", model="gpt-5.4")
+        self.assertEqual(xa[xa.index("--model") + 1], "gpt-5.4")
+
+    def test_subprocess_launcher_passes_model_to_argv(self) -> None:
+        captured = {}
+
+        class _FakeProc:
+            pid = 4321
+
+        def _fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                SubprocessLauncher("copilot", model="claude-haiku-4.5").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=d
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+        argv = captured["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-haiku-4.5")
+
+    def test_launch_sentinel_is_absolute_cwd_independent(self) -> None:
+        # bug：相對 log_dir + 子進程 cwd=worktree → sentinel 寫到 worktree（poller 找不到）。
+        # 修：launch 把 log_dir resolve 成絕對 → script 內 sentinel 與回傳 log_path 皆絕對。
+        import os
+        import re as _re
+
+        captured = {}
+
+        class _FakeProc:
+            pid = 5555
+
+        def _fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        original_cwd = os.getcwd()
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                os.chdir(d)  # launcher 在某 cwd，log_dir 給相對路徑
+                handle = SubprocessLauncher("copilot").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir="runtime/dispatch/s"
+                )
+                os.chdir(original_cwd)
+        finally:
+            os.chdir(original_cwd)
+            launcher_module.subprocess.Popen = original
+        argv = captured["argv"]
+        sentinel = argv[argv.index("--sentinel") + 1]
+        self.assertTrue(Path(sentinel).is_absolute(), f"sentinel 非絕對: {sentinel}")
+        self.assertTrue(Path(handle.log_path).is_absolute(), f"log_path 非絕對: {handle.log_path}")
+
+
+class CopilotCredentialEnvTests(unittest.TestCase):
+    """#396 item 2(b)：pure-function 單元測試，覆蓋 `_copilot_credential_env` 的
+    優先序與 no-op 分支，獨立於 SubprocessLauncher.launch() 的 Popen 接線。
+    """
+
+    def test_prefers_existing_copilot_github_token(self) -> None:
+        env = {"COPILOT_GITHUB_TOKEN": "a", "GH_TOKEN": "b", "GITHUB_TOKEN": "c"}
+        self.assertEqual(launcher_module._copilot_credential_env(env), {})
+
+    def test_falls_back_to_gh_token(self) -> None:
+        env = {"GH_TOKEN": "b", "GITHUB_TOKEN": "c"}
+        self.assertEqual(
+            launcher_module._copilot_credential_env(env), {"COPILOT_GITHUB_TOKEN": "b"}
+        )
+
+    def test_falls_back_to_github_token_when_gh_token_absent(self) -> None:
+        env = {"GITHUB_TOKEN": "c"}
+        self.assertEqual(
+            launcher_module._copilot_credential_env(env), {"COPILOT_GITHUB_TOKEN": "c"}
+        )
+
+    def test_empty_string_token_treated_as_absent(self) -> None:
+        env = {"COPILOT_GITHUB_TOKEN": "", "GH_TOKEN": "", "GITHUB_TOKEN": ""}
+        self.assertEqual(launcher_module._copilot_credential_env(env), {})
+
+    def test_no_candidate_env_is_no_op(self) -> None:
+        self.assertEqual(launcher_module._copilot_credential_env({}), {})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,652 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+from paulsha_cortex.config import paths
+
+from . import autonomy, broker_reaper, engineering_outcome
+from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
+from .registry import JobRegistry
+from .seams import PaneSender, ScriptWorktreeCreator, TmuxPaneSender, WorktreeCreator
+from .usage_aggregate import aggregate_usage_by_run
+from .workflow import WorkflowRun
+
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
+DEFAULT_REQUEST_POLL_INTERVAL_SECONDS = 0.1
+DEFAULT_REQUESTED_BY = "coordinator-cli"
+EXIT_SUBMITTED_PENDING = 3
+
+
+_REQUEST_TIMEOUTS: dict[str, float] = {
+    "fanout": 60.0,
+    "tick": 60.0,
+    "complete": 30.0,
+    "work-action": 30.0,
+}
+
+
+def _default_specs_dir() -> str:
+    return os.environ.get("PSC_MANAGER_SPECS_DIR") or str(paths.specs_root())
+
+
+def _resolve_launcher(executor, injected, *, allow_unsafe, model):
+    """注入優先；否則僅在 executor 指定時建 SubprocessLauncher（帶 allow_unsafe/model）。"""
+    if injected is not None:
+        return injected
+    if executor is None:
+        return None
+    return SubprocessLauncher(executor=executor, allow_unsafe=allow_unsafe, model=model)
+
+
+def _refuse_unsafe_fanout(metas, predicate, *, allow_unsafe, max_ready=1):
+    """fail-closed：--allow-unsafe 旁路各 executor 的沙箱/核可，故僅允許 ≤max_ready 個就緒
+    slice（canary 一次一個）。就緒集過大（如誤指 specs-dir、或真實 specs 多個 dispatch:auto）
+    時拒絕，避免一次對多個 slice 大量自主越權派工。"""
+    if not allow_unsafe:
+        return
+    ready = autonomy.ready_units(metas, predicate)
+    if len(ready) > max_ready:
+        raise ValueError(
+            f"--allow-unsafe 僅允許 ≤{max_ready} 個就緒 slice（canary 一次一個），實得 {len(ready)}"
+        )
+
+
+def _workflow_run_attribution(run: WorkflowRun | None) -> dict[str, str | None]:
+    """把 WorkflowRun 投影成 job 輸出要補的歸屬欄位（#323）：
+    ``workflow_work_id``／``workflow_primary_issue``。``run`` 為 ``None``
+    （非 workflow lane job，或 workflow_run_id 已查無對應 run）時兩欄位皆為
+    ``None``，與既有 ``workflow_*`` 欄位「一律出現、N/A 時為 null」的慣例一致，
+    讓既有消費者可安全假設欄位存在而不必分支處理缺欄位。card 已由既有
+    ``workflow_card`` 欄位提供，不重複新增。"""
+    return {
+        "workflow_work_id": run.work_id if run is not None else None,
+        "workflow_primary_issue": (
+            run.issue_refs[0] if run is not None and run.issue_refs else None
+        ),
+    }
+
+
+def _attribute_job(job: dict[str, Any], reg: JobRegistry) -> dict[str, Any]:
+    """單一 job dict（``stat``）的輸出端補欄：依 ``workflow_run_id`` join
+    registry 現有的 workflow run，零額外持久化狀態。"""
+    workflow_run_id = job.get("workflow_run_id")
+    run: WorkflowRun | None = None
+    if isinstance(workflow_run_id, str) and workflow_run_id:
+        try:
+            run = reg.get_workflow_run(workflow_run_id)
+        except KeyError:
+            run = None
+    job.update(_workflow_run_attribution(run))
+    return job
+
+
+def _attribute_jobs(jobs: list[dict[str, Any]], reg: JobRegistry) -> list[dict[str, Any]]:
+    """``jobs`` 列表輸出端補欄：一次性把 workflow runs 建成 ``run_id`` 索引，
+    避免對每個 job 各自線性掃描 registry 的 workflow run 列表。"""
+    runs_by_id = {run.run_id: run for run in reg.list_workflow_runs()}
+    for job in jobs:
+        job.update(_workflow_run_attribution(runs_by_id.get(job.get("workflow_run_id"))))
+    return jobs
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cortex",
+        description="讀取 manager 狀態，或透過 control queue 執行派工與交付 gate。",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_dispatch = sub.add_parser(
+        "dispatch",
+        help="已停用的舊低階入口（請改用 fanout/tick）",
+        description="此入口缺少 spec/verification metadata，固定拒絕執行；請改用 fanout 或 tick。",
+    )
+    p_dispatch.add_argument("--task", required=True)
+    p_dispatch.add_argument("--persona", required=True)
+    p_dispatch.add_argument("--pane", required=True)
+    p_dispatch.add_argument("--command", required=True)
+
+    sub.add_parser("jobs", help="列出所有 Job 執行紀錄")
+
+    p_stat = sub.add_parser(
+        "stat",
+        help=(
+            "查單一 Job 執行紀錄；--retry-classifications 依 retry 分類彙總 workflow runs；"
+            "--decomposition-depths 依拆分深度彙總；"
+            "--combo-selections 依 combo provenance 彙總；"
+            "--usage-by-run 依 workflow_run_id 彙總 token usage"
+        ),
+    )
+    p_stat.add_argument("job_id", nargs="?", default=None)
+    p_stat.add_argument(
+        "--retry-classifications",
+        action="store_true",
+        help="依 retry_classification 彙總 workflow runs（#208：cortex stat 可依原因分類彙總）",
+    )
+    p_stat.add_argument(
+        "--decomposition-depths",
+        action="store_true",
+        help="依 decomposition_depth 彙總 workflow runs（#223：拆分深度可觀測面）",
+    )
+    p_stat.add_argument(
+        "--combo-selections",
+        action="store_true",
+        help="依 combo_selection 的 source × task_type 彙總 workflow runs（#202）",
+    )
+    p_stat.add_argument(
+        "--usage-by-run",
+        default=None,
+        metavar="WORKFLOW_RUN_ID",
+        help="依 workflow_run_id 彙總該 run 底下所有 job 的 token usage（#325）",
+    )
+
+    p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
+    p_ready.add_argument(
+        "--specs-dir",
+        default=None,
+        help="要掃描的 spec 目錄（預設：manager specs 目錄）",
+    )
+
+    p_fanout = sub.add_parser("fanout", help="透過 manager daemon 派送目前 ready 的 slices")
+    p_fanout.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
+    p_fanout.add_argument("--persona", default="builder", help="builder persona role（預設：builder）")
+    p_fanout.add_argument(
+        "--executor",
+        choices=sorted(_ARGV_BUILDERS),
+        default=None,
+        help="headless executor；未指定時使用 daemon 預設值",
+    )
+    p_fanout.add_argument(
+        "--allow-unsafe",
+        action="store_true",
+        help="高風險：旁路 executor approval/sandbox；只允許單一 ready slice canary",
+    )
+    p_fanout.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "builder model ID 預設值；spec frontmatter 宣告 executor/model_id 時逐 slice 覆寫；"
+            "明確指定的 (executor, model_id) 須為 model-identities 已註冊身分"
+        ),
+    )
+
+    p_complete = sub.add_parser(
+        "complete",
+        help="輪詢既有 jobs，執行 verification/review/completion gate",
+    )
+    p_complete.add_argument(
+        "--handoff-dir",
+        default=autonomy.DEFAULT_HANDOFF_DIR,
+        help=f"handoff 目錄（預設為相對路徑：{autonomy.DEFAULT_HANDOFF_DIR}）",
+    )
+    p_complete.add_argument(
+        "--specs-dir", default=None,
+        help="設定後據 dependency graph 觀測算出本趟釋放的下游（released）",
+    )
+    p_complete.add_argument(
+        "--review-executor", choices=sorted(_ARGV_BUILDERS), default=None,
+        help="foreign reviewer executor",
+    )
+    p_complete.add_argument("--review-model", default=None, help="foreign reviewer model ID")
+
+    p_slice_action = sub.add_parser("slice-action", help="對 needs_human slice 送出本機 recovery action")
+    p_slice_action.add_argument("slice_id")
+    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"])
+    p_slice_action.add_argument("--actor", required=True)
+    # #396 item 4：retry-review／retry-verify 落 needs_human(reviewer-identity-missing)
+    # 時，先前只能靠 tick/complete 的 request 級參數補 foreign reviewer identity——
+    # slice-action 本身沒有對應旗標可帶。比照 complete/tick 既有的 identity
+    # override 機制（apply_slice_action／manager_daemon 早已接受這兩個 kwarg，
+    # 見 manager.py:1303-1304、manager_daemon.py:482-483，缺口純粹在 CLI 表層）。
+    p_slice_action.add_argument(
+        "--review-executor", choices=sorted(_ARGV_BUILDERS), default=None,
+        help="foreign reviewer executor",
+    )
+    p_slice_action.add_argument("--review-model", default=None, help="foreign reviewer model ID")
+
+    p_work = sub.add_parser("work", help="透過 manager daemon 執行 work lifecycle mutation")
+    p_work.add_argument(
+        "action",
+        choices=[
+            "link", "unlink", "start", "resume", "retry-build", "retry-verify",
+            "retry-review", "recover-planning", "recover-pre-candidate",
+            "recover-repair-commit", "abandon", "retire-delivered", "auto",
+            "ship", "review-attest", "intake",
+        ],
+    )
+    p_work.add_argument("work_id")
+    p_work.add_argument("--repo", required=True)
+    p_work.add_argument("--issue", type=int)
+    p_work.add_argument("--kind", choices=["github_issue", "github_pr", "openspec", "path"])
+    p_work.add_argument("--ref")
+    p_work.add_argument("--actor")
+    p_work.add_argument("--failure-classification")
+    p_work.add_argument("--failure-reason")
+    p_work.add_argument(
+        "--expected-run-id",
+        help="abandon／retire-delivered 使用的 exact WorkflowRun CAS",
+    )
+    p_work.add_argument(
+        "--reason", help="abandon／retire-delivered 的單行審計理由（最多 500 字）"
+    )
+    p_work.add_argument(
+        "--combo",
+        help="start／intake 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
+    )
+    toggle = p_work.add_mutually_exclusive_group()
+    toggle.add_argument("--enable", action="store_true")
+    toggle.add_argument("--disable", action="store_true")
+    p_work.add_argument("--payload", help="額外 manager-side evidence refs JSON object")
+
+    sub.add_parser("status", help="讀取 manager daemon 的 ready/held/slices/attention 快照")
+
+    p_reap = sub.add_parser("reap-brokers", help="操作員 dry-run/apply 孤兒 codex broker 回收")
+    p_reap.add_argument("--apply", action="store_true")
+    p_reap.add_argument("--cwd-root")
+
+    p_tick = sub.add_parser(
+        "tick",
+        help="執行完整 manager tick：fanout → verification/review/completion",
+    )
+    p_tick.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
+    p_tick.add_argument("--persona", default="builder", help="builder persona role（預設：builder）")
+    p_tick.add_argument(
+        "--executor", choices=sorted(_ARGV_BUILDERS), default=None,
+        help="headless builder executor；未指定時使用 daemon 預設值",
+    )
+    p_tick.add_argument(
+        "--handoff-dir",
+        default=autonomy.DEFAULT_HANDOFF_DIR,
+        help=f"handoff 目錄（預設為相對路徑：{autonomy.DEFAULT_HANDOFF_DIR}）",
+    )
+    p_tick.add_argument("--require-idle", action="store_true", help="系統負載高於 --max-load 時不派新工作")
+    p_tick.add_argument("--max-load", type=float, default=1.0, help="--require-idle 的 1-minute load threshold")
+    p_tick.add_argument(
+        "--allow-unsafe",
+        action="store_true",
+        help="高風險：旁路 executor approval/sandbox；只允許單一 ready slice canary",
+    )
+    p_tick.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "builder model ID 預設值；spec frontmatter 宣告 executor/model_id 時逐 slice 覆寫；"
+            "明確指定的 (executor, model_id) 須為 model-identities 已註冊身分"
+        ),
+    )
+    p_tick.add_argument(
+        "--review-executor", choices=sorted(_ARGV_BUILDERS), default=None,
+        help="foreign reviewer executor",
+    )
+    p_tick.add_argument("--review-model", default=None, help="foreign reviewer model ID")
+
+    p_outcome = sub.add_parser(
+        "outcome",
+        help="讀取 canonical engineering outcome outbox（唯讀，#275）",
+    )
+    p_outcome.add_argument("mode", choices=["list", "show", "replay"])
+    p_outcome.add_argument(
+        "outcome_id", nargs="?", default=None, help="show 專用：目標 outcome_id"
+    )
+    p_outcome.add_argument(
+        "--repo", default=None, help="限定 repo；省略時掃描全部 repo 的 outbox 檔案"
+    )
+    p_outcome.add_argument("--work-id", default=None, help="list 專用：限定 work_id")
+    p_outcome.add_argument(
+        "--since", default=None, help="replay 專用：ISO8601 起點（含），依 emitted_at 過濾"
+    )
+
+    return parser
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    registry: JobRegistry | None = None,
+    pane_sender: PaneSender | None = None,
+    worktree_creator: WorktreeCreator | None = None,
+    is_satisfied=None,
+    git_runner=None,
+    launcher: AgentLauncher | None = None,
+    reaper=None,
+    control_read_status: Callable[[], dict] | None = None,
+    control_submit_request: Callable[[str, dict, str], str] | None = None,
+    control_poll_done: Callable[[str, float, float], dict | None] | None = None,
+) -> int:
+    args = _build_parser().parse_args(argv)
+
+    if args.cmd == "dispatch":
+        print(
+            "錯誤: 低階 dispatch 已停用；缺少 spec / verification metadata。"
+            "請改用 fanout/tick 或 control plane dispatch request。",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.cmd == "reap-brokers":
+        if args.apply and not args.cwd_root:
+            print("錯誤: --apply 需要搭配 --cwd-root", file=sys.stderr)
+            return 2
+        cwd_root = Path(args.cwd_root).resolve() if args.cwd_root else None
+        summary = broker_reaper.reap_orphan_brokers(apply=args.apply, cwd_root=cwd_root)
+        print(json.dumps(summary, ensure_ascii=False))
+        if not summary.get("ran"):
+            return 1
+        return 0 if summary.get("returncode", 0) == 0 else 1
+
+    read_status_fn, submit_request_fn, poll_done_fn = _resolve_control_hooks(
+        control_read_status=control_read_status,
+        control_submit_request=control_submit_request,
+        control_poll_done=control_poll_done,
+    )
+
+    if args.cmd == "status":
+        print(json.dumps(read_status_fn(), ensure_ascii=False))
+        return 0
+
+    if args.cmd == "ready":
+        predicate = is_satisfied if is_satisfied is not None else autonomy.default_is_satisfied
+        try:
+            specs_dir = args.specs_dir if args.specs_dir is not None else _default_specs_dir()
+        except ValueError as exc:
+            print(f"錯誤: {exc}", file=sys.stderr)
+            return 1
+        metas = autonomy.scan_specs(specs_dir)
+        batch_ids = {
+            slice_id
+            for meta in metas
+            if isinstance((slice_id := meta.get("slice_id")), str) and slice_id
+        }
+        try:
+            ready = autonomy.ready_units(metas, predicate)
+            for meta in metas:
+                slice_id = meta.get("slice_id")
+                if not isinstance(slice_id, str) or not slice_id:
+                    continue
+                for dep in meta.get("depends_on", []):
+                    if predicate(dep):
+                        continue
+                    reason = autonomy.classify_batch_dependency(
+                        dep,
+                        batch_ids=batch_ids,
+                        handoff_dir=autonomy.DEFAULT_HANDOFF_DIR,
+                    )
+                    if reason and reason.startswith("deps-unknown:"):
+                        print(f"診斷: {slice_id} {reason}", file=sys.stderr)
+            print(json.dumps(ready, ensure_ascii=False))
+            return 0
+        except (ValueError, autonomy.DispatchReadyRequiresLauncherError) as exc:
+            print(f"錯誤: {exc}", file=sys.stderr)
+            return 1
+
+    if args.cmd == "complete":
+        request_args = {"handoff_dir": args.handoff_dir}
+        if args.specs_dir:
+            request_args["specs_dir"] = args.specs_dir
+        if args.review_executor is not None:
+            request_args["review_executor"] = args.review_executor
+        if args.review_model is not None:
+            request_args["review_model"] = args.review_model
+        return _submit_mutation_request(
+            "complete",
+            request_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "slice-action":
+        slice_action_args = {"slice_id": args.slice_id, "action": args.action, "actor": args.actor}
+        if args.review_executor is not None:
+            slice_action_args["review_executor"] = args.review_executor
+        if args.review_model is not None:
+            slice_action_args["review_model"] = args.review_model
+        return _submit_mutation_request(
+            "slice-action",
+            slice_action_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "work":
+        request_args = {
+            "action": args.action,
+            "repo": args.repo,
+            "work_id": args.work_id,
+        }
+        if args.issue is not None:
+            request_args["issue"] = args.issue
+        if args.kind is not None:
+            request_args["kind"] = args.kind
+        if args.ref is not None:
+            request_args["ref"] = args.ref
+        if args.actor is not None:
+            request_args["actor"] = args.actor
+        if args.failure_classification is not None:
+            request_args["failure_classification"] = args.failure_classification
+        if args.failure_reason is not None:
+            request_args["failure_reason"] = args.failure_reason
+        if args.expected_run_id is not None:
+            request_args["expected_run_id"] = args.expected_run_id
+        if args.reason is not None:
+            request_args["reason"] = args.reason
+        if args.combo is not None and args.action in {"start", "intake"}:
+            request_args["combo"] = args.combo
+        if args.enable or args.disable:
+            request_args["enabled"] = bool(args.enable)
+        if args.payload:
+            try:
+                extra = json.loads(Path(args.payload).read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                print(f"錯誤: work payload unreadable: {exc}", file=sys.stderr)
+                return 2
+            if not isinstance(extra, dict):
+                print("錯誤: work payload must be a JSON object", file=sys.stderr)
+                return 2
+            protected = {"action", "repo", "work_id"}
+            if protected & set(extra):
+                print("錯誤: work payload cannot override action/repo/work_id", file=sys.stderr)
+                return 2
+            request_args.update(extra)
+        return _submit_mutation_request(
+            "work-action",
+            request_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "tick":
+        request_args = {
+            "specs_dir": args.specs_dir,
+            "persona": args.persona,
+            "handoff_dir": args.handoff_dir,
+            "require_idle": args.require_idle,
+            "max_load": args.max_load,
+            "allow_unsafe": args.allow_unsafe,
+            "model": args.model,
+        }
+        if args.executor is not None:
+            request_args["executor"] = args.executor
+        if args.review_executor is not None:
+            request_args["review_executor"] = args.review_executor
+        if args.review_model is not None:
+            request_args["review_model"] = args.review_model
+        return _submit_mutation_request(
+            "tick",
+            request_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "fanout":
+        request_args = {
+            "specs_dir": args.specs_dir,
+            "persona": args.persona,
+            "allow_unsafe": args.allow_unsafe,
+            "model": args.model,
+        }
+        if args.executor is not None:
+            request_args["executor"] = args.executor
+        return _submit_mutation_request(
+            "fanout",
+            request_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "outcome":
+        root = engineering_outcome.default_outcomes_root()
+        if args.mode == "show":
+            if not args.outcome_id:
+                print("錯誤: outcome show 需要 outcome_id", file=sys.stderr)
+                return 1
+            record = engineering_outcome.show_outcome(root, args.outcome_id, repo=args.repo)
+            if record is None:
+                print(f"錯誤: 查無 outcome_id={args.outcome_id}", file=sys.stderr)
+                return 1
+            print(json.dumps(record, ensure_ascii=False))
+            return 0
+        if args.mode == "list":
+            records = list(
+                engineering_outcome.list_outcomes(root, repo=args.repo, work_id=args.work_id)
+            )
+            print(json.dumps(records, ensure_ascii=False))
+            return 0
+        records = list(
+            engineering_outcome.replay_outcomes(root, repo=args.repo, since=args.since)
+        )
+        print(json.dumps(records, ensure_ascii=False))
+        return 0
+
+    # 讀取型命令以下才需要本地 snapshot 物件。
+    reg = registry if registry is not None else JobRegistry()
+
+    if args.cmd == "jobs":
+        print(json.dumps(_attribute_jobs(reg.list_jobs(), reg), ensure_ascii=False))
+        return 0
+
+    if args.cmd == "stat":
+        if args.retry_classifications:
+            counts: dict[str, int] = {}
+            for run in reg.list_workflow_runs():
+                key = run.retry_classification or "unclassified"
+                counts[key] = counts.get(key, 0) + 1
+            print(json.dumps({"retry_classifications": counts}, ensure_ascii=False))
+            return 0
+        if args.decomposition_depths:
+            # #223：decomposition_depth 進可觀測面，比照既有 retry_classifications
+            # 彙總模式（key 為字串化深度，方便與 JSON 輸出對齊）。
+            depth_counts: dict[str, int] = {}
+            for run in reg.list_workflow_runs():
+                key = str(run.decomposition_depth)
+                depth_counts[key] = depth_counts.get(key, 0) + 1
+            print(json.dumps({"decomposition_depths": depth_counts}, ensure_ascii=False))
+            return 0
+        if args.combo_selections:
+            counts: dict[str, dict[str, int]] = {}
+            for run in reg.list_workflow_runs():
+                selection = run.combo_selection
+                source = "unrecorded"
+                task_type = "unrecorded"
+                if isinstance(selection, dict):
+                    raw_source = selection.get("source")
+                    raw_task_type = selection.get("task_type")
+                    if isinstance(raw_source, str) and raw_source:
+                        source = raw_source
+                    if isinstance(raw_task_type, str) and raw_task_type:
+                        task_type = raw_task_type
+                counts.setdefault(source, {})
+                counts[source][task_type] = counts[source].get(task_type, 0) + 1
+            print(json.dumps({"combo_selections": counts}, ensure_ascii=False))
+            return 0
+        if args.usage_by_run is not None:
+            summary = aggregate_usage_by_run(reg.list_jobs(), args.usage_by_run)
+            print(json.dumps({"usage_by_run": summary}, ensure_ascii=False))
+            return 0
+        if args.job_id is None:
+            print(
+                "錯誤: stat 需要 job_id（或 --retry-classifications／--decomposition-depths／"
+                "--combo-selections／--usage-by-run）",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            job = reg.get_job(args.job_id)
+        except KeyError as exc:
+            print(f"錯誤: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(_attribute_job(job, reg), ensure_ascii=False))
+        return 0
+
+    return 2  # pragma: no cover（argparse required=True 已擋）
+
+
+def _resolve_control_hooks(
+    *,
+    control_read_status: Callable[[], dict] | None,
+    control_submit_request: Callable[[str, dict, str], str] | None,
+    control_poll_done: Callable[[str, float, float], dict | None] | None,
+) -> tuple[
+    Callable[[], dict],
+    Callable[[str, dict, str], str],
+    Callable[[str, float, float], dict | None],
+]:
+    if control_read_status and control_submit_request and control_poll_done:
+        return control_read_status, control_submit_request, control_poll_done
+    from paulsha_cortex.control import client as control_client
+
+    return (
+        control_read_status or control_client.read_status,
+        control_submit_request or control_client.submit_request,
+        control_poll_done or control_client.poll_done,
+    )
+
+
+def _submit_mutation_request(
+    req_type: str,
+    args: dict,
+    *,
+    read_status_fn: Callable[[], dict],
+    submit_request_fn: Callable[[str, dict, str], str],
+    poll_done_fn: Callable[[str, float, float], dict | None],
+) -> int:
+    status = read_status_fn()
+    if isinstance(status, dict) and status.get("degraded"):
+        reason = status.get("degraded_reason") or "unknown"
+        print(
+            f"錯誤: manager daemon 未就緒（{reason}）；無法處理 {req_type}，請先啟動 daemon。",
+            file=sys.stderr,
+        )
+        return 1
+
+    timeout_seconds = _REQUEST_TIMEOUTS.get(req_type, DEFAULT_REQUEST_TIMEOUT_SECONDS)
+    req_id = submit_request_fn(req_type, dict(args), DEFAULT_REQUESTED_BY)
+    done = poll_done_fn(req_id, timeout_seconds, DEFAULT_REQUEST_POLL_INTERVAL_SECONDS)
+    if not isinstance(done, dict):
+        print(
+            f"錯誤: manager daemon 未在 {timeout_seconds:.1f}s 內完成 {req_type} request: {req_id}。",
+            file=sys.stderr,
+        )
+        print(
+            f"請使用 `cortex request show {req_id}` 或 `cortex request wait {req_id} --timeout {int(timeout_seconds)}` 追蹤狀態。",
+            file=sys.stderr,
+        )
+        return EXIT_SUBMITTED_PENDING
+    if done.get("status") != "ok":
+        print(f"錯誤: {done.get('error') or 'unknown request error'}", file=sys.stderr)
+        return 1
+    print(json.dumps(done.get("result"), ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

@@ -1,0 +1,878 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Callable
+
+from paulsha_cortex.config import paths
+
+from .._yaml import YAMLError, safe_load
+from ..persona.contract import get_persona_contract
+from . import completion
+from .contract_command import build_dispatch_prompt
+from .dispatcher import _default_git_runner
+from .launcher import AgentLauncher, LaunchHandle
+from .model_identities import load_model_identities
+from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
+from . import verification
+
+# is_satisfied predicate 型別：收 slice_id，回該相依是否「已滿足」（可釋放下游）。
+# 判定來源由呼叫者決定（merged-to-main vs handoff gate_status）——#104 留開放。
+IsSatisfied = Callable[[str], bool]
+
+# Dispatcher duck-type：只需有 dispatch(task, persona, pane_id, command) -> dict（Phase 2 介面）。
+DEFAULT_HANDOFF_DIR = "runtime/handoff"
+
+
+class DispatchReadyError(RuntimeError):
+    _MAX_MESSAGE_LENGTH = 160
+
+    @staticmethod
+    def _compact_message(exc: Exception) -> str:
+        raw = str(exc)
+        if len(raw) > DispatchReadyError._MAX_MESSAGE_LENGTH:
+            return f"{raw[: DispatchReadyError._MAX_MESSAGE_LENGTH - 3]}..."
+        return raw
+
+    def __init__(self, errors: list[tuple[str, Exception]], jobs: list[dict]) -> None:
+        self.errors = tuple(errors)
+        self.jobs = list(jobs)
+        failed = ", ".join(
+            f"{slice_id}({exc.__class__.__name__}: {self._compact_message(exc)})"
+            for slice_id, exc in errors
+        )
+        super().__init__(f"dispatch_ready failed for slice(s): {failed}")
+
+
+# --------------------------------------------------------------------------- #
+# 1) frontmatter 解析（預設 HOLD）
+# --------------------------------------------------------------------------- #
+def _split_frontmatter(text: str) -> str | None:
+    """回 frontmatter 區塊原文；無合法 frontmatter（不以 --- 起頭/無收尾 ---）→ None。"""
+    if not text.startswith("---"):
+        return None
+    # 首行 --- 之後找下一個單獨成行的 ---
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[1:i])
+    return None  # 無收尾 ---
+
+
+def parse_spec_frontmatter(path) -> dict:
+    """解析 superpowers spec 開頭 --- frontmatter。
+
+    回 {path, dispatch, slice_id, plan, depends_on, target_branch, verification,
+    executor, model_id, repo, parse_error}。
+    硬約束：dispatch 僅在字面值為 'auto' 時為 'auto'，其餘一律 'hold'（fail-safe）。
+    容忍無 frontmatter（視為 hold），不 raise。
+    """
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    block = _split_frontmatter(text)
+
+    meta: dict = {
+        "path": str(p),
+        "dispatch": "hold",
+        "slice_id": None,
+        "plan": None,
+        "depends_on": [],
+        "target_branch": None,
+        "verification": None,
+        "executor": None,
+        "model_id": None,
+        "repo": None,
+        "parse_error": None,
+    }
+    if block is None:
+        return meta
+
+    try:
+        data = safe_load(block)
+    except YAMLError as exc:
+        meta["parse_error"] = {
+            "code": "invalid-frontmatter",
+            "field": "frontmatter",
+            "message": str(exc),
+        }
+        return meta
+    if not isinstance(data, dict):
+        meta["parse_error"] = {
+            "code": "invalid-frontmatter",
+            "field": "frontmatter",
+            "message": "frontmatter must be a mapping",
+        }
+        return meta
+    try:
+        return _normalize_frontmatter(p, data)
+    except verification.ContractValidationError as exc:
+        meta["slice_id"] = data.get("slice_id") if isinstance(data.get("slice_id"), str) else None
+        meta["plan"] = data.get("plan") if isinstance(data.get("plan"), str) else None
+        meta["depends_on"] = _normalize_depends_on(data.get("depends_on"))
+        meta["target_branch"] = (
+            data.get("target_branch") if isinstance(data.get("target_branch"), str) else None
+        )
+        meta["executor"] = data.get("executor") if isinstance(data.get("executor"), str) else None
+        meta["model_id"] = data.get("model_id") if isinstance(data.get("model_id"), str) else None
+        meta["repo"] = data.get("repo") if isinstance(data.get("repo"), str) else None
+        meta["parse_error"] = exc.as_payload()
+        return meta
+
+
+def _normalize_frontmatter(path: Path, data: dict) -> dict:
+    allowed = {
+        "dispatch",
+        "slice_id",
+        "plan",
+        "depends_on",
+        "target_branch",
+        "verification",
+        "executor",
+        "model_id",
+        "repo",
+        "parse_error",
+    }
+    extras = set(data) - allowed
+    if extras:
+        extra = sorted(extras)[0]
+        raise verification.ContractValidationError(extra, f"unknown frontmatter key: {extra}")
+
+    dispatch = "auto" if data.get("dispatch") == "auto" else "hold"
+    repo_root = _infer_repo_root(path)
+    meta: dict = {
+        "path": str(path),
+        "dispatch": dispatch,
+        "slice_id": data.get("slice_id") if isinstance(data.get("slice_id"), str) else None,
+        "plan": None,
+        "depends_on": _normalize_depends_on(data.get("depends_on")),
+        "target_branch": None,
+        "verification": None,
+        "executor": None,
+        "model_id": None,
+        "repo": None,
+        "parse_error": None,
+    }
+    plan = data.get("plan")
+    if isinstance(plan, str) and plan.strip():
+        meta["plan"] = verification.normalize_repo_relative_path(
+            plan,
+            repo_root=repo_root,
+            field="plan",
+        )
+    elif dispatch == "auto":
+        raise verification.ContractValidationError("plan", "auto dispatch requires a plan path")
+
+    target_branch = data.get("target_branch")
+    if target_branch is not None:
+        meta["target_branch"] = verification.normalize_non_empty_string(
+            target_branch,
+            field="target_branch",
+        )
+    elif dispatch == "auto":
+        raise verification.ContractValidationError(
+            "target_branch", "auto dispatch requires a target_branch"
+        )
+
+    verification_value = data.get("verification")
+    if verification_value is not None:
+        meta["verification"] = verification.validate_verification_contract(
+            verification_value,
+            repo_root=repo_root,
+            auto_dispatch=(dispatch == "auto"),
+        )
+    elif dispatch == "auto":
+        raise verification.ContractValidationError(
+            "verification", "auto dispatch requires a verification contract"
+        )
+    has_executor = data.get("executor") is not None
+    has_model_id = data.get("model_id") is not None
+    if has_executor != has_model_id:
+        missing = "model_id" if has_executor else "executor"
+        counterpart = "executor" if missing == "model_id" else "model_id"
+        raise verification.ContractValidationError(
+            missing,
+            f"{missing} must be declared together with {counterpart}",
+        )
+    if has_executor:
+        meta["executor"] = verification.normalize_non_empty_string(
+            data.get("executor"),
+            field="executor",
+        )
+        meta["model_id"] = verification.normalize_non_empty_string(
+            data.get("model_id"),
+            field="model_id",
+        )
+    # #469：optional 顯式 repo 歸屬宣告（owner/repo）。派工時投影進 builder job
+    # 的 workflow_repo，終局 manifest / recent_done / slices 才有 repo 歸屬。
+    # 未宣告 → None：依 #230/#349 契約不從路徑或 git remote 推斷。
+    # shape 比照 completion.py 的 work_authority.repo：恰一個 '/' 且兩段非空。
+    repo_value = data.get("repo")
+    if repo_value is not None:
+        normalized_repo = repo_value.strip() if isinstance(repo_value, str) else None
+        if (
+            normalized_repo is None
+            or normalized_repo.count("/") != 1
+            or not all(normalized_repo.split("/"))
+            or any(char.isspace() for char in normalized_repo)
+        ):
+            raise verification.ContractValidationError(
+                "repo", "repo must be an explicit owner/repo string"
+            )
+        meta["repo"] = normalized_repo
+    if data.get("parse_error") is not None:
+        raise verification.ContractValidationError(
+            "parse_error",
+            "parse_error is runtime-owned and must be null when present",
+        )
+    return meta
+
+
+def _normalize_depends_on(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def _infer_repo_root(spec_path: Path) -> Path:
+    # 只有「顯式宣告的」才算 configured。舊實作用 paths.repo_root()，未宣告
+    # PSC_REPO_ROOT 時它會退回 cwd——daemon 的 cwd 就是 operator 的真實
+    # checkout，於是 spec 會被「推斷」到一個沒人指定過的樹（上游 #612）。
+    # 沒宣告就走下面的 .git 祖先搜尋，那條路徑本來就有明確的判準。
+    configured_root = paths.configured_repo_root()
+    configured = configured_root.resolve() if configured_root is not None else None
+    resolved_spec = spec_path.resolve()
+    if configured is None:
+        return _infer_repo_root_from_ancestors(resolved_spec)
+    try:
+        resolved_spec.relative_to(configured)
+        return configured
+    except ValueError:
+        pass
+
+    return _infer_repo_root_from_ancestors(resolved_spec, configured)
+
+
+def _infer_repo_root_from_ancestors(
+    resolved_spec: Path, configured: Path | None = None
+) -> Path:
+    """從 spec 路徑往上找 `.git`；找不到才退回 spec 所在目錄。
+
+    `~/.agents` 底下的 git 樹是 agent 契約區，不是被治理的目標 repo，所以跳過。
+    """
+    agents_dir = Path.home() / ".agents"
+    for parent in [resolved_spec, *resolved_spec.parents]:
+        if (parent / ".git").exists():
+            if parent == agents_dir or parent.name in {".agents", "agents"}:
+                continue
+            return parent
+
+    if configured is not None:
+        return configured
+    return resolved_spec.parent
+
+
+def _resolve_contract_path(path_value: str | None, repo_root: Path) -> Path | None:
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    return (repo_root / path_value).resolve()
+
+
+def pin_dispatch_inputs(meta: dict, *, target_remote: str | None = None) -> dict:
+    precomputed = meta.get("_pinned_inputs")
+    if isinstance(precomputed, dict):
+        return {
+            "spec_path": precomputed["spec_path"],
+            "spec_hash": precomputed["spec_hash"],
+            "plan_path": precomputed["plan_path"],
+            "plan_hash": precomputed["plan_hash"],
+            "target_branch": precomputed.get("target_branch") or meta.get("target_branch") or "main",
+            "target_remote": verification.normalize_remote_name(
+                precomputed.get("target_remote")
+                if target_remote is None
+                else target_remote
+            ),
+            "verification_hash": precomputed["verification_hash"],
+            "verification": meta.get("verification"),
+            "review_policy": (
+                meta.get("verification", {}).get("review_policy")
+                if isinstance(meta.get("verification"), dict)
+                else None
+            ),
+        }
+    raw_spec_path = meta.get("path") or str(Path("specs") / f"{meta.get('slice_id', 'unknown')}.md")
+    repo_root = _infer_repo_root(Path(raw_spec_path))
+    spec_path = Path(raw_spec_path).resolve()
+    plan_path = _resolve_contract_path(meta.get("plan"), repo_root)
+    if plan_path is None:
+        raise ValueError(f"slice 缺 plan path，無法 pin dispatch inputs: {meta.get('slice_id')}")
+    try:
+        spec_bytes = spec_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"spec file unreadable for dispatch pinning: {spec_path}") from exc
+    try:
+        plan_bytes = plan_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"plan file unreadable for dispatch pinning: {plan_path}") from exc
+    spec_hash = verification.sha256_bytes(spec_bytes)
+    plan_hash = verification.sha256_bytes(plan_bytes)
+    verification_contract = meta.get("verification")
+    verification_hash = (
+        verification.canonical_json_hash(verification_contract)
+        if verification_contract is not None
+        else verification.canonical_json_hash(None)
+    )
+    return {
+        "spec_path": str(spec_path),
+        "spec_hash": spec_hash,
+        "plan_path": str(plan_path),
+        "plan_hash": plan_hash,
+        "target_branch": meta.get("target_branch") or "main",
+        "target_remote": verification.normalize_remote_name(
+            os.environ.get("PSC_TARGET_REMOTE") if target_remote is None else target_remote
+        ),
+        "verification_hash": verification_hash,
+        "verification": verification_contract,
+        "review_policy": (
+            verification_contract.get("review_policy")
+            if isinstance(verification_contract, dict)
+            else None
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 2) scan_specs（確定性）
+# --------------------------------------------------------------------------- #
+def scan_specs(specs_dir) -> list[dict]:
+    """掃 specs_dir 下 *.md，逐檔 parse_spec_frontmatter，確定性排序。
+
+    目錄不存在 → []（非錯誤）。
+    """
+    d = Path(specs_dir)
+    if not d.is_dir():
+        return []
+    return [parse_spec_frontmatter(p) for p in sorted(d.glob("*.md"))]
+
+
+# --------------------------------------------------------------------------- #
+# 3) detect_cycles（DAG 回邊偵測，refuse）
+# --------------------------------------------------------------------------- #
+def _build_graph(metas: list[dict]) -> dict[str, list[str]]:
+    """以 slice_id 為節點、depends_on 為有向邊建圖。
+
+    重複 slice_id → raise ValueError（身分不明確的 DAG 直接拒絕，不靜默合併）。
+    兩份 spec 誤用同一 slice_id 是現實的 copy-paste 錯誤：若靜默以後者覆寫前者的
+    邊，會遮蔽真實的環；下游 fan-out 也會對同一 `feature/<slice_id>` 重複派工
+    （第二次 `git worktree add` 必失敗、且違反「一單位一 job」）。故 fail-safe 提前拒絕。
+    不含 slice_id（None/非字串）的 meta 不入圖（無身分，不可為相依目標）。
+    """
+    graph: dict[str, list[str]] = {}
+    for m in metas:
+        sid = m.get("slice_id")
+        if not isinstance(sid, str):
+            continue
+        if sid in graph:
+            raise ValueError(f"depends_on 偵測到重複 slice_id: {sid}")
+        graph[sid] = [d for d in m.get("depends_on", [])]
+    return graph
+
+
+def classify_batch_dependency(
+    dep: str,
+    *,
+    batch_ids: set[str],
+    handoff_dir: str,
+) -> str | None:
+    if dep in batch_ids:
+        return None
+    manifest_path = Path(handoff_dir) / f"{dep}.json"
+    if manifest_path.is_file():
+        return f"deps-external:{dep}"
+    return f"deps-unknown:{dep}"
+
+
+def detect_cycles(metas: list[dict]) -> None:
+    """以 slice_id 為節點、depends_on 為有向邊偵測循環相依。
+
+    成環 → raise ValueError（帶 cycle path）。
+    重複 slice_id → raise ValueError（先於 DFS，見 _build_graph）。
+    指向不在 metas 的 slice_id 的邊不算環（外部/未掃到；診斷責任在
+    classify_batch_dependency）。
+    """
+    graph = _build_graph(metas)
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = {sid: WHITE for sid in graph}
+    stack: list[str] = []
+
+    def visit(node: str) -> None:
+        color[node] = GRAY
+        stack.append(node)
+        for dep in graph.get(node, []):
+            if dep not in graph:
+                continue  # 外部相依 → 不算環
+            if color[dep] == GRAY:
+                cycle = stack[stack.index(dep):] + [dep]
+                raise ValueError(f"depends_on 偵測到循環相依: {' -> '.join(cycle)}")
+            if color[dep] == WHITE:
+                visit(dep)
+        stack.pop()
+        color[node] = BLACK
+
+    for sid in graph:
+        if color[sid] == WHITE:
+            visit(sid)
+
+
+# --------------------------------------------------------------------------- #
+# 4) ready_units（三條件 + 先偵測環）
+# --------------------------------------------------------------------------- #
+def ready_units(metas: list[dict], is_satisfied: IsSatisfied) -> list[dict]:
+    """回就緒單位：有 slice_id ∧ dispatch=='auto' ∧ plan 非空 ∧ depends_on 全滿足。
+
+    MUST 先 detect_cycles（成環/重複 slice_id 整批 raise，不回部分集）。
+    無 slice_id（None/非字串/空字串）的單位無身分——無法成為 depends_on 目標、
+    無法被追蹤或交接——依 fail-safe 立場 MUST NOT 就緒；此檢查也使 dispatch_ready
+    存取 m['slice_id'] / m['plan'] 必為合法非空字串。
+    is_satisfied 為必注入參數（呼叫者決定判定來源）。確定性序（沿 metas 順序）。
+    """
+    detect_cycles(metas)  # 先 refuse 環/重複 slice_id
+    ready: list[dict] = []
+    for m in metas:
+        if not (isinstance(m.get("slice_id"), str) and m["slice_id"]):
+            continue
+        if m.get("dispatch") != "auto":
+            continue
+        if not (isinstance(m.get("plan"), str) and m["plan"]):
+            continue
+        deps = m.get("depends_on", [])
+        if all(is_satisfied(dep) for dep in deps):
+            ready.append(m)
+    return ready
+
+
+# --------------------------------------------------------------------------- #
+# 5) default_is_satisfied（預設來源 = handoff gate_status；保持可注入覆寫）
+# --------------------------------------------------------------------------- #
+def default_is_satisfied(
+    slice_id: str,
+    handoff_dir: str = DEFAULT_HANDOFF_DIR,
+    *,
+    repo_root: str | Path | None = None,
+    git_runner=None,
+) -> bool:
+    """預設判定：handoff 指向有效 CompletionRecord 且 candidate 仍為 target ancestor。"""
+    return (
+        completion.load_completion_from_handoff(
+            slice_id,
+            handoff_dir=handoff_dir,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        )
+        is not None
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 6) dispatch_ready（fan-out，reuse Phase 2 Dispatcher）
+# --------------------------------------------------------------------------- #
+class DispatchReadyRequiresLauncherError(RuntimeError):
+    """fan-out 需 headless launcher 卻未提供時 fail-fast 拋出（zh-tw）。"""
+
+
+def dispatch_ready(
+    metas: list[dict],
+    is_satisfied: IsSatisfied,
+    dispatcher,
+    persona: str = "builder",
+    git_runner=None,
+    launcher: AgentLauncher | None = None,
+    handoff_dir: str = DEFAULT_HANDOFF_DIR,
+    identity_registry=None,
+    launcher_factory=None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
+) -> list[dict]:
+    """算就緒集，對每單位經注入的 headless AgentLauncher 各啟一個 agent（一單位一 job）。
+
+    隔離靠 per-worktree headless session，故並行安全。
+
+    spawn_admission（#381）：就緒集在同一次呼叫內背靠背 spawn 多個 agent 時，
+    同一 provider（executor CLI，例如 copilot 啟動時連續探測 GitHub `/user`
+    約 6-7 次）會瞬間把獨立於 core rate_limit 的 quota bucket 打爆。真正 launch
+    前先呼叫 ``limiter.admit(provider)``：同一 provider 未跑滿最小間隔就等待，
+    不同 provider 互不阻塞，spawn 成功即釋放（不佔住 job 的整個執行期）。
+    未注入（``None``）時解析為零間隔 no-op，與過去「完全沒有這個參數」的行為
+    等價——只有呼叫端顯式建構並注入 limiter 才會真的節流。
+
+    fail-fast（reviewer #112-3）：manager 自主 fan-out 一律走 headless launcher。
+    persona 契約 prompt 是多行文字，舊 tmux pane 路徑用 `send-keys -l` 會把每個
+    `\\n` 變成 Enter、把 prompt 打散；故就緒集非空卻無 launcher 時，直接拒絕並
+    指示改用 `--executor`（headless），不再 silently 經 pane 送多行 prompt。
+    （git_runner 為歷史相容參數，headless 路徑不使用。）
+
+    prompt 構建（build_dispatch_prompt）置於 per-slice try/except 內（reviewer #112-2）：
+    未知 role / render 失敗只影響該單位，被收進 errors，不破壞其他就緒單位的派工隔離。
+    回 dispatched jobs；有任何單位失敗 → 收齊後 raise DispatchReadyError（帶成功 jobs）。
+
+    dispatch_head baseline（#131）：worktree 建好、launch 前取 `feature/<slice>` 的
+    branch head 持久化於 job，complete_tick 的預設 shadow gate 才有 base 可算
+    `compute_changed_paths(base, branch)`；取不到（git 例外）→ None，shadow 降級不阻釋放。
+    git_runner 注入即沿用（預設 `_default_git_runner`，與 dispatcher.dispatch 同源）。
+    """
+    ready = ready_units(metas, is_satisfied)
+    if ready and launcher is None:
+        raise DispatchReadyRequiresLauncherError(
+            "manager 自主 fan-out 需 headless launcher："
+            "persona 契約為多行 prompt，經 tmux pane send-keys -l 會被換行打散。"
+            "請以 --executor（copilot/claude/codex）走 headless 路徑派工。"
+        )
+    if ready and persona == "builder":
+        commit_required_factory = getattr(launcher, "as_commit_required", None)
+        if callable(commit_required_factory):
+            launcher = commit_required_factory()
+    runner = git_runner or _default_git_runner
+    resolved_identity_registry = identity_registry
+    limiter = resolve_limiter(spawn_admission)
+    jobs: list[dict] = []
+    errors: list[tuple[str, Exception]] = []
+    for m in ready:
+        slice_id = m["slice_id"]
+        job: dict | None = None
+        pinned_inputs: dict | None = None
+        try:
+            pinned_inputs = pin_dispatch_inputs(m)
+            # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
+            # 或 base_sha 解析若晚點失敗，slice 落 needs_human 後 dispatch_base 不會
+            # 再被更新（見下方 _mark_slice_needs_human），故先嘗試取現有 branch head
+            # 存底；branch 尚未建立（首次派工常態）時取不到，None 為預期落點。
+            try:
+                early_dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
+            except Exception:
+                early_dispatch_head = None
+            _record_pending_slice(
+                dispatcher=dispatcher,
+                slice_id=slice_id,
+                pinned_inputs=pinned_inputs,
+                dispatch_base=early_dispatch_head,
+            )
+            active_launcher = launcher
+            executor = m.get("executor")
+            model_id = m.get("model_id")
+            identity = None
+            if isinstance(executor, str) and executor and isinstance(model_id, str) and model_id:
+                if resolved_identity_registry is None:
+                    resolved_identity_registry = load_model_identities()
+                identity = resolved_identity_registry.get(executor, model_id)
+                if identity is None:
+                    available = ", ".join(
+                        f"{item.executor}/{item.model_id}"
+                        for item in resolved_identity_registry.identities
+                    ) or "(none)"
+                    raise ValueError(
+                        f"spec identity unknown: {executor}/{model_id}（可用 candidates: {available}）"
+                    )
+                if launcher_factory is None:
+                    raise ValueError(
+                        f"slice {slice_id} declares executor/model_id but launcher_factory is unavailable"
+                    )
+                active_launcher = launcher_factory(identity)
+                if persona == "builder":
+                    commit_required_factory = getattr(active_launcher, "as_commit_required", None)
+                    if callable(commit_required_factory):
+                        active_launcher = commit_required_factory()
+            persona_contract = get_persona_contract(persona)
+            persona_tools_factory = getattr(active_launcher, "with_persona_tools", None)
+            if persona_contract is not None and callable(persona_tools_factory):
+                active_launcher = persona_tools_factory(persona_contract.allowed_tools)
+            base_sha = _resolve_target_base_sha(
+                meta=m,
+                pinned_inputs=pinned_inputs,
+                handoff_dir=handoff_dir,
+                git_runner=runner,
+            )
+            worktree = _launcher_worktree(dispatcher, slice_id, base_sha=base_sha)
+            prompt = build_dispatch_prompt(
+                persona,
+                task=slice_id,
+                plan_path=m["plan"],
+                worktree_root=str(Path(worktree).resolve()),
+            )
+            # baseline 須在 agent 動工前取（launch 前），否則含進 agent 的 commit → 空 diff。
+            try:
+                dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
+            except Exception:
+                dispatch_head = None
+            log_dir = str(Path("runtime/dispatch") / slice_id)
+            # 在 launch 前先落地 registry row：Popen 之後、記錄完成之前若 daemon
+            # 崩潰，仍有可回收的 job 列（否則 agent 在跑卻無 job / in_flight / 輪詢）。
+            job = _record_launching_job(
+                dispatcher=dispatcher,
+                slice_id=slice_id,
+                persona=persona,
+                worktree=worktree,
+                dispatch_head=dispatch_head,
+                # #469：spec frontmatter 顯式宣告的 repo 歸屬（未宣告 → None，
+                # 不推斷）；寫進 job record 既有 workflow_repo 欄，終局 manifest
+                # 與 slices/attention 讀取端（#465/#349）即可投影。
+                workflow_repo=m.get("repo"),
+            )
+            _mark_slice_building(
+                dispatcher=dispatcher,
+                slice_id=slice_id,
+                builder_job_id=job.get("job_id"),
+                dispatch_base=base_sha or dispatch_head,
+            )
+            # #381：真正 spawn 前才 admit——記錄下這次要用的 job row 之後、
+            # Popen 之前，讓等待時間不計入「job 已在跑」的錯覺。
+            limiter.admit(
+                resolve_provider(identity=identity, executor=executor, launcher=active_launcher)
+            )
+            handle = active_launcher.launch(
+                slice_id=slice_id,
+                prompt=prompt,
+                worktree=worktree,
+                log_dir=log_dir,
+            )
+            job = _attach_launch_handle(dispatcher=dispatcher, job=job, handle=handle)
+            jobs.append(job)
+        except Exception as exc:
+            if job is not None:
+                _fail_launching_job(dispatcher, job)
+            if pinned_inputs is not None:
+                _mark_slice_needs_human(dispatcher, slice_id, reason=str(exc))
+            errors.append((slice_id, exc))
+    if errors:
+        raise DispatchReadyError(errors, jobs)
+    return jobs
+
+
+def _branch_for_slice(slice_id: str) -> str:
+    return f"feature/{slice_id}"
+
+
+def _resolve_target_base_sha(
+    *,
+    meta: dict,
+    pinned_inputs: dict,
+    handoff_dir: str,
+    git_runner,
+) -> str:
+    repo_root = _infer_repo_root(Path(pinned_inputs["spec_path"]))
+    target_branch = str(pinned_inputs["target_branch"])
+    target_remote = str(pinned_inputs["target_remote"])
+    target_ref = f"refs/remotes/{target_remote}/{target_branch}"
+    fetch = verification._run_git(
+        ["-C", str(repo_root), "fetch", "--no-tags", target_remote, target_branch],
+        git_runner,
+    )
+    if fetch["status"] != "ok":
+        raise ValueError(f"target fetch failed: {target_remote}/{target_branch}")
+    target_head = verification._run_git(["-C", str(repo_root), "rev-parse", target_ref], git_runner)
+    target_sha = target_head["stdout"].strip().lower()
+    if target_head["status"] != "ok" or verification.SAFE_SHA_RE.fullmatch(target_sha) is None:
+        raise ValueError(f"target ref unreadable: {target_ref}")
+    dependency_target: str | None = None
+    for dep in meta.get("depends_on", []):
+        dep_record = completion.load_completion_from_handoff(
+            str(dep),
+            handoff_dir=handoff_dir,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        )
+        if dep_record is None:
+            raise ValueError(f"dependency unsatisfied: {dep}")
+        dep_target = str(dep_record["target_branch"])
+        if dependency_target is None:
+            dependency_target = dep_target
+        elif dependency_target != dep_target:
+            raise ValueError("dependency target branch mismatch")
+        if dep_target != target_branch:
+            raise ValueError("dependency chain target branch mismatch")
+        dep_candidate = str(dep_record["candidate"])
+        ancestor = verification._run_git(
+            ["-C", str(repo_root), "merge-base", "--is-ancestor", dep_candidate, target_sha],
+            git_runner,
+        )
+        if ancestor["status"] != "ok":
+            raise ValueError(f"dependency candidate stale: {dep}")
+    return target_sha
+
+
+def _launcher_worktree(dispatcher, slice_id: str, *, base_sha: str | None = None) -> str:
+    worktree_creator = getattr(dispatcher, "_worktree_creator", None)
+    if worktree_creator is None:
+        return str(Path.cwd())
+    branch = _branch_for_slice(slice_id)
+    if base_sha is None:
+        return worktree_creator.create(branch)
+    try:
+        return worktree_creator.create(branch, base_sha=base_sha)
+    except TypeError:
+        return worktree_creator.create(branch)
+
+
+def _record_launching_job(
+    *,
+    dispatcher,
+    slice_id: str,
+    persona: str,
+    worktree: str,
+    dispatch_head: str | None = None,
+    workflow_repo: str | None = None,
+) -> dict:
+    """Persist the job row *before* launch (handle fields filled in later)."""
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return {
+            "task": slice_id,
+            "persona": persona,
+            "worktree": worktree,
+            "status": "dispatched",
+            "dispatch_head": dispatch_head,
+            "executor": None,
+            "session_name": None,
+            "pid": None,
+            "log_path": None,
+            "workflow_repo": workflow_repo,
+        }
+    return registry.create_job(
+        task=slice_id,
+        persona=persona,
+        kind="build",
+        branch=_branch_for_slice(slice_id),
+        pane="",
+        worktree=worktree,
+        dispatch_head=dispatch_head,
+        executor=None,
+        session_name=None,
+        pid=None,
+        log_path=None,
+        # #469：slice-lane 的 repo 歸屬只來自 spec 顯式宣告；lane 判定看
+        # workflow_run_id（manager._is_workflow_lane_job），帶此欄不會誤判 lane。
+        workflow_repo=workflow_repo,
+    )
+
+
+def _record_pending_slice(
+    *,
+    dispatcher,
+    slice_id: str,
+    pinned_inputs: dict,
+    dispatch_base: str | None,
+) -> None:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return
+    try:
+        registry.create_slice(
+            slice_id=slice_id,
+            spec_path=pinned_inputs["spec_path"],
+            spec_hash=pinned_inputs["spec_hash"],
+            plan_path=pinned_inputs["plan_path"],
+            plan_hash=pinned_inputs["plan_hash"],
+            target_branch=pinned_inputs["target_branch"],
+            target_remote=pinned_inputs["target_remote"],
+            verification_hash=pinned_inputs["verification_hash"],
+            verification=pinned_inputs.get("verification"),
+            dispatch_base=dispatch_base,
+            builder_job_id=None,
+            reviewer_job_id=None,
+            candidate=None,
+        )
+    except ValueError as exc:
+        if "slice 已存在" not in str(exc):
+            raise
+        registry.repin_slice(
+            slice_id,
+            spec_path=pinned_inputs["spec_path"],
+            spec_hash=pinned_inputs["spec_hash"],
+            plan_path=pinned_inputs["plan_path"],
+            plan_hash=pinned_inputs["plan_hash"],
+            target_branch=pinned_inputs["target_branch"],
+            target_remote=pinned_inputs["target_remote"],
+            verification_hash=pinned_inputs["verification_hash"],
+            verification=pinned_inputs.get("verification"),
+            dispatch_base=dispatch_base,
+        )
+
+
+def _mark_slice_building(
+    *,
+    dispatcher,
+    slice_id: str,
+    builder_job_id: str | None,
+    dispatch_base: str | None,
+) -> None:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return
+    registry.update_slice(
+        slice_id,
+        state="building",
+        builder_job_id=builder_job_id,
+        dispatch_base=dispatch_base,
+    )
+
+
+def _mark_slice_needs_human(dispatcher, slice_id: str, *, reason: str) -> None:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return
+    try:
+        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+    except Exception:
+        return
+    try:
+        registry.record_action(
+            slice_id,
+            action="dispatch-failed",
+            actor="manager",
+            state="needs_human",
+            gate_state="needs_human",
+        )
+    except Exception:
+        _ = reason
+
+
+def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dict:
+    """Fill in the launch handle on the pre-launch job row."""
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None or "job_id" not in job:
+        attached = {
+            **job,
+            "executor": handle.executor,
+            "session_name": handle.session_name,
+            "pid": handle.pid,
+            "log_path": handle.log_path,
+        }
+        if handle.executable_path is not None:
+            attached["executable_path"] = handle.executable_path
+        return attached
+    launch_kwargs = {
+        "executor": handle.executor,
+        "model_id": handle.model_id,
+        "session_name": handle.session_name,
+        "pid": handle.pid,
+        "log_path": handle.log_path,
+    }
+    if handle.executable_path is not None:
+        launch_kwargs["executable_path"] = handle.executable_path
+    return registry.attach_launch_handle(
+        job["job_id"],
+        **launch_kwargs,
+    )
+
+
+def _fail_launching_job(dispatcher, job: dict) -> None:
+    """Reconcile a pre-launch row whose launch raised (mark failed)."""
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None or "job_id" not in job:
+        return
+    try:
+        registry.update_status(job["job_id"], "failed")
+    except Exception:
+        pass

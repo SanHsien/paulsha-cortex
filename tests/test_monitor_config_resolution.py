@@ -1,0 +1,164 @@
+from pathlib import Path
+import warnings
+
+import pytest
+
+from paulsha_cortex.monitor.config import _resolve_config_source, load_config
+import paulsha_cortex.monitor.config as monitor_config
+from paulsha_cortex.monitor.work_api import MonitorSocketClient
+from paulsha_cortex.config import paths
+
+
+def _write(p: Path, text="workspaces:\n  - {name: a, path: /tmp/a}\n"):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+@pytest.fixture
+def isolate_warning_state(monkeypatch):
+    original = getattr(monitor_config, "_WARNED_DEPRECATIONS", None)
+    monkeypatch.setattr(monitor_config, "_WARNED_DEPRECATIONS", set(), raising=False)
+    yield
+    if original is None:
+        monkeypatch.delattr(monitor_config, "_WARNED_DEPRECATIONS", raising=False)
+    else:
+        monkeypatch.setattr(monitor_config, "_WARNED_DEPRECATIONS", original)
+
+
+def test_prefers_new_project_cortex_over_legacy(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+    new = _write(tmp_path / "agents" / "project-cortex.yaml")
+    _write(tmp_path / "legacy" / "paulshaclaw.yaml")
+    assert _resolve_config_source(None) == new
+
+
+def test_legacy_only_transition(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+    legacy = _write(tmp_path / "legacy" / "paulshaclaw.yaml")
+    with pytest.raises(ValueError, match="deprecated legacy monitor"):
+        _resolve_config_source(None)
+
+
+def test_legacy_file_fails_loudly(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+    legacy = _write(tmp_path / "legacy" / "paulshaclaw.yaml")
+    expected_message = (
+        f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {tmp_path / 'agents' / 'project-cortex.yaml'}"
+    )
+    with pytest.raises(ValueError) as exc_info:
+        _resolve_config_source(None)
+    assert str(exc_info.value) == expected_message
+
+
+def test_legacy_env_fails_loudly(monkeypatch, tmp_path):
+    legacy_env = tmp_path / "legacy-env-config.yaml"
+    legacy = _write(legacy_env)
+    monkeypatch.setenv("PAULSHACLAW_CONFIG", str(legacy))
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+
+    with pytest.raises(ValueError, match="PAULSHACLAW_CONFIG"):
+        _resolve_config_source(None)
+
+
+
+def test_new_config_has_no_deprecation_warning(monkeypatch, tmp_path, isolate_warning_state):
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+    new = _write(tmp_path / "agents" / "project-cortex.yaml")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resolved = [_resolve_config_source(None) for _ in range(3)]
+
+    assert resolved == [new, new, new]
+    assert caught == []
+
+
+def test_none_when_no_manual(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
+    monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
+    assert _resolve_config_source(None) is None
+
+
+def test_socket_client_discovers_selected_instance_project_config(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    runtime = home / ".agents" / "core" / "runtime"
+    runtime.mkdir(parents=True)
+    project_config_root = tmp_path / "selected-config"
+    socket_path = tmp_path / "selected-run" / "monitor.sock"
+    (runtime / "beta-manager.env").write_text(
+        f"PSC_AGENTS_ROOT={tmp_path / 'selected-agents'}\n"
+        f"PSC_RUN_ROOT={tmp_path / 'selected-run'}\n"
+        f"PSC_PROJECT_CONFIG_ROOT={project_config_root}\n",
+        encoding="utf-8",
+    )
+    _write(
+        project_config_root / "project-cortex.yaml",
+        "workspaces:\n"
+        f"  - {{name: selected, path: {tmp_path / 'repo'}}}\n"
+        "monitor:\n"
+        f"  socket_path: {socket_path}\n",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PSC_INSTANCE", "beta")
+    for name in (
+        "PSC_AGENTS_ROOT",
+        "PSC_RUN_ROOT",
+        "PSC_PROJECT_CONFIG_ROOT",
+        "PSC_MONITOR_CONFIG",
+        "PAULSHACLAW_CONFIG",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert paths.agents_root() == tmp_path / "selected-agents"
+    assert paths.control_root() == tmp_path / "selected-agents" / "control"
+    assert paths.coordinator_root() == tmp_path / "selected-agents" / "coordinator"
+    assert paths.specs_root() == tmp_path / "selected-agents" / "specs"
+    assert paths.project_config_root() == project_config_root
+    assert MonitorSocketClient().socket_path == socket_path
+
+
+def test_load_config_wraps_read_os_error(monkeypatch, tmp_path):
+    config_path = _write(tmp_path / "agents" / "project-cortex.yaml")
+    original = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == config_path:
+            raise PermissionError("denied")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    with pytest.raises(ValueError, match="讀取或解析失敗"):
+        load_config(config_path=config_path)
+
+
+def test_explicit_config_path_scopes_hippo_sidecar_to_same_directory(monkeypatch, tmp_path):
+    external = tmp_path / "external"
+    local = tmp_path / "local"
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(external))
+    (external / "project-hippo.yaml").parent.mkdir(parents=True, exist_ok=True)
+    (external / "project-hippo.yaml").write_text(
+        f"projects:\n  - slug: external\n    roots: [{tmp_path / 'external-repo'}]\n",
+        encoding="utf-8",
+    )
+    config_path = _write(local / "project-cortex.yaml")
+
+    cfg = load_config(config_path=config_path)
+
+    assert cfg.hippo_projects == ()

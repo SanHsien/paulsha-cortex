@@ -1,0 +1,60 @@
+name: Upstream check
+
+# 上游 hamanpaul/paulsha-cortex 仍在高頻開發，「有沒有落後」不能靠人記得去 fetch。
+# 這支每週比對 upstream main 與 tools/upstream_baseline.json 的 reviewed_through，
+# 有未審 commit 就讓 workflow 失敗並在 summary 列出清單。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - tools/check_upstream_updates.py
+      - tools/upstream_baseline.json
+      - .github/workflows/upstream-check.yml
+  schedule:
+    # 每週一 11:00（Asia/Taipei）。
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          # checker 自己 fetch upstream；完整歷史才能讓 `git log reviewed..upstream` 成立。
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Check upstream for unreviewed commits
+        id: upstream
+        continue-on-error: true
+        run: python tools/check_upstream_updates.py --strict
+
+      - name: Publish report
+        if: always()
+        run: cat upstream-review-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require review when upstream moved
+        if: steps.upstream.outcome == 'failure'
+        run: |
+          echo "::error::上游有未審視的 commit，見 workflow summary；審完寫進 docs/UPSTREAM.md 再推進 tools/upstream_baseline.json。"
+          exit 1

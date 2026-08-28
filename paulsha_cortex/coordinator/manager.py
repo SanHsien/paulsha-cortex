@@ -1,0 +1,9118 @@
+from __future__ import annotations
+
+import base64
+import fnmatch
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import stat
+import subprocess
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Mapping, Protocol
+from uuid import uuid4
+
+from paulsha_cortex.config import paths
+from paulsha_cortex.lib.durability import fsync_directory
+from paulsha_cortex.lib.permissions import mode_matches
+from paulsha_cortex.lib.filesystem import remove_tree
+from paulsha_cortex.lib.path_safety import is_absolute_any
+
+from .._yaml import YAMLError, safe_load
+from ..lib import idle
+from ..persona import gate, handoff
+from . import autonomy
+from . import completion
+from . import planning_runtime
+from . import provider_backoff
+from . import provider_outcome
+from . import seams
+from . import review as foreign_review
+from . import terminal_contract
+from . import verification
+from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
+from .registry import slice_repin_eligible
+from ..config.paths import worktree_root_for
+from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
+from .model_identities import (
+    AGY_DOMAIN,
+    AGY_LIVE_PROBE,
+    AGY_MODEL_ID,
+    CapabilityProbe,
+    IdentityRegistry,
+    ModelIdentity,
+    load_model_identities,
+)
+from .planning import (
+    ACCEPTANCE_SURFACE_RULES,
+    PlanningArtifact,
+    PlanningScope,
+    assess_planning_artifact,
+    assess_planning_completeness,
+    plan_review_gate,
+    run_heterogeneous_brainstorm,
+)
+from .workflow import (
+    WORKFLOW_PHASES,
+    GateEvidenceRef,
+    PlanningArtifactAuthority,
+    WorkflowManifest,
+    validate_workflow_phase_transition,
+)
+
+logger = logging.getLogger(__name__)
+
+IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
+TERMINAL_STATUSES = frozenset({"exited", "failed"})
+
+# workflow lane 的 phase job（issue #264）terminal manifest 語意：不查 slices
+# 表，gate 依據就是 job 自身的 exit 結果——phase 的實際推進/gate 判定由
+# workflow registry（_dispatch_workflow_card 重掃 list_jobs()）負責，跟這裡
+# 寫的 handoff manifest 無關（manifest 只供 operator 視野／cockpit 展示用）。
+# 用獨立的 gate_status/gate_reason，機械區分於 slice lane 的
+# needs_human/missing-slice-proof，不得誤觸 needs_human 佇列。
+WORKFLOW_LANE_GATE_STATUS = "workflow-tracked"
+WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
+VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
+SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"})
+WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _is_safe_slice_id(slice_id) -> bool:
+    """slice_id 用作單一檔名；拒絕路徑分隔/相對跳脫/絕對路徑（fail-closed 防越界寫）。"""
+    return (
+        isinstance(slice_id, str)
+        and bool(slice_id)
+        and slice_id not in (".", "..")
+        and re.fullmatch(r"[A-Za-z0-9._-]+", slice_id) is not None
+    )
+
+
+class GateRunner(Protocol):
+    def __call__(self, job: dict) -> dict | None: ...
+
+
+def _default_gate_runner(job: dict) -> dict | None:
+    """shadow diff gate（觀測用）。取不到 base/head 或 git 失敗 → None（不阻釋放）。"""
+    branch = job.get("branch")
+    base = job.get("dispatch_head")
+    if not (isinstance(branch, str) and branch and isinstance(base, str) and base):
+        return None
+    role = job.get("persona") if isinstance(job.get("persona"), str) else "builder"
+    # branch 為 ref 名（非 commit sha）是刻意的：git 在 eval 當下把 base...branch
+    # 解析成該 branch 的 HEAD。shadow-only，任何失敗皆降級為 None（不阻釋放）。
+    try:
+        changed = gate.compute_changed_paths(base, branch)
+    except Exception:
+        return None
+    return gate.build_verdict(role=role, changed_paths=changed, manifest_ok=False)
+
+
+def _satisfied_pred(handoff_dir: str):
+    # 委派單一真相源 default_is_satisfied（消費端零改，不 fork readiness 邏輯）。
+    # try/except 僅做 error-hardening（壞檔/壞編碼 UnicodeDecodeError〔ValueError 子類〕/OSError
+    # → False，不 crash tick），非 readiness 邏輯分岔。
+    def _pred(slice_id: str) -> bool:
+        try:
+            return autonomy.default_is_satisfied(slice_id, handoff_dir=handoff_dir)
+        except (OSError, ValueError):
+            return False
+
+    return _pred
+
+
+def _read_manifest_payload(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _existing_manifest_job_id(path: Path) -> str | None:
+    """既存 manifest 的 job_id（缺檔/壞檔/缺欄 → None，觸發 overwrite）。"""
+    payload = _read_manifest_payload(path)
+    if payload is None:
+        return None
+    if payload.get("gate_status") in {"passed", "verified"}:
+        return None
+    if payload.get("gate_status") == "needs_human" and payload.get("verification_evidence_path") is None and (
+        payload.get("gate_reason") in {"pinned-input-mismatch", "verification-runner-error", "verification-state-update-error"}
+    ):
+        return None
+    job_id = payload.get("job_id")
+    return job_id if isinstance(job_id, str) else None
+
+
+def _supersede_handoff_manifest(
+    *,
+    handoff_dir: str,
+    slice_id: str,
+    action: str,
+    actor: str,
+    clock: Callable[[], str] = _utcnow,
+) -> None:
+    """操作者復原動作（recover-pre-candidate／abandon）後，替殘留 handoff manifest
+    補上 superseded 稽核標記（issue #383）。
+
+    `run_tick()`/`dispatch_gate_scan()` 的 fanout 放行判定改成與 registry 現況
+    對帳（`_manifest_still_blocks_fanout`），本函式失敗與否都不影響「復原後
+    下一輪 tick 能不能重派」這個驗收條件——這裡純粹補稽核可見性，讓直接檢視
+    manifest 檔的人（非只看 tick 行為）也能看出這份終局紀錄已經過期，而不是
+    誤以為它仍是這個 slice 的最新狀態。
+
+    不刪檔（保留稽核紀錄）；只在既有 payload 補 `superseded_at`/`superseded_by`/
+    `superseded_reason` 三欄後覆寫回同一路徑。manifest 不存在（尚未跑過任何
+    job）／壞檔／symlink／已標記過，皆 best-effort no-op——復原是主動作，
+    manifest 標記是次要動作，不得讓次要動作的失敗連帶讓復原本身 raise。
+    """
+    manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+    if manifest_path.is_symlink():
+        return
+    payload = _read_manifest_payload(manifest_path)
+    if payload is None or payload.get("superseded_at") is not None:
+        return
+    payload = dict(payload)
+    payload["superseded_at"] = clock()
+    payload["superseded_by"] = actor
+    payload["superseded_reason"] = action
+    try:
+        handoff.write_manifest(manifest_path, payload)
+    except OSError:
+        pass
+
+
+def _is_workflow_lane_job(job: dict) -> bool:
+    """job 屬於 workflow lane 的判定（issue #264）。
+
+    registry.create_job() 只有透過 workflow 派工路徑（_job_for_workflow_card /
+    dispatch_workflow_card）才會帶 workflow_run_id；slice lane 的 job（經
+    autonomy.dispatch_ready 派工）恆為 None。以此欄位機械區分兩條 lane，
+    而不是靠查不到 slices 表就一律當成 slice lane 缺 proof。
+    """
+    return job.get("workflow_run_id") is not None
+
+
+def _slice_for_job(registry, slice_id: str, job_id: str) -> dict | None:
+    if registry is None:
+        return None
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return None
+    if slice_row.get("builder_job_id") != job_id:
+        return None
+    return slice_row
+
+
+def _slice_for_reviewer_job(registry, slice_id: str, job_id: str) -> dict | None:
+    if registry is None:
+        return None
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return None
+    if slice_row.get("reviewer_job_id") != job_id:
+        return None
+    return slice_row
+
+
+def _pinned_input_mismatches(slice_row: dict) -> list[str]:
+    repo_root = autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
+    mismatches: list[str] = []
+    spec_path = Path(slice_row["spec"]["path"])
+    plan_path = Path(slice_row["plan"]["path"])
+    if not plan_path.is_absolute():
+        plan_path = (repo_root / plan_path).resolve()
+    try:
+        current_spec_hash = verification.sha256_bytes(spec_path.read_bytes())
+    except OSError:
+        return ["spec-unreadable"]
+    if current_spec_hash != slice_row["spec"]["hash"]:
+        mismatches.append("spec-hash")
+    try:
+        current_plan_hash = verification.sha256_bytes(plan_path.read_bytes())
+    except OSError:
+        return mismatches + ["plan-unreadable"]
+    if current_plan_hash != slice_row["plan"]["hash"]:
+        mismatches.append("plan-hash")
+    try:
+        current_meta = autonomy.parse_spec_frontmatter(spec_path)
+    except (OSError, UnicodeDecodeError):
+        return mismatches + ["spec-frontmatter-unreadable"]
+    if current_meta.get("parse_error") is not None:
+        return mismatches + ["spec-frontmatter-invalid"]
+    if current_meta.get("target_branch") != slice_row.get("target_branch"):
+        mismatches.append("target-branch")
+    current_verification = current_meta.get("verification")
+    current_verification_hash = verification.canonical_json_hash(current_verification)
+    if current_verification_hash != slice_row["verification"]["hash"]:
+        mismatches.append("verification-hash")
+    return mismatches
+
+
+def _candidate_for_evidence(
+    *,
+    slice_row: dict | None,
+    job: dict,
+    repo_root: Path,
+    git_runner,
+) -> str:
+    fallback = None
+    if slice_row is not None:
+        dispatch_base = slice_row.get("dispatch_base")
+        if isinstance(dispatch_base, str) and verification.SAFE_SHA_RE.fullmatch(dispatch_base):
+            fallback = dispatch_base.lower()
+    branch = job.get("branch")
+    if isinstance(branch, str) and branch:
+        branch_head = verification._run_git(["-C", str(repo_root), "rev-parse", branch], git_runner)
+        stdout = branch_head["stdout"].strip()
+        if branch_head["status"] == "ok" and verification.SAFE_SHA_RE.fullmatch(stdout):
+            return stdout.lower()
+    worktree = job.get("worktree")
+    if isinstance(worktree, str) and worktree:
+        worktree_head = verification._run_git(["-C", worktree, "rev-parse", "HEAD"], git_runner)
+        stdout = worktree_head["stdout"].strip()
+        if worktree_head["status"] == "ok" and verification.SAFE_SHA_RE.fullmatch(stdout):
+            return stdout.lower()
+    return fallback or ("0" * 40)
+
+
+def _write_status_evidence(
+    *,
+    slice_row: dict | None,
+    job: dict,
+    repo_root: Path,
+    coordinator_root: Path | None,
+    git_runner,
+    status: str,
+    summary: str,
+    details: dict,
+) -> dict | None:
+    slice_id = job.get("task")
+    if not isinstance(slice_id, str) or not slice_id:
+        return None
+    payload = {
+        "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+        "slice_id": slice_id,
+        "candidate": _candidate_for_evidence(
+            slice_row=slice_row,
+            job=job,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        ),
+        "status": status,
+        "summary": summary,
+        "details": details,
+    }
+    return verification.write_verification_evidence(payload, coordinator_root=coordinator_root)
+
+
+def _discard_unpublished_evidence(evidence: dict | None) -> None:
+    if not isinstance(evidence, dict):
+        return
+    path = evidence.get("path")
+    if not isinstance(path, str) or not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _validate_result_evidence(
+    *,
+    evidence: object,
+    slice_id: str,
+    coordinator_root: Path | None,
+) -> dict:
+    if not isinstance(evidence, dict):
+        raise ValueError("verification runner must return an evidence object")
+    normalized = verification.validate_verification_evidence(evidence.get("payload"))
+    if normalized["slice_id"] != slice_id:
+        raise ValueError("verification evidence slice_id mismatch")
+    if normalized["status"] not in VERIFICATION_RESULT_STATES:
+        raise ValueError(f"unsupported verification evidence status: {normalized['status']!r}")
+    expected_path = verification.evidence_path(
+        slice_id=slice_id,
+        candidate=normalized["candidate"],
+        coordinator_root=coordinator_root,
+    )
+    if evidence.get("path") != str(expected_path):
+        raise ValueError("verification evidence path mismatch")
+    expected_hash = verification.canonical_json_hash(normalized)
+    if evidence.get("hash") != expected_hash:
+        raise ValueError("verification evidence hash mismatch")
+    stored_payload = _read_manifest_payload(expected_path)
+    if stored_payload is None:
+        raise ValueError("verification evidence file unreadable")
+    stored_normalized = verification.validate_verification_evidence(stored_payload)
+    if stored_normalized != normalized:
+        raise ValueError("verification evidence payload mismatch")
+    return {"path": str(expected_path), "hash": expected_hash, "payload": normalized}
+
+
+def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
+    payload = evidence["payload"]
+    refs = [evidence["path"]]
+    state = payload["status"]
+    gate_state = "pending" if state == "reviewing" else ("passed" if state == "verified" else "needs_human")
+    action = {
+        "reviewing": "verification-passed-await-review",
+        "verified": "verification-passed",
+    }.get(state, "verification-failed")
+    registry.record_action(
+        slice_id,
+        action=action,
+        actor="manager",
+        state=state,
+        gate_state=gate_state,
+        evidence_refs=refs,
+        candidate=payload["candidate"],
+    )
+    registry.update_slice(
+        slice_id,
+        verification_hash=evidence["hash"],
+        current_evidence_refs=refs,
+        candidate=payload["candidate"],
+    )
+
+
+def _identity_registry() -> dict[tuple[str, str], dict[str, str]]:
+    return foreign_review.load_model_identity_registry()
+
+
+def _builder_launch_identity(job: dict, identity_registry: dict[tuple[str, str], dict[str, str]] | None = None) -> dict | None:
+    executor = job.get("executor")
+    model_id = job.get("model_id")
+    domain = job.get("independence_domain")
+    if isinstance(executor, str) and isinstance(model_id, str) and isinstance(domain, str) and domain:
+        return {"executor": executor, "model_id": model_id, "independence_domain": domain}
+    if identity_registry is None:
+        return None
+    if not isinstance(executor, str) or not isinstance(model_id, str):
+        return None
+    return identity_registry.get((executor, model_id))
+
+
+def _reviewer_launch_identity(job: dict) -> dict | None:
+    executor = job.get("executor")
+    model_id = job.get("model_id")
+    domain = job.get("independence_domain")
+    if not (isinstance(executor, str) and isinstance(model_id, str) and isinstance(domain, str) and domain):
+        return None
+    return {"executor": executor, "model_id": model_id, "independence_domain": domain}
+
+
+def _current_verification_ref(slice_row: dict | None) -> tuple[str | None, str | None]:
+    if not isinstance(slice_row, dict):
+        return None, None
+    refs = slice_row.get("current_evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        return None, None
+    path = refs[0]
+    if not isinstance(path, str):
+        return None, None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        normalized = verification.validate_verification_evidence(payload)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return path, None
+    return path, verification.canonical_json_hash(normalized)
+
+
+def _current_review_ref(slice_row: dict | None) -> tuple[str | None, str | None, dict | None]:
+    if not isinstance(slice_row, dict):
+        return None, None, None
+    refs = slice_row.get("current_evaluation_refs")
+    if not isinstance(refs, list) or not refs:
+        return None, None, None
+    path = refs[0]
+    if not isinstance(path, str):
+        return None, None, None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return path, None, None
+    if not isinstance(payload, dict):
+        return path, None, None
+    return path, verification.canonical_json_hash(payload), payload
+
+
+def _review_policy_for_slice(slice_row: dict) -> str:
+    contract = slice_row.get("verification", {}).get("contract")
+    if isinstance(contract, dict):
+        policy = contract.get("review_policy")
+        if policy in {"required", "not-required"}:
+            return str(policy)
+        docs_class = contract.get("docs_class")
+        if docs_class in {"informational", "trivial"}:
+            return "not-required"
+    return "required"
+
+
+def _current_verification_payload(slice_row: dict | None) -> dict | None:
+    if not isinstance(slice_row, dict):
+        return None
+    refs = slice_row.get("current_evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        return None
+    path = refs[0]
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        normalized = verification.validate_verification_evidence(payload)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    return {
+        "path": path,
+        "hash": verification.canonical_json_hash(normalized),
+        "payload": normalized,
+    }
+
+
+def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
+    if not isinstance(slice_row, dict):
+        return []
+    candidate = slice_row.get("candidate")
+    valid_candidate = (
+        isinstance(candidate, str)
+        and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+    )
+    state = slice_row.get("state")
+    if state == "failed":
+        # retry-build 底層即 registry.repin_slice()。只有在 repin_slice()
+        # 真的會接受目前 (state, gate_state) 組合時才宣告 retry-build——
+        # slice_repin_eligible() 與 repin_slice() 共用同一張表／同一判準
+        # （registry.REPINNABLE_SLICE_STATES / GATE_STATE_TRANSITIONS），
+        # 讓「宣告的動作」與「mutation 端實際接受的動作」保持一致，不再宣告
+        # 一個保證失敗的 retry-build（#382）。
+        actions = ["recover-pre-candidate", "abandon"] if not valid_candidate else ["abandon"]
+        if slice_repin_eligible(slice_row):
+            actions = ["retry-build"] + actions
+        return actions
+    if state != "needs_human":
+        return []
+    if not valid_candidate:
+        return ["recover-pre-candidate", "abandon"]
+    actions = ["retry-build", "abandon"]
+    builder_job_id = slice_row.get("builder_job_id")
+    if not isinstance(builder_job_id, str):
+        return actions
+    try:
+        builder_job = registry.get_job(builder_job_id)
+    except Exception:
+        return actions
+    if builder_job.get("status") != "exited":
+        return actions
+    evidence = _current_verification_payload(slice_row)
+    if evidence is None:
+        return actions
+    if evidence["payload"].get("candidate", "").lower() != candidate.lower():
+        return actions
+    actions.append("retry-verify")
+    if (
+        _review_policy_for_slice(slice_row) == "required"
+        and evidence["payload"].get("status") in {"reviewing", "verified"}
+    ):
+        actions.append("retry-review")
+    return actions
+
+
+def _resolve_ancestry_status(slice_row: dict, *, git_runner) -> dict[str, Any]:
+    target_remote = str(slice_row.get("target_remote") or "origin")
+    target_branch = str(slice_row.get("target_branch") or "main")
+    target_ref = f"refs/remotes/{target_remote}/{target_branch}"
+    summary: dict[str, Any] = {
+        "target_ref": target_ref,
+        "target_head": None,
+        "status": "unknown",
+    }
+    candidate = slice_row.get("candidate")
+    if not (
+        isinstance(candidate, str)
+        and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+    ):
+        summary["status"] = "candidate-missing"
+        return summary
+    spec_path = slice_row.get("spec", {}).get("path")
+    if not isinstance(spec_path, str) or not spec_path:
+        summary["status"] = "repo-unresolved"
+        return summary
+    runner = git_runner or verification._default_git_runner
+    repo_root = autonomy._infer_repo_root(Path(spec_path))
+    target_head = verification._run_git(["-C", str(repo_root), "rev-parse", target_ref], runner)
+    target_sha = target_head["stdout"].strip().lower()
+    if target_head["status"] != "ok" or verification.SAFE_SHA_RE.fullmatch(target_sha) is None:
+        summary["status"] = "target-unresolved"
+        return summary
+    summary["target_head"] = target_sha
+    ancestor = verification._run_git(
+        ["-C", str(repo_root), "merge-base", "--is-ancestor", candidate.lower(), target_sha],
+        runner,
+    )
+    if ancestor["status"] == "ok":
+        summary["status"] = "ancestor"
+    elif ancestor["status"] == "non-zero" and ancestor["returncode"] == 1:
+        summary["status"] = "not-ancestor"
+    else:
+        summary["status"] = "error"
+    return summary
+
+
+def _status_repo(*values: object) -> str | None:
+    """Return an explicit ``owner/repo`` value, never infer one from a path."""
+    for value in values:
+        if not isinstance(value, str) or value.count("/") != 1:
+            continue
+        owner, repo = value.split("/", 1)
+        if owner and repo:
+            return value
+    return None
+
+
+def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runner=None) -> dict[str, Any]:
+    slice_id = str(slice_row.get("slice_id") or "")
+    builder_job_id = slice_row.get("builder_job_id")
+    reviewer_job_id = slice_row.get("reviewer_job_id")
+    builder_job: dict[str, Any] | None = None
+    reviewer_job: dict[str, Any] | None = None
+    builder_job_state: str | None = None
+    reviewer_job_state: str | None = None
+    if hasattr(registry, "get_job"):
+        try:
+            if isinstance(builder_job_id, str):
+                builder_job = registry.get_job(builder_job_id)
+                builder_job_state = str(builder_job.get("status"))
+        except Exception:
+            builder_job = None
+            builder_job_state = None
+        try:
+            if isinstance(reviewer_job_id, str):
+                reviewer_job = registry.get_job(reviewer_job_id)
+                reviewer_job_state = str(reviewer_job.get("status"))
+        except Exception:
+            reviewer_job = None
+            reviewer_job_state = None
+    reason = None
+    manifest = _read_manifest_payload(Path(handoff_dir) / f"{slice_id}.json")
+    if isinstance(manifest, dict):
+        gate_reason = manifest.get("gate_reason")
+        if isinstance(gate_reason, str) and gate_reason:
+            reason = gate_reason
+    if reason is None:
+        actions = slice_row.get("actions")
+        if isinstance(actions, list) and actions:
+            latest = actions[-1]
+            if isinstance(latest, dict):
+                latest_action = latest.get("action")
+                if isinstance(latest_action, str) and latest_action:
+                    reason = latest_action
+    # #384：manifest 上的 typed provider failure 分類（None 除非本輪終局是
+    # build-phase failure 且分類得到結果，見上面 write_manifest 的呼叫端）。
+    # 投影出來讓 `cortex inspect status` 不必自己解析 `reason` 字串。
+    manifest_provider_outcome = (
+        manifest.get("provider_outcome") if isinstance(manifest, dict) else None
+    )
+    if provider_outcome.ProviderFailureClassification.from_dict(manifest_provider_outcome) is None:
+        manifest_provider_outcome = None
+    authority = manifest.get("work_authority") if isinstance(manifest, dict) else None
+    authority_repo = authority.get("repo") if isinstance(authority, dict) else None
+    repo = _status_repo(
+        slice_row.get("repo"),
+        authority_repo,
+        reviewer_job.get("workflow_repo") if reviewer_job else None,
+        builder_job.get("workflow_repo") if builder_job else None,
+    )
+    return {
+        "slice_id": slice_id,
+        "slice_state": slice_row.get("state"),
+        "gate_state": slice_row.get("gate_state"),
+        "job_state": reviewer_job_state or builder_job_state,
+        "builder_job_id": builder_job_id,
+        "builder_job_state": builder_job_state,
+        "reviewer_job_id": reviewer_job_id,
+        "reviewer_job_state": reviewer_job_state,
+        "reason": reason,
+        "provider_outcome": manifest_provider_outcome,
+        "repo": repo,
+        "candidate": slice_row.get("candidate"),
+        "target_remote": slice_row.get("target_remote"),
+        "target_branch": slice_row.get("target_branch"),
+        "ancestry": _resolve_ancestry_status(slice_row, git_runner=git_runner),
+        "current_evidence_refs": list(slice_row.get("current_evidence_refs") or []),
+        "current_evaluation_refs": list(slice_row.get("current_evaluation_refs") or []),
+        "next_actions": allowed_slice_actions(registry, slice_row),
+    }
+
+
+def _completion_candidate_ref(
+    *,
+    registry,
+    slice_row: dict,
+    repo_root: Path,
+    coordinator_root: Path | None,
+    gate_status: str,
+    gate_reason: str | None,
+    clock: Callable[[], str],
+    git_runner,
+) -> tuple[str, str | None, dict | None]:
+    if gate_status not in {"verified", "passed"}:
+        return gate_status, gate_reason, None
+    slice_id = str(slice_row["slice_id"])
+    candidate = slice_row.get("candidate")
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+        registry.record_action(
+            slice_id,
+            action="completion-candidate-invalid",
+            actor="manager",
+            state="needs_human",
+            gate_state="needs_human",
+        )
+        return "needs_human", "completion-candidate-invalid", None
+    target_remote = str(slice_row.get("target_remote") or "origin")
+    target_branch = str(slice_row.get("target_branch") or "main")
+    target_ref = f"refs/remotes/{target_remote}/{target_branch}"
+    if slice_row.get("state") == "completed" and slice_row.get("gate_state") == "passed":
+        try:
+            record_path = completion.completion_record_path(
+                slice_id=slice_id,
+                candidate=candidate.lower(),
+                coordinator_root=coordinator_root,
+            )
+            payload = completion.read_completion_record(record_path)
+            return "passed", "candidate-merged", {
+                "path": str(record_path),
+                "hash": verification.canonical_json_hash(payload),
+                "payload": payload,
+            }
+        except Exception:
+            return "needs_human", "completion-record-missing", None
+    fetch_result = verification._run_git(
+        ["-C", str(repo_root), "fetch", "--no-tags", target_remote, target_branch],
+        git_runner,
+    )
+    if fetch_result["status"] != "ok":
+        return "verified", "target-fetch-failed", None
+    target_head = verification._run_git(["-C", str(repo_root), "rev-parse", target_ref], git_runner)
+    target_sha = target_head["stdout"].strip().lower()
+    if target_head["status"] != "ok" or verification.SAFE_SHA_RE.fullmatch(target_sha) is None:
+        return "verified", "target-ref-unreadable", None
+    ancestor = verification._run_git(
+        ["-C", str(repo_root), "merge-base", "--is-ancestor", candidate.lower(), target_sha],
+        git_runner,
+    )
+    if ancestor["status"] != "ok":
+        if ancestor["status"] == "non-zero" and ancestor["returncode"] == 1:
+            return "verified", "candidate-not-merged", None
+        return "verified", "target-ancestry-error", None
+
+    verification_path, verification_hash = _current_verification_ref(slice_row)
+    review_path, review_hash, _ = _current_review_ref(slice_row)
+    contract = slice_row.get("verification", {}).get("contract")
+    docs_class = (
+        contract.get("docs_class")
+        if isinstance(contract, dict) and isinstance(contract.get("docs_class"), str)
+        else "code"
+    )
+    review_policy = (
+        contract.get("review_policy")
+        if isinstance(contract, dict) and contract.get("review_policy") in {"required", "not-required"}
+        else ("required" if docs_class in {"normative", "code"} else "not-required")
+    )
+    if verification_path is None or verification_hash is None:
+        return "verified", "completion-missing-verification-evidence", None
+    if review_policy == "required" and (
+        not isinstance(slice_row.get("reviewer_job_id"), str)
+        or review_path is None
+        or review_hash is None
+    ):
+        try:
+            registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+            registry.record_action(
+                slice_id,
+                action="completion-missing-review-evaluation",
+                actor="manager",
+                state="needs_human",
+                gate_state="needs_human",
+            )
+        except Exception:
+            pass
+        return "needs_human", "completion-missing-review-evaluation", None
+    payload = {
+        "schema_version": completion.COMPLETION_SCHEMA_VERSION,
+        "slice_id": slice_id,
+        "spec_hash": str(slice_row["spec"]["hash"]),
+        "plan_hash": str(slice_row["plan"]["hash"]),
+        "verification_hash": str(slice_row["verification"]["hash"]),
+        "builder_job_id": str(slice_row["builder_job_id"]),
+        "reviewer_job_id": slice_row.get("reviewer_job_id"),
+        "dispatch_base": str(slice_row["dispatch_base"]),
+        "candidate": candidate.lower(),
+        "target_branch": target_branch,
+        "target_remote": target_remote,
+        "target_ref": target_ref,
+        "target_ref_sha": target_sha,
+        "verification_evidence_path": verification_path,
+        "verification_evidence_hash": verification_hash,
+        "review_policy": review_policy,
+        "docs_class": docs_class,
+        "review_evaluation_path": review_path,
+        "review_evaluation_hash": review_hash,
+        "completed_at": clock(),
+    }
+    try:
+        record = completion.write_completion_record(payload, coordinator_root=coordinator_root)
+    except Exception:
+        try:
+            registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+            registry.record_action(
+                slice_id,
+                action="completion-record-write-failed",
+                actor="manager",
+                state="needs_human",
+                gate_state="needs_human",
+            )
+        except Exception:
+            pass
+        return "needs_human", "completion-record-write-failed", None
+    try:
+        registry.update_slice(slice_id, state="completed", gate_state="passed")
+    except Exception:
+        return "verified", "completion-state-update-failed", record
+    record_action_kwargs: dict[str, Any] = {
+        "action": "completion-recorded",
+        "actor": "manager",
+        "state": "completed",
+        "gate_state": "passed",
+        "candidate": candidate.lower(),
+        "evidence_refs": [verification_path],
+    }
+    if review_path is not None:
+        record_action_kwargs["evaluation_refs"] = [review_path]
+    try:
+        registry.record_action(slice_id, **record_action_kwargs)
+    except Exception:
+        return "verified", "completion-action-record-failed", record
+    return "passed", "candidate-merged", record
+
+
+_CODEX_STDIN_BANNER = "Reading additional input from stdin..."
+
+
+def _review_log_has_only_json_lines(log_path: object, *, executor: object = None) -> bool:
+    if not isinstance(log_path, (str, os.PathLike)) or not str(log_path):
+        return True
+    path = Path(log_path)
+    if not path.is_file():
+        return True
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    events: list[dict[str, object]] = []
+    content_index = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        if executor == "codex" and content_index == 0 and line.strip() == _CODEX_STDIN_BANNER:
+            content_index += 1
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if executor == "codex" and not isinstance(parsed, dict):
+            return False
+        if isinstance(parsed, dict):
+            events.append(parsed)
+        content_index += 1
+    if executor == "codex" and events:
+        event_types = {event.get("type") for event in events}
+        if "turn.failed" in event_types or "error" in event_types:
+            return False
+        return "turn.completed" in event_types
+    return True
+
+
+def _apply_review_evaluation(registry, slice_id: str, evaluation: dict) -> None:
+    payload = evaluation["payload"]
+    state = payload["state"]
+    gate_state = {"passed": "passed", "rejected": "failed", "absent": "needs_human"}[state]
+    slice_state = "verified" if state == "passed" else "needs_human"
+    action = {
+        "passed": "foreign-review-passed",
+        "rejected": "foreign-review-rejected",
+        "absent": "foreign-review-absent",
+    }[state]
+    registry.record_action(
+        slice_id,
+        action=action,
+        actor="manager",
+        state=slice_state,
+        gate_state=gate_state,
+        evaluation_refs=[evaluation["path"]],
+        candidate=payload["candidate"],
+    )
+
+
+def _write_gate_evaluation(
+    *,
+    slice_id: str,
+    state: str,
+    reason: str,
+    builder_job_id: str,
+    reviewer_job_id: str | None,
+    candidate: str,
+    builder_identity: dict | None,
+    reviewer_identity: dict | None,
+    findings: list[dict] | None,
+    coordinator_root: Path | None,
+) -> dict:
+    payload = foreign_review.build_gate_evaluation(
+        slice_id=slice_id,
+        state=state,
+        reason=reason,
+        builder_job_id=builder_job_id,
+        reviewer_job_id=reviewer_job_id,
+        candidate=candidate,
+        launch_identity={"builder": builder_identity, "reviewer": reviewer_identity},
+        findings=findings,
+    )
+    return foreign_review.write_gate_evaluation(payload, coordinator_root=coordinator_root)
+
+
+def _review_inputs_drifted(slice_row: dict, review_job: dict) -> bool:
+    if slice_row.get("candidate") != review_job.get("subject_head"):
+        return True
+    return any(
+        slice_row[key]["hash"] != review_job.get(f"{key}_hash")
+        for key in ("spec", "plan")
+    ) or slice_row["verification"]["hash"] != review_job.get("verification_hash")
+
+
+def _slice_review_authority_inputs(
+    *,
+    slice_row: Mapping[str, object],
+    repo_root: Path,
+    coordinator_root: Path | None,
+    candidate: str,
+) -> tuple[dict[str, str] | None, tuple[dict[str, str], ...] | None]:
+    if coordinator_root is None:
+        return None, None
+    identity = SimpleNamespace(
+        run_id=str(slice_row["slice_id"]),
+        work_id=str(slice_row["slice_id"]),
+        repo=str(repo_root),
+        source_revision=candidate,
+    )
+    authority: dict[str, str] = {}
+    rows: list[dict[str, str]] = []
+    for key in ("spec", "plan"):
+        payload = slice_row.get(key)
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"slice review {key} payload invalid")
+        raw_path = payload.get("path")
+        digest = payload.get("hash")
+        if not isinstance(raw_path, str) or not isinstance(digest, str):
+            raise ValueError(f"slice review {key} payload invalid")
+        path = Path(raw_path)
+        # 對齊 _pinned_input_mismatches：legacy/回復情境可能留下相對 path（例如
+        # 舊版 pin_dispatch_inputs 寫入的 plan path），一律以 repo_root 為 base
+        # resolve，避免這裡誤用當前 cwd 解析而讀錯檔或拋例外。
+        if not path.is_absolute():
+            path = repo_root / path
+        path = path.resolve()
+        relative = path.relative_to(repo_root.resolve()).as_posix()
+        data = path.read_bytes()
+        actual = verification.sha256_bytes(data)
+        if actual != digest:
+            raise ValueError(f"slice review {key} input drift")
+        authority[relative] = actual
+        content_ref = _write_workflow_input_content(
+            coordinator_root=coordinator_root,
+            run=identity,
+            ref=relative,
+            digest=actual,
+            content=data.decode("utf-8"),
+        )
+        rows.append(
+            {
+                "pattern": relative,
+                "path": relative,
+                "sha256": actual,
+                "authority": "planning-authority",
+                "content_ref": content_ref,
+            }
+        )
+    return authority, tuple(rows)
+
+
+def _launch_foreign_review(
+    *,
+    registry,
+    slice_row: dict,
+    builder_job: dict,
+    repo_root: Path,
+    coordinator_root: Path | None,
+    candidate: str,
+    subprocess_runner,
+    git_runner,
+    review_launcher,
+    review_executor: str | None,
+    review_model: str | None,
+) -> dict[str, Any]:
+    builder_job_id = str(builder_job["job_id"])
+    slice_id = str(slice_row["slice_id"])
+    builder_identity = None
+    try:
+        tier = foreign_review.read_repo_tier(repo_root)
+        identity_registry = _identity_registry()
+    except Exception as exc:
+        builder_identity = _builder_launch_identity(builder_job)
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="config-error",
+            builder_job_id=builder_job_id,
+            reviewer_job_id=None,
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=None,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": f"foreign-review-config-error:{exc}",
+            "evaluation": evaluation,
+        }
+    decision = foreign_review.select_foreign_reviewer(
+        registry=identity_registry,
+        builder_executor=builder_job.get("executor"),
+        builder_model_id=builder_job.get("model_id"),
+        review_executor=review_executor,
+        review_model_id=review_model,
+        tier=tier,
+    )
+    builder_identity = decision.get("builder") or _builder_launch_identity(builder_job, identity_registry)
+    reviewer_identity = decision.get("reviewer")
+    if decision["state"] == "needs_human":
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason=str(decision["reason"]),
+            builder_job_id=builder_job_id,
+            reviewer_job_id=None,
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": str(decision["reason"]),
+            "evaluation": evaluation,
+        }
+    if decision["state"] == "absent":
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason=str(decision["reason"]),
+            builder_job_id=builder_job_id,
+            reviewer_job_id=None,
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": "foreign-review-absent",
+            "evaluation": evaluation,
+        }
+    if review_launcher is None:
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="launcher-missing",
+            builder_job_id=builder_job_id,
+            reviewer_job_id=None,
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": "foreign-review-launcher-missing",
+            "evaluation": evaluation,
+        }
+    reviewer_job = registry.create_job(
+        task=slice_id,
+        persona="reviewer",
+        kind="review",
+        branch=str(builder_job.get("branch") or f"feature/{slice_id}"),
+        pane="",
+        worktree="",
+        dispatch_head=slice_row.get("dispatch_base"),
+        executor=review_executor,
+        model_id=review_model,
+        independence_domain=reviewer_identity["independence_domain"] if reviewer_identity else None,
+        subject_head=candidate,
+        spec_hash=slice_row["spec"]["hash"],
+        plan_hash=slice_row["plan"]["hash"],
+        verification_hash=slice_row["verification"]["hash"],
+        # #469：reviewer 繼承 builder 的 repo 歸屬——reviewer terminal 時終局
+        # manifest 讀的是 reviewer job，slice_status_entry 的 fallback 也
+        # reviewer-first，不繼承會落 null。
+        workflow_repo=builder_job.get("workflow_repo"),
+    )
+    try:
+        authority_inputs = _slice_review_authority_inputs(
+            slice_row=slice_row,
+            repo_root=repo_root,
+            coordinator_root=coordinator_root,
+            candidate=candidate,
+        )
+        review_worktree = foreign_review.prepare_review_worktree(
+            repo_root=repo_root,
+            slice_id=slice_id,
+            reviewer_job_id=reviewer_job["job_id"],
+            candidate=candidate,
+            authority=authority_inputs[0],
+            input_snapshot=authority_inputs[1],
+            source_revision=candidate if authority_inputs[0] else None,
+            subprocess_runner=subprocess_runner,
+            git_runner=git_runner,
+        )
+        registry.update_job(reviewer_job["job_id"], worktree=str(review_worktree))
+        prompt = foreign_review.build_review_prompt(
+            slice_id=slice_id,
+            plan_path=slice_row["plan"]["path"],
+            verdict_path=str(foreign_review.review_verdict_path(review_worktree)),
+            builder_job_id=builder_job_id,
+            reviewer_job_id=reviewer_job["job_id"],
+            candidate=candidate,
+            launch_identity=reviewer_identity,
+            output_mode="terminal-json",
+        )
+        active_review_launcher = review_launcher
+        review_only_factory = getattr(review_launcher, "as_review_only", None)
+        if callable(review_only_factory):
+            active_review_launcher = review_only_factory(
+                terminal_kind="workflow-review-result"
+            )
+        handle = active_review_launcher.launch(
+            slice_id=reviewer_job["job_id"],
+            prompt=prompt,
+            worktree=str(review_worktree),
+            log_dir=str(Path("runtime/review") / slice_id),
+        )
+        registry.attach_launch_handle(
+            reviewer_job["job_id"],
+            executor=handle.executor,
+            model_id=handle.model_id,
+            session_name=handle.session_name,
+            pid=handle.pid,
+            log_path=handle.log_path,
+            executable_path=handle.executable_path,
+        )
+        registry.update_slice(slice_id, reviewer_job_id=reviewer_job["job_id"], candidate=candidate)
+        registry.record_action(
+            slice_id,
+            action="foreign-review-dispatched",
+            actor="manager",
+            state="reviewing",
+            gate_state="pending",
+            candidate=candidate,
+        )
+        return {"launched": True, "reviewer_job_id": reviewer_job["job_id"]}
+    except Exception as exc:
+        try:
+            registry.update_status(reviewer_job["job_id"], "failed")
+        except Exception:
+            pass
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="launch-error",
+            builder_job_id=builder_job_id,
+            reviewer_job_id=reviewer_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": f"foreign-review-launch-error:{exc}",
+            "evaluation": evaluation,
+        }
+
+
+def _finalize_review_job(
+    *,
+    registry,
+    slice_row: dict,
+    review_job: dict,
+    coordinator_root: Path | None,
+    identity_registry: dict[tuple[str, str], dict[str, str]] | None,
+    git_runner,
+) -> tuple[dict | None, str, str]:
+    slice_id = str(slice_row["slice_id"])
+    builder_job = registry.get_job(slice_row["builder_job_id"])
+    candidate = str(review_job.get("subject_head") or slice_row.get("candidate") or "")
+    builder_identity = _builder_launch_identity(builder_job, identity_registry)
+    reviewer_identity = _reviewer_launch_identity(review_job)
+    if _review_inputs_drifted(slice_row, review_job):
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="stale-input",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        registry.record_action(
+            slice_id,
+            action="foreign-review-stale-input",
+            actor="manager",
+            state="needs_human",
+            gate_state="needs_human",
+            evaluation_refs=[evaluation["path"]],
+            candidate=slice_row.get("candidate"),
+        )
+        registry.update_slice(slice_id, current_evaluation_refs=[], state="needs_human", gate_state="needs_human")
+        return evaluation, "needs_human", "stale-input"
+    if review_job.get("status") == "failed":
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="reviewer-process-failed",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    worktree = Path(str(review_job["worktree"]))
+    review_head = verification._run_git(["-C", str(worktree), "rev-parse", "HEAD"], git_runner)
+    if review_head["status"] != "ok" or review_head["stdout"].strip().lower() != candidate.lower():
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="stale-head",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    if not _review_log_has_only_json_lines(
+        review_job.get("log_path"), executor=review_job.get("executor")
+    ):
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="invalid-process-output",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    verdict_path = foreign_review.review_verdict_path(worktree)
+    try:
+        if verdict_path.is_file():
+            # Backward compatibility for injected/legacy launchers. Production
+            # reviewers use terminal JSON so their Candidate sandbox stays read-only.
+            verdict = foreign_review.read_review_verdict_file(
+                verdict_path,
+                builder_job_id=builder_job["job_id"],
+                reviewer_job_id=review_job["job_id"],
+                candidate=candidate,
+                launch_identity=reviewer_identity,
+            )
+        else:
+            terminal = _extract_terminal_json(review_job.get("log_path"))
+            if terminal.get("status") in terminal_contract.NON_PASSING_STATUSES:
+                raise ValueError("review terminal reported non-passing status")
+            allowed_keys = {"schema_version", "kind", "reason", "findings", "reports"}
+            if terminal.get("status") == "passed":
+                allowed_keys.add("status")
+            if (
+                set(terminal) != allowed_keys
+                or terminal.get("schema_version") != 1
+                or terminal.get("kind") != "workflow-review-result"
+                or not isinstance(terminal.get("reason"), str)
+                or not str(terminal["reason"]).strip()
+                or not isinstance(terminal.get("findings"), list)
+                or not isinstance(terminal.get("reports"), list)
+                or not terminal["reports"]
+                or any(
+                    not isinstance(report, dict)
+                    or set(report) != {"path", "body"}
+                    or not all(isinstance(report.get(key), str) and report[key] for key in ("path", "body"))
+                    for report in terminal["reports"]
+                )
+            ):
+                raise ValueError("review terminal schema invalid")
+            verdict = foreign_review.validate_review_verdict(
+                {
+                    "schema_version": foreign_review.REVIEW_SCHEMA_VERSION,
+                    "builder_job_id": builder_job["job_id"],
+                    "reviewer_job_id": review_job["job_id"],
+                    "candidate": candidate,
+                    "launch_identity": reviewer_identity,
+                    "findings": terminal["findings"],
+                },
+                builder_job_id=builder_job["job_id"],
+                reviewer_job_id=review_job["job_id"],
+                candidate=candidate,
+                launch_identity=reviewer_identity,
+            )
+    except Exception:
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="invalid-verdict",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    reason = "blocking-findings" if verdict["state"] == "rejected" else "accepted"
+    evaluation = _write_gate_evaluation(
+        slice_id=slice_id,
+        state=verdict["state"],
+        reason=reason,
+        builder_job_id=builder_job["job_id"],
+        reviewer_job_id=review_job["job_id"],
+        candidate=candidate,
+        builder_identity=builder_identity,
+        reviewer_identity=reviewer_identity,
+        findings=verdict["findings"],
+        coordinator_root=coordinator_root,
+    )
+    _apply_review_evaluation(registry, slice_id, evaluation)
+    gate_status = "passed" if verdict["state"] == "passed" else "failed"
+    return evaluation, gate_status, reason
+
+
+def apply_slice_action(
+    dispatcher,
+    *,
+    slice_id: str,
+    action: str,
+    actor: str,
+    specs_dir: str,
+    handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
+    launcher=None,
+    identity_registry=None,
+    launcher_factory=None,
+    review_launcher=None,
+    persona: str = "builder",
+    review_executor: str | None = None,
+    review_model: str | None = None,
+    clock: Callable[[], str] = _utcnow,
+    git_runner=None,
+    subprocess_runner=None,
+    verification_runner=None,
+    scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
+    dispatch_ready_fn: Callable[..., list[dict[str, Any]]] = autonomy.dispatch_ready,
+) -> dict[str, Any]:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        raise RuntimeError("slice-action requires dispatcher._registry")
+    if action not in SLICE_ACTIONS:
+        raise ValueError(f"unsupported-slice-action:{action}")
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("slice-action actor must be a non-empty string")
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError as exc:
+        raise ValueError("unknown-slice") from exc
+    if action not in allowed_slice_actions(registry, slice_row):
+        raise ValueError(f"action-not-allowed:{action}")
+
+    requested_at = clock()
+    runner = git_runner or getattr(dispatcher, "_git_runner", None) or autonomy._default_git_runner
+    verification_runner = verification_runner or verification.run_result_verification
+
+    if action == "abandon":
+        consumed_at = clock()
+        registry.record_action(
+            slice_id,
+            action="operator-abandon",
+            actor=actor,
+            state="failed",
+            gate_state="failed",
+            requested_at=requested_at,
+            consumed_at=consumed_at,
+            result="ok",
+        )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-abandon",
+            actor=actor,
+            clock=clock,
+        )
+        latest = registry.get_slice(slice_id)
+        return {
+            "slice_id": slice_id,
+            "action": action,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+            "result": "ok",
+            "requested_at": requested_at,
+            "consumed_at": consumed_at,
+        }
+
+    if action == "recover-pre-candidate":
+        cand = slice_row.get("candidate")
+        if isinstance(cand, str) and verification.SAFE_SHA_RE.fullmatch(cand) is not None:
+            raise ValueError("action-not-allowed:recover-pre-candidate")
+
+        if slice_row.get("state") == "pending" and slice_row.get("builder_job_id") is None:
+            consumed_at = clock()
+            return {
+                "slice_id": slice_id,
+                "action": action,
+                "slice_state": "pending",
+                "gate_state": "pending",
+                "result": "ok",
+                "reason": "already-recovered",
+                "requested_at": requested_at,
+                "consumed_at": consumed_at,
+            }
+
+        builder_job_id = slice_row.get("builder_job_id")
+        wt_path = None
+        if isinstance(builder_job_id, str):
+            try:
+                b_job = registry.get_job(builder_job_id)
+                wt_path = b_job.get("worktree")
+            except Exception:
+                pass
+        if not wt_path:
+            wt_path = slice_row.get("worktree")
+        if not wt_path and isinstance(slice_row.get("branch"), str):
+            slug = slice_row["branch"].replace("/", "-")
+            wt_path = str(Path(paths.worktree_root()) / slug)
+
+        if wt_path and isinstance(wt_path, (str, Path)):
+            target_wt = Path(wt_path)
+            if target_wt.is_symlink():
+                raise RuntimeError("recover-pre-candidate refuses symlink worktree path")
+
+            def _worktree_listing() -> str:
+                raw = runner(["worktree", "list", "--porcelain"])
+                if isinstance(raw, str):
+                    return raw
+                returncode = getattr(raw, "returncode", None)
+                stdout = getattr(raw, "stdout", None)
+                stderr = getattr(raw, "stderr", "")
+                if returncode != 0 or not isinstance(stdout, str):
+                    raise RuntimeError(
+                        f"git worktree list failed: {str(stderr).strip()}"
+                    )
+                return stdout
+
+            target_resolved = target_wt.resolve(strict=False)
+
+            def _is_registered(listing: str) -> bool:
+                for line in listing.splitlines():
+                    if not line.startswith("worktree "):
+                        continue
+                    if Path(line.removeprefix("worktree ")).resolve(strict=False) == target_resolved:
+                        return True
+                return False
+
+            registered = _is_registered(_worktree_listing())
+            if registered:
+                runner(["worktree", "remove", "--force", str(target_wt)])
+                if _is_registered(_worktree_listing()):
+                    raise RuntimeError("git worktree registry entry remains after recovery")
+            elif target_wt.exists():
+                remove_tree(target_wt)
+            if target_wt.exists() or target_wt.is_symlink():
+                raise RuntimeError("pre-candidate worktree cleanup incomplete")
+
+        consumed_at = clock()
+        registry.record_action(
+            slice_id,
+            action="operator-recover-pre-candidate",
+            actor=actor,
+            state="pending",
+            gate_state="pending",
+            requested_at=requested_at,
+            consumed_at=consumed_at,
+            result="ok",
+        )
+        registry.update_slice(
+            slice_id,
+            state="pending",
+            gate_state="pending",
+            clear_builder_job_id=True,
+            clear_reviewer_job_id=True,
+            clear_candidate=True,
+            current_evidence_refs=[],
+            current_evaluation_refs=[],
+        )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-recover-pre-candidate",
+            actor=actor,
+            clock=clock,
+        )
+        latest = registry.get_slice(slice_id)
+        return {
+            "slice_id": slice_id,
+            "action": action,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+            "result": "ok",
+            "requested_at": requested_at,
+            "consumed_at": consumed_at,
+        }
+
+    if action == "retry-build":
+        metas = scan_specs_fn(specs_dir)
+        target = next((meta for meta in metas if meta.get("slice_id") == slice_id), None)
+        if target is None:
+            raise ValueError("unknown-slice")
+        if isinstance(target.get("parse_error"), dict):
+            raise ValueError(f"invalid-spec:{target['parse_error'].get('field')}")
+        if not (isinstance(target.get("plan"), str) and target["plan"]):
+            raise ValueError("no-plan")
+        dispatched = dispatch_ready_fn(
+            [{**target, "dispatch": "auto"}],
+            lambda sid: autonomy.default_is_satisfied(
+                sid,
+                handoff_dir=handoff_dir,
+                git_runner=runner,
+            ),
+            dispatcher,
+            persona=persona,
+            launcher=launcher,
+            handoff_dir=handoff_dir,
+            git_runner=runner,
+            identity_registry=identity_registry,
+            launcher_factory=launcher_factory,
+        )
+        if not dispatched:
+            raise RuntimeError("retry-build-dispatch-failed")
+        latest = registry.get_slice(slice_id)
+        outcome = {
+            "slice_id": slice_id,
+            "action": action,
+            "job_id": dispatched[0].get("job_id"),
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+        }
+    elif action == "retry-verify":
+        builder_job_id = slice_row.get("builder_job_id")
+        if not isinstance(builder_job_id, str):
+            raise ValueError("retry-verify-missing-builder")
+        builder_job = registry.get_job(builder_job_id)
+        if builder_job.get("status") != "exited":
+            raise ValueError("retry-verify-builder-not-exited")
+        repo_root = autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
+        state_path = getattr(registry, "_state_path", None)
+        coordinator_root = Path(state_path).parent if state_path is not None else None
+        try:
+            evidence = verification_runner(
+                slice_row=slice_row,
+                job=builder_job,
+                repo_root=repo_root,
+                coordinator_root=coordinator_root,
+                git_runner=runner,
+                subprocess_runner=subprocess_runner,
+            )
+            evidence = _validate_result_evidence(
+                evidence=evidence,
+                slice_id=slice_id,
+                coordinator_root=coordinator_root,
+            )
+            _apply_verification_result(registry, slice_id, evidence)
+            gate_status = str(evidence["payload"]["status"])
+            gate_reason = str(evidence["payload"]["summary"])
+        except Exception as exc:
+            evidence = _write_status_evidence(
+                slice_row=slice_row,
+                job=builder_job,
+                repo_root=repo_root,
+                coordinator_root=coordinator_root,
+                git_runner=runner,
+                status="needs_human",
+                summary="verification-runner-error",
+                details={"error": str(exc)},
+            )
+            if evidence is not None:
+                _apply_verification_result(registry, slice_id, evidence)
+            else:
+                registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+            gate_status = "needs_human"
+            gate_reason = "verification-runner-error"
+        launch_result: dict[str, Any] | None = None
+        if gate_status == "reviewing":
+            launch_result = _launch_foreign_review(
+                registry=registry,
+                slice_row=registry.get_slice(slice_id),
+                builder_job=builder_job,
+                repo_root=repo_root,
+                coordinator_root=coordinator_root,
+                candidate=str(evidence["payload"]["candidate"]),
+                subprocess_runner=subprocess_runner,
+                git_runner=runner,
+                review_launcher=review_launcher,
+                review_executor=review_executor,
+                review_model=review_model,
+            )
+            if not launch_result.get("launched"):
+                gate_status = str(launch_result.get("gate_status") or "needs_human")
+                gate_reason = str(launch_result.get("gate_reason") or "foreign-review-absent")
+        latest = registry.get_slice(slice_id)
+        refs = latest.get("current_evidence_refs") or []
+        outcome = {
+            "slice_id": slice_id,
+            "action": action,
+            "gate_status": gate_status,
+            "gate_reason": gate_reason,
+            "verification_evidence_path": refs[0] if refs else None,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+        }
+        if launch_result is not None:
+            outcome["review_launched"] = bool(launch_result.get("launched"))
+            if launch_result.get("reviewer_job_id") is not None:
+                outcome["reviewer_job_id"] = launch_result.get("reviewer_job_id")
+    else:  # retry-review
+        builder_job_id = slice_row.get("builder_job_id")
+        candidate = slice_row.get("candidate")
+        if not isinstance(builder_job_id, str):
+            raise ValueError("retry-review-missing-builder")
+        if not (
+            isinstance(candidate, str)
+            and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+        ):
+            raise ValueError("retry-review-candidate-invalid")
+        builder_job = registry.get_job(builder_job_id)
+        repo_root = autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
+        state_path = getattr(registry, "_state_path", None)
+        coordinator_root = Path(state_path).parent if state_path is not None else None
+        launch_result = _launch_foreign_review(
+            registry=registry,
+            slice_row=registry.get_slice(slice_id),
+            builder_job=builder_job,
+            repo_root=repo_root,
+            coordinator_root=coordinator_root,
+            candidate=candidate.lower(),
+            subprocess_runner=subprocess_runner,
+            git_runner=runner,
+            review_launcher=review_launcher,
+            review_executor=review_executor,
+            review_model=review_model,
+        )
+        latest = registry.get_slice(slice_id)
+        outcome = {
+            "slice_id": slice_id,
+            "action": action,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+        }
+        if launch_result.get("launched"):
+            outcome["launched"] = True
+            outcome["reviewer_job_id"] = launch_result.get("reviewer_job_id")
+        else:
+            outcome["launched"] = False
+            outcome["gate_status"] = launch_result.get("gate_status")
+            outcome["gate_reason"] = launch_result.get("gate_reason")
+            evaluation = launch_result.get("evaluation")
+            if isinstance(evaluation, dict):
+                outcome["review_evaluation_path"] = evaluation.get("path")
+
+    consumed_at = clock()
+    registry.record_action(
+        slice_id,
+        action=f"operator-{action}",
+        actor=actor,
+        requested_at=requested_at,
+        consumed_at=consumed_at,
+        result="ok",
+    )
+    outcome["result"] = "ok"
+    outcome["requested_at"] = requested_at
+    outcome["consumed_at"] = consumed_at
+    return outcome
+
+
+def complete_tick(
+    dispatcher,
+    *,
+    gate_runner: GateRunner | None = None,
+    handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
+    metas: list[dict] | None = None,
+    clock: Callable[[], str] = _utcnow,
+    git_runner=None,
+    subprocess_runner=None,
+    verification_runner=None,
+    review_launcher=None,
+    review_executor: str | None = None,
+    review_model: str | None = None,
+) -> dict:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        raise RuntimeError("complete_tick 需 dispatcher._registry（fail-closed）")
+    hdir = Path(handoff_dir)
+    git_runner = git_runner or getattr(dispatcher, "_git_runner", None)
+    verification_runner = verification_runner or verification.run_result_verification
+
+    polled: list[str] = []
+    completed: list[dict] = []
+    # completed 對應的 terminal job 全量快照（issue #204 skill_ledger 用）：
+    # 與 completed 1:1 同步更新（含同輪同 slice 雙 terminal 的「後者勝」語意），
+    # 讓 run_tick 的 ledger_recorder 注入點能拿到 workflow_card/job_id 等記帳
+    # 所需欄位，不必重新 parse 精簡過的 completed 條目。
+    completed_jobs: list[dict] = []
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    seen_slices: dict[str, str] = {}  # slice_id → 本輪已寫盤的 job_id（偵測同輪同 slice 雙 terminal）
+
+    meta_by_slice: dict[str, dict] = {}
+    if isinstance(metas, list):
+        for meta in metas:
+            if not isinstance(meta, dict):
+                continue
+            sid = meta.get("slice_id")
+            if isinstance(sid, str):
+                meta_by_slice[sid] = meta
+
+    def _repo_root_for_slice(slice_id: str) -> Path | None:
+        spec_path = None
+        meta = meta_by_slice.get(slice_id)
+        if isinstance(meta, dict):
+            spec_path = meta.get("spec_path")
+        if not isinstance(spec_path, str) or not spec_path:
+            try:
+                spec_path = registry.get_slice(slice_id).get("spec", {}).get("path")
+            except Exception:
+                spec_path = None
+        if not isinstance(spec_path, str) or not spec_path:
+            return None
+        return autonomy._infer_repo_root(Path(spec_path))
+
+    def _ready_ids() -> set[str]:
+        return {
+            m["slice_id"]
+            for m in autonomy.ready_units(
+                metas,
+                lambda sid: autonomy.default_is_satisfied(
+                    sid,
+                    handoff_dir=handoff_dir,
+                    repo_root=_repo_root_for_slice(sid),
+                    git_runner=git_runner,
+                ),
+            )
+        }
+
+    released_ok = metas is not None
+    before_ready: set[str] = set()
+    if released_ok:
+        try:
+            before_ready = _ready_ids()
+        except ValueError:
+            released_ok = False  # metas 有環/重複 → released 觀測停用，不擋完成側
+
+    list_slices_fn = getattr(registry, "list_slices", None)
+    slices = list_slices_fn() if callable(list_slices_fn) else []
+    for slice_item in slices:
+        if slice_item.get("state") == "needs_human":
+            ev_data = _current_verification_payload(slice_item)
+            if ev_data and ev_data.get("payload", {}).get("summary") in {
+                "candidate-worktree-dirty",
+                "candidate-worktree-dirty-after-verification",
+            }:
+                builder_job_id = slice_item.get("builder_job_id")
+                if isinstance(builder_job_id, str):
+                    try:
+                        b_job = registry.get_job(builder_job_id)
+                        if b_job.get("status") in TERMINAL_STATUSES:
+                            try:
+                                r_root = (
+                                    autonomy._infer_repo_root(Path(slice_item["spec"]["path"]))
+                                    if isinstance(slice_item.get("spec"), dict) and slice_item["spec"].get("path")
+                                    else Path.cwd().resolve()
+                                )
+                            except Exception:
+                                r_root = Path.cwd().resolve()
+                            st_path = getattr(registry, "_state_path", None)
+                            coord_root = Path(st_path).parent if st_path is not None else None
+                            re_ev = verification_runner(
+                                slice_row=slice_item,
+                                job=b_job,
+                                repo_root=r_root,
+                                coordinator_root=coord_root,
+                                git_runner=git_runner,
+                                subprocess_runner=subprocess_runner,
+                            )
+                            if re_ev and isinstance(re_ev, dict):
+                                validated_ev = _validate_result_evidence(
+                                    evidence=re_ev,
+                                    slice_id=slice_item["slice_id"],
+                                    coordinator_root=coord_root,
+                                )
+                                _apply_verification_result(registry, slice_item["slice_id"], validated_ev)
+                    except Exception:
+                        pass
+
+    for snapshot in registry.list_jobs():
+        job_id = snapshot["job_id"]
+        try:
+            job = snapshot
+            status = job.get("status")
+            if status in IN_FLIGHT_STATUSES:
+                job = dispatcher.poll_headless_done(job_id)
+                polled.append(job_id)
+                status = job.get("status")
+
+            if status not in TERMINAL_STATUSES:
+                continue
+
+            slice_id = job.get("task")
+            if not _is_safe_slice_id(slice_id):
+                errors.append({"job_id": job_id, "error": f"job 缺合法/安全 task/slice_id: {slice_id!r}"})
+                continue
+            if job.get("kind") == "review":
+                slice_row = _slice_for_reviewer_job(registry, slice_id, job_id)
+            else:
+                slice_row = _slice_for_job(registry, slice_id, job_id)
+
+            # A registered slice may accumulate multiple terminal attempts. Only the
+            # currently bound builder/reviewer is allowed to mutate current state or
+            # the single current handoff manifest; older attempts remain registry
+            # audit evidence. A later operator recovery clears the current binding,
+            # which is therefore also a monotonic replay fence.
+            if slice_row is None and not _is_workflow_lane_job(job):
+                try:
+                    registered_slice = registry.get_slice(slice_id)
+                except KeyError:
+                    registered_slice = None
+                if registered_slice is not None:
+                    continue
+
+            manifest_path = hdir / f"{slice_id}.json"
+            if manifest_path.is_symlink():
+                # 單檔 symlink 檢查：防預置 symlink 讓 write_manifest 寫出界（不誤殺部署上層 symlink）。
+                errors.append(
+                    {"job_id": job_id, "error": f"handoff manifest path 拒絕 symlink: {manifest_path}"}
+                )
+                continue
+            if _existing_manifest_job_id(manifest_path) == job_id:
+                continue  # 真冪等：同一個 terminal job 已落盤（同 job_id → skip；異 job_id/壞檔 → overwrite）
+
+            if job.get("kind") != "review" and slice_row is not None and slice_row.get("reviewer_job_id"):
+                continue
+            repo_root = (
+                autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
+                if slice_row is not None
+                else Path.cwd().resolve()
+            )
+            state_path = getattr(registry, "_state_path", None)
+            coordinator_root = Path(state_path).parent if state_path is not None else None
+            evidence = None
+            publish_evidence = False
+            evaluation = None
+            completion_record = None
+            gate_status = "failed" if status == "failed" else "needs_human"
+            gate_reason = None
+            # #384：build-phase failure 的 typed 分類，供下面 manifest 寫入時
+            # 投影給 `cortex inspect status` 讀（見 slice_status_entry）。只有
+            # `elif status == "failed":` 分支會賦值；其餘終局（passed／
+            # needs_human 但非 builder failure）維持 None。
+            slice_provider_outcome_payload: dict[str, object] | None = None
+
+            if job.get("kind") == "review":
+                try:
+                    identity_registry = _identity_registry()
+                except Exception:
+                    identity_registry = None
+                if slice_row is None:
+                    if _is_workflow_lane_job(job):
+                        gate_status = "failed" if status == "failed" else WORKFLOW_LANE_GATE_STATUS
+                        gate_reason = WORKFLOW_LANE_GATE_REASON
+                    else:
+                        gate_status = "needs_human"
+                        gate_reason = "missing-slice-proof"
+                elif slice_row.get("state") in {"verified", "completed"} and slice_row.get("gate_state") == "passed":
+                    review_path, review_hash, review_payload = _current_review_ref(slice_row)
+                    if review_payload is not None:
+                        evaluation = {"path": review_path, "hash": review_hash, "payload": review_payload}
+                    gate_status = "passed" if slice_row.get("state") == "completed" else "verified"
+                    gate_reason = "accepted"
+                else:
+                    evaluation, gate_status, gate_reason = _finalize_review_job(
+                        registry=registry,
+                        slice_row=slice_row,
+                        review_job=job,
+                        coordinator_root=coordinator_root,
+                        identity_registry=identity_registry,
+                        git_runner=git_runner,
+                    )
+            else:
+                mismatches = _pinned_input_mismatches(slice_row) if slice_row is not None else []
+
+                if mismatches:
+                    gate_status = "needs_human"
+                    gate_reason = "pinned-input-mismatch"
+                    try:
+                        evidence = _write_status_evidence(
+                            slice_row=slice_row,
+                            job=job,
+                            repo_root=repo_root,
+                            coordinator_root=coordinator_root,
+                            git_runner=git_runner,
+                            status="needs_human",
+                            summary="pinned-input-mismatch",
+                            details={"mismatches": mismatches},
+                        )
+                        if evidence is not None:
+                            _apply_verification_result(registry, slice_id, evidence)
+                            publish_evidence = True
+                        else:
+                            registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                    except Exception:
+                        try:
+                            registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                        except Exception:
+                            pass
+                elif status == "failed":
+                    gate_status = "failed"
+                    # #384：不再一律壓平成 "builder-failed"——`job` 已在
+                    # `Dispatcher._finalize_headless` 分類過（見
+                    # provider_outcome.py），有分類時把 outcome 併進 gate_reason，
+                    # 供 operator／`cortex inspect status` 直接看出是 auth／
+                    # rate_limited／transient／content／quota 哪一種，不必回頭
+                    # 翻 log。slice lane 沒有 workflow lane 的 `run.attempts`
+                    # 可持久化 retry 計數，故本 lane 只做分類與可觀測性，不做
+                    # bounded auto-retry（沿用既有 operator `retry-build` 手動
+                    # 復原路徑）。
+                    classification = provider_outcome.classification_from_job(job)
+                    if classification is not None:
+                        gate_reason = f"builder-failed-{classification.outcome.value}"
+                        slice_provider_outcome_payload = classification.to_dict()
+                    else:
+                        gate_reason = "builder-failed"
+                    if slice_row is not None:
+                        try:
+                            registry.update_slice(slice_id, state="failed", gate_state="failed")
+                        except Exception:
+                            pass
+                elif slice_row is None and _is_workflow_lane_job(job):
+                    # workflow lane 的 build phase job 到這裡必為 status == "exited"
+                    # （failed 已在上面 `elif status == "failed":` 分支處理掉），不查
+                    # slices 表、不當成缺 slice proof。
+                    gate_status = WORKFLOW_LANE_GATE_STATUS
+                    gate_reason = WORKFLOW_LANE_GATE_REASON
+                elif slice_row is None:
+                    evidence = _write_status_evidence(
+                        slice_row=None,
+                        job=job,
+                        repo_root=repo_root,
+                        coordinator_root=coordinator_root,
+                        git_runner=git_runner,
+                        status="needs_human",
+                        summary="missing-slice-proof",
+                        details={"reason": "builder exited without pinned slice verification contract"},
+                    )
+                    gate_status = "needs_human"
+                    gate_reason = "missing-slice-proof"
+                    publish_evidence = evidence is not None
+                elif slice_row.get("state") in {"verified", "completed"} and slice_row.get("gate_state") == "passed":
+                    gate_status = "passed" if slice_row.get("state") == "completed" else "verified"
+                    gate_reason = "accepted"
+                else:
+                    try:
+                        evidence = verification_runner(
+                            slice_row=slice_row,
+                            job=job,
+                            repo_root=repo_root,
+                            coordinator_root=coordinator_root,
+                            git_runner=git_runner,
+                            subprocess_runner=subprocess_runner,
+                        )
+                        evidence = _validate_result_evidence(
+                            evidence=evidence,
+                            slice_id=slice_id,
+                            coordinator_root=coordinator_root,
+                        )
+                        gate_status = evidence["payload"]["status"]
+                        gate_reason = evidence["payload"]["summary"]
+                    except Exception as exc:
+                        gate_status = "needs_human"
+                        gate_reason = "verification-runner-error"
+                        try:
+                            evidence = _write_status_evidence(
+                                slice_row=slice_row,
+                                job=job,
+                                repo_root=repo_root,
+                                coordinator_root=coordinator_root,
+                                git_runner=git_runner,
+                                status="needs_human",
+                                summary="verification-runner-error",
+                                details={"error": str(exc)},
+                            )
+                            if evidence is not None:
+                                _apply_verification_result(registry, slice_id, evidence)
+                                publish_evidence = True
+                            else:
+                                registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                        except Exception:
+                            try:
+                                registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            _apply_verification_result(registry, slice_id, evidence)
+                            publish_evidence = True
+                        except Exception:
+                            gate_status = "needs_human"
+                            gate_reason = "verification-state-update-error"
+                            publish_evidence = False
+
+                    if gate_status == "reviewing" and slice_row is not None:
+                        launch_result = _launch_foreign_review(
+                            registry=registry,
+                            slice_row=registry.get_slice(slice_id),
+                            builder_job=registry.get_job(job_id),
+                            repo_root=repo_root,
+                            coordinator_root=coordinator_root,
+                            candidate=evidence["payload"]["candidate"],
+                            subprocess_runner=subprocess_runner,
+                            git_runner=git_runner,
+                            review_launcher=review_launcher,
+                            review_executor=review_executor,
+                            review_model=review_model,
+                        )
+                        if launch_result.get("launched"):
+                            continue
+                        gate_status = str(launch_result["gate_status"])
+                        gate_reason = str(launch_result["gate_reason"])
+                        evaluation = launch_result.get("evaluation")
+
+            if slice_row is not None:
+                gate_status, gate_reason, completion_record = _completion_candidate_ref(
+                    registry=registry,
+                    slice_row=registry.get_slice(slice_id),
+                    repo_root=repo_root,
+                    coordinator_root=coordinator_root,
+                    gate_status=gate_status,
+                    gate_reason=gate_reason,
+                    clock=clock,
+                    git_runner=git_runner,
+                )
+                slice_row = registry.get_slice(slice_id)
+            verification_path, verification_hash = _current_verification_ref(slice_row)
+            review_path, review_hash, review_payload = _current_review_ref(slice_row)
+            if evaluation is None and review_payload is not None:
+                evaluation = {"path": review_path, "hash": review_hash, "payload": review_payload}
+            handoff.write_manifest(
+                manifest_path,
+                {
+                    "slice_id": slice_id,
+                    "job_id": job_id,
+                    "gate_status": gate_status,
+                    "completion": status,
+                    "exit_code": job.get("exit_code"),
+                    "branch": job.get("branch"),
+                    # #465：workflow-lane job 派工時帶 workflow_repo（build 與
+                    # review kind 皆有），寫進終局 manifest 讓讀取端
+                    # `_repo_from_manifest` 投影 repo 歸屬；slice-lane job 自 spec
+                    # frontmatter 的顯式 `repo:` 宣告帶入（#469，reviewer 繼承
+                    # builder）；未宣告仍寫 null，依 #230 契約不從 branch 推斷。
+                    "workflow_repo": job.get("workflow_repo"),
+                    "gate_reason": gate_reason,
+                    "gate_verdict": (
+                        evaluation["payload"]
+                        if evaluation is not None
+                        else (evidence["payload"] if publish_evidence and evidence is not None else None)
+                    ),
+                    "verification_evidence_path": (
+                        evidence["path"] if publish_evidence and evidence is not None else verification_path
+                    ),
+                    "verification_evidence_hash": (
+                        evidence["hash"] if publish_evidence and evidence is not None else verification_hash
+                    ),
+                    "review_evaluation_path": evaluation["path"] if evaluation is not None else None,
+                    "review_evaluation_hash": evaluation["hash"] if evaluation is not None else None,
+                    "completion_record_path": (
+                        completion_record["path"] if completion_record is not None else None
+                    ),
+                    "completion_record_hash": (
+                        completion_record["hash"] if completion_record is not None else None
+                    ),
+                    "slice_state": slice_row.get("state") if isinstance(slice_row, dict) else None,
+                    "spec_hash": (
+                        slice_row.get("spec", {}).get("hash") if isinstance(slice_row, dict) else None
+                    ),
+                    "plan_hash": (
+                        slice_row.get("plan", {}).get("hash") if isinstance(slice_row, dict) else None
+                    ),
+                    "verification_hash": (
+                        slice_row.get("verification", {}).get("hash")
+                        if isinstance(slice_row, dict)
+                        else None
+                    ),
+                    "completed_at": clock(),
+                    # #384：typed provider failure 分類（None 除非本輪終局是
+                    # build-phase failure 且分類得到結果）。`slice_status_entry`
+                    # 讀回這個欄位投影給 `cortex inspect status`。
+                    "provider_outcome": slice_provider_outcome_payload,
+                },
+            )
+            if not publish_evidence and gate_reason in {
+                "pinned-input-mismatch",
+                "verification-runner-error",
+                "verification-state-update-error",
+            }:
+                _discard_unpublished_evidence(evidence)
+            if slice_id in seen_slices:
+                # 同輪同 slice 第二個 terminal job：後者勝（manifest 已覆寫）→ 記 warning、completed 去重更新。
+                warnings.append({"slice_id": slice_id, "warning": "same-slice concurrent terminals"})
+                for entry in completed:
+                    if entry["slice_id"] == slice_id:
+                        entry["gate_status"] = gate_status
+                        break
+                for job_entry in completed_jobs:
+                    if job_entry.get("task") == slice_id:
+                        job_entry.clear()
+                        job_entry.update(job)
+                        break
+            else:
+                completed.append({"slice_id": slice_id, "gate_status": gate_status})
+                completed_jobs.append(dict(job))
+            seen_slices[slice_id] = job_id
+        except Exception as exc:
+            errors.append({"job_id": job_id, "error": str(exc)})
+
+    summary: dict = {
+        "polled": polled,
+        "completed": completed,
+        "completed_jobs": completed_jobs,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if released_ok:
+        try:
+            summary["released"] = sorted(_ready_ids() - before_ready)
+        except ValueError:
+            pass
+    return summary
+
+
+def _manifest_still_blocks_fanout(registry, slice_id: str) -> bool:
+    """判斷殘留 handoff 終局 manifest 是否仍該擋本輪 fanout（issue #383 提案 2）。
+
+    manifest 只反映「某個 job 曾經跑到終局」，不代表「這個 slice 現在仍該被
+    跳過」——`apply_slice_action` 的 `recover-pre-candidate`／`abandon` 等復原
+    動作會把 registry state 撥回 `"pending"`（可重派），但沒有義務刪除舊
+    manifest（保留稽核紀錄）。此處與 registry 現況對帳，而不是只看 handoff
+    目錄有沒有檔案：
+
+    - registry 查無此 slice（從未建過 slice row，例如純 handoff-only 情境）
+      → 無法確認已復原，保守照舊擋。
+    - `state == "pending"` → 已被復原到可重派狀態，manifest 過期，不擋。
+    - 其餘狀態（needs_human/failed/building/verified/completed 等）→ 與
+      manifest 描述的終局一致，照舊擋。
+    """
+    if registry is None:
+        return True
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return True
+    return str(slice_row.get("state")) != "pending"
+
+
+def dispatch_gate_scan(
+    metas: list[dict],
+    *,
+    handoff_dir: str,
+    registry,
+) -> tuple[list[dict], dict[str, dict], list[dict]]:
+    """算出本輪允許進 `dispatch_ready()`/`ready_units()` 就緒判定的 meta 子集。
+
+    `run_tick()` 與 `manager_daemon.py` 的 `request_type == "fanout"` 分支皆呼叫
+    本函式，消除兩條路徑各自維護一份過濾邏輯導致的分歧（issue #383 複驗指出
+    「fanout 路徑不只沒 already_terminal 過濾、連 in-flight active 過濾也沒
+    有」）。兩層過濾疊加：
+
+    1. in-flight 過濾：registry 中仍 dispatched/running 的 job 對應 slice 本趟
+       不重派（同一 slice 一 job 不變量，review F-A）。
+    2. handoff 終局過濾：已有 handoff 終局紀錄（needs_human/failed/passed/
+       verified 皆算）的 slice 預設不重派（issue #339 冪等）——但終局是否仍
+       該擋，改與 registry 現況對帳而非只看檔案存不存在（`_manifest_still_blocks_fanout`，
+       issue #383 提案 2），避免復原後的 slice 被殘留 manifest 永久靜默跳過。
+
+    回 `(fanout_metas, already_terminal, needs_human)`：
+    - `fanout_metas`：真正該餵給 `dispatch_ready()` 的子集。
+    - `already_terminal`：slice_id -> manifest payload，供呼叫端組 needs_human
+      清單用途——不論是否阻擋 fanout 皆收，維持既有回報語意（不受本次對帳
+      影響，複驗要求 needs_human 回傳語意不變）。
+    - `needs_human`：manifest `gate_status == "needs_human"` 的清單（維持既有
+      語意；即使已復原也照列，這是操作者可見的歷史軌跡，不是「靜默」問題）。
+    """
+    already_terminal: dict[str, dict] = {}
+    needs_human: list = []
+    blocking: set[str] = set()
+    for meta in metas:
+        slice_id = meta.get("slice_id") if isinstance(meta, dict) else None
+        if not isinstance(slice_id, str) or not slice_id:
+            continue
+        manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        already_terminal[slice_id] = payload
+        if payload.get("gate_status") == "needs_human":
+            needs_human.append(
+                {
+                    "slice_id": slice_id,
+                    "gate_reason": payload.get("gate_reason"),
+                    "handoff_path": str(manifest_path),
+                }
+            )
+        if _manifest_still_blocks_fanout(registry, slice_id):
+            blocking.add(slice_id)
+
+    active: set[str] = set()
+    if registry is not None:
+        active = {j.get("task") for j in registry.list_jobs() if j.get("status") in IN_FLIGHT_STATUSES}
+    fanout_metas = [m for m in metas if m.get("slice_id") not in active and m.get("slice_id") not in blocking]
+    return fanout_metas, already_terminal, needs_human
+
+
+def run_tick(
+    dispatcher,
+    *,
+    metas: list[dict],
+    launcher=None,
+    review_launcher=None,
+    persona: str = "builder",
+    is_satisfied=None,
+    gate_runner: GateRunner | None = None,
+    handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
+    require_idle: bool = False,
+    max_load: float = 1.0,
+    idle_probe: Callable[[], tuple] = idle.system_load_average,
+    clock: Callable[[], str] = _utcnow,
+    reaper: Callable[[], dict] | None = None,
+    ledger_recorder: Callable[[list[dict]], list[dict]] | None = None,
+    skill_janitor: Callable[[], dict] | None = None,
+    review_executor: str | None = None,
+    review_model: str | None = None,
+    identity_registry=None,
+    launcher_factory=None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
+) -> dict:
+    """跑完整 manager tick：fanout（dispatch_ready）→ complete_tick →（可選）收尾 janitor。
+
+    require_idle 時以 1-min load average gate（reuse memory.dream.idle，可注入 probe）——
+    僅擋 fanout（新工作），complete_tick 一律跑。已有 dispatched/running job **或已有
+    handoff 終局紀錄**的 slice 本趟不重派（冪等，issue #339）：`ready_units`/
+    `default_is_satisfied` 只檢查「別人 depends_on 我」是否滿足，從未檢查「我自己是否
+    已經跑過」——slice 一旦 exited 離開 IN_FLIGHT_STATUSES，若沒有這層過濾，下一趟
+    tick 會把它判定為就緒、對同一 branch/worktree 重新 fanout，撞
+    `ScriptWorktreeCreator.create` 的 "worktree target already exists"。
+    fanout 例外（DispatchReadyError/RequiresLauncher/ValueError 環）收進 errors，不阻
+    complete。
+
+    reaper 為收尾 janitor（issue #161）：傳入時於 complete 後呼叫一次以回收孤兒 codex
+    broker（多 worktree 派工殘留），其回傳放 summary["reaped"]；任何例外收進 errors（stage=reap），
+    不破壞 tick。預設 None（不啟用）——避免單測誤觸真實行程回收；production 由 CLI 接上。
+
+    ledger_recorder／skill_janitor 為 skill 治理收尾 hook（issue #204），與 reaper 同款
+    「預設 None 不啟用、例外一律吸收不破壞 tick」注入模式：
+    - ledger_recorder：若提供，於 complete_tick 之後以本輪 `complete["completed_jobs"]`
+      （terminal job 全量快照清單）呼叫一次，預期回傳實際記錄的 usage event 清單，放進
+      summary["skill_usage_events"]；典型注入值為
+      `functools.partial(skill_ledger.record_usage_events, cards=cards)`。
+    - skill_janitor：若提供，於 complete 後呼叫一次（zero-arg），只做 cold-skill 偵測與
+      proposal 產生（不動 park state），回傳放 summary["skill_janitor"]；典型注入值為
+      `functools.partial(skill_janitor.run_janitor_tick, cards=cards, ledger_path=..., proposals_dir=...)`。
+    兩者任一丟例外都收進 errors（stage 分別為 skill_ledger／skill_janitor），不影響
+    dispatch/complete/reap 任何一段的結果。
+    回 {dispatch_skipped, dispatched, completed, errors, reaped, needs_human, skill_usage_events, skill_janitor}。
+    """
+    satisfied = is_satisfied if is_satisfied is not None else _satisfied_pred(handoff_dir)
+    dispatched: list = []
+    errors: list = []
+    # 已有 handoff 終局紀錄（needs_human/failed/passed/verified 皆算）的 slice：
+    # 不論 dispatch_skipped 與否都要掃描——這段刻意放在 idle 判斷之前、兩分支共用，
+    # 因為「idle gate 擋不擋新工作」跟「有沒有 job 卡在 needs_human 待人工」是兩件事，
+    # 高負載（not-idle）時操作者更需要看到 needs_human 清單，不能被 idle-skip 短路成空清單。
+    # fanout_metas 已與 registry 現況對帳（dispatch_gate_scan，issue #383 提案 2）：
+    # 復原動作（recover-pre-candidate 等）把 slice 撥回 pending 後，殘留的舊終局
+    # manifest 不再讓它被永久跳過。
+    registry = getattr(dispatcher, "_registry", None)
+    fanout_metas, already_terminal, needs_human = dispatch_gate_scan(
+        metas, handoff_dir=handoff_dir, registry=registry
+    )
+    # idle gate 只擋「派工側（新工作，會啟 agent，昂貴）」；完成側（poll→manifest，便宜的
+    # 回收/記帳）一律跑，否則高負載時 job 完成/失敗狀態與下游釋放會被埋住（review F-C）。
+    if require_idle and not idle.is_idle(max_load=max_load, probe=idle_probe):
+        dispatch_skipped: str | bool = "not-idle"
+    else:
+        dispatch_skipped = False
+        try:
+            dispatched = autonomy.dispatch_ready(
+                fanout_metas,
+                satisfied,
+                dispatcher,
+                persona=persona,
+                launcher=launcher,
+                git_runner=getattr(dispatcher, "_git_runner", None),
+                handoff_dir=handoff_dir,
+                identity_registry=identity_registry,
+                launcher_factory=launcher_factory,
+                spawn_admission=spawn_admission,
+            )
+        except autonomy.DispatchReadyError as exc:
+            dispatched = list(exc.jobs)
+            errors.extend(
+                {
+                    "slice_id": slice_id,
+                    "type": exc_value.__class__.__name__,
+                    "message": str(exc_value),
+                    "stage": "fanout",
+                }
+                for slice_id, exc_value in exc.errors
+            )
+        except (autonomy.DispatchReadyRequiresLauncherError, ValueError) as exc:
+            errors.append({"stage": "fanout", "error": str(exc)})
+    complete = complete_tick(
+        dispatcher,
+        gate_runner=gate_runner,
+        handoff_dir=handoff_dir,
+        metas=metas,
+        clock=clock,
+        review_launcher=review_launcher,
+        review_executor=review_executor,
+        review_model=review_model,
+    )
+    # skill usage ledger 記錄（issue #204）：complete_tick 本輪產出的 terminal job
+    # 全量快照過 ledger_recorder（若有注入）。跟 reaper 同款 try/except 隔離——記錄
+    # 失敗不得讓 tick 中斷；結果放 summary["skill_usage_events"]，例外收進 errors
+    # （stage=skill_ledger）。預設 None（不啟用）：避免單測誤寫真實 ledger 檔。
+    skill_usage_events = None
+    ledger_errors: list = []
+    if ledger_recorder is not None:
+        try:
+            skill_usage_events = ledger_recorder(complete["completed_jobs"])
+        except Exception as exc:
+            ledger_errors.append({"stage": "skill_ledger", "error": str(exc)})
+
+    # skill park janitor（issue #204）：proposal-first，只讀 ledger、只寫 proposal，
+    # 絕不動 park state。例外一律吸收；結果放 summary["skill_janitor"]。
+    skill_janitor_result = None
+    janitor_errors: list = []
+    if skill_janitor is not None:
+        try:
+            skill_janitor_result = skill_janitor()
+        except Exception as exc:
+            janitor_errors.append({"stage": "skill_janitor", "error": str(exc)})
+
+    # 收尾 janitor（issue #161）：回收孤兒 codex broker。失敗一律不破壞 tick——
+    # 收進 errors（stage=reap），狀態放 summary["reaped"]。
+    reaped = None
+    reap_errors: list = []
+    if reaper is not None:
+        try:
+            reaped = reaper()
+        except Exception as exc:
+            reap_errors.append({"stage": "reap", "error": str(exc)})
+    return {
+        "dispatch_skipped": dispatch_skipped,
+        "dispatched": dispatched,
+        "completed": complete["completed"],
+        "errors": errors + complete["errors"] + ledger_errors + janitor_errors + reap_errors,
+        "reaped": reaped,
+        "needs_human": needs_human,
+        "skill_usage_events": skill_usage_events,
+        "skill_janitor": skill_janitor_result,
+    }
+
+
+def _required_workflow_string(args: Mapping[str, object], field: str) -> str:
+    value = args.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"workflow-action requires {field}")
+    return value.strip()
+
+
+def _load_workflow_manifest(path_value: str) -> WorkflowManifest:
+    path = Path(path_value)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"workflow manifest unreadable: {path}") from exc
+    return WorkflowManifest.from_dict(payload)
+
+
+def _read_planning_artifact_content(root: Path, ref: str) -> tuple[bytes, str]:
+    relative = Path(ref)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("planning artifact escapes artifact root")
+    unresolved = root / relative
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError("symlink planning artifact")
+    resolved = unresolved.resolve()
+    resolved.relative_to(root)
+    content = resolved.read_bytes()
+    return content, content.decode("utf-8")
+
+
+def _load_planning_artifacts(
+    args: Mapping[str, object],
+    *,
+    work_id: str,
+    persisted: tuple[PlanningArtifactAuthority, ...] = (),
+) -> tuple[tuple[PlanningArtifact, ...], tuple[PlanningArtifactAuthority, ...]]:
+    root = Path(_required_workflow_string(args, "artifact_root")).resolve()
+    rows = args.get("planning_artifacts")
+    if not isinstance(rows, list):
+        raise ValueError("workflow-action planning_artifacts must be a list")
+    requested: list[tuple[str, str]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {"kind", "ref"}:
+            raise ValueError(f"workflow-action planning_artifacts[{index}] invalid")
+        kind = row.get("kind")
+        ref = row.get("ref")
+        if not isinstance(kind, str) or not isinstance(ref, str) or not ref:
+            raise ValueError(f"workflow-action planning_artifacts[{index}] invalid")
+        requested.append((kind, ref))
+    if persisted:
+        expected = [(item.kind, item.ref) for item in persisted]
+        if requested != expected:
+            raise ValueError("workflow planning artifact scan differs from persisted authority")
+        authority = persisted
+    else:
+        authority = ()
+    artifacts: list[PlanningArtifact] = []
+    scanned: list[PlanningArtifactAuthority] = []
+    for index, (kind, ref) in enumerate(requested):
+        try:
+            content, text = _read_planning_artifact_content(root, ref)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(f"workflow planning artifact unreadable: {ref}") from exc
+        artifacts.append(PlanningArtifact(kind=kind, ref=ref, text=text))
+        scanned.append(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=kind,
+                work_id=work_id,
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    if authority and tuple(scanned) != authority:
+        raise ValueError("workflow planning artifact current authority drift")
+    return tuple(artifacts), tuple(scanned)
+
+
+def _load_run_planning_artifacts(run) -> tuple[PlanningArtifact, ...] | None:
+    root = Path(run.workspace_root).resolve()
+    artifacts: list[PlanningArtifact] = []
+    for authority in run.planning_authority:
+        try:
+            _content, text = _read_planning_artifact_content(root, authority.ref)
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        artifacts.append(PlanningArtifact(kind=authority.kind, ref=authority.ref, text=text))
+    return tuple(artifacts)
+
+
+# --- #414：deterministic pass plan 卡前的 declared-outputs 驗證 -------------
+#
+# 根因（生產實測 run workflow-e18785ac）：`assess_planning_completeness` 只看
+# kind 覆蓋率——workstream todo（kind=plan、accepted）就足以讓 planning 判定
+# complete，manager 因此把 plan 卡（如 writing-plans-light）deterministic
+# pass，卻從未檢查卡片自己宣告的 `produces` glob（如
+# `docs/superpowers/plans/*<task-slug>*.md`）是否真的命中檔案——todo 的
+# ref 通常不落在該 pattern 內。下一棒 build 卡宣告同一 pattern 為
+# declared input，`_workflow_input_snapshot`（見上方 `_safe_input_matches`
+# 用法）找不到檔案便直接 raise，整個 run 卡死在 needs_human。
+#
+# 這裡補上與 build 端對稱的檢查：deterministic pass 之前，用同一套
+# `_safe_input_matches` glob 語意驗證 outputs 是否已存在；缺席時嘗試把
+# 已 accepted 的 kind=plan 內容 materialize 到卡片宣告的 canonical 路徑
+# （`_materialize_plan_card_output`）。plan 卡目前沒有「planning_complete
+# 為真時仍會走正常派工」的路徑（見 `_dispatch_workflow_card` 讀碼：一旦
+# `planning_complete` 為真，本函式只會 needs_decomposition／needs_human／
+# plan-review 重試／deterministic pass 四選一，從不落到下面建立真實 job
+# 的路徑），materialize 因此是唯一可行的最小修法；不可 materialize 時
+# （宣告了非單一 output pattern、或找不到已 accepted 的 kind=plan 內容）
+# fail-closed：不跳過、不動 registry，交由下一輪 dispatch 重新判定。
+def _plan_card_declared_outputs_present(root: Path, patterns: tuple[str, ...]) -> bool:
+    """驗證 plan 卡宣告的 outputs glob patterns 是否皆已在 ``root``
+    （run.workspace_root）命中至少一個實檔。空 patterns 視為已滿足。"""
+    return all(_safe_input_matches(root, pattern) for pattern in patterns)
+
+
+def _plan_card_canonical_output_path(pattern: str) -> str:
+    """把單一 `*`-only 萬用字元 output glob pattern 收斂為 canonical 具體
+    路徑（移除 `*`）。非此形狀（含 `?`／`[...]`，或移除萬用字元後路徑不
+    合法）一律 raise，交由呼叫端視為不可 materialize。"""
+    if "*" not in pattern or "?" in pattern or "[" in pattern:
+        raise ValueError(f"plan output pattern 不支援 materialize：{pattern!r}")
+    canonical = pattern.replace("*", "")
+    relative = Path(canonical)
+    if (
+        not canonical
+        or canonical.endswith("/")
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or relative.as_posix() != canonical
+    ):
+        raise ValueError(f"plan output pattern materialize 路徑不合法：{pattern!r}")
+    return canonical
+
+
+def _materialize_plan_card_output(
+    *,
+    run,
+    step,
+    artifacts: tuple[PlanningArtifact, ...],
+    workspace_root: Path,
+):
+    """把已 accepted 的 kind=plan 規劃內容原樣 materialize 到 ``step`` 宣告
+    的（唯一）output pattern 之 canonical 路徑，透過既有 planning
+    publication 機制（`_PlanningPublicationTransaction.publish`）做
+    CAS-safe 的 atomic 寫入。成功時回傳
+    ``(更新後的 artifacts, 新的 PlanningArtifactAuthority, transaction)``——
+    呼叫端需把 authority 併入 ``run.planning_authority`` 一併提交（build
+    worktree 是獨立 git worktree，declared input 檢查缺席時要靠
+    authority 記錄從 workspace_root seed 進去，見 `_workflow_input_snapshot`
+    的 authority_refs fallback），並在後續 registry 提交失敗時呼叫
+    ``transaction.rollback()``。不可 materialize 時回傳 ``None``（不寫檔、
+    不動 registry）。
+
+    ``journal_root=None``：此次寫入與呼叫端的 registry 提交在同一次
+    dispatch 呼叫內完成，不借用 brainstorm 那份跨 run 的
+    crash-recoverable journal（避免與其 `reconcile()` 語意〔預期
+    kind=evidence 的 brainstorm gate ref〕互相干擾）；殘餘風險是寫入成功
+    後、registry 提交前這極窄的視窗內若 manager 崩潰，materialize 出的
+    檔案會變成未登記的孤兒——下一輪 dispatch 會重新判定 outputs 是否存在
+    並可能需要人工介入，但不劣於修復前 100% 必炸的現狀。
+    """
+    if len(step.outputs) != 1:
+        return None
+    try:
+        canonical_relative = _plan_card_canonical_output_path(step.outputs[0])
+    except ValueError:
+        return None
+    accepted_plan = next(
+        (
+            assessment.artifact
+            for assessment in assess_planning_completeness(artifacts).assessments
+            if assessment.artifact.kind == "plan" and assessment.accepted
+        ),
+        None,
+    )
+    if accepted_plan is None:
+        return None
+    destination = workspace_root / canonical_relative
+    if destination.is_symlink():
+        return None
+    cursor = workspace_root
+    for part in Path(canonical_relative).parent.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return None
+    content = accepted_plan.text.encode("utf-8")
+    transaction = _PlanningPublicationTransaction(
+        root=workspace_root, run_id=run.run_id, journal_root=None,
+    )
+    try:
+        transaction.publish(destination, content, baseline_hash=None, mode=0o644, kind="artifact")
+    except ValueError:
+        return None
+    materialized = PlanningArtifact(kind="plan", ref=canonical_relative, text=accepted_plan.text)
+    authority = PlanningArtifactAuthority(
+        ref=canonical_relative,
+        kind="plan",
+        work_id=run.work_id,
+        baseline_sha256=hashlib.sha256(content).hexdigest(),
+    )
+    return artifacts + (materialized,), authority, transaction
+
+
+def _manager_archive_applied(run) -> bool:
+    archives = [
+        step
+        for step in run.steps
+        if step.phase == "ship"
+        and step.card == "openspec-archive"
+        and step.gate_result == "passed"
+    ]
+    return len(archives) == 1 and (
+        archives[0].executor,
+        archives[0].model,
+        archives[0].domain,
+    ) == ("cortex-manager", "deterministic", "cortex")
+
+
+def _planning_artifact_relative_path_after_archive(
+    run,
+    *,
+    workspace: Path,
+    ref: str,
+    digest: str,
+) -> Path:
+    relative = Path(ref)
+    cursor = workspace
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError("workflow brainstorm artifact symlink rejected")
+    direct = workspace / relative
+    if direct.is_file() or not _manager_archive_applied(run):
+        return relative
+    parts = relative.parts
+    if (
+        len(parts) < 4
+        or parts[:2] != ("openspec", "changes")
+        or parts[2] not in run.openspec_refs
+    ):
+        return relative
+    archive_root = workspace / "openspec" / "changes" / "archive"
+    if archive_root.is_symlink() or not archive_root.is_dir():
+        return relative
+    suffix = f"-{parts[2]}"
+    matches: list[Path] = []
+    for archived_change in archive_root.iterdir():
+        if archived_change.is_symlink() or not archived_change.name.endswith(suffix):
+            continue
+        candidate = archived_change.joinpath(*parts[3:])
+        cursor = workspace
+        for part in candidate.relative_to(workspace).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow brainstorm archived artifact symlink rejected")
+        if candidate.is_file() and hashlib.sha256(candidate.read_bytes()).hexdigest() == digest:
+            matches.append(candidate)
+    if len(matches) > 1:
+        raise ValueError("workflow brainstorm archived artifact authority ambiguous")
+    return matches[0].relative_to(workspace) if matches else relative
+
+
+def _validated_brainstorm_planning_authority(
+    run,
+    *,
+    coordinator_root: str | Path,
+    brainstorm_ref: GateEvidenceRef | None = None,
+) -> tuple[tuple[PlanningArtifactAuthority, ...], str | None]:
+    """Bind published planning artifacts from canonical brainstorm evidence."""
+    refs = (
+        [brainstorm_ref]
+        if brainstorm_ref is not None
+        else [ref for ref in run.gate_refs if ref.kind == "brainstorm"]
+    )
+    if not refs:
+        if run.brainstorm_required:
+            raise ValueError("workflow brainstorm evidence missing")
+        return run.planning_authority, run.planning_source_revision
+    if len(refs) != 1 or refs[0] is None:
+        raise ValueError("workflow brainstorm authority must be unique")
+    gate_ref = refs[0]
+    evidence_path = Path(gate_ref.ref)
+    evidence_root = Path(coordinator_root).resolve() / "evidence"
+    if (
+        not evidence_path.is_absolute()
+        or evidence_path.is_symlink()
+        or not evidence_path.is_file()
+    ):
+        raise ValueError("workflow brainstorm evidence missing")
+    resolved_evidence = evidence_path.resolve()
+    try:
+        resolved_evidence.relative_to(evidence_root)
+    except ValueError as exc:
+        raise ValueError("workflow brainstorm evidence outside coordinator root") from exc
+    encoded = resolved_evidence.read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != gate_ref.sha256:
+        raise ValueError("workflow brainstorm evidence hash drift")
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("workflow brainstorm evidence invalid") from exc
+    scope = payload.get("scope") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "brainstorm-peer"
+        or not isinstance(scope, dict)
+        or set(scope) != {"repo", "work_id", "source_revision"}
+        or scope.get("repo") != run.repo
+        or scope.get("work_id") != run.work_id
+        or not isinstance(scope.get("source_revision"), str)
+        or not scope["source_revision"]
+        or not isinstance(payload.get("artifacts"), list)
+    ):
+        raise ValueError("workflow brainstorm evidence binding invalid")
+    evidence_source_revision = scope["source_revision"]
+    if (
+        run.planning_source_revision is not None
+        and run.planning_source_revision != evidence_source_revision
+    ):
+        raise ValueError("workflow brainstorm evidence source revision drift")
+    rows = payload["artifacts"]
+
+    declared_patterns = tuple(
+        pattern
+        for step in run.steps
+        if step.persona == "planner" and step.phase in {"define", "plan"}
+        for pattern in step.outputs
+    )
+    # #418：plan 卡 deterministic pass materialize 出的 canonical plan 檔
+    # （`_materialize_plan_card_output`）與 brainstorm 實際發佈的 plan
+    # artifact（例如 workstreams/<slug>/todo.md）路徑不同、卻是同一份內容
+    # 的 byte-copy，僅為滿足 build 端 declared input pattern
+    # （`docs/superpowers/plans/*<slug>*.md`）而落地。下面單獨算出 plan
+    # phase 宣告的 output patterns，用來把這種合法副本從「omission」判定
+    # 中排除——與 `declared_patterns`（含 define phase）分開，避免誤放行
+    # 不相干的 define 階段路徑。
+    plan_output_patterns = tuple(
+        pattern
+        for step in run.steps
+        if step.persona == "planner" and step.phase == "plan"
+        for pattern in step.outputs
+    )
+    persisted = {item.ref: item for item in run.planning_authority}
+    scanned: dict[str, PlanningArtifactAuthority] = {}
+    workspace = Path(run.workspace_root).resolve()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {"kind", "ref", "sha256"}:
+            raise ValueError(f"workflow brainstorm artifact[{index}] invalid")
+        kind = row.get("kind")
+        ref = row.get("ref")
+        digest = row.get("sha256")
+        if (
+            kind not in {"spec", "design", "plan"}
+            or not isinstance(ref, str)
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or ref in scanned
+        ):
+            raise ValueError(f"workflow brainstorm artifact[{index}] invalid")
+        relative = Path(ref)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("workflow brainstorm artifact escapes workspace")
+        target_relative = _planning_artifact_relative_path_after_archive(
+            run,
+            workspace=workspace,
+            ref=ref,
+            digest=digest,
+        )
+        cursor = workspace
+        for part in target_relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow brainstorm artifact symlink rejected")
+        target = (workspace / target_relative).resolve()
+        try:
+            target.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError("workflow brainstorm artifact escapes workspace") from exc
+        if not target.is_file():
+            raise ValueError("workflow brainstorm artifact hash drift")
+        data = target.read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError("workflow brainstorm artifact hash drift")
+        existing = persisted.get(ref)
+        if existing is None:
+            if not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns):
+                raise ValueError("workflow brainstorm artifact outside planner outputs")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("workflow brainstorm artifact unreadable") from exc
+            if not assess_planning_artifact(PlanningArtifact(kind=kind, ref=ref, text=text)).accepted:
+                raise ValueError("workflow brainstorm artifact is not accepted")
+        elif (
+            existing.kind != kind
+            or existing.work_id != run.work_id
+            or existing.baseline_sha256 != digest
+        ):
+            raise ValueError("workflow brainstorm artifact differs from persisted authority")
+        scanned[ref] = PlanningArtifactAuthority(
+            ref=ref,
+            kind=kind,
+            work_id=run.work_id,
+            baseline_sha256=digest,
+        )
+
+    missing = set(persisted) - set(scanned)
+    if missing:
+        # #418：materialized plan 副本本身不在 brainstorm evidence 的
+        # artifacts 列表裡（它是 plan 卡 deterministic pass 之後才產生
+        # 的），因此天生落在 `persisted - scanned` 差集中。逐一檢查是否
+        # 為「合法副本」：kind=plan、work_id 對得上這個 run、內容
+        # （baseline_sha256）與某個已通過 brainstorm 驗證的 kind=plan
+        # entry 完全一致（byte-copy）、且 ref 落在 plan phase 宣告的
+        # output pattern 內（即 build 端會讀的那個 canonical 路徑）。四條
+        # 全符合才視為合法副本、不計入 omission；其餘（真正的 omission）
+        # 維持 raise，fail-closed 語意不變。
+        scanned_plan_digests = {
+            entry.baseline_sha256 for entry in scanned.values() if entry.kind == "plan"
+        }
+        unresolved = {
+            ref
+            for ref in missing
+            if not (
+                persisted[ref].kind == "plan"
+                and persisted[ref].work_id == run.work_id
+                and persisted[ref].baseline_sha256 in scanned_plan_digests
+                and any(fnmatch.fnmatch(ref, pattern) for pattern in plan_output_patterns)
+            )
+        }
+        if unresolved:
+            raise ValueError("workflow brainstorm evidence omits persisted authority")
+    # `ordered` 起始自 `run.planning_authority`（即 `persisted` 的來源），
+    # 因此上面被判定為合法副本的 materialized plan entry 原樣留在回傳值
+    # 裡——它必須繼續存在，好讓 build worktree 透過 `_workflow_input_snapshot`
+    # 的 authority_refs fallback seed 到這份 canonical plan 檔。
+    ordered = list(run.planning_authority)
+    ordered.extend(scanned[ref] for ref in scanned if ref not in persisted)
+    return tuple(ordered), evidence_source_revision
+
+
+def _audit_phase_steps(
+    steps,
+    *,
+    phase: str,
+    executor: str,
+    model: str,
+    domain: str,
+    outputs: tuple[str, ...],
+    gate_result: str = "passed",
+    card_id: str | None = None,
+):
+    from .workflow import WorkflowStep
+
+    return tuple(
+        WorkflowStep(
+            phase=step.phase,
+            persona=step.persona,
+            card=step.card,
+            executor=executor if step.phase == phase and (card_id is None or step.card == card_id) else step.executor,
+            model=model if step.phase == phase and (card_id is None or step.card == card_id) else step.model,
+            domain=domain if step.phase == phase and (card_id is None or step.card == card_id) else step.domain,
+            inputs=step.inputs,
+            outputs=outputs if step.phase == phase and (card_id is None or step.card == card_id) else step.outputs,
+            gate_result=gate_result if step.phase == phase and (card_id is None or step.card == card_id) else step.gate_result,
+            # #379 複驗發現：此函式過去重建每個 step 時漏傳
+            # skill_ref/action/commit_policy/test_policy，導致 WorkflowStep 的
+            # dataclass 預設值（None）覆寫掉「完全不在本次 (phase, card_id)
+            # 範圍內」的其他 step 的既有值——包含尚未輪到的 build phase 卡片。
+            # 實務上，run 通常在 claim phase 就先 advance 過一次，因此 build
+            # phase 卡片的 test_policy 在真正被拿來跑之前就已經被抹成 None，
+            # #307 的 red-required 語意反轉、以及 #379 由 test_policy 導出
+            # 應驗 gate 名稱的機制都會因此變成 dead code。這四個欄位本就只
+            # 該由 deck compile 決定、run 存續期間不變，故一律原樣帶過，不
+            # 受 (phase, card_id) 命中與否影響。
+            skill_ref=step.skill_ref,
+            action=step.action,
+            commit_policy=step.commit_policy,
+            test_policy=step.test_policy,
+        )
+        for step in steps
+    )
+
+
+def _job_for_workflow_card(
+    registry,
+    *,
+    run,
+    card_id: str,
+    job_id: object,
+    expected_persona: str,
+    identities: IdentityRegistry,
+) -> tuple[dict[str, object], object]:
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("workflow card evidence requires registry job_id")
+    job = registry.get_job(job_id)
+    expected = {
+        "workflow_run_id": run.run_id,
+        "workflow_claim_key": run.claim_key,
+        "workflow_repo": run.repo,
+        "workflow_card": card_id,
+        "workflow_phase": run.current_phase,
+        "source_revision": run.source_revision,
+        "persona": expected_persona,
+    }
+    for field, value in expected.items():
+        if job.get(field) != value:
+            raise ValueError(f"workflow job binding mismatch: {field}")
+    if job.get("status") != "exited" or job.get("exit_code") != 0:
+        raise ValueError("workflow job has no successful terminal result")
+    executor = job.get("executor")
+    model = job.get("model_id")
+    if not isinstance(executor, str) or not isinstance(model, str):
+        raise ValueError("workflow job identity missing")
+    identity = identities.require(executor, model)
+    if job.get("independence_domain") != identity.independence_domain:
+        raise ValueError("workflow job identity/domain mismatch")
+    return job, identity
+
+
+def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> str:
+    candidate = job.get("subject_head")
+    worktree = (
+        job.get("workflow_repo_root")
+        if job.get("persona") == "reviewer"
+        else job.get("worktree")
+    )
+    if (
+        not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or not isinstance(worktree, str)
+    ):
+        raise ValueError("workflow job candidate/worktree missing")
+
+    def run_git(argv: list[str]):
+        if git_runner is None:
+            return subprocess.run(argv, capture_output=True, text=True, check=False)
+        try:
+            return git_runner(argv, capture_output=True, text=True, check=False)
+        except TypeError:
+            return git_runner(argv[1:] if argv and argv[0] == "git" else argv)
+
+    exists = run_git(["git", "-C", worktree, "cat-file", "-e", f"{candidate}^{{commit}}"])
+    if isinstance(exists, str):
+        exists_ok = True
+    else:
+        exists_ok = getattr(exists, "returncode", 1) == 0
+    if not exists_ok:
+        raise ValueError("workflow candidate does not exist")
+    head = run_git(["git", "-C", worktree, "rev-parse", "HEAD"])
+    if isinstance(head, str):
+        head_ok = True
+        head_text = head
+    else:
+        head_ok = getattr(head, "returncode", 1) == 0
+        head_text = getattr(head, "stdout", "")
+    if not head_ok or not isinstance(head_text, str) or head_text.strip().lower() != candidate:
+        raise ValueError("workflow candidate is not exact worktree HEAD")
+    return candidate
+
+
+def _verify_build_candidate_transition(
+    job: Mapping[str, object],
+    *,
+    previous_candidate: object,
+    git_runner=None,
+) -> str:
+    """Accept an exact build HEAD only when it monotonically extends its trusted baseline."""
+
+    candidate = _verify_exact_candidate(job, git_runner=git_runner)
+    baseline = previous_candidate if previous_candidate is not None else job.get("dispatch_head")
+    worktree = job.get("worktree")
+    if (
+        not isinstance(baseline, str)
+        or verification.SAFE_SHA_RE.fullmatch(baseline) is None
+        or not isinstance(worktree, str)
+    ):
+        raise ValueError("workflow build candidate baseline missing")
+    if baseline == candidate:
+        return candidate
+
+    argv = ["git", "-C", worktree, "merge-base", "--is-ancestor", baseline, candidate]
+    if git_runner is None:
+        ancestry = subprocess.run(argv, capture_output=True, text=True, check=False)
+    else:
+        try:
+            ancestry = git_runner(argv, capture_output=True, text=True, check=False)
+        except TypeError:
+            ancestry = git_runner(argv[1:])
+    if isinstance(ancestry, str):
+        return candidate
+    returncode = getattr(ancestry, "returncode", 1)
+    if returncode == 1:
+        raise ValueError("workflow build candidate is not a descendant")
+    if returncode != 0:
+        raise ValueError("workflow build candidate ancestry unavailable")
+    return candidate
+
+
+def _review_builder_job_binding(
+    registry,
+    *,
+    run,
+    builder_job_id: object,
+    candidate: str,
+) -> tuple[dict[str, object], bool]:
+    if not isinstance(builder_job_id, str) or not builder_job_id:
+        raise ValueError("review evaluation builder job missing")
+    builder = registry.get_job(builder_job_id)
+    archive_author = (
+        builder.get("workflow_phase") == "ship"
+        and builder.get("workflow_card") == "openspec-archive"
+        and builder.get("persona") == "manager"
+    )
+    expected = {
+        "workflow_run_id": run.run_id,
+        "workflow_claim_key": run.claim_key,
+        "workflow_repo": run.repo,
+        "source_revision": run.source_revision,
+        "subject_head": candidate,
+        "status": "exited",
+        "exit_code": 0,
+    }
+    expected.update(
+        {
+            "workflow_phase": "ship" if archive_author else "build",
+            "persona": "manager" if archive_author else "builder",
+        }
+    )
+    for field, value in expected.items():
+        if builder.get(field) != value:
+            raise ValueError(f"review evaluation builder binding mismatch: {field}")
+    card = builder.get("workflow_card")
+    if not isinstance(card, str) or not any(
+        step.card == card
+        and step.gate_result == "passed"
+        and (
+            (step.phase == "build" and not archive_author)
+            or (step.phase == "ship" and archive_author)
+        )
+        for step in run.steps
+    ):
+        raise ValueError("review evaluation builder card is not passed")
+    return builder, archive_author
+
+
+def _review_builder_job(
+    registry,
+    *,
+    run,
+    builder_job_id: object,
+    candidate: str,
+    identities: IdentityRegistry,
+) -> tuple[dict[str, object], object]:
+    builder, archive_author = _review_builder_job_binding(
+        registry,
+        run=run,
+        builder_job_id=builder_job_id,
+        candidate=candidate,
+    )
+    executor = builder.get("executor")
+    model = builder.get("model_id")
+    if not isinstance(executor, str) or not isinstance(model, str):
+        raise ValueError("review evaluation builder identity missing")
+    identity = (
+        ModelIdentity(
+            executor=executor,
+            model_id=model,
+            independence_domain=str(builder.get("independence_domain")),
+        )
+        if archive_author
+        else identities.require(executor, model)
+    )
+    if builder.get("independence_domain") != identity.independence_domain:
+        raise ValueError("review evaluation builder identity/domain mismatch")
+    return builder, identity
+
+
+def _unwrap_structured_output(value: object) -> dict[str, object] | None:
+    """#261 R3／D4：只剝一層白名單 wrapper，未知形狀一律回 ``None``。
+
+    刻意不在這裡拋錯：``_extract_terminal_json`` 還會繼續掃描其他行，
+    真正的「找不到 terminal evidence」由該函式統一終止。寬鬆解析（遞迴找出
+    看起來像 canonical 的 dict）會把契約破口變成安靜的錯誤資料，故不採用。
+    """
+
+    if not isinstance(value, Mapping) or len(value) != 1:
+        return None
+    only_key = next(iter(value))
+    if only_key not in terminal_contract.WRAPPER_KEYS:
+        return None
+    try:
+        normalized = terminal_contract.normalize_structured_output(value)
+    except terminal_contract.TerminalContractError:
+        return None
+    payload = normalized.payload
+    return payload if _is_workflow_terminal_payload(payload) else None
+
+
+def _schema_retry_attempt_key(card_id: str) -> str:
+    """#261 D5：schema mismatch retry 計數在 run.attempts 上的鍵。
+
+    刻意與 phase attempts 分開命名，避免和既有的 phase 重試次數混淆。
+    """
+
+    return f"schema-mismatch:{card_id}"
+
+
+def _provider_retry_attempt_key(card_id: str) -> str:
+    """#384：provider 失敗（rate_limited／transient）bounded retry 計數在
+    ``run.attempts`` 上的鍵。比照 :func:`_schema_retry_attempt_key` 的樣板——
+    同一份 ``run.attempts`` 字典上以字首區分兩種完全不同性質的重試（schema
+    mismatch 是模型輸出形狀問題；provider 失敗是 executor/服務層問題），
+    互不影響、各自的 needs_human 原因也分開回報。
+    """
+
+    return f"provider-retry:{card_id}"
+
+
+def _provider_failure_reroute(
+    run,
+    step,
+    identities: IdentityRegistry,
+    *,
+    failed_job: Mapping[str, object],
+    classification: "provider_outcome.ProviderFailureClassification",
+):
+    """#384：provider 失敗時，在既有 candidate 順序上 re-route，不放寬
+    independence domain（forward-looking 約束：禁 policy-shopping，例如
+    Codex builder 失敗後不得 re-route 成也用 Codex 的 reviewer）。
+
+    複用 :func:`runtime_preflight.evaluate_dispatch_gate`（#369 已把 provider
+    snapshot 接進生產的同一套機制）：把「剛剛觀察到的這次失敗」餵成一筆
+    僅本次呼叫可見、in-memory 的 provider snapshot，讓 gate 依
+    :func:`_workflow_identity_candidates`（既有 domain-filtered 順序，完全未
+    改動）跳過剛失敗的 identity、選下一個候選。刻意不觸碰
+    ``_EXECUTOR_AUTH_CACHE`` 或任何 durable snapshot——這只是這一次 retry
+    決策的暫時性輸入，不影響其他 dispatch 熱路徑（`provider_prober=None`：
+    不觸發任何真實 CLI 探測子行程）。
+
+    只剩失敗的那個 identity 本身合格時，`evaluate_dispatch_gate` 必然又選回
+    它——這不是 bug，是唯一合法選擇（沒有domain-合法的替代候選可換）。
+    """
+
+    from .runtime_preflight import (
+        DEFAULT_PROVIDER_TTL_SECONDS,
+        PROVIDER_EXECUTOR_SENTINEL,
+        ProviderFreshness,
+        RuntimeCapability,
+        evaluate_dispatch_gate,
+        host_environment,
+    )
+
+    candidates = _workflow_identity_candidates(run, step, identities)
+    failed_executor = failed_job.get("executor")
+    observed_at = time.time()
+
+    def _snapshot_lookup(provider_id: str) -> ProviderFreshness | None:
+        if provider_id != failed_executor:
+            # 其餘候選：無快照 -> STALE_SNAPSHOT（non-blocking，直接放行，
+            # 不多探測、不 spawn 任何子行程）。
+            return None
+        return ProviderFreshness(
+            provider_id=provider_id,
+            status="degraded",
+            observed_at=observed_at,
+            ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
+            source="provider-failure-observed",
+            reason=f"{classification.outcome.value}: {classification.reason}",
+        )
+
+    # `_workflow_identity_candidates` 在無合格候選時已 raise ValueError——與
+    # `_select_workflow_identity` 完全相同的既有錯誤行為，這裡刻意不吞掉它
+    # （沒有候選是設定錯誤，不是「這次 retry 剛好找不到人可換」）。
+    decision = evaluate_dispatch_gate(
+        card=step.card,
+        requirements=(RuntimeCapability(kind="provider", name=PROVIDER_EXECUTOR_SENTINEL),),
+        candidates=candidates,
+        environment_for=lambda _identity: host_environment(),
+        snapshot_lookup=_snapshot_lookup,
+        provider_prober=None,
+    )
+    if decision.action == "needs_human":
+        return None
+    return decision.identity
+
+
+def _canonicalize_card_terminal(raw: Mapping[str, object]) -> dict[str, object]:
+    """#261 D1：把 canonical envelope 投影成既有 card 驗證路徑吃得下的形狀。
+
+    canonical envelope 多帶 ``diagnostics``／``gate_evidence`` 兩個欄位，兩者的
+    語意（診斷與 gate 背書）都已經在 :func:`_assert_terminal_gate_consistency`
+    消費完畢；此處只保留 lifecycle 需要的欄位，避免新舊兩種讀法在下游並存。
+    """
+
+    projected = {
+        key: value
+        for key, value in raw.items()
+        if key not in {"diagnostics", "gate_evidence"}
+    }
+    projected["schema_version"] = 1
+    return projected
+
+
+def _terminal_parse_diagnostics(
+    job: Mapping[str, object],
+    *,
+    error: BaseException | None = None,
+) -> terminal_contract.TerminalDiagnostics:
+    """#261 R4／D6：parse 失敗時保留唯讀診斷，但不授予 candidate authority。
+
+    ``observed_head`` 取自 job 上「觀察到的」 subject/dispatch HEAD，與
+    ``WorkflowRun.candidate_head``（已授權）分離；呼叫端不得用它去 bind。
+    """
+
+    reason = str(error) if error is not None else ""
+    if not reason:
+        try:
+            _extract_terminal_json(job.get("log_path"))
+        except ValueError as exc:
+            reason = str(exc)
+        else:
+            reason = "workflow terminal payload did not satisfy the result contract"
+    observed = job.get("subject_head")
+    if not isinstance(observed, str) or not observed:
+        observed = job.get("dispatch_head")
+    return terminal_contract.TerminalDiagnostics(
+        job_id=str(job.get("job_id")),
+        observed_head=observed if isinstance(observed, str) and observed else None,
+        reason=reason,
+        validation_path=getattr(error, "validation_path", "$"),
+    )
+
+
+# #261 R2：會實際跑確定性 gate 的 phase。這些 phase 的 `passed` 必須有 manager 獨立
+# 產生的 gate ledger 背書；plan card 不改動 candidate、不跑 gate，故不在此列。
+# #313：verify 亦不在此列——verification 卡以 review-only 沙箱啟動，
+# `launcher._should_run_gates` 依設計不讓唯讀 reviewer 跑 gate（也不寫 ledger），
+# 要求 ledger 等於讓 verification 卡結構性永不可過；verify 的獨立證據層是
+# deterministic verification report 管線（schema／binding／report 重驗）。
+GATE_LEDGER_REQUIRED_PHASES = frozenset({"build"})
+
+
+def _workflow_step_test_policy(registry, job: Mapping[str, object]) -> str | None:
+    """#307：從 job 綁定的 :class:`WorkflowRun` 撈出目前 card 的 ``execution.test_policy``。
+
+    只用來餵給 :func:`terminal_contract.authorize_terminal` 做 red-required 語意
+    反轉；找不到（``registry`` 未提供、run/card 不存在、欄位缺失等）一律回
+    ``None``——維持既有 fail-closed 行為，不因為查找失敗而放寬任何一般卡的檢查。
+    """
+
+    if registry is None:
+        return None
+    run_id = job.get("workflow_run_id")
+    card_id = job.get("workflow_card")
+    if not isinstance(run_id, str) or not isinstance(card_id, str):
+        return None
+    phase = job.get("workflow_phase")
+    try:
+        run = registry.get_workflow_run(run_id)
+    except Exception:
+        return None
+    for step in getattr(run, "steps", ()):
+        if step.card == card_id and (phase is None or step.phase == phase):
+            return step.test_policy
+    return None
+
+
+def _expected_gate_names_for_test_policy(test_policy: str | None) -> frozenset[str]:
+    """#379：從 plan 的驗收條件（deck compile 依 combo/cards.yaml 綁在每個 build
+    phase 卡片上的 ``test_policy``）機械導出這個 phase 應驗的 gate 名稱集合。
+
+    ``test_policy`` 目前是 workflow lane 裡唯一由 spec/plan（而非 operator 的
+    ``PSC_GATE_CMD_*`` env）決定的驗收訊號：``None``／``"none"`` 代表卡片本就
+    不要求測試（例如 worktree-isolation 這類不動 candidate 程式碼的卡），維持
+    既有 #308 的合法空 ledger 放行語意；其餘合法值（``"red-required"``／
+    ``"focused"``／``"full"``）皆代表這張卡的正確產出需要跑測試，對應 ledger
+    裡 :data:`terminal_contract.RED_REQUIRED_TEST_GATE_NAME`（"pytest"）這個
+    gate 名稱——與 #307 red-required 反轉引用的是同一個名稱來源，不另立一套。
+    """
+
+    if test_policy in (None, "none"):
+        return frozenset()
+    return frozenset({terminal_contract.RED_REQUIRED_TEST_GATE_NAME})
+
+
+def _workflow_acceptance_definition_drifted(
+    job: Mapping[str, object], *, fresh_test_policy: str | None
+) -> bool:
+    """#379：驗收判準（test_policy）pinned-input drift 偵測，比照既有
+    ``_pinned_input_mismatches``／``_review_inputs_drifted`` 的「派工當下 pin
+    一份快照、harvest 時與現況比對」模式。
+
+    ``job["workflow_test_policy"]`` 是 :func:`_dispatch_workflow_card` 派工當下
+    寫入的快照（見該函式對 ``registry.create_job`` 的呼叫）；``fresh_test_policy``
+    是 harvest 當下重新從 registry 現有 ``WorkflowRun.steps`` 讀到的值。兩者不
+    一致代表這張卡的驗收判準在派工之後被動過——無論肇因是 operator／其他行程
+    的合法變更，還是任何讓 builder 自報得以「改判準讓自報成真」的路徑，都必須
+    fail closed，不得沿用新值靜默通過。
+
+    ``job`` 沒有 ``workflow_test_policy`` 欄位（例如非經
+    :func:`_dispatch_workflow_card` 真正派工路徑建立的 legacy／測試 job）時視為
+    「未 pin」，不受本檢查約束——維持既有行為，不因為新增這道保護而誤殺舊資料。
+    """
+
+    pinned = job.get("workflow_test_policy")
+    if pinned is None:
+        return False
+    return pinned != fresh_test_policy
+
+
+def _assert_terminal_gate_consistency(
+    raw: Mapping[str, object],
+    *,
+    job: Mapping[str, object],
+    registry=None,
+) -> None:
+    """#261 R2／D3：矛盾偵測優先於狀態採信。
+
+    manager 讀的是 :mod:`paulsha_cortex.coordinator.gate_ledger` 在模型行程結束
+    **之後**、於 manager 掌控的 wrapper script 內產生的 ledger——不是模型講的話。
+    只要有任何確定性 gate 的實際結果不是 passed，terminal 自稱的 ``passed`` 一律
+    fail closed，並把「哪一個 gate、期望值、實際值」保留在錯誤訊息裡。
+
+    會跑 gate 的 phase（build／verify）若連 ledger 都不存在，代表 wrapper 的 gate
+    階段沒跑完，同樣 fail closed：模型文字、exit code 為 0、無明確錯誤三者皆不構成
+    成功授權。
+
+    #307：``registry`` 為選填——提供時會用來解析目前 card 的 ``test_policy``，讓
+    ``test_policy=red-required``（tdd-red）卡對測試 gate 的語意反轉在
+    :func:`terminal_contract.authorize_terminal` 生效；未提供或解析不到時
+    ``test_policy`` 視為 ``None``，行為與反轉前完全相同。
+
+    #379：同一份 ``test_policy`` 另外餵給 :func:`_expected_gate_names_for_test_policy`
+    導出這個 phase 應驗的 gate 名稱集合，交給 ``authorize_terminal`` 的
+    ``expected_gate_names`` 參數把 #308 的空/局部 ledger 早退收斂成「只有 plan
+    本就沒有應驗 gate 時才放行」。派工當下 pin 進 job 的 ``workflow_test_policy``
+    與這裡重新解析出的現值不一致時（:func:`_workflow_acceptance_definition_drifted`），
+    在呼叫 ``authorize_terminal`` 之前就先 fail closed，不讓「判準本身被動過」
+    偽裝成一次乾淨的 gate 驗證。
+    """
+
+    try:
+        envelope = terminal_contract.validate_envelope(raw)
+    except terminal_contract.TerminalContractError:
+        # 形狀問題交給既有的 per-phase schema 驗證發聲，這裡只負責矛盾偵測，
+        # 不改寫既有錯誤訊息。
+        return
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return
+    test_policy = _workflow_step_test_policy(registry, job)
+    if _workflow_acceptance_definition_drifted(job, fresh_test_policy=test_policy):
+        raise terminal_contract.TerminalContractError(
+            "workflow card 的驗收判準（test_policy）自派工後已變動："
+            f"pinned={job.get('workflow_test_policy')!r}，現值={test_policy!r}；"
+            "不得沿用新值讓 builder 自報靜默通過",
+            reason="workflow-acceptance-definition-drift",
+            validation_path="$.gate_evidence",
+            errors=(
+                {
+                    "pinned_test_policy": job.get("workflow_test_policy"),
+                    "current_test_policy": test_policy,
+                },
+            ),
+        )
+    terminal_contract.authorize_terminal(
+        envelope,
+        ledger_path=terminal_contract.gate_ledger_path(log_path),
+        require_ledger=job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES,
+        test_policy=test_policy,
+        expected_gate_names=_expected_gate_names_for_test_policy(test_policy),
+    )
+
+
+def _extract_terminal_json(log_path: object) -> dict[str, object]:
+    if not isinstance(log_path, str) or not log_path:
+        raise ValueError("workflow terminal log missing")
+    try:
+        content = Path(log_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("workflow terminal log unreadable") from exc
+    lines = content.splitlines()
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        nested = value.get("workflow_evidence")
+        if _is_workflow_terminal_payload(nested):
+            return nested
+        item = value.get("item")
+        if (
+            value.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+        ):
+            parsed = _parse_terminal_json_text(item.get("text"))
+            if parsed is not None:
+                return parsed
+        data = value.get("data")
+        if value.get("type") == "assistant.message" and isinstance(data, dict):
+            parsed = _parse_terminal_json_text(data.get("content"))
+            if parsed is not None:
+                return parsed
+        for key in ("result", "content", "message", "text"):
+            parsed = _parse_terminal_json_text(value.get(key))
+            if parsed is not None:
+                return parsed
+        if _is_workflow_terminal_payload(value):
+            return value
+        # #261 R3：StructuredOutput 有時把 canonical payload 包在白名單外層鍵裡；
+        # 只剝一層，未知形狀不處理（留給下方統一終止）。
+        unwrapped = _unwrap_structured_output(value)
+        if unwrapped is not None:
+            return unwrapped
+    fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```\r?\n?", content)
+    if fenced is not None:
+        parsed = _parse_terminal_json_text(fenced.group("body"))
+        if parsed is not None:
+            return parsed
+    raise ValueError("workflow terminal log has no JSON evidence")
+
+
+def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
+    if not isinstance(value, str):
+        return None
+    fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```", value)
+    if fenced is not None:
+        value = fenced.group("body")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if _is_workflow_terminal_payload(parsed) else None
+
+
+def _is_workflow_terminal_payload(value: object) -> bool:
+    if isinstance(value, dict) and value.get("kind") in {
+        "workflow-verification-result",
+        "workflow-review-result",
+    }:
+        return type(value.get("schema_version")) is int and isinstance(value.get("reports"), list)
+    return (
+        isinstance(value, dict)
+        and type(value.get("schema_version")) is int
+        and ("status" in value or "state" in value)
+        and "candidate" in value
+        and "outputs" in value
+        and (value.get("kind") == "workflow-card" or "slice_id" in value)
+    )
+
+
+def _is_stale_terminalized_failed_job(job: Mapping[str, object]) -> bool:
+    """#260 D6：把「exited 且 exit code 非 0」併入既有 ``status == 'failed'`` 的
+    stale-terminal 判定。
+
+    `resume_workflow_run` 的 replacement 選擇與 `_dispatch_workflow_card` 的
+    `retryable_latest` 過去只認 ``status == "failed"``；repair job 以非 0 exit
+    code 正常終止（``status == "exited"``）時不落在這條件內，導致第一次
+    operator resume 只重新回報 stale job 的 `job-failed`，要再執行一次才
+    dispatch replacement。收斂點刻意選在既有條件式旁新增一個並列分支，不動
+    exited/0 的既有三條路徑（unbound terminal recovery、malformed schema
+    retry、正常 terminalize）。
+    """
+
+    if job.get("status") == "failed":
+        return True
+    return job.get("status") == "exited" and type(job.get("exit_code")) is int and job.get("exit_code") != 0
+
+
+def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
+    """Recognize an immutable, bound card terminal that explicitly requested a stop."""
+
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or job.get("workflow_phase") not in {"plan", "build"}
+    ):
+        return False
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return False
+    if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
+        raw = _canonicalize_card_terminal(raw)
+    required = {
+        "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
+    }
+    phase = job.get("workflow_phase")
+    candidate = raw.get("candidate")
+    outputs = raw.get("outputs")
+    return (
+        set(raw) == required
+        and type(raw.get("schema_version")) is int
+        and raw.get("schema_version") == 1
+        and raw.get("kind") == "workflow-card"
+        and raw.get("status") in {"failed", "needs_human"}
+        and raw.get("run_id") == job.get("workflow_run_id")
+        and raw.get("card_id") == job.get("workflow_card")
+        and (
+            (phase == "plan" and candidate is None)
+            or (
+                phase == "build"
+                and isinstance(candidate, str)
+                and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+            )
+        )
+        and isinstance(outputs, list)
+        and all(isinstance(ref, str) for ref in outputs)
+    )
+
+
+def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
+    """Recognize plan/build terminals that cannot be bound as a passed workflow-card."""
+
+    if _retryable_nonpassing_workflow_terminal(job):
+        return False
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or job.get("workflow_phase") not in {"plan", "build"}
+    ):
+        return False
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return True
+    if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
+        raw = _canonicalize_card_terminal(raw)
+    required = {
+        "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
+    }
+    if (
+        set(raw) != required
+        or type(raw.get("schema_version")) is not int
+        or raw.get("schema_version") != 1
+        or raw.get("kind") != "workflow-card"
+    ):
+        return True
+    if raw.get("status") != "passed":
+        return True
+    candidate = raw.get("candidate")
+    if job.get("workflow_phase") == "build":
+        return (
+            not isinstance(candidate, str)
+            or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        )
+    return candidate is not None
+
+
+def _workflow_review_evidence_state(
+    job: Mapping[str, object],
+    *,
+    run,
+    coordinator_root: str | Path,
+) -> str | None:
+    """Return the exact immutable review state eligible for operator recovery."""
+
+    card = job.get("workflow_card")
+    if (
+        job.get("workflow_run_id") != run.run_id
+        or job.get("workflow_claim_key") != run.claim_key
+        or job.get("workflow_repo") != run.repo
+        or job.get("source_revision") != run.source_revision
+        or not isinstance(card, str)
+        or not any(
+            step.phase == "review"
+            and step.card == card
+            and step.gate_result != "passed"
+            for step in run.steps
+        )
+        or job.get("workflow_phase") != "review"
+        or job.get("persona") != "reviewer"
+        or job.get("kind") != "review"
+        or job.get("subject_head") != run.candidate_head
+        or job.get("workflow_evidence") is None
+        or job.get("status") != "exited"
+        or job.get("exit_code") != 0
+    ):
+        return None
+    try:
+        evidence, _outputs, _path, _digest = _read_job_workflow_evidence(
+            job,
+            run=run,
+            coordinator_root=coordinator_root,
+        )
+        payload = dict(evidence)
+        payload.pop("outputs", None)
+        evaluation = foreign_review.validate_gate_evaluation(payload)
+    except (OSError, ValueError):
+        return None
+    state = evaluation.get("state")
+    if (
+        state not in {"passed", "rejected"}
+        or evaluation.get("slice_id") != f"{run.run_id}-{card}"
+        or evaluation.get("candidate") != run.candidate_head
+        or evaluation.get("reviewer_job_id") != job.get("job_id")
+    ):
+        return None
+    return str(state)
+
+
+def _is_rejected_workflow_review_evidence(
+    job: Mapping[str, object],
+    *,
+    run,
+    coordinator_root: str | Path,
+) -> bool:
+    """Recognize an exact immutable rejected review for explicit fresh review only."""
+
+    return _workflow_review_evidence_state(
+        job,
+        run=run,
+        coordinator_root=coordinator_root,
+    ) == "rejected"
+
+
+def _is_exact_legacy_agy_recovery(
+    job: Mapping[str, object],
+    *,
+    run,
+    step,
+    identities: IdentityRegistry,
+) -> bool:
+    """Classify the one legacy planning-only Agy reviewer terminal eligible for operator recovery."""
+
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or step.persona != "reviewer"
+        or step.phase not in {"verify", "review"}
+        or job.get("persona") != "reviewer"
+        or job.get("kind") != "review"
+        or job.get("workflow_run_id") != run.run_id
+        or job.get("workflow_claim_key") != run.claim_key
+        or job.get("workflow_repo") != run.repo
+        or job.get("source_revision") != run.source_revision
+        or job.get("workflow_card") != step.card
+        or job.get("workflow_phase") != step.phase
+        or job.get("subject_head") != run.candidate_head
+        or job.get("executor") != "agy"
+        or job.get("model_id") != AGY_MODEL_ID
+        or job.get("independence_domain") != AGY_DOMAIN
+    ):
+        return False
+    worktree = job.get("worktree")
+    repo_root = job.get("workflow_repo_root")
+    input_root = job.get("workflow_input_root")
+    if (
+        not isinstance(worktree, str)
+        or not Path(worktree).is_absolute()
+        or Path(worktree).resolve(strict=False) != Path(worktree)
+        or repo_root != worktree
+        or input_root != worktree
+    ):
+        return False
+    identity = identities.get("agy", AGY_MODEL_ID)
+    if (
+        identity is None
+        or identity.independence_domain != AGY_DOMAIN
+        or identity.capabilities != ("planning",)
+        or identity.live_probe != AGY_LIVE_PROBE
+    ):
+        return False
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return False
+    if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
+        raw = _canonicalize_card_terminal(raw)
+    required = {
+        "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
+    }
+    outputs = raw.get("outputs")
+    declared_outputs = job.get("workflow_outputs")
+    return (
+        set(raw) == required
+        and raw.get("schema_version") == 1
+        and raw.get("kind") == "workflow-card"
+        and raw.get("status") == "passed"
+        and raw.get("run_id") == run.run_id
+        and raw.get("card_id") == step.card
+        and raw.get("candidate") == run.candidate_head
+        and isinstance(run.candidate_head, str)
+        and verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is not None
+        and isinstance(outputs, list)
+        and all(
+            isinstance(ref, str)
+            and ref
+            and not Path(ref).is_absolute()
+            and ".." not in Path(ref).parts
+            and Path(ref).as_posix() == ref
+            for ref in outputs
+        )
+        and isinstance(declared_outputs, list)
+        and declared_outputs == list(step.outputs)
+        and all(
+            any(fnmatch.fnmatch(ref, pattern) for pattern in declared_outputs)
+            for ref in outputs
+        )
+        and all(
+            any(fnmatch.fnmatch(ref, pattern) for ref in outputs)
+            for pattern in declared_outputs
+        )
+    )
+
+
+def _is_exact_reviewer_terminal_recovery(
+    registry,
+    job: Mapping[str, object],
+    *,
+    run,
+    step,
+    identities: IdentityRegistry,
+    coordinator_root: str | Path,
+) -> bool:
+    """Classify an exact reviewer with no payload for explicit operator retry only."""
+
+    repo_root_value = job.get("workflow_repo_root")
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or step.persona != "reviewer"
+        or step.phase not in {"verify", "review"}
+        or job.get("persona") != "reviewer"
+        or job.get("kind") != "review"
+        or job.get("workflow_run_id") != run.run_id
+        or job.get("workflow_claim_key") != run.claim_key
+        or job.get("workflow_repo") != run.repo
+        or job.get("source_revision") != run.source_revision
+        or job.get("workflow_card") != step.card
+        or job.get("workflow_phase") != step.phase
+        or job.get("subject_head") != run.candidate_head
+        or job.get("workflow_outputs") != list(step.outputs)
+        or not isinstance(repo_root_value, str)
+    ):
+        return False
+    executor = job.get("executor")
+    model_id = job.get("model_id")
+    if not isinstance(executor, str) or not isinstance(model_id, str):
+        return False
+    identity = identities.get(executor, model_id)
+    if (
+        identity is None
+        or "review" not in identity.capabilities
+        or identity.independence_domain != job.get("independence_domain")
+    ):
+        return False
+    try:
+        builder, _ = _review_builder_job(
+            registry,
+            run=run,
+            builder_job_id=job.get("workflow_builder_job_id"),
+            candidate=str(run.candidate_head),
+            identities=identities,
+        )
+        sandbox = _reviewer_sandbox_path(job, coordinator_root)
+        checkout = _reviewer_checkout_path(
+            job,
+            coordinator_root,
+            allow_legacy_claude_layout=True,
+        )
+    except ValueError:
+        return False
+    builder_worktree = builder.get("worktree")
+    if (
+        not isinstance(builder_worktree, str)
+        or Path(repo_root_value).resolve() != Path(builder_worktree).resolve()
+    ):
+        return False
+    expected = job.get("workflow_sandbox_hash")
+    candidate_root = Path(repo_root_value)
+    try:
+        candidate_unchanged = (
+            isinstance(expected, str)
+            and len(expected) == 64
+            and not candidate_root.is_symlink()
+            and candidate_root.is_dir()
+            and planning_runtime._tree_snapshot(candidate_root) == expected
+        )
+    except (OSError, PermissionError):
+        return False
+    if (
+        not candidate_unchanged
+        or sandbox == candidate_root
+        or checkout == candidate_root
+        or builder.get("independence_domain") == identity.independence_domain
+    ):
+        return False
+    log_value = job.get("log_path")
+    job_id = job.get("job_id")
+    if not isinstance(log_value, str) or not isinstance(job_id, str):
+        return False
+    log = Path(log_value)
+    expected_log_root = Path(coordinator_root).resolve() / "logs" / "workflow"
+    if (
+        log.is_symlink()
+        or not log.is_file()
+        or log.name != f"{job_id}.jsonl"
+        or log.resolve().parent != expected_log_root
+    ):
+        return False
+    try:
+        log.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    try:
+        _extract_terminal_json(str(log))
+    except ValueError:
+        return True
+    return False
+
+
+def _canonical_workflow_artifacts(
+    rows: object,
+    *,
+    repo_root: Path,
+    baseline_by_ref: Mapping[str, str],
+) -> list[dict[str, str | None]]:
+    if not isinstance(rows, list):
+        raise ValueError("workflow terminal outputs must be a list")
+    artifacts: list[dict[str, str]] = []
+    for ref in rows:
+        if not isinstance(ref, str) or not ref:
+            raise ValueError("workflow terminal output path invalid")
+        relative = Path(ref)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("workflow terminal output escapes repo")
+        unresolved = repo_root / relative
+        cursor = repo_root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow terminal output symlink rejected")
+        resolved = unresolved.resolve()
+        resolved.relative_to(repo_root)
+        if not resolved.is_file():
+            raise ValueError("workflow terminal output missing")
+        artifacts.append(
+            {
+                "path": ref,
+                "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+                "baseline_sha256": baseline_by_ref.get(ref),
+            }
+        )
+    return artifacts
+
+
+def _workflow_output_baseline(repo_root: Path, patterns: tuple[str, ...]) -> tuple[dict[str, str], ...]:
+    rows: dict[str, str] = {}
+    for pattern in patterns:
+        relative_pattern = Path(pattern)
+        if relative_pattern.is_absolute() or ".." in relative_pattern.parts:
+            raise ValueError("workflow manifest output pattern escapes repo")
+        static_parts: list[str] = []
+        for part in relative_pattern.parts:
+            if any(marker in part for marker in ("*", "?", "[")):
+                break
+            static_parts.append(part)
+        static_root = repo_root.joinpath(*static_parts)
+        cursor = repo_root
+        for part in static_parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow output baseline symlink rejected")
+        if len(static_parts) == len(relative_pattern.parts):
+            candidates = (static_root,)
+        elif static_root.is_dir():
+            candidates = tuple(static_root.rglob("*"))
+        else:
+            candidates = ()
+        for unresolved in candidates:
+            relative = unresolved.relative_to(repo_root).as_posix()
+            cursor = repo_root
+            for part in Path(relative).parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise ValueError("workflow output baseline symlink rejected")
+            resolved = unresolved.resolve()
+            resolved.relative_to(repo_root)
+            if resolved.is_file():
+                rows[relative] = _sha256_path(resolved)
+    return tuple({"path": path, "sha256": rows[path]} for path in sorted(rows))
+
+
+def _effective_workflow_inputs(run, step) -> tuple[str, ...]:
+    """Include earlier same-phase inputs so legacy pending cards retain bounded context."""
+    patterns: list[str] = []
+    for item in run.steps:
+        if item.phase == step.phase:
+            for pattern in item.inputs:
+                if pattern not in patterns:
+                    patterns.append(pattern)
+        if item is step or item.card == step.card:
+            break
+    return tuple(patterns)
+
+
+def _reviewer_input_patterns(run, effective_inputs: tuple[str, ...]) -> tuple[str, ...]:
+    """Ensure every frozen planning authority ref is proven into the reviewer's
+    input snapshot even when the review card itself declares no ``requires``
+    (the deck default): #219 closes the gap where a reviewer job could
+    dispatch and PASS a candidate without ever seeing the frozen plan.
+    """
+    missing = tuple(
+        dict.fromkeys(
+            item.ref
+            for item in run.planning_authority
+            if not any(fnmatch.fnmatch(item.ref, pattern) for pattern in effective_inputs)
+        )
+    )
+    return effective_inputs + missing
+
+
+def _safe_input_matches(root: Path, pattern: str) -> tuple[Path, ...]:
+    relative = Path(pattern)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("workflow manifest input pattern escapes repo")
+    matches: list[Path] = []
+    for unresolved in root.glob(pattern):
+        ref = unresolved.relative_to(root)
+        cursor = root
+        for part in ref.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow input symlink rejected")
+        resolved = unresolved.resolve()
+        resolved.relative_to(root)
+        if resolved.is_file():
+            matches.append(resolved)
+    return tuple(sorted(matches, key=lambda item: item.relative_to(root).as_posix()))
+
+
+def _write_workflow_input_content(
+    *,
+    coordinator_root: Path,
+    run,
+    ref: str,
+    digest: str,
+    content: str,
+) -> str:
+    envelope = {
+        "schema_version": 1,
+        "kind": "workflow-input-content",
+        "run_id": run.run_id,
+        "work_id": run.work_id,
+        "repo": run.repo,
+        "source_revision": run.source_revision,
+        "path": ref,
+        "sha256": digest,
+        "content": content,
+    }
+    encoded = (
+        json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    locator_digest = hashlib.sha256(encoded).hexdigest()
+    path = coordinator_root.resolve() / "evidence" / "workflow-inputs" / f"{locator_digest}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if path.is_symlink() or path.read_bytes() != encoded or path.stat().st_mode & 0o222:
+            raise ValueError("workflow input content-address conflict")
+    else:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(path, 0o444)
+        fsync_directory(path.parent)
+    return str(path)
+
+
+_CHECKBOX_VOLATILE_PLAN_BASENAMES = frozenset({"tasks.md", "todo.md"})
+_CHECKBOX_RE = re.compile(r"^(\s*(?:[-+*]|\d+[.)])\s+)\[[xX]\]", re.M)
+
+
+def _canonical_workflow_input_bytes(data: bytes) -> bytes:
+    """Canonicalize UTF-8 text so authority hashes are checkout-platform stable."""
+    text = data.decode("utf-8")
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def _authority_hash_matches(data: bytes, expected: str) -> bool:
+    canonical = _canonical_workflow_input_bytes(data)
+    return expected in {
+        hashlib.sha256(data).hexdigest(),
+        hashlib.sha256(canonical).hexdigest(),
+        hashlib.sha256(canonical.replace(b"\n", b"\r\n")).hexdigest(),
+    }
+
+
+def _checkbox_insensitive_equal(baseline: bytes, current: bytes) -> bool:
+    """#310：卡片契約要求 builder 勾選 tasks/todo 的 checkbox；只有 checkbox
+    狀態差異（``- [x]``→``- [ ]`` 正規化後相等）視為未漂移。任何其他 byte 差異
+    仍屬 drift。"""
+    try:
+        base_text = _canonical_workflow_input_bytes(baseline).decode("utf-8")
+        cur_text = _canonical_workflow_input_bytes(current).decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    normalize = lambda text: _CHECKBOX_RE.sub(lambda m: m.group(1) + "[ ]", text)
+    return normalize(base_text) == normalize(cur_text)
+
+
+def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict[str, str]:
+    """#310 補遺：reviewer 的 frozen authority 驗證沿用 checkbox-insensitive 容忍。
+
+    tasks/todo（kind=plan）在候選 worktree 的 checkbox 勾選不視為 drift；容忍
+    成立時以候選內容的實際 hash 作為 pinned 期望值——reviewer 收到的 input
+    snapshot 就是這份內容，hash 必須對得上實檔。其他差異維持 baseline，使
+    `verify_authority_in_input_snapshot` 照舊 fail-closed。baseline bytes 取自
+    operator_root 的同 ref 檔案，且必須先驗證其 hash 等於 authority baseline。
+    """
+    operator_root = Path(run.workspace_root).resolve()
+    mapping: dict[str, str] = {}
+    for item in run.planning_authority:
+        expected = item.baseline_sha256
+        candidate_matches = _safe_input_matches(candidate_root, item.ref)
+        baseline_matches = _safe_input_matches(operator_root, item.ref)
+        if len(candidate_matches) == 1 and len(baseline_matches) == 1:
+            candidate_data = _canonical_workflow_input_bytes(candidate_matches[0].read_bytes())
+            baseline_raw = baseline_matches[0].read_bytes()
+            baseline_data = _canonical_workflow_input_bytes(baseline_raw)
+            digest = hashlib.sha256(candidate_data).hexdigest()
+            if _authority_hash_matches(baseline_raw, expected) and (
+                baseline_data == candidate_data
+                or (
+                    item.kind == "plan"
+                    and Path(item.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+                    and _checkbox_insensitive_equal(baseline_data, candidate_data)
+                )
+            ):
+                expected = digest
+        mapping[item.ref] = expected
+    return mapping
+
+
+def _workflow_input_snapshot(
+    *,
+    run,
+    repo_root: Path,
+    patterns: tuple[str, ...],
+    coordinator_root: str | Path,
+) -> tuple[dict[str, str], ...]:
+    root = repo_root.resolve()
+    operator_root = Path(run.workspace_root).resolve()
+    authority = {item.ref: item for item in run.planning_authority}
+    seeds: dict[str, bytes] = {}
+
+    for pattern in patterns:
+        if _safe_input_matches(root, pattern):
+            continue
+        authority_refs = sorted(ref for ref in authority if fnmatch.fnmatch(ref, pattern))
+        if not authority_refs:
+            raise ValueError(f"workflow declared input missing: {pattern}")
+        for ref in authority_refs:
+            source_matches = _safe_input_matches(operator_root, ref)
+            if len(source_matches) != 1:
+                archived_ref = _planning_artifact_relative_path_after_archive(
+                    run,
+                    workspace=operator_root,
+                    ref=ref,
+                    digest=authority[ref].baseline_sha256,
+                ).as_posix()
+                if archived_ref != ref:
+                    source_matches = _safe_input_matches(operator_root, archived_ref)
+            if len(source_matches) != 1:
+                raise ValueError("workflow planning input missing")
+            source = source_matches[0]
+            source_data = source.read_bytes()
+            data = _canonical_workflow_input_bytes(source_data)
+            if not _authority_hash_matches(source_data, authority[ref].baseline_sha256):
+                raise ValueError("workflow planning input drift")
+            seeds[ref] = data
+
+    for ref, data in seeds.items():
+        destination = root / ref
+        parent = root
+        for part in Path(ref).parent.parts:
+            child = parent / part
+            if child.is_symlink():
+                raise ValueError("workflow input seed parent symlink rejected")
+            child.mkdir(exist_ok=True)
+            if child.is_symlink() or not child.is_dir():
+                raise ValueError("workflow input seed parent invalid")
+            child.resolve().relative_to(root)
+            parent = child
+        if destination.is_symlink():
+            raise ValueError("workflow input seed symlink rejected")
+        if destination.exists():
+            if (
+                not destination.is_file()
+                or _canonical_workflow_input_bytes(destination.read_bytes()) != data
+            ):
+                raise ValueError("workflow input seed conflict")
+            continue
+        fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    rows: list[dict[str, str]] = []
+    total_bytes = 0
+    for pattern in patterns:
+        matches = _safe_input_matches(root, pattern)
+        if not matches:
+            raise ValueError(f"workflow declared input missing: {pattern}")
+        for resolved in matches:
+            ref = resolved.relative_to(root).as_posix()
+            try:
+                data = _canonical_workflow_input_bytes(resolved.read_bytes())
+            except UnicodeDecodeError as exc:
+                raise ValueError("workflow input must be UTF-8") from exc
+            digest = hashlib.sha256(data).hexdigest()
+            bound = authority.get(ref)
+            if bound is not None and digest != bound.baseline_sha256:
+                # #310：tasks/todo（kind=plan）的 checkbox 勾選是卡片契約的既定
+                # 行為，不得視為 drift。baseline bytes 取自 operator_root 的同
+                # ref 檔案，且必須先驗證其 hash 等於 authority baseline，才可
+                # 作為 checkbox-insensitive 比對的基準；其餘任何差異 fail-closed。
+                tolerated = False
+                baseline_matches = _safe_input_matches(operator_root, ref)
+                if len(baseline_matches) == 1:
+                    baseline_raw = baseline_matches[0].read_bytes()
+                    tolerated = (
+                        _authority_hash_matches(baseline_raw, bound.baseline_sha256)
+                        and _canonical_workflow_input_bytes(baseline_raw) == data
+                    )
+                if (
+                    not tolerated
+                    and
+                    bound.kind == "plan"
+                    and Path(ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+                ):
+                    if len(baseline_matches) == 1:
+                        baseline_data = _canonical_workflow_input_bytes(
+                            baseline_matches[0].read_bytes()
+                        )
+                        if (
+                            _authority_hash_matches(baseline_raw, bound.baseline_sha256)
+                            and _checkbox_insensitive_equal(baseline_data, data)
+                        ):
+                            tolerated = True
+                if not tolerated:
+                    raise ValueError(
+                        f"workflow planning input drift: {ref} "
+                        f"(expected={bound.baseline_sha256}, observed={digest})"
+                    )
+            pattern_has_authority = any(
+                fnmatch.fnmatch(candidate_ref, pattern) for candidate_ref in authority
+            )
+            if pattern_has_authority and bound is None:
+                raise ValueError("workflow planning input lacks authority")
+            content = data.decode("utf-8")
+            total_bytes += len(data)
+            if total_bytes > 131072:
+                raise ValueError("workflow input envelope exceeds bound")
+            content_ref = _write_workflow_input_content(
+                coordinator_root=Path(coordinator_root),
+                run=run,
+                ref=ref,
+                digest=digest,
+                content=content,
+            )
+            rows.append(
+                {
+                    "pattern": pattern,
+                    "path": ref,
+                    "sha256": digest,
+                    "authority": "planning-authority" if bound is not None else "worktree",
+                    "content_ref": content_ref,
+                }
+            )
+    return tuple(rows)
+
+
+def _read_workflow_input_content(
+    row: Mapping[str, object],
+    *,
+    run=None,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, object]:
+    raw_ref = row.get("content_ref")
+    if not isinstance(raw_ref, str):
+        raise ValueError("workflow input content reference invalid")
+    content_path = Path(raw_ref)
+    if not content_path.is_absolute() or content_path.is_symlink() or not content_path.is_file():
+        raise ValueError("workflow input content reference missing")
+    if content_path.stat().st_mode & 0o222:
+        raise ValueError("workflow input content reference mutable")
+    resolved = content_path.resolve()
+    if coordinator_root is not None:
+        expected_root = Path(coordinator_root).resolve() / "evidence" / "workflow-inputs"
+        if resolved.parent != expected_root:
+            raise ValueError("workflow input content reference outside evidence root")
+    encoded = resolved.read_bytes()
+    if resolved.suffix != ".json" or hashlib.sha256(encoded).hexdigest() != resolved.stem:
+        raise ValueError("workflow input content locator drift")
+    try:
+        envelope = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("workflow input content reference invalid") from exc
+    required = {
+        "schema_version", "kind", "run_id", "work_id", "repo", "source_revision",
+        "path", "sha256", "content",
+    }
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != required
+        or envelope.get("schema_version") != 1
+        or envelope.get("kind") != "workflow-input-content"
+        or envelope.get("path") != row.get("path")
+        or envelope.get("sha256") != row.get("sha256")
+        or not isinstance(envelope.get("content"), str)
+        or hashlib.sha256(envelope["content"].encode("utf-8")).hexdigest() != row.get("sha256")
+    ):
+        raise ValueError("workflow input content reference drift")
+    if run is not None and (
+        envelope.get("run_id") != run.run_id
+        or envelope.get("work_id") != run.work_id
+        or envelope.get("repo") != run.repo
+        or envelope.get("source_revision") != run.source_revision
+    ):
+        raise ValueError("workflow input content authority drift")
+    return envelope
+
+
+def _validate_workflow_input_snapshot(
+    repo_root: Path,
+    rows: object,
+    *,
+    coordinator_root: str | Path | None = None,
+) -> None:
+    if not isinstance(rows, list):
+        raise ValueError("workflow input snapshot missing")
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {
+            "pattern", "path", "sha256", "authority", "content_ref"
+        }:
+            raise ValueError("workflow input snapshot invalid")
+        ref = Path(str(row["path"]))
+        if ref.is_absolute() or ".." in ref.parts:
+            raise ValueError("workflow input snapshot path invalid")
+        target = repo_root / ref
+        if target.is_symlink() or not target.is_file():
+            raise ValueError("workflow input snapshot file missing")
+        try:
+            target_data = _canonical_workflow_input_bytes(target.read_bytes())
+        except UnicodeDecodeError as exc:
+            raise ValueError("workflow input must be UTF-8") from exc
+        if hashlib.sha256(target_data).hexdigest() != row["sha256"]:
+            raise ValueError("workflow input snapshot hash drift")
+        _read_workflow_input_content(row, coordinator_root=coordinator_root)
+
+
+def _report_binding(content: bytes) -> Mapping[str, object]:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("workflow report must be UTF-8") from exc
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("workflow report binding frontmatter missing")
+    try:
+        closing = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
+    except StopIteration as exc:
+        raise ValueError("workflow report binding frontmatter missing") from exc
+    try:
+        payload = safe_load("\n".join(lines[1:closing]))
+    except YAMLError as exc:
+        raise ValueError("workflow report binding frontmatter invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("workflow report binding frontmatter invalid")
+    return payload
+
+
+def _inline_terminal_reports(
+    value: object,
+    *,
+    phase: str,
+    declared_outputs: list[str],
+) -> tuple[tuple[str, str], ...]:
+    governed_root = {
+        "verify": ("reports", "verify"),
+        "review": ("reports", "review"),
+    }.get(phase)
+    if governed_root is None:
+        raise ValueError("workflow terminal report phase invalid")
+    for pattern in declared_outputs:
+        relative_pattern = Path(pattern)
+        if (
+            relative_pattern.is_absolute()
+            or ".." in relative_pattern.parts
+            or relative_pattern.parts[:2] != governed_root
+            or relative_pattern.suffix != ".md"
+        ):
+            raise ValueError("workflow terminal report manifest root invalid")
+    if not isinstance(value, list) or not value:
+        raise ValueError("workflow terminal reports must be a non-empty list")
+    reports: list[tuple[str, str]] = []
+    refs: set[str] = set()
+    total = 0
+    for index, row in enumerate(value):
+        if not isinstance(row, dict) or set(row) != {"path", "body"}:
+            raise ValueError(f"workflow terminal reports[{index}] schema invalid")
+        ref = row.get("path")
+        body = row.get("body")
+        relative = Path(ref) if isinstance(ref, str) else Path()
+        if (
+            not isinstance(ref, str)
+            or not ref
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() != ref
+            or relative.parts[:2] != governed_root
+            or relative.suffix != ".md"
+            or ref in refs
+            or not isinstance(body, str)
+            or not body.strip()
+        ):
+            raise ValueError(f"workflow terminal reports[{index}] invalid")
+        encoded = body.encode("utf-8")
+        total += len(encoded)
+        if total > WORKFLOW_REPORT_MAX_BYTES:
+            raise ValueError("workflow terminal report content exceeds bound")
+        refs.add(ref)
+        reports.append((ref, body))
+    if any(
+        not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_outputs)
+        for ref, _body in reports
+    ):
+        raise ValueError("workflow terminal report is outside manifest refs")
+    if any(
+        not any(fnmatch.fnmatch(ref, pattern) for ref, _body in reports)
+        for pattern in declared_outputs
+    ):
+        raise ValueError("workflow terminal report is incomplete for manifest refs")
+    return tuple(reports)
+
+
+def _manager_report_content(
+    *,
+    job: Mapping[str, object],
+    candidate: str,
+    body: str,
+) -> bytes:
+    binding = {
+        "workflow_run_id": job.get("workflow_run_id"),
+        "workflow_card_id": job.get("workflow_card"),
+        "workflow_job_id": job.get("job_id"),
+        "candidate": candidate,
+    }
+    frontmatter = "\n".join(
+        f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in binding.items()
+    )
+    normalized_body = body.rstrip() + "\n"
+    return f"---\n{frontmatter}\n---\n{normalized_body}".encode("utf-8")
+
+
+class WorkflowReportPublicationDrift(RuntimeError):
+    """A report publication journal cannot be safely committed or rolled back."""
+
+
+class _WorkflowReportPublicationTransaction:
+    """Crash-consistent report publication around canonical evidence binding."""
+
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        coordinator_root: Path,
+        job_id: str,
+    ) -> None:
+        self.repo_root = repo_root.resolve()
+        self.coordinator_root = coordinator_root.resolve()
+        self.job_id = job_id
+        name = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
+        self.journal_path = self.coordinator_root / "workflow-report-transactions" / f"{name}.json"
+        self.operations: list[dict[str, object]] = []
+        self.expected_evidence: dict[str, str] | None = None
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "workflow-report-publication-intent",
+            "job_id": self.job_id,
+            "repo_root": str(self.repo_root),
+            "operations": self.operations,
+            "expected_evidence": self.expected_evidence,
+        }
+
+    def _persist(self) -> None:
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        content = (json.dumps(self._payload(), ensure_ascii=False, sort_keys=True) + "\n").encode()
+        fd, tmp_name = tempfile.mkstemp(dir=self.journal_path.parent, suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.journal_path)
+            fsync_directory(self.journal_path.parent)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _content(operation: Mapping[str, object], field: str) -> bytes:
+        encoded = operation.get(field)
+        if not isinstance(encoded, str):
+            raise WorkflowReportPublicationDrift("workflow report transaction content invalid")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (TypeError, ValueError) as exc:
+            raise WorkflowReportPublicationDrift(
+                "workflow report transaction content invalid"
+            ) from exc
+
+    @staticmethod
+    def _guard_path(path: Path, root: Path) -> None:
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise WorkflowReportPublicationDrift(
+                "workflow report transaction path escapes repo"
+            ) from exc
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction symlink rejected"
+                )
+
+    def publish(
+        self,
+        reports: tuple[tuple[str, str], ...],
+        *,
+        job: Mapping[str, object],
+        candidate: str,
+    ) -> None:
+        baseline_rows = job.get("workflow_output_baseline")
+        if not isinstance(baseline_rows, list):
+            raise ValueError("workflow job output baseline missing")
+        baseline_by_ref = {
+            str(row["path"]): str(row["sha256"])
+            for row in baseline_rows
+            if isinstance(row, dict)
+            and set(row) == {"path", "sha256"}
+            and isinstance(row.get("path"), str)
+            and isinstance(row.get("sha256"), str)
+        }
+        if len(baseline_by_ref) != len(baseline_rows):
+            raise ValueError("workflow job output baseline invalid")
+        operations: list[dict[str, object]] = []
+        for ref, body in reports:
+            path = self.repo_root / ref
+            self._guard_path(path, self.repo_root)
+            existed = path.is_file()
+            before = path.read_bytes() if existed else None
+            if before is not None and len(before) > WORKFLOW_REPORT_MAX_BYTES:
+                raise ValueError(f"workflow report baseline exceeds bound: {ref}")
+            before_hash = hashlib.sha256(before).hexdigest() if before is not None else None
+            baseline_hash = baseline_by_ref.get(ref)
+            if (baseline_hash is None and existed) or (
+                baseline_hash is not None and before_hash != baseline_hash
+            ):
+                raise ValueError(f"workflow report baseline CAS conflict: {ref}")
+            after = _manager_report_content(job=job, candidate=candidate, body=body)
+            operations.append(
+                {
+                    "path": str(path),
+                    "before_exists": existed,
+                    "before_hash": before_hash,
+                    "before_content": base64.b64encode(before).decode("ascii") if before is not None else None,
+                    "before_mode": path.stat().st_mode & 0o7777 if existed else None,
+                    "after_hash": hashlib.sha256(after).hexdigest(),
+                    "after_content": base64.b64encode(after).decode("ascii"),
+                    "after_mode": 0o644,
+                }
+            )
+        self.operations = operations
+        self._persist()
+        try:
+            self._apply(forward=True)
+        except BaseException:
+            self.rollback()
+            raise
+
+    def bind_expected_evidence(self, locator: Mapping[str, object]) -> None:
+        if (
+            set(locator) != {"kind", "path", "hash"}
+            or not all(isinstance(locator.get(key), str) for key in ("kind", "path", "hash"))
+        ):
+            raise ValueError("workflow report expected evidence invalid")
+        self.expected_evidence = {key: str(locator[key]) for key in ("kind", "path", "hash")}
+        self._persist()
+
+    def _apply(self, *, forward: bool) -> None:
+        rows = self.operations if forward else list(reversed(self.operations))
+        for operation in rows:
+            path = Path(str(operation["path"]))
+            self._guard_path(path, self.repo_root)
+            current_hash = _sha256_path(path) if path.is_file() else None
+            before_hash = operation.get("before_hash")
+            after_hash = operation.get("after_hash")
+            wanted_hash = after_hash if forward else before_hash
+            tolerated_hash = before_hash if forward else after_hash
+            if current_hash == wanted_hash:
+                continue
+            if current_hash != tolerated_hash:
+                raise WorkflowReportPublicationDrift(
+                    f"workflow report publication drift: {path}"
+                )
+            if not forward and not bool(operation["before_exists"]):
+                path.unlink(missing_ok=True)
+                if path.parent.exists():
+                    fsync_directory(path.parent)
+                continue
+            content_field = "after_content" if forward else "before_content"
+            mode_field = "after_mode" if forward else "before_mode"
+            content = self._content(operation, content_field)
+            mode = operation.get(mode_field)
+            if not isinstance(mode, int):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction mode invalid"
+                )
+            _PlanningPublicationTransaction._write_atomic(
+                path,
+                content,
+                mode,
+                expect_absent=current_hash is None,
+                expected_hash=current_hash,
+            )
+
+    def rollback(self) -> None:
+        if not self.journal_path.exists():
+            return
+        self._apply(forward=False)
+        self.commit()
+
+    def commit(self) -> None:
+        self.journal_path.unlink(missing_ok=True)
+        if self.journal_path.parent.exists():
+            fsync_directory(self.journal_path.parent)
+
+    @classmethod
+    def reconcile(
+        cls,
+        *,
+        registry,
+        job: Mapping[str, object],
+        coordinator_root: Path,
+    ) -> None:
+        repo_root_value = job.get("workflow_repo_root")
+        job_id = job.get("job_id")
+        if not isinstance(repo_root_value, str) or not isinstance(job_id, str):
+            return
+        transaction = cls(
+            repo_root=Path(repo_root_value),
+            coordinator_root=coordinator_root,
+            job_id=job_id,
+        )
+        path = transaction.journal_path
+        if path.is_symlink():
+            raise WorkflowReportPublicationDrift("workflow report transaction symlink rejected")
+        if not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WorkflowReportPublicationDrift(
+                "workflow report transaction unreadable"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {
+                "schema_version", "kind", "job_id", "repo_root", "operations", "expected_evidence",
+            }
+            or payload.get("schema_version") != 1
+            or payload.get("kind") != "workflow-report-publication-intent"
+            or payload.get("job_id") != job_id
+            or payload.get("repo_root") != str(Path(repo_root_value).resolve())
+            or not isinstance(payload.get("operations"), list)
+        ):
+            raise WorkflowReportPublicationDrift("workflow report transaction invalid")
+        phase_root = {
+            "verify": ("reports", "verify"),
+            "review": ("reports", "review"),
+        }.get(job.get("workflow_phase"))
+        required_operation = {
+            "path", "before_exists", "before_hash", "before_content", "before_mode",
+            "after_hash", "after_content", "after_mode",
+        }
+        operations: list[dict[str, object]] = []
+        operation_paths: set[Path] = set()
+        for row in payload["operations"]:
+            if not isinstance(row, dict) or set(row) != required_operation or phase_root is None:
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                )
+            operation = dict(row)
+            operation_path = Path(str(operation["path"]))
+            if (
+                not operation_path.is_absolute()
+                or operation_path != operation_path.resolve(strict=False)
+            ):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                )
+            try:
+                relative = operation_path.relative_to(transaction.repo_root)
+            except ValueError as exc:
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                ) from exc
+            if (
+                ".." in relative.parts
+                or relative.parts[:2] != phase_root
+                or relative.suffix != ".md"
+                or operation_path in operation_paths
+            ):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                )
+            operation_paths.add(operation_path)
+            if not isinstance(operation.get("before_exists"), bool):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                )
+            before = operation.get("before_content")
+            before_hash = operation.get("before_hash")
+            before_mode = operation.get("before_mode")
+            if operation["before_exists"]:
+                before_bytes = transaction._content(operation, "before_content")
+                if (
+                    not isinstance(before_hash, str)
+                    or hashlib.sha256(before_bytes).hexdigest() != before_hash
+                    or not isinstance(before_mode, int)
+                ):
+                    raise WorkflowReportPublicationDrift(
+                        "workflow report transaction baseline invalid"
+                    )
+            elif any(value is not None for value in (before, before_hash, before_mode)):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction baseline invalid"
+                )
+            after_bytes = transaction._content(operation, "after_content")
+            if (
+                not isinstance(operation.get("after_hash"), str)
+                or hashlib.sha256(after_bytes).hexdigest() != operation["after_hash"]
+                or not isinstance(operation.get("after_mode"), int)
+            ):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction target invalid"
+                )
+            operations.append(operation)
+        transaction.operations = operations
+        expected = payload.get("expected_evidence")
+        expected_path = Path(str(expected.get("path"))) if isinstance(expected, dict) else None
+        if expected is not None and (
+            not isinstance(expected, dict)
+            or set(expected) != {"kind", "path", "hash"}
+            or expected.get("kind") != job.get("workflow_phase")
+            or not isinstance(expected.get("path"), str)
+            or expected_path is None
+            or expected_path.is_absolute()
+            or ".." in expected_path.parts
+            or expected_path.as_posix() != expected.get("path")
+            or expected_path.parts[:2] != ("evidence", "workflow")
+            or not isinstance(expected.get("hash"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(expected["hash"])) is None
+        ):
+            raise WorkflowReportPublicationDrift(
+                "workflow report transaction expected evidence invalid"
+            )
+        transaction.expected_evidence = dict(expected) if isinstance(expected, dict) else None
+        persisted = registry.get_job(job_id).get("workflow_evidence")
+        if persisted is not None:
+            if persisted != transaction.expected_evidence:
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction evidence binding drift"
+                )
+            transaction._apply(forward=True)
+            transaction.commit()
+        else:
+            transaction.rollback()
+
+
+def _persisted_job_identity(job: Mapping[str, object], *, field: str) -> dict[str, str]:
+    identity = {
+        "executor": job.get("executor"),
+        "model_id": job.get("model_id"),
+        "independence_domain": job.get("independence_domain"),
+    }
+    if any(not isinstance(value, str) or not value for value in identity.values()):
+        raise ValueError(f"workflow {field} identity missing")
+    return {key: str(value) for key, value in identity.items()}
+
+
+def _validate_terminal_reports(
+    refs: list[str],
+    *,
+    repo_root: Path,
+    job: Mapping[str, object],
+    candidate: str | None,
+) -> None:
+    if job.get("workflow_phase") not in {"verify", "review"}:
+        return
+    baseline = {
+        row["path"]: row["sha256"]
+        for row in job.get("workflow_output_baseline", [])
+        if isinstance(row, dict)
+    }
+    for ref in refs:
+        path = (repo_root / ref).resolve()
+        content = path.read_bytes()
+        current_hash = hashlib.sha256(content).hexdigest()
+        if baseline.get(ref) == current_hash:
+            raise ValueError(f"workflow stale preexisting report rejected: {ref}")
+        binding = _report_binding(content)
+        expected = {
+            "workflow_run_id": job.get("workflow_run_id"),
+            "workflow_card_id": job.get("workflow_card"),
+            "workflow_job_id": job.get("job_id"),
+            "candidate": candidate,
+        }
+        if any(binding.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"workflow report binding mismatch: {ref}")
+
+
+def _planner_sandbox_path(job: Mapping[str, object], coordinator_root: str | Path) -> Path:
+    raw = job.get("worktree")
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("planner sandbox path missing")
+    path = Path(raw)
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or path != path.resolve(strict=False)
+    ):
+        raise ValueError("planner sandbox path invalid")
+    root = Path(coordinator_root).resolve()
+    allowed_parents = {
+        root / "planning-sandboxes",
+        root.parent / f".{root.name}-planning-sandboxes",
+    }
+    if path.parent not in allowed_parents or re.fullmatch(r"[0-9a-f]{32}", path.name) is None:
+        raise ValueError("planner sandbox path outside coordinator boundary")
+    return path
+
+
+def _discard_failed_planner_sandbox(
+    job: Mapping[str, object],
+    *,
+    run_id: str,
+    card: str,
+    coordinator_root: str | Path,
+) -> None:
+    if job.get("persona") != "planner" or (
+        job.get("status") != "failed"
+        and not _retryable_nonpassing_workflow_terminal(job)
+        and not _malformed_workflow_card_terminal(job)
+    ):
+        raise ValueError("planner sandbox retry requires failed planner job")
+    path = _planner_sandbox_path(job, coordinator_root)
+    expected_name = hashlib.sha256(f"{run_id}:{card}".encode()).hexdigest()[:32]
+    if path.name != expected_name:
+        raise ValueError("planner sandbox retry identity mismatch")
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError("planner sandbox retry target is not a directory")
+        shutil.rmtree(path)
+    if path.exists() or path.is_symlink():
+        raise ValueError("planner sandbox retry cleanup incomplete")
+
+
+def _reviewer_sandbox_parent(
+    *,
+    coordinator_root: str | Path,
+    candidate_root: Path,
+) -> Path:
+    parent = Path(coordinator_root).resolve() / "review-sandboxes"
+    try:
+        parent.relative_to(candidate_root.resolve())
+    except ValueError:
+        return parent
+    return Path(coordinator_root).resolve().parent / f".{Path(coordinator_root).name}-review-sandboxes"
+
+
+_CLAUDE_REVIEW_PROTECTED_FILES = (
+    ".bash_profile",
+    ".bashrc",
+    ".claude.json",
+    ".gitconfig",
+    ".gitmodules",
+    ".mcp.json",
+    ".profile",
+    ".ripgreprc",
+    ".zprofile",
+    ".zshrc",
+)
+_CLAUDE_REVIEW_PROTECTED_DIRS = (
+    ".claude",
+    ".claude/agents",
+    ".claude/commands",
+    ".claude/skills",
+    ".claude/worktrees",
+    ".husky",
+    ".idea",
+    ".vscode",
+)
+
+
+def _prepare_claude_review_sandbox(sandbox: Path) -> None:
+    """Create only the bind targets required by Claude's strict Bash sandbox."""
+
+    for ref in _CLAUDE_REVIEW_PROTECTED_DIRS:
+        target = sandbox / ref
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise ValueError("workflow reviewer protected directory invalid")
+        if not target.exists():
+            target.mkdir(parents=True)
+    for ref in _CLAUDE_REVIEW_PROTECTED_FILES:
+        target = sandbox / ref
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise ValueError("workflow reviewer protected file invalid")
+        if not target.exists():
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+
+
+def _create_reviewer_sandbox(
+    *,
+    run,
+    step,
+    executor: str,
+    candidate_root: Path,
+    coordinator_root: str | Path,
+    input_snapshot: tuple[dict[str, str], ...],
+) -> tuple[Path, Path]:
+    candidate = run.candidate_head
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        raise ValueError("workflow reviewer candidate invalid")
+    parent = _reviewer_sandbox_parent(
+        coordinator_root=coordinator_root,
+        candidate_root=candidate_root,
+    )
+    parent.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(f"{run.run_id}:{step.card}:{candidate}".encode()).hexdigest()[:32]
+    sandbox = parent / name
+    if sandbox.exists() or sandbox.is_symlink():
+        raise ValueError("stale reviewer sandbox requires reconciliation")
+    checkout_root = sandbox / "candidate" if executor == "claude" else sandbox
+    if executor == "claude":
+        sandbox.mkdir()
+        _prepare_claude_review_sandbox(sandbox)
+    clone = subprocess.run(
+        [
+            "git", "clone", "--quiet", "--no-hardlinks", "--no-local", "--no-checkout",
+            str(candidate_root.resolve()), str(checkout_root),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if clone.returncode != 0:
+        remove_tree(sandbox)
+        raise ValueError("workflow reviewer sandbox clone failed")
+    checkout = subprocess.run(
+        ["git", "-C", str(checkout_root), "checkout", "--quiet", "--detach", candidate],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if checkout.returncode != 0:
+        remove_tree(sandbox)
+        raise ValueError("workflow reviewer sandbox checkout failed")
+    remove_origin = subprocess.run(
+        ["git", "-C", str(checkout_root), "remote", "remove", "origin"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    remotes = subprocess.run(
+        ["git", "-C", str(checkout_root), "remote"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if remove_origin.returncode != 0 or remotes.returncode != 0 or remotes.stdout.strip():
+        remove_tree(sandbox)
+        raise ValueError("workflow reviewer sandbox remote isolation failed")
+    head = subprocess.run(
+        ["git", "-C", str(checkout_root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if head.returncode != 0 or head.stdout.strip().lower() != candidate.lower():
+        remove_tree(sandbox)
+        raise ValueError("workflow reviewer sandbox head mismatch")
+    for link in checkout_root.rglob("*"):
+        if not link.is_symlink():
+            continue
+        try:
+            link.resolve(strict=False).relative_to(checkout_root.resolve())
+        except ValueError as exc:
+            remove_tree(sandbox)
+            raise ValueError("workflow reviewer sandbox external symlink rejected") from exc
+    try:
+        for row in input_snapshot:
+            envelope = _read_workflow_input_content(
+                row,
+                run=run,
+                coordinator_root=coordinator_root,
+            )
+            ref = str(envelope["path"])
+            target = checkout_root / ref
+            target.parent.mkdir(parents=True, exist_ok=True)
+            content = str(envelope["content"]).encode("utf-8")
+            if target.is_symlink():
+                raise ValueError("workflow reviewer input symlink rejected")
+            if target.exists():
+                if not target.is_file():
+                    raise ValueError("workflow reviewer input seed conflict")
+                try:
+                    target_content = _canonical_workflow_input_bytes(target.read_bytes())
+                except UnicodeDecodeError as exc:
+                    raise ValueError("workflow reviewer input seed conflict") from exc
+                if target_content != content:
+                    raise ValueError("workflow reviewer input seed conflict")
+            if not target.exists():
+                _PlanningPublicationTransaction._write_atomic(
+                    target,
+                    content,
+                    0o600,
+                    expect_absent=True,
+                )
+    except BaseException:
+        remove_tree(sandbox)
+        raise
+    return sandbox, checkout_root
+
+
+def _reviewer_sandbox_path(job: Mapping[str, object], coordinator_root: str | Path) -> Path:
+    raw = job.get("worktree")
+    repo_root = job.get("workflow_repo_root")
+    if not isinstance(raw, str) or not isinstance(repo_root, str):
+        raise ValueError("reviewer sandbox path missing")
+    path = Path(raw)
+    allowed = _reviewer_sandbox_parent(
+        coordinator_root=coordinator_root,
+        candidate_root=Path(repo_root),
+    )
+    run_id = job.get("workflow_run_id")
+    card = job.get("workflow_card")
+    candidate = job.get("subject_head")
+    if (
+        not isinstance(run_id, str)
+        or not isinstance(card, str)
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+    ):
+        raise ValueError("reviewer sandbox identity missing")
+    expected_name = hashlib.sha256(f"{run_id}:{card}:{candidate}".encode()).hexdigest()[:32]
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or path.parent != allowed
+        or path.name != expected_name
+    ):
+        raise ValueError("reviewer sandbox path invalid")
+    return path
+
+
+def _reviewer_checkout_path(
+    job: Mapping[str, object],
+    coordinator_root: str | Path,
+    *,
+    allow_legacy_claude_layout: bool = False,
+) -> Path:
+    """Resolve the exact disposable checkout nested under a reviewer session root."""
+
+    sandbox = _reviewer_sandbox_path(job, coordinator_root)
+    input_root = job.get("workflow_input_root")
+    executor = job.get("executor")
+    if not isinstance(input_root, str) or not isinstance(executor, str):
+        raise ValueError("reviewer checkout path missing")
+    checkout = Path(input_root)
+    expected = sandbox / "candidate" if executor == "claude" else sandbox
+    legacy = executor == "claude" and allow_legacy_claude_layout and checkout == sandbox
+    if (
+        not checkout.is_absolute()
+        or checkout.is_symlink()
+        or (checkout != expected and not legacy)
+    ):
+        raise ValueError("reviewer checkout path invalid")
+    return checkout
+
+
+def _discard_reviewer_sandbox(
+    job: Mapping[str, object],
+    *,
+    coordinator_root: str | Path,
+    require_candidate_unchanged: bool,
+) -> None:
+    if job.get("persona") != "reviewer" or not isinstance(job.get("workflow_sandbox_hash"), str):
+        return
+    repo_root = job.get("workflow_repo_root")
+    if not isinstance(repo_root, str):
+        raise ValueError("reviewer candidate root missing")
+    candidate_root = Path(repo_root).resolve()
+    expected = str(job["workflow_sandbox_hash"])
+    sandbox = _reviewer_sandbox_path(job, coordinator_root)
+    if not sandbox.exists() and not sandbox.is_symlink():
+        return
+    unchanged = candidate_root.is_dir() and planning_runtime._tree_snapshot(candidate_root) == expected
+    remove_tree(sandbox)
+    if sandbox.exists() or sandbox.is_symlink():
+        raise ValueError("reviewer sandbox cleanup incomplete")
+    if require_candidate_unchanged and not unchanged:
+        raise ValueError("workflow reviewer modified Candidate checkout")
+
+
+def terminalize_workflow_job(
+    registry,
+    *,
+    job_id: str,
+    coordinator_root: str | Path,
+) -> dict[str, object]:
+    """Create and atomically bind canonical evidence for one terminal workflow job."""
+
+    job = registry.get_job(job_id)
+    _WorkflowReportPublicationTransaction.reconcile(
+        registry=registry,
+        job=job,
+        coordinator_root=Path(coordinator_root),
+    )
+    job = registry.get_job(job_id)
+    sandbox_path: Path | None = None
+    if job.get("workflow_evidence") is not None:
+        if job.get("persona") == "planner":
+            sandbox_path = _planner_sandbox_path(job, coordinator_root)
+            remove_tree(sandbox_path)
+        elif job.get("persona") == "reviewer":
+            _discard_reviewer_sandbox(
+                job,
+                coordinator_root=coordinator_root,
+                require_candidate_unchanged=True,
+            )
+        return job
+    if job.get("persona") == "planner":
+        expected_sandbox_hash = job.get("workflow_sandbox_hash")
+        if not isinstance(expected_sandbox_hash, str) or len(expected_sandbox_hash) != 64:
+            raise ValueError("planner job sandbox baseline missing")
+        sandbox_path = _planner_sandbox_path(job, coordinator_root)
+        if not sandbox_path.is_dir() or planning_runtime._tree_snapshot(sandbox_path) != expected_sandbox_hash:
+            remove_tree(sandbox_path)
+            raise ValueError("planner modified disposable read-only sandbox")
+    if job.get("status") != "exited" or job.get("exit_code") != 0:
+        raise ValueError("workflow job is not successful terminal")
+    phase = job.get("workflow_phase")
+    if phase not in {"plan", "build", "verify", "review"}:
+        raise ValueError("workflow job phase is not terminalizable")
+    raw = _extract_terminal_json(job.get("log_path"))
+    # #261 R2／D3：矛盾偵測排在任何狀態採信之前。放在 per-phase schema 驗證之前，
+    # 是為了避免「先按 passed 走一段流程、後面才發現不對」造成的部分副作用。
+    # #307：帶入 registry 讓 red-required 卡的測試 gate 語意反轉生效。
+    _assert_terminal_gate_consistency(raw, job=job, registry=registry)
+    declared_outputs = job.get("workflow_outputs")
+    if not isinstance(declared_outputs, list):
+        raise ValueError("workflow job declared outputs missing")
+    candidate: str | None = None
+    inline_reports: tuple[tuple[str, str], ...] = ()
+    if phase in {"plan", "build"}:
+        if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
+            # canonical envelope（#261 D1）：多帶 diagnostics 與 gate_evidence 兩個
+            # 欄位；其餘欄位語意與 legacy 一致，往下沿用同一條驗證路徑。
+            raw = _canonicalize_card_terminal(raw)
+        required = {"schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"}
+        if set(raw) != required or raw.get("schema_version") != 1 or raw.get("kind") != "workflow-card":
+            raise ValueError("workflow card terminal evidence schema invalid")
+        if raw.get("status") != "passed":
+            raise ValueError("workflow card terminal evidence did not pass")
+        candidate_value = raw.get("candidate")
+        if phase == "build":
+            if not isinstance(candidate_value, str) or verification.SAFE_SHA_RE.fullmatch(candidate_value) is None:
+                raise ValueError("workflow build candidate invalid")
+            candidate = candidate_value.lower()
+        elif candidate_value is not None:
+            raise ValueError("workflow plan candidate must be null")
+        normalized_payload: dict[str, object] = dict(raw)
+    elif phase == "verify":
+        required = {"schema_version", "kind", "status", "summary", "details", "reports"}
+        # #261 R1：verifier 也必須能誠實回報 failed／needs_human，不得只有成功形狀
+        # 合法。非通過狀態在此 fail closed 為可操作錯誤，而不是被誤判成 schema 壞掉。
+        if raw.get("status") in terminal_contract.NON_PASSING_STATUSES:
+            raise ValueError(
+                f"workflow verification terminal reported non-passing status: {raw.get('status')}"
+            )
+        if (
+            set(raw) != required
+            or raw.get("schema_version") != 1
+            or raw.get("kind") != "workflow-verification-result"
+            or raw.get("status") not in {"verified", "passed"}
+            or not isinstance(raw.get("summary"), str)
+            or not str(raw["summary"]).strip()
+            or not isinstance(raw.get("details"), dict)
+        ):
+            raise ValueError("workflow verification terminal schema invalid")
+        if not isinstance(job.get("subject_head"), str):
+            raise ValueError("workflow verification candidate missing")
+        candidate = str(job["subject_head"])
+        inline_reports = _inline_terminal_reports(
+            raw.get("reports"), phase="verify", declared_outputs=declared_outputs
+        )
+        normalized_payload = verification.validate_verification_evidence(
+            {
+                "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+                "slice_id": f"{job['workflow_run_id']}-{job['workflow_card']}",
+                "candidate": candidate,
+                "status": "verified",
+                "summary": str(raw["summary"]).strip(),
+                "details": raw["details"],
+            }
+        )
+        normalized_payload["outputs"] = [ref for ref, _body in inline_reports]
+    else:
+        expected_authority_hashes = {
+            row["path"]: row["sha256"]
+            for row in job.get("workflow_input_snapshot", [])
+            if isinstance(row, dict) and row.get("authority") == "planning-authority"
+        }
+        required = {"schema_version", "kind", "reason", "findings", "reports"}
+        if expected_authority_hashes:
+            required = required | {"authority_hashes"}
+        # #261 R1：review card 同樣必須能誠實回報 failed／needs_human。status 是
+        # canonical envelope 的選填欄位（review verdict 本身由 findings 決定），
+        # 在此先取出並攔截非通過狀態，再做既有的 exact key-set 驗證。
+        if "status" in raw:
+            declared_review_status = raw.get("status")
+            if declared_review_status in terminal_contract.NON_PASSING_STATUSES:
+                raise ValueError(
+                    f"workflow review terminal reported non-passing status: {declared_review_status}"
+                )
+            if declared_review_status != "passed":
+                raise ValueError("workflow review terminal schema invalid")
+            raw = {key: value for key, value in raw.items() if key != "status"}
+        if (
+            set(raw) != required
+            or raw.get("schema_version") != 1
+            or raw.get("kind") != "workflow-review-result"
+            or not isinstance(raw.get("reason"), str)
+            or not str(raw["reason"]).strip()
+            or not isinstance(raw.get("findings"), list)
+            or not isinstance(job.get("subject_head"), str)
+        ):
+            raise ValueError("workflow review terminal schema invalid")
+        candidate = str(job["subject_head"])
+        builder_job_id = job.get("workflow_builder_job_id")
+        if not isinstance(builder_job_id, str) or not builder_job_id:
+            raise ValueError("workflow review builder job binding missing")
+        run_id = job.get("workflow_run_id")
+        if not isinstance(run_id, str):
+            raise ValueError("workflow review run binding missing")
+        run = registry.get_workflow_run(run_id)
+        builder_job, _archive_author = _review_builder_job_binding(
+            registry,
+            run=run,
+            builder_job_id=builder_job_id,
+            candidate=candidate,
+        )
+        reviewer_identity = _persisted_job_identity(job, field="reviewer")
+        builder_identity = _persisted_job_identity(builder_job, field="builder")
+        verdict_payload = {
+            "schema_version": foreign_review.REVIEW_SCHEMA_VERSION,
+            "builder_job_id": builder_job_id,
+            "reviewer_job_id": str(job["job_id"]),
+            "candidate": candidate,
+            "launch_identity": reviewer_identity,
+            "findings": raw["findings"],
+        }
+        if expected_authority_hashes:
+            verdict_payload["authority_hashes"] = raw.get("authority_hashes")
+        verdict = foreign_review.validate_review_verdict(
+            verdict_payload,
+            builder_job_id=builder_job_id,
+            reviewer_job_id=str(job["job_id"]),
+            candidate=candidate,
+            launch_identity=reviewer_identity,
+            expected_authority_hashes=expected_authority_hashes or None,
+        )
+        inline_reports = _inline_terminal_reports(
+            raw.get("reports"), phase="review", declared_outputs=declared_outputs
+        )
+        normalized_payload = foreign_review.build_gate_evaluation(
+            slice_id=f"{job['workflow_run_id']}-{job['workflow_card']}",
+            state=str(verdict["state"]),
+            reason=str(raw["reason"]).strip(),
+            builder_job_id=builder_job_id,
+            reviewer_job_id=str(job["job_id"]),
+            candidate=candidate,
+            launch_identity={"builder": builder_identity, "reviewer": reviewer_identity},
+            findings=verdict["findings"],
+        )
+        normalized_payload = foreign_review.validate_gate_evaluation(normalized_payload)
+        normalized_payload["outputs"] = [ref for ref, _body in inline_reports]
+    if (
+        normalized_payload.get("run_id", job.get("workflow_run_id")) != job.get("workflow_run_id")
+        or normalized_payload.get("card_id", job.get("workflow_card")) != job.get("workflow_card")
+    ):
+        raise ValueError("workflow terminal evidence run/card mismatch")
+    output_refs = normalized_payload.get("outputs", [])
+    if not isinstance(output_refs, list):
+        raise ValueError("workflow terminal outputs invalid")
+    if any(
+        not isinstance(ref, str)
+        or not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_outputs)
+        for ref in output_refs
+    ):
+        raise ValueError("workflow terminal output is outside manifest refs")
+    if any(
+        not any(fnmatch.fnmatch(str(ref), pattern) for ref in output_refs)
+        for pattern in declared_outputs
+    ):
+        raise ValueError("workflow terminal output is incomplete for manifest refs")
+    repo_root_value = job.get("workflow_repo_root")
+    if not isinstance(repo_root_value, str) or not repo_root_value:
+        raise ValueError("workflow job repo root missing")
+    repo_root = Path(repo_root_value).resolve()
+    input_root_value = job.get("workflow_input_root") or repo_root_value
+    if not isinstance(input_root_value, str) or not input_root_value:
+        raise ValueError("workflow job input root missing")
+    input_root = Path(input_root_value).resolve()
+    input_snapshot = job.get("workflow_input_snapshot", [])
+    _validate_workflow_input_snapshot(
+        input_root,
+        input_snapshot,
+        coordinator_root=coordinator_root,
+    )
+    if job.get("persona") == "reviewer":
+        _discard_reviewer_sandbox(
+            job,
+            coordinator_root=coordinator_root,
+            require_candidate_unchanged=True,
+        )
+    baseline_rows = job.get("workflow_output_baseline")
+    if not isinstance(baseline_rows, list):
+        raise ValueError("workflow job output baseline missing")
+    baseline_by_ref = {
+        str(row["path"]): str(row["sha256"])
+        for row in baseline_rows
+        if isinstance(row, dict)
+        and set(row) == {"path", "sha256"}
+        and isinstance(row.get("path"), str)
+        and isinstance(row.get("sha256"), str)
+    }
+    if len(baseline_by_ref) != len(baseline_rows):
+        raise ValueError("workflow job output baseline invalid")
+    report_transaction: _WorkflowReportPublicationTransaction | None = None
+    created_evidence = False
+    path: Path | None = None
+    try:
+        if inline_reports:
+            if candidate is None:
+                raise ValueError("workflow report candidate missing")
+            report_transaction = _WorkflowReportPublicationTransaction(
+                repo_root=repo_root,
+                coordinator_root=Path(coordinator_root),
+                job_id=job_id,
+            )
+            report_transaction.publish(inline_reports, job=job, candidate=candidate)
+        _validate_terminal_reports(
+            output_refs,
+            repo_root=repo_root,
+            job=job,
+            candidate=candidate,
+        )
+        artifacts = _canonical_workflow_artifacts(
+            normalized_payload.get("outputs", []),
+            repo_root=repo_root,
+            baseline_by_ref=baseline_by_ref,
+        )
+        job_binding = {
+            "job_id": job["job_id"],
+            "run_id": job["workflow_run_id"],
+            "claim_key": job["workflow_claim_key"],
+            "repo": job["workflow_repo"],
+            "source_revision": job["source_revision"],
+            "card_id": job["workflow_card"],
+            "phase": phase,
+            "inputs": job.get("workflow_inputs", []),
+            "outputs": declared_outputs,
+            "output_baseline": baseline_rows,
+        }
+        if "workflow_input_snapshot" in job:
+            job_binding["input_snapshot"] = input_snapshot
+        envelope = {
+            "schema_version": 1,
+            "kind": str(phase),
+            "job": job_binding,
+            "payload": normalized_payload,
+            "artifacts": artifacts,
+        }
+        content = (
+            json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        root = Path(coordinator_root).resolve()
+        relative = Path("evidence") / "workflow" / f"{hashlib.sha256(job_id.encode()).hexdigest()}.json"
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        locator = {
+            "kind": str(phase),
+            "path": relative.as_posix(),
+            "hash": hashlib.sha256(content).hexdigest(),
+        }
+        if report_transaction is not None:
+            report_transaction.bind_expected_evidence(locator)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if path.is_symlink() or path.read_bytes() != content:
+                raise ValueError("workflow canonical evidence conflict")
+        else:
+            created_evidence = True
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+            fsync_directory(path.parent)
+        bound = registry.bind_workflow_evidence(job_id, locator=locator, subject_head=candidate)
+        if report_transaction is not None:
+            report_transaction.commit()
+    except BaseException:
+        persisted = registry.get_job(job_id).get("workflow_evidence")
+        if persisted is None:
+            if created_evidence and path is not None:
+                path.unlink(missing_ok=True)
+                fsync_directory(path.parent)
+            if report_transaction is not None:
+                report_transaction.rollback()
+        elif report_transaction is not None:
+            _WorkflowReportPublicationTransaction.reconcile(
+                registry=registry,
+                job=registry.get_job(job_id),
+                coordinator_root=Path(coordinator_root),
+            )
+        raise
+    if sandbox_path is not None:
+        remove_tree(sandbox_path)
+    return bound
+
+
+def _read_job_workflow_evidence(
+    job: Mapping[str, object],
+    *,
+    run,
+    coordinator_root: str | Path,
+) -> tuple[dict[str, object], tuple[str, ...], str, str]:
+    locator = job.get("workflow_evidence")
+    if not isinstance(locator, dict) or set(locator) != {"kind", "path", "hash"}:
+        raise ValueError("workflow job has no canonical evidence locator")
+    relative = Path(str(locator["path"]))
+    if relative.is_absolute() or ".." in relative.parts or relative.parts[:2] != ("evidence", "workflow"):
+        raise ValueError("workflow canonical evidence path invalid")
+    root = Path(coordinator_root).resolve()
+    unresolved = root / relative
+    if unresolved.is_symlink():
+        raise ValueError("workflow canonical evidence symlink rejected")
+    path = unresolved.resolve()
+    path.relative_to(root)
+    content = path.read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    if digest != locator["hash"]:
+        raise ValueError("workflow canonical evidence hash mismatch")
+    payload = json.loads(content.decode("utf-8"))
+    expected_job = {
+        "job_id": job["job_id"],
+        "run_id": run.run_id,
+        "claim_key": run.claim_key,
+        "repo": run.repo,
+        "source_revision": job["source_revision"],
+        "card_id": job["workflow_card"],
+        "phase": job["workflow_phase"],
+        "inputs": job.get("workflow_inputs", []),
+        "outputs": job.get("workflow_outputs", []),
+        "output_baseline": job.get("workflow_output_baseline", []),
+    }
+    payload_job = payload.get("job") if isinstance(payload, dict) else None
+    if job.get("workflow_input_snapshot") or (
+        isinstance(payload_job, dict) and "input_snapshot" in payload_job
+    ):
+        expected_job["input_snapshot"] = job.get("workflow_input_snapshot", [])
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != locator["kind"]
+        or payload.get("job") != expected_job
+        or not isinstance(payload.get("payload"), dict)
+        or not isinstance(payload.get("artifacts"), list)
+    ):
+        raise ValueError("workflow canonical evidence binding invalid")
+    repo_root_value = job.get("workflow_repo_root")
+    if not isinstance(repo_root_value, str) or not repo_root_value:
+        raise ValueError("workflow evidence repo root missing")
+    repo_root = Path(repo_root_value).resolve()
+    refs: list[str] = []
+    for row in payload["artifacts"]:
+        if not isinstance(row, dict) or set(row) != {"path", "sha256", "baseline_sha256"}:
+            raise ValueError("workflow canonical artifact locator invalid")
+        ref = row.get("path")
+        expected_hash = row.get("sha256")
+        baseline_hash = row.get("baseline_sha256")
+        if (
+            not isinstance(ref, str)
+            or not isinstance(expected_hash, str)
+            or baseline_hash is not None and not isinstance(baseline_hash, str)
+        ):
+            raise ValueError("workflow canonical artifact locator invalid")
+        expected_baseline = {
+            str(item["path"]): str(item["sha256"])
+            for item in job.get("workflow_output_baseline", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and isinstance(item.get("sha256"), str)
+        }.get(ref)
+        if baseline_hash != expected_baseline:
+            raise ValueError("workflow canonical artifact baseline mismatch")
+        relative_artifact = Path(ref)
+        if relative_artifact.is_absolute() or ".." in relative_artifact.parts:
+            raise ValueError("workflow canonical artifact escapes repo")
+        unresolved_artifact = repo_root / relative_artifact
+        cursor = repo_root
+        for part in relative_artifact.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow canonical artifact symlink rejected")
+        artifact_path = unresolved_artifact.resolve()
+        artifact_path.relative_to(repo_root)
+        artifact_present = artifact_path.is_file()
+        artifact_bytes = None
+        if artifact_present:
+            try:
+                artifact_bytes = artifact_path.read_bytes()
+            except FileNotFoundError:
+                artifact_present = False
+        if not artifact_present:
+            if not _workflow_report_cleanup_allows_missing(
+                coordinator_root=root,
+                run=run,
+                ref=ref,
+                expected_hash=expected_hash,
+            ):
+                raise ValueError("workflow canonical artifact drift")
+        elif hashlib.sha256(artifact_bytes).hexdigest() != expected_hash:
+            raise ValueError("workflow canonical artifact drift")
+        refs.append(ref)
+    return payload["payload"], tuple(refs), str(path), digest
+
+
+def _workflow_report_cleanup_allows_missing(
+    *,
+    coordinator_root: Path,
+    run,
+    ref: str,
+    expected_hash: str,
+) -> bool:
+    directory = coordinator_root / "evidence" / "report-cleanup"
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    matched = False
+    try:
+        markers = directory.iterdir()
+        for count, marker in enumerate(markers, start=1):
+            if count > 2048:
+                return False
+            try:
+                invalid_marker = (
+                    marker.is_symlink()
+                    or not marker.is_file()
+                    or marker.stat().st_mode & 0o222
+                    or re.fullmatch(r"[0-9a-f]{64}\.json", marker.name) is None
+                )
+            except OSError:
+                continue
+            if invalid_marker:
+                continue
+            envelope = json.loads(marker.read_text(encoding="utf-8"))
+            payload = envelope.get("payload") if isinstance(envelope, dict) else None
+            reports = payload.get("reports") if isinstance(payload, dict) else None
+            digest = marker.stem
+            if (
+                not isinstance(envelope, dict)
+                or set(envelope) != {"payload", "hash"}
+                or not isinstance(payload, dict)
+                or envelope.get("hash") != digest
+                or verification.canonical_json_hash(payload) != digest
+                or set(payload) != {"schema", "run_id", "candidate", "reports"}
+                or payload.get("schema") != "cortex-workflow-report-cleanup/v1"
+                or payload.get("run_id") != run.run_id
+                or payload.get("candidate") != run.candidate_head
+                or not isinstance(reports, list)
+                or not reports
+            ):
+                continue
+            normalized: dict[str, str] = {}
+            valid = True
+            for row in reports:
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != {"path", "sha256"}
+                    or not isinstance(row.get("path"), str)
+                    or Path(str(row["path"])).is_absolute()
+                    or ".." in Path(str(row["path"])).parts
+                    or Path(str(row["path"])).as_posix() != str(row["path"])
+                    or not str(row["path"]).startswith(("reports/verify/", "reports/review/"))
+                    or not isinstance(row.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", str(row["sha256"])) is None
+                    or str(row["path"]) in normalized
+                ):
+                    valid = False
+                    break
+                normalized[str(row["path"])] = str(row["sha256"])
+            if valid and normalized.get(ref) == expected_hash:
+                matched = True
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return matched
+
+
+def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
+    def matches_candidate(card: str, job: Mapping[str, object]) -> bool:
+        subject = job.get("subject_head")
+        if subject == candidate:
+            return True
+        if (
+            card != "openspec-archive"
+            or not _manager_archive_applied(run)
+            or not isinstance(subject, str)
+            or verification.SAFE_SHA_RE.fullmatch(subject) is None
+            or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        ):
+            return False
+        try:
+            ancestry = subprocess.run(
+                [
+                    "git", "-C", str(run.workspace_root), "merge-base", "--is-ancestor",
+                    subject, candidate,
+                ],
+                shell=False,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return False
+        return ancestry.returncode == 0
+
+    steps = run.steps
+    for card in ("openspec-archive", "policy-commit"):
+        jobs = [
+            job
+            for job in registry.list_jobs()
+            if job.get("workflow_run_id") == run.run_id
+            and job.get("workflow_phase") == "ship"
+            and job.get("workflow_card") == card
+            and job.get("persona") == "manager"
+            and matches_candidate(card, job)
+            and job.get("status") == "exited"
+            and job.get("exit_code") == 0
+        ]
+        if len(jobs) != 1:
+            raise ValueError(f"workflow ship card audit missing or ambiguous: {card}")
+        payload, _outputs, _path, _digest = _read_job_workflow_evidence(
+            jobs[0], run=run, coordinator_root=coordinator_root
+        )
+        if (
+            payload.get("kind") != "workflow-card"
+            or payload.get("status") != "passed"
+            or payload.get("run_id") != run.run_id
+            or payload.get("card_id") != card
+            or payload.get("candidate") != jobs[0].get("subject_head")
+        ):
+            raise ValueError(f"workflow ship card evidence invalid: {card}")
+        steps = _audit_phase_steps(
+            steps,
+            phase="ship",
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            outputs=(),
+            card_id=card,
+        )
+    return steps
+
+
+def _sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class PlanningPublicationDrift(RuntimeError):
+    """A durable planning intent cannot be safely committed or rolled back."""
+
+
+class _PlanningPublicationTransaction:
+    """Recoverable filesystem side of the brainstorm -> registry commit.
+
+    Every intended mutation is durably journaled before it is applied.  A
+    registry save fault can roll the group back immediately; after a crash,
+    Manager reconciles the journal against the persisted brainstorm gate.
+    """
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        run_id: str,
+        journal_root: Path | None,
+    ) -> None:
+        self.root = root.resolve()
+        self.run_id = run_id
+        self.operations: list[dict[str, object]] = []
+        self.expected_gate_ref: dict[str, str] | None = None
+        self.journal_root = journal_root.resolve() if journal_root is not None else None
+        self.journal_path = (
+            self.journal_root / "planning-transactions" / f"{run_id}.json"
+            if self.journal_root is not None
+            else None
+        )
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "kind": "planning-publication-intent",
+            "run_id": self.run_id,
+            "root": str(self.root),
+            "operations": self.operations,
+            "expected_gate_ref": self.expected_gate_ref,
+        }
+
+    def _persist(self) -> None:
+        if self.journal_path is None:
+            return
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        content = (json.dumps(self._payload(), ensure_ascii=False, sort_keys=True) + "\n").encode()
+        fd, tmp_name = tempfile.mkstemp(dir=self.journal_path.parent, suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.journal_path)
+            fsync_directory(self.journal_path.parent)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _write_atomic(
+        path: Path,
+        content: bytes,
+        mode: int,
+        *,
+        expect_absent: bool = False,
+        expected_hash: str | None = None,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".planning.tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, mode)
+            if expect_absent:
+                os.link(tmp, path)
+                tmp.unlink()
+            else:
+                if expected_hash is not None and (
+                    not path.is_file() or _sha256_path(path) != expected_hash
+                ):
+                    raise ValueError(f"planning artifact baseline CAS conflict: {path}")
+                os.replace(tmp, path)
+            fsync_directory(path.parent)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def publish(
+        self,
+        path: Path,
+        content: bytes,
+        *,
+        baseline_hash: str | None,
+        mode: int = 0o644,
+        kind: str = "artifact",
+    ) -> None:
+        path = Path(os.path.abspath(path))
+        boundary = self.root
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError:
+            if kind != "evidence" or self.journal_root is None:
+                raise
+            relative = path.relative_to(self.journal_root)
+            boundary = self.journal_root
+        if path.is_symlink():
+            raise ValueError("planning publication symlink rejected")
+        cursor = path.parent
+        while cursor != boundary:
+            if cursor.is_symlink():
+                raise ValueError("planning publication parent symlink rejected")
+            parent = cursor.parent
+            if parent == cursor:
+                raise ValueError("planning publication boundary invalid")
+            cursor = parent
+        existed = path.is_file()
+        before = path.read_bytes() if existed else None
+        before_hash = hashlib.sha256(before).hexdigest() if before is not None else None
+        idempotent_evidence = (
+            existed
+            and kind == "evidence"
+            and _canonical_workflow_input_bytes(before) == _canonical_workflow_input_bytes(content)
+        )
+        if idempotent_evidence and not mode_matches(path.stat().st_mode, mode):
+            raise ValueError(f"planning immutable evidence mode conflict: {relative}")
+        if existed and baseline_hash is None:
+            if not idempotent_evidence:
+                raise ValueError(f"planning artifact no-clobber conflict: {relative}")
+        if baseline_hash is not None and (not existed or before_hash != baseline_hash):
+            raise ValueError(f"planning artifact baseline CAS conflict: {relative}")
+        missing_dirs: list[str] = []
+        parent = path.parent
+        while parent != boundary and not parent.exists():
+            missing_dirs.append(str(parent))
+            parent = parent.parent
+        after_mode = (path.stat().st_mode & 0o7777) if existed else mode
+        operation: dict[str, object] = {
+            "kind": kind,
+            "path": str(path),
+            "before_exists": existed,
+            "before_hash": before_hash,
+            "before_content": (
+                base64.b64encode(before).decode("ascii") if before is not None else None
+            ),
+            "before_mode": (path.stat().st_mode & 0o7777) if existed else None,
+            "after_hash": before_hash if idempotent_evidence else hashlib.sha256(content).hexdigest(),
+            "after_mode": after_mode,
+            "created_dirs": list(reversed(missing_dirs)),
+            "mutation": not idempotent_evidence,
+        }
+        self.operations.append(operation)
+        self._persist()
+        if idempotent_evidence:
+            return
+        self._write_atomic(
+            path,
+            content,
+            after_mode,
+            expect_absent=not existed,
+            expected_hash=before_hash if existed else None,
+        )
+
+    def write_evidence(self, path: Path, payload: object) -> None:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("kind") != "brainstorm-peer"
+        ):
+            raise ValueError("brainstorm evidence payload is invalid")
+        content = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        self.expected_gate_ref = {
+            "kind": "brainstorm",
+            "ref": str(Path(os.path.abspath(path))),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        self.publish(path, content, baseline_hash=None, mode=0o600, kind="evidence")
+        actual_hash = _sha256_path(Path(path))
+        if self.expected_gate_ref["sha256"] != actual_hash:
+            self.expected_gate_ref["sha256"] = actual_hash
+            self._persist()
+
+    def rollback(self) -> None:
+        for operation in reversed(self.operations):
+            path = Path(str(operation["path"]))
+            after_hash = str(operation["after_hash"])
+            boundary = (
+                self.journal_root
+                if operation.get("kind") == "evidence"
+                and self.journal_root is not None
+                and not path.is_relative_to(self.root)
+                else self.root
+            )
+            cursor = path.parent
+            while cursor != boundary:
+                if cursor.is_symlink():
+                    raise RuntimeError(f"planning rollback parent became symlink: {cursor}")
+                parent = cursor.parent
+                if parent == cursor:
+                    raise RuntimeError("planning rollback boundary invalid")
+                cursor = parent
+            if path.is_symlink():
+                raise RuntimeError(f"planning rollback path became symlink: {path}")
+            current_hash = _sha256_path(path) if path.is_file() else None
+            before_hash = operation.get("before_hash")
+            if current_hash == before_hash:
+                pass
+            elif current_hash != after_hash:
+                raise RuntimeError(f"planning rollback refused operator drift: {path}")
+            elif bool(operation["before_exists"]):
+                encoded = operation.get("before_content")
+                if not isinstance(encoded, str):
+                    raise RuntimeError("planning rollback baseline missing")
+                self._write_atomic(
+                    path,
+                    base64.b64decode(encoded),
+                    int(operation["before_mode"]),
+                )
+            else:
+                path.unlink(missing_ok=True)
+                if path.parent.exists():
+                    fsync_directory(path.parent)
+            for directory in reversed(list(operation.get("created_dirs", []))):
+                try:
+                    Path(str(directory)).rmdir()
+                except OSError:
+                    pass
+        self.operations.clear()
+        self.commit()
+
+    def commit(self) -> None:
+        if self.journal_path is not None:
+            self.journal_path.unlink(missing_ok=True)
+            if self.journal_path.parent.exists():
+                fsync_directory(self.journal_path.parent)
+
+    def _validate_loaded_operation(self, value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise RuntimeError("planning transaction operation is invalid")
+        required = {
+            "kind", "path", "before_exists", "before_hash", "before_content",
+            "before_mode", "after_hash", "after_mode", "created_dirs", "mutation",
+        }
+        if set(value) != required or value.get("kind") not in {"artifact", "evidence"}:
+            raise RuntimeError("planning transaction operation is invalid")
+        raw_path = value.get("path")
+        if (
+            not isinstance(raw_path, str)
+            or not Path(raw_path).is_absolute()
+            or ".." in Path(raw_path).parts
+        ):
+            raise RuntimeError("planning transaction operation path is invalid")
+        path = Path(raw_path)
+        boundary = self.root
+        try:
+            path.relative_to(boundary)
+        except ValueError:
+            if value.get("kind") != "evidence" or self.journal_root is None:
+                raise RuntimeError("planning transaction operation escapes boundary")
+            boundary = self.journal_root
+            try:
+                path.relative_to(boundary)
+            except ValueError as exc:
+                raise RuntimeError("planning transaction operation escapes boundary") from exc
+        for field in ("before_hash", "after_hash"):
+            digest = value.get(field)
+            if digest is not None and (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise RuntimeError("planning transaction hash is invalid")
+        if not isinstance(value.get("before_exists"), bool):
+            raise RuntimeError("planning transaction baseline is invalid")
+        if not isinstance(value.get("mutation"), bool):
+            raise RuntimeError("planning transaction mutation flag is invalid")
+        if not value["mutation"] and (
+            value.get("kind") != "evidence"
+            or value.get("before_hash") != value.get("after_hash")
+        ):
+            raise RuntimeError("planning transaction immutable operation is invalid")
+        if not isinstance(value.get("after_hash"), str) or not isinstance(value.get("after_mode"), int):
+            raise RuntimeError("planning transaction target is invalid")
+        if value["before_exists"]:
+            if (
+                not isinstance(value.get("before_hash"), str)
+                or not isinstance(value.get("before_content"), str)
+                or not isinstance(value.get("before_mode"), int)
+            ):
+                raise RuntimeError("planning transaction baseline is invalid")
+            try:
+                base64.b64decode(value["before_content"], validate=True)
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("planning transaction baseline is invalid") from exc
+        elif any(value.get(field) is not None for field in ("before_hash", "before_content", "before_mode")):
+            raise RuntimeError("planning transaction absent baseline is invalid")
+        created_dirs = value.get("created_dirs")
+        if not isinstance(created_dirs, list):
+            raise RuntimeError("planning transaction created_dirs is invalid")
+        parents = set(path.parents)
+        for raw_dir in created_dirs:
+            directory = Path(str(raw_dir))
+            if not directory.is_absolute() or directory not in parents or directory == boundary:
+                raise RuntimeError("planning transaction created_dir escapes boundary")
+            try:
+                directory.relative_to(boundary)
+            except ValueError as exc:
+                raise RuntimeError("planning transaction created_dir escapes boundary") from exc
+        return dict(value)
+
+    def _validate_committed_operation(self, operation: Mapping[str, object]) -> None:
+        path = Path(str(operation["path"]))
+        boundary = self.root
+        try:
+            path.relative_to(boundary)
+        except ValueError:
+            if operation.get("kind") != "evidence" or self.journal_root is None:
+                raise PlanningPublicationDrift("planning committed artifact escaped boundary")
+            boundary = self.journal_root
+            try:
+                path.relative_to(boundary)
+            except ValueError as exc:
+                raise PlanningPublicationDrift(
+                    "planning committed artifact escaped boundary"
+                ) from exc
+        cursor = path.parent
+        while cursor != boundary:
+            if cursor.is_symlink():
+                raise PlanningPublicationDrift(
+                    f"planning committed artifact parent type drift: {cursor}"
+                )
+            parent = cursor.parent
+            if parent == cursor:
+                raise PlanningPublicationDrift("planning committed artifact boundary drift")
+            cursor = parent
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise PlanningPublicationDrift(f"planning committed artifact drift: {path}") from exc
+        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+            raise PlanningPublicationDrift(f"planning committed artifact type drift: {path}")
+        if _sha256_path(path) != operation["after_hash"]:
+            raise PlanningPublicationDrift(f"planning committed artifact hash drift: {path}")
+        if not mode_matches(metadata.st_mode, int(operation["after_mode"])):
+            raise PlanningPublicationDrift(f"planning committed artifact mode drift: {path}")
+        if operation.get("kind") == "evidence":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise PlanningPublicationDrift("planning committed evidence drift") from exc
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != 1
+                or payload.get("kind") != "brainstorm-peer"
+                or self.expected_gate_ref is None
+                or self.expected_gate_ref.get("ref") != str(path)
+                or self.expected_gate_ref.get("sha256") != operation["after_hash"]
+            ):
+                raise PlanningPublicationDrift("planning committed evidence binding drift")
+
+    @classmethod
+    def reconcile(cls, *, root: Path, journal_root: Path, run) -> None:
+        path = journal_root.resolve() / "planning-transactions" / f"{run.run_id}.json"
+        if path.is_symlink():
+            raise PlanningPublicationDrift("planning transaction journal symlink rejected")
+        if not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PlanningPublicationDrift("planning transaction journal is unreadable") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 2
+            or payload.get("kind") != "planning-publication-intent"
+            or payload.get("run_id") != run.run_id
+            or payload.get("root") != str(root.resolve())
+            or not isinstance(payload.get("operations"), list)
+            or payload.get("expected_gate_ref") is not None
+            and not isinstance(payload.get("expected_gate_ref"), dict)
+        ):
+            raise PlanningPublicationDrift("planning transaction journal is invalid")
+        transaction = cls(root=root, run_id=run.run_id, journal_root=journal_root)
+        expected_gate_ref = payload["expected_gate_ref"]
+        expected: GateEvidenceRef | None = None
+        if expected_gate_ref is not None:
+            try:
+                expected = GateEvidenceRef.from_dict(expected_gate_ref)
+            except ValueError as exc:
+                raise PlanningPublicationDrift("planning expected gate ref is invalid") from exc
+            if expected.kind != "brainstorm" or expected.sha256 is None:
+                raise PlanningPublicationDrift("planning expected gate ref is invalid")
+            transaction.expected_gate_ref = expected.to_dict()
+        try:
+            transaction.operations = [
+                transaction._validate_loaded_operation(operation)
+                for operation in payload["operations"]
+            ]
+        except RuntimeError as exc:
+            raise PlanningPublicationDrift("planning transaction operation drift") from exc
+        evidence_operations = [
+            operation
+            for operation in transaction.operations
+            if operation.get("kind") == "evidence"
+        ]
+        if expected is not None and len(evidence_operations) != 1:
+            raise PlanningPublicationDrift("planning committed evidence operation is invalid")
+        committed = expected is not None and any(ref == expected for ref in run.gate_refs)
+        if committed:
+            for operation in transaction.operations:
+                transaction._validate_committed_operation(operation)
+            transaction.commit()
+        else:
+            try:
+                transaction.rollback()
+            except RuntimeError as exc:
+                raise PlanningPublicationDrift("planning uncommitted rollback drift") from exc
+
+
+# #416：`_publish_planning_artifacts` 對「檔案已存在但無/與目前 authority
+# 不符」一律 fail-closed（見下方兩處 raise），這正是 abandon 未回滾已發佈
+# 殘留檔（`work_actions._gc_abandoned_planning_artifacts` 修復前的缺口）撞見
+# 下一世代重新發佈同一 destinations 時的典型死鎖地雷特徵——屬環境／狀態
+# 殘留，不是模型內容缺陷。這兩個訊息子字串必須與下方兩個 raise 的字面文字
+# 完全一致，`_is_planning_authority_residue_failure` 才能正確辨識。
+_PLANNING_AUTHORITY_RESIDUE_MARKERS = (
+    "planning artifact lacks current planning authority",
+    "planning artifact current authority drift",
+)
+
+
+def _is_planning_authority_residue_failure(reason: str | None) -> bool:
+    """判斷 brainstorm not-ready 的 reason 是否為 #416 的 authority 殘留死鎖。
+
+    只窄判斷 `run_heterogeneous_brainstorm` 對 `artifact_writer` 例外包出的
+    `primary-artifact-write-rejected: ...` 前綴、且訊息命中
+    `_PLANNING_AUTHORITY_RESIDUE_MARKERS` 兩個明確子字串之一。
+    `_publish_planning_artifacts` 其餘的內容型驗證錯誤（schema 不合法、路徑
+    逃出 governed roots、artifact 未通過驗收……）刻意不在此範圍內，維持
+    #393 既有的 `content` 分類與 fail-closed 意圖，不擴大分類映射。
+    """
+
+    return (
+        reason is not None
+        and reason.startswith("primary-artifact-write-rejected:")
+        and any(marker in reason for marker in _PLANNING_AUTHORITY_RESIDUE_MARKERS)
+    )
+
+
+def _publish_planning_artifacts(
+    root_value: str,
+    rows: object,
+    *,
+    work_id: str,
+    allowed_refs: tuple[str, ...],
+    authorities: tuple[PlanningArtifactAuthority, ...] = (),
+    transaction: _PlanningPublicationTransaction | None = None,
+) -> Callable[[], None]:
+    if not isinstance(rows, list):
+        raise ValueError("planning artifacts must be a list")
+    root = Path(root_value).resolve()
+    authority_by_ref = {item.ref: item for item in authorities}
+    if len(authority_by_ref) != len(authorities):
+        raise ValueError("duplicate planning authority ref")
+    prepared: list[tuple[Path, bytes, str | None]] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"kind", "path", "content"}:
+            raise ValueError("planning artifact schema invalid")
+        path_value = row.get("path")
+        content = row.get("content")
+        if not isinstance(path_value, str) or not isinstance(content, str):
+            raise ValueError("planning artifact path/content invalid")
+        relative = Path(path_value)
+        docs_bound = (
+            relative.parts[:3] in {
+                ("docs", "superpowers", "specs"),
+                ("docs", "superpowers", "plans"),
+            }
+        )
+        openspec_bound = (
+            len(relative.parts) >= 4
+            and relative.parts[:2] == ("openspec", "changes")
+            and relative.parts[2] == work_id
+            and relative.parts[2] != "archive"
+        )
+        manifest_bound = any(fnmatch.fnmatch(path_value, pattern) for pattern in allowed_refs)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not (docs_bound or openspec_bound)
+            or not manifest_bound
+            or relative.suffix != ".md"
+        ):
+            raise ValueError("planning artifact path outside governed roots")
+        unresolved = root / relative
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("planning artifact symlink rejected")
+        path = unresolved.resolve()
+        path.relative_to(root)
+        artifact = PlanningArtifact(kind=str(row["kind"]), ref=path_value, text=content)
+        if not assess_planning_artifact(artifact).accepted:
+            raise ValueError(f"planning artifact is not accepted: {path_value}")
+        owner = authority_by_ref.get(path_value)
+        baseline_hash: str | None = None
+        if path.exists():
+            if (
+                owner is None
+                or owner.ref != path_value
+                or owner.kind != row["kind"]
+                or owner.work_id != work_id
+            ):
+                raise ValueError(f"planning artifact lacks current planning authority: {path_value}")
+            baseline_hash = owner.baseline_sha256
+            if not path.is_file() or _sha256_path(path) != baseline_hash:
+                raise ValueError(f"planning artifact current authority drift: {path_value}")
+        elif owner is not None:
+            raise ValueError(f"planning artifact current authority drift: {path_value}")
+        prepared.append((path, content.encode("utf-8"), baseline_hash))
+
+    publication = transaction or _PlanningPublicationTransaction(
+        root=root, run_id="ephemeral", journal_root=None
+    )
+    try:
+        for target, content, baseline_hash in prepared:
+            publication.publish(target, content, baseline_hash=baseline_hash)
+    except BaseException:
+        publication.rollback()
+        raise
+    return publication.rollback
+
+
+def _current_workflow_step(run):
+    pending = [
+        step
+        for step in run.steps
+        if step.phase == run.current_phase and step.gate_result != "passed"
+    ]
+    return pending[0] if pending else None
+
+
+_MODEL_CHAIN_CAPABILITY_BY_PERSONA = {
+    "planner": "planning",
+    "reviewer": "review",
+    "builder": "build",
+}
+
+
+def _identity_candidates_for_persona(persona: str, identities: IdentityRegistry, builder_domains: set):
+    """依 persona 過濾出合法 candidate 清單（capability + independence domain）。
+
+    #205 的 run-scoped 覆寫用它做約束檢查，與共享 registry 選擇共用同一份過濾
+    條件，避免兩處判準漂移。**刻意不含 `primary_domain` 偏好**——那是「同 domain
+    優先」的排序偏好，不是合法性限制；拿它驗證覆寫會把偏好升級成硬約束，讓
+    operator 明確指定的 identity 被誤判為違規。
+    """
+    # 非 planner／reviewer 一律視為 builder（比照 #205 之前既有的 else 分支
+    # catch-all 行為，deck 目前只會派出 planner/build/reviewer 三種 persona）。
+    capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona, "build")
+    candidates = [item for item in identities.identities if capability in item.capabilities]
+    if persona == "reviewer":
+        candidates = [item for item in candidates if item.independence_domain not in builder_domains]
+    return candidates
+
+
+def _measured_profile_partition(
+    persona: str, sizing_band, candidates: list
+) -> tuple[list, list[tuple[object, str]]]:
+    """#452 C：measured 側寫的解析優先序與 capable() 判準 1 過濾。
+
+    - 帶該 persona 實測側寫（accepts_bands source=measured）的身分排前
+      （解析優先序：override > measured 側寫 > registry/預設；同層維持既有
+      registry 順序，stable partition 不重排）。
+    - 實測 accepts_bands 排除本 run 的 sizing_band 的身分被剔除，理由隨
+      excluded 回傳給呼叫端（#209 R1：全滅時進 fail-closed 錯誤訊息，部分
+      剔除時由呼叫端落 manager log，兩者皆可觀測）。band 未知（planning 尚未
+      產出）或封套來自預設（#453 零過濾不變量）時一律不過濾。
+    """
+
+    from .model_identities import ENVELOPE_SOURCE_MEASURED, project_envelope
+
+    measured: list = []
+    defaults: list = []
+    excluded: list[tuple[object, str]] = []
+    for identity in candidates:
+        projection = project_envelope(identity, persona)
+        if projection.source.get("accepts_bands") != ENVELOPE_SOURCE_MEASURED:
+            defaults.append(identity)
+            continue
+        bands = tuple(projection.envelope["accepts_bands"])
+        if sizing_band is not None and sizing_band not in bands:
+            excluded.append(
+                (
+                    identity,
+                    f"measured accepts_bands={list(bands)} 排除 sizing_band={sizing_band}",
+                )
+            )
+            continue
+        measured.append(identity)
+    return measured + defaults, excluded
+
+
+def _workflow_identity_candidates_for_persona(
+    run, persona: str, identities: IdentityRegistry
+) -> list:
+    """依既有規則產生合格 identity 清單，順序即優先序。
+
+    #262：re-route 需要「次佳但合法」的候選，因此把原本只回傳 candidates[0]
+    的邏輯抽成清單。過濾條件（persona capability、independence domain）完全
+    不變——spec 明列「不改 identity 選擇順序與 independence domain 規則」。
+
+    #205：run-scoped 覆寫先於共享 registry 選擇被檢查；命中時回傳**單元素**
+    清單，使 #262 的 preflight re-route 不會把 operator 明確指定的 identity
+    換成別的——覆寫的意義就是「用這一個」，被 re-route 掉等同靜默失效。
+    #452 C：覆寫優先序高於 measured 側寫，measured band 過濾不套用在覆寫上。
+    """
+
+    builder_domains = {
+        item.domain
+        for item in run.steps
+        if item.phase == "build" and item.gate_result == "passed" and item.domain is not None
+    }
+    # #205 R1/D1/D3/D4：run-scoped 覆寫先於共享 registry 選擇；三段各自獨立，
+    # 未覆寫的段落回退既有共享 registry 選擇邏輯（下方 fallback 完全不動）。
+    # 覆寫仍須通過與共享路徑相同的 capability／independence domain 約束，違反
+    # 時 fail closed 並列出可用 candidates，MUST NOT 靜默退回共享預設。
+    override = getattr(run, "model_chain_override", None)
+    persona_override = override.get(persona) if isinstance(override, dict) else None
+    if persona_override is not None:
+        eligible = _identity_candidates_for_persona(persona, identities, builder_domains)
+        executor = persona_override.get("executor")
+        model_id = persona_override.get("model_id")
+        identity = identities.get(executor, model_id)
+        available = ", ".join(f"{item.executor}/{item.model_id}" for item in eligible) or "(none)"
+        if identity is None:
+            raise ValueError(
+                "model chain override 指定的 identity 不存在於 registry: "
+                f"{persona}={executor}/{model_id}（可用 candidates: {available}）"
+            )
+        if identity not in eligible:
+            if persona == "reviewer" and identity.independence_domain in builder_domains:
+                reason = "independence_domain 與 builder 相同"
+            else:
+                capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona, "build")
+                reason = f"不具備 {capability} capability"
+            raise ValueError(
+                "model chain override 指定的 identity 不符既有約束: "
+                f"{persona}={executor}/{model_id}（{reason}；可用 candidates: {available}）"
+            )
+        return [identity]
+    candidates = _identity_candidates_for_persona(persona, identities, builder_domains)
+    if persona == "builder" and run.primary_domain is not None:
+        # #452 對抗審查修正：primary_domain 是「同 domain 優先」的**排序偏好**，
+        # 不是合法性限制（見 _identity_candidates_for_persona docstring）。舊實
+        # 作「preferred 非空即整組收窄」在 packaged roster 只有 agy 時無害，但
+        # roster 擴充 build 候選（#456 R3）後，僅為候選宣告的 packaged 身分會把
+        # host overlay 的可跑 builder 整個擠出候選清單，#262 preflight re-route
+        # 因此失去 fallback——packaged 登錄不隱含本機可用（比照 doctor #456 R6
+        # 的候選宣告語意）。改為 preferred 排前、其餘保留在後：首選不變，
+        # fallback 不丟。
+        preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
+        if preferred:
+            rest = [
+                item for item in candidates if item.independence_domain != run.primary_domain
+            ]
+            candidates = preferred + rest
+    if not candidates:
+        raise ValueError(f"no configured identity for workflow persona: {persona}")
+    # #452 C：measured 側寫優先＋band 過濾（三段 persona 之外的 catch-all
+    # persona 沒有封套語意，維持原清單）。
+    from .model_identities import DEFAULT_ENVELOPE
+
+    if persona in DEFAULT_ENVELOPE:
+        ordered, excluded = _measured_profile_partition(
+            persona, getattr(run, "sizing_band", None), candidates
+        )
+        if excluded and ordered:
+            # #452 對抗審查修正（#209 R1）：部分剔除（仍有存活候選）時排除理由
+            # 也要可觀測——落 manager log，不再靜默丟棄；全滅時走下方
+            # fail-closed 錯誤訊息。
+            logger.info(
+                "workflow run=%s persona=%s measured 側寫剔除候選：%s（存活候選 %d）",
+                getattr(run, "run_id", None),
+                persona,
+                "; ".join(
+                    f"{identity.executor}/{identity.model_id}: {reason}"
+                    for identity, reason in excluded
+                ),
+                len(ordered),
+            )
+        if not ordered:
+            detail = "; ".join(
+                f"{identity.executor}/{identity.model_id}: {reason}"
+                for identity, reason in excluded
+            )
+            raise ValueError(
+                f"no capable identity for workflow persona: {persona}（{detail}）"
+            )
+        candidates = ordered
+    return candidates
+
+
+def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> list:
+    return _workflow_identity_candidates_for_persona(run, step.persona, identities)
+
+
+def _select_workflow_identity(run, step, identities: IdentityRegistry):
+    return _workflow_identity_candidates(run, step, identities)[0]
+
+
+def _specialize_workflow_launcher(launcher, step):
+    """依 persona／commit policy 套用 launcher 的執行契約。
+
+    抽成函式是為了讓 #262 的 preflight 能取得「與正式 job 完全相同」的
+    launcher（進而是相同的 PATH／HOME／sandbox policy）。若 preflight 用未
+    specialize 的 launcher，reviewer 的最小 env 就不會被檢查到——那正是
+    design D2 說的安慰劑。
+    """
+
+    if step.persona == "planner":
+        read_only_factory = getattr(launcher, "as_read_only", None)
+        if not callable(read_only_factory):
+            raise ValueError("planner launcher lacks enforced read-only contract")
+        launcher = read_only_factory()
+    elif step.persona == "reviewer":
+        review_only_factory = getattr(launcher, "as_review_only", None)
+        if not callable(review_only_factory):
+            raise ValueError("reviewer launcher lacks enforced read-only contract")
+        terminal_kind = (
+            "workflow-verification-result"
+            if step.phase == "verify"
+            else "workflow-review-result"
+        )
+        launcher = review_only_factory(terminal_kind=terminal_kind)
+    effective_commit_policy = step.commit_policy or _LEGACY_CARD_EXECUTION.get(
+        step.card, (None, None, None, None)
+    )[2]
+    if effective_commit_policy == "required":
+        if step.persona != "builder":
+            raise ValueError("commit-required workflow card must use builder persona")
+        commit_required_factory = getattr(launcher, "as_commit_required", None)
+        if not callable(commit_required_factory):
+            raise ValueError("builder launcher lacks explicit commit-required capability")
+        launcher = commit_required_factory()
+    return launcher
+
+
+# #369：provider capability 探測的死碼修復。修復前 `_runtime_preflight_gate`
+# 呼叫 `evaluate_dispatch_gate` 時從未傳入 `snapshot_lookup`／`provider_prober`
+# （兩者預設 None）——`_resolve_provider_freshness` 在 `snapshot_lookup is None`
+# 時直接回 STALE_SNAPSHOT，而 STALE_SNAPSHOT 不在 `_BLOCKING_OUTCOMES`（只有
+# CAPABILITY_MISSING／PROVIDER_UNAVAILABLE 會擋），所以任何 `provider:` 宣告
+# 在生產環境永遠放行，等於整條路徑是死碼。以下兩個 factory 把它接上真正的
+# 資料源：GitHub 走既有 monitor durable snapshot（唯讀，無快照時安全回退成
+# STALE_SNAPSHOT，不變更行為的保守面）；executor 走 dispatch-time 的登入態
+# 探測（`coordinator.executor_auth`），以 process-level 快取避免每次 dispatch
+# 都重新 spawn CLI 子行程（見 `_EXECUTOR_AUTH_CACHE`）。
+#
+# #442：`provider:executor` sentinel 已（小範圍）接上 cards——openspec-archive
+# ／policy-commit 兩張 ship-phase 卡宣告了它（與 #369 先行接上的
+# `provider:github:<repo>` 併存），啟用前已在部署環境驗證 claude／codex／
+# copilot CLI 皆在場且登入態探測可用（見 #442 PR 的驗證紀錄）。其餘卡仍
+# 維持 hold：待 ship-phase 觀測無誤後再擴大，避免 dispatch 熱路徑對更多
+# combo 意外 spawn 探測子行程。探測成本由 `_EXECUTOR_AUTH_CACHE`（process-
+# level、TTL 900s）與 ProbeBudget 上限共同約束。
+_EXECUTOR_AUTH_CACHE: dict[str, object] = {}
+
+
+def _executor_auth_cache_identity(provider_id: str) -> tuple[str, str | None]:
+    """Bind Claude auth freshness to the configured compatible executable."""
+
+    if provider_id != "claude":
+        return provider_id, None
+    from .launcher import CLAUDE_EXECUTABLE_ENV, resolve_claude_executable
+
+    configured = os.environ.get(CLAUDE_EXECUTABLE_ENV, "").strip()
+    try:
+        executable = resolve_claude_executable()
+    except ValueError:
+        # Keep unavailable PATH/override authority isolated from previous valid
+        # paths; check_executor_auth resolves again and records the failure.
+        authority = configured or os.environ.get("PATH", "")
+        return f"{provider_id}:unavailable:{authority}", None
+    return f"{provider_id}:{executable}", executable
+
+
+def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> object | None:
+    from paulsha_cortex.monitor.work_models import parse_timestamp
+
+    from .runtime_preflight import DEFAULT_PROVIDER_TTL_SECONDS, ProviderFreshness
+
+    try:
+        snapshot = snapshot_store.load()
+    except Exception:  # noqa: BLE001 - monitor 快照壞掉不得拖垮 dispatch
+        return None
+    if snapshot is None:
+        return None
+    provider = snapshot.providers.get(provider_id)
+    if provider is None:
+        return None
+    try:
+        observed_at = parse_timestamp(provider.last_attempt_at).timestamp()
+    except ValueError:
+        return None
+    reason = "; ".join(provider.diagnostics) if provider.diagnostics else None
+    return ProviderFreshness(
+        provider_id=provider.provider_id,
+        status=provider.status,
+        observed_at=observed_at,
+        ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
+        source="monitor-snapshot",
+        reason=reason,
+    )
+
+
+def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
+    """#369：executor 登入態的「快照」層——實際是 process-level 快取。
+
+    沒有既有的 durable executor-auth snapshot 基礎設施（GitHub 有，monitor
+    daemon 會定期掃描並落盤；executor CLI 登入態沒有），因此第一次查詢時合成
+    一筆「已過期」的紀錄，讓 `_resolve_provider_freshness` 的 stale 分支去
+    呼叫 `provider_prober` 做一次真正探測；探測結果回寫這個 cache，後續在
+    TTL 內的查詢會直接命中 `is_fresh()`、不再重新 spawn 子行程。
+    """
+
+    from .runtime_preflight import ProviderFreshness
+
+    cache_key, _executable = _executor_auth_cache_identity(provider_id)
+    cached = _EXECUTOR_AUTH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    from .executor_auth import EXECUTOR_AUTH_TTL_SECONDS
+
+    return ProviderFreshness(
+        provider_id=provider_id,
+        status="degraded",
+        observed_at=0.0,
+        ttl_seconds=EXECUTOR_AUTH_TTL_SECONDS,
+        source="cold-start",
+        reason="no prior executor auth probe",
+    )
+
+
+def _executor_auth_prober(provider_id: str) -> object | None:
+    from .executor_auth import check_executor_auth
+
+    cache_key, executable = _executor_auth_cache_identity(provider_id)
+    result = check_executor_auth(provider_id, executable=executable)
+    _EXECUTOR_AUTH_CACHE[cache_key] = result
+    return result
+
+
+def _combined_provider_snapshot_lookup(*, snapshot_store) -> Callable[[str], object | None]:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    def _lookup(provider_id: str) -> object | None:
+        if provider_id in EXECUTOR_CANDIDATES:
+            return _executor_auth_snapshot_lookup(provider_id)
+        return _monitor_provider_snapshot_lookup(provider_id, snapshot_store=snapshot_store)
+
+    return _lookup
+
+
+def _combined_provider_prober(provider_id: str) -> object | None:
+    from .executor_auth import EXECUTOR_CANDIDATES
+
+    if provider_id in EXECUTOR_CANDIDATES:
+        return _executor_auth_prober(provider_id)
+    # GitHub 目前只用 monitor snapshot，不做額外 live probe：monitor daemon
+    # 本身已定期刷新該快照，再疊一層 live probe 只是重複付網路成本
+    # （#369 範圍界定，見 changelog）。
+    return None
+
+
+def _runtime_preflight_gate(
+    run, step, *, identities: IdentityRegistry, launcher_factory, snapshot_store=None
+):
+    """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
+
+    回傳 None 代表這張 card 未宣告任何 capability，呼叫端照原路徑走；否則回傳
+    `DispatchGateDecision`，其中 `launcher` 只在通過 preflight 的 identity 上建立
+    ——被擋下的 identity 不會產生任何 model session。
+
+    `snapshot_store` 預設 None 時延後到真正需要時才建立
+    `monitor.work_snapshot.WorkSnapshotStore()`（讀既有 monitor durable
+    snapshot）；測試可注入指向 tmp_path 的 store，不觸碰真實安裝路徑。
+    """
+
+    from .runtime_preflight import card_runtime_requirements, evaluate_dispatch_gate
+
+    try:
+        requirements = card_runtime_requirements(step.card)
+    except Exception:  # noqa: BLE001 - deck 載入問題不得把 dispatch 一起拖垮
+        return None
+    if not requirements:
+        return None
+
+    candidates = _workflow_identity_candidates(run, step, identities)
+
+    # 每個 identity 只 specialize 一次並記憶：preflight 與最終 dispatch 共用同一
+    # 個 launcher 實例，因此（a）檢查的環境就是 job 的環境，（b）通過的 identity
+    # 不會被重複套用 as_commit_required／as_review_only 等契約工廠。
+    specialized: dict[int, object] = {}
+
+    def _launcher_for(identity):
+        key = id(identity)
+        if key not in specialized:
+            specialized[key] = _specialize_workflow_launcher(launcher_factory(identity), step)
+        return specialized[key]
+
+    def _environment_for(identity):
+        launcher = _launcher_for(identity)
+        describe = getattr(launcher, "executor_environment", None)
+        if callable(describe):
+            return describe()
+        # launcher 未描述自身環境時退回 host 描述：仍會檢查，只是無法保證與正式
+        # job 完全一致；這是 fail-soft，不比 #262 之前更差。
+        from .runtime_preflight import host_environment
+
+        return host_environment()
+
+    active_store = snapshot_store
+    if active_store is None:
+        from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+        active_store = WorkSnapshotStore()
+
+    return evaluate_dispatch_gate(
+        card=step.card,
+        requirements=requirements,
+        candidates=candidates,
+        environment_for=_environment_for,
+        launcher_factory=_launcher_for,
+        snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
+        provider_prober=_combined_provider_prober,
+    )
+
+
+def _record_resolved_model_chain(registry, run, step, identity) -> None:
+    """#205 R4/D5：把本次 dispatch 實際解析到的 executor/model/domain 與來源
+    寫入 run，供事後稽核。純 provenance 寫入，逐段覆蓋合併既有紀錄，不影響
+    既有 workflow 語意或推進邏輯。
+
+    #452 C：source 記錄實際解析依據——run-scoped 覆寫記 ``override``；身分帶
+    該 persona 的實測側寫記 ``patchmud-profile``；查表投影落在保守預設記
+    ``default-envelope``（``registry`` 保留為 #452 前既有紀錄的 legacy 值）。
+    """
+    override = getattr(run, "model_chain_override", None)
+    if isinstance(override, dict) and step.persona in override:
+        source = "override"
+    else:
+        from .model_identities import (
+            DEFAULT_ENVELOPE,
+            ENVELOPE_SOURCE_MEASURED,
+            project_envelope,
+        )
+
+        source = "default-envelope"
+        if step.persona in DEFAULT_ENVELOPE:
+            projection = project_envelope(identity, step.persona)
+            if ENVELOPE_SOURCE_MEASURED in projection.source.values():
+                source = "patchmud-profile"
+    resolved = dict(getattr(run, "resolved_model_chain", None) or {})
+    resolved[step.persona] = {
+        "executor": identity.executor,
+        "model_id": identity.model_id,
+        "independence_domain": identity.independence_domain,
+        "source": source,
+    }
+    registry._manager_update_workflow_run(run.run_id, resolved_model_chain=resolved)
+
+
+_LEGACY_CARD_EXECUTION = {
+    "worktree-isolation": (
+        "superpowers:using-git-worktrees",
+        "Confirm the Manager-provisioned worktree; do not create a second worktree.",
+        "forbidden",
+        "none",
+    ),
+    "tdd-red": (
+        "superpowers:test-driven-development",
+        "Use the accepted plan to add and commit a reproducible RED regression test. "
+        "In pinned planning files (tasks.md / todo.md) you may ONLY toggle checkbox "
+        "state; never edit, rephrase, or annotate their text — any wording change "
+        "is planning-input drift and fails the run.",
+        "required",
+        "red-required",
+    ),
+    "subagent-build": (
+        "superpowers:subagent-driven-development",
+        "Implement the accepted plan with the minimum diff and commit a tested candidate HEAD. "
+        "In pinned planning files (tasks.md / todo.md) you may ONLY toggle checkbox "
+        "state; never edit, rephrase, or annotate their text — any wording change "
+        "is planning-input drift and fails the run.",
+        "required",
+        "focused",
+    ),
+}
+
+
+def _repair_findings_prompt_suffix(run, *, coordinator_root: str | Path) -> str:
+    journal_path = Path(coordinator_root) / "delivery-journal.json"
+    if journal_path.is_symlink() or not journal_path.is_file():
+        return ""
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    runs = journal.get("runs") if isinstance(journal, dict) else None
+    row = runs.get(run.run_id) if isinstance(runs, dict) else None
+    ship = row.get("ship") if isinstance(row, dict) else None
+    findings = ship.get("findings") if isinstance(ship, dict) else None
+    if not (
+        isinstance(ship, dict)
+        and ship.get("phase") == "needs-fix"
+        and isinstance(findings, list)
+        and findings
+    ):
+        return ""
+    compact: list[str] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        path = finding.get("path")
+        line = finding.get("line")
+        body = finding.get("body")
+        if path is not None and not isinstance(path, str):
+            continue
+        if line is not None and (not isinstance(line, int) or isinstance(line, bool)):
+            continue
+        if not isinstance(body, str) or not body:
+            continue
+        compact.append(f"[{path or '?'}:{line if line is not None else '?'}] {body}")
+    if not compact:
+        return ""
+    suffix = " Reviewer findings to fix in this repair (address each, then commit): " + "; ".join(
+        compact
+    )
+    return suffix[:2000]
+
+
+def _workflow_job_prompt(
+    run,
+    step,
+    *,
+    builder_job_id: str | None,
+    coordinator_root: str | Path,
+    input_snapshot: tuple[dict[str, str], ...] = (),
+    candidate_checkout: str | None = None,
+) -> str:
+    fallback = _LEGACY_CARD_EXECUTION.get(step.card, (None, None, None, None))
+    source_material: list[dict[str, object]] = []
+    for row in input_snapshot:
+        envelope = _read_workflow_input_content(
+            row,
+            run=run,
+            coordinator_root=coordinator_root,
+        )
+        source_material.append({**row, "content": envelope["content"]})
+    if step.phase == "verify":
+        terminal_schema: dict[str, object] = {
+            "kind": "workflow-verification-result",
+            "schema_version": 1,
+            "required": ["schema_version", "kind", "status", "summary", "details", "reports"],
+            "fixed": {"schema_version": 1, "kind": "workflow-verification-result"},
+            # #261 R1：成功、失敗與需人工介入三者對等可達。gate 失敗時必須誠實回
+            # failed／needs_human，不得為了讓 card 收斂而輸出 verified。
+            "status": ["verified", "failed", "needs_human"],
+            "status_policy": (
+                "Report verified only when every deterministic gate you ran actually passed. "
+                "If any gate failed, report failed; if the decision needs a human, report "
+                "needs_human. A non-passing terminal is a valid, expected outcome."
+            ),
+            "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
+        }
+    elif step.phase == "review":
+        authority_hashes_expected = {
+            row["path"]: row["sha256"]
+            for row in input_snapshot
+            if row.get("authority") == "planning-authority"
+        }
+        terminal_schema = {
+            "kind": "workflow-review-result",
+            "schema_version": 1,
+            "required": [
+                "schema_version", "kind", "reason", "findings", "reports",
+                *(["authority_hashes"] if authority_hashes_expected else []),
+            ],
+            "fixed": {
+                "schema_version": 1,
+                "kind": "workflow-review-result",
+                # #315 補遺 2：sonnet reviewer 對「actually opened」措辭的條件性
+                # 解讀會整組省略 authority_hashes（實測 2/2）。expected 值由
+                # manager 原樣提供，列入 fixed 要求逐字照抄——照抄本身即攻證
+                # 「收到的 frozen authority 與 pinned hash 一致」；harvest 端
+                # 的精確比對不變。
+                **(
+                    {"authority_hashes": dict(authority_hashes_expected)}
+                    if authority_hashes_expected
+                    else {}
+                ),
+            },
+            # #261 R1：選填欄位；review verdict 仍由 findings 決定，status 只用來
+            # 誠實表達「這張 review card 自己沒能完成」。
+            "optional": ["status"],
+            "status": ["passed", "failed", "needs_human"],
+            "finding_keys": ["category", "severity", "summary", "evidence", "recommendation"],
+            "finding_evidence_keys": ["path", "line", "detail"],
+            "finding_categories": sorted(foreign_review.VALID_FINDING_CATEGORIES),
+            "finding_severities": sorted(foreign_review.VALID_SEVERITIES),
+            "finding_category_policy": {
+                "blocking": (
+                    "Use correctness/acceptance/security/data-loss/race/scope-bypass/"
+                    "verification-bypass only for Candidate or acceptance defects."
+                ),
+                "report_only": (
+                    "Use style for prior-report wording or enumeration inaccuracies that do not "
+                    "change the Candidate verdict, and correct the record in this report."
+                ),
+            },
+            "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
+        }
+        if authority_hashes_expected:
+            terminal_schema["authority_hashes"] = {
+                "description": (
+                    "MANDATORY: copy the expected mapping below verbatim into the "
+                    "authority_hashes field of your terminal JSON. It attests the frozen "
+                    "planning authority you received; the verdict is rejected if the field "
+                    "is missing or differs in any way."
+                ),
+                "expected": dict(authority_hashes_expected),
+            }
+    else:
+        fixed_terminal_fields: dict[str, object] = {
+            "schema_version": terminal_contract.TERMINAL_SCHEMA_VERSION,
+            "kind": "workflow-card",
+            "run_id": run.run_id,
+            "card_id": step.card,
+        }
+        if not step.outputs:
+            fixed_terminal_fields["outputs"] = []
+        terminal_schema = {
+            "kind": "workflow-card",
+            # #261 D1：canonical envelope。舊的 schema_version 1 形狀仍可被 harvest
+            # 讀取（相容路徑＋legacy 標記），但新派工一律要求 canonical 版本。
+            "schema_version": terminal_contract.TERMINAL_SCHEMA_VERSION,
+            "required": [
+                "schema_version", "kind", "status", "run_id", "card_id", "candidate",
+                "outputs", "diagnostics", "gate_evidence",
+            ],
+            "fixed": fixed_terminal_fields,
+            "status": ["passed", "failed", "needs_human"],
+            # #261 R2：成功必須由 gate evidence 證明。模型自述、exit code 為 0、
+            # 「沒看到錯誤」三者皆不構成成功授權；manager 會重讀 gate ledger 做
+            # 確定性 cross-check，矛盾即 fail closed。
+            "status_policy": (
+                "Report passed only when every deterministic gate you ran (OpenSpec / pytest / "
+                "policy) actually passed. Natural-language confidence, an exit code of 0, and "
+                "the absence of an explicit error do NOT authorize passed. If any gate failed, "
+                "report failed; the Manager re-reads the gate ledger and fails closed on any "
+                "contradiction, so a dishonest passed only costs you a retry."
+            ),
+            "outputs": {
+                "type": "array",
+                "items": "repo-relative artifact path string matching declared_outputs",
+                "must_match_every_declared_output": True,
+                "descriptive_objects_forbidden": True,
+            },
+            # #261 R1：結構化 diagnostics，讓失敗與需人工介入有對等的表達位置。
+            "diagnostics": {
+                "type": "object",
+                "description": (
+                    "Structured, machine-readable context for this terminal. Required for "
+                    "every status; put the concrete failure detail here when reporting "
+                    "failed or needs_human instead of burying it in prose."
+                ),
+            },
+            # #261 R2：模型自述跑了哪些 gate。Manager 會用它自己在你結束之後獨立
+            # 產生的 gate ledger 對照這份宣告，任何不一致都會 fail closed。
+            "gate_evidence": {
+                "type": "array",
+                "items": {"name": "gate name", "status": "passed | failed"},
+                "description": (
+                    "Declare every deterministic gate you actually ran and its real result. "
+                    "The Manager independently re-runs the declared gate commands after your "
+                    "process exits and compares; claiming a gate you did not run, or claiming "
+                    "passed for a gate that failed, fails the card closed."
+                ),
+            },
+        }
+    contract: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "workflow-card-prompt",
+        "run_id": run.run_id,
+        "work_id": run.work_id,
+        "repo": run.repo,
+        "source_revision": run.source_revision,
+        "phase": step.phase,
+        "card_id": step.card,
+        "persona": step.persona,
+        "inputs": list(dict.fromkeys(row["pattern"] for row in input_snapshot)),
+        "source_material": source_material,
+        "declared_outputs": list(step.outputs),
+        "candidate": run.candidate_head,
+        "skill_ref": step.skill_ref or fallback[0],
+        "action": step.action or fallback[1],
+        "commit_policy": step.commit_policy or fallback[2],
+        "test_policy": step.test_policy or fallback[3],
+        "terminal_schema": terminal_schema,
+    }
+    if run.openspec_refs:
+        contract["openspec_ref"] = run.openspec_refs[0]
+    if builder_job_id is not None:
+        contract["builder_job_id"] = builder_job_id
+    if candidate_checkout is not None:
+        contract["candidate_checkout"] = candidate_checkout
+    effective_commit_policy = step.commit_policy or fallback[2]
+    tasks_path = (
+        f"openspec/changes/{contract['openspec_ref']}/tasks.md"
+        if isinstance(contract.get("openspec_ref"), str)
+        else "openspec/changes/<change>/tasks.md"
+    )
+    planner_contract = (
+        " This planner card is read-only: use the disposable checkout only, do not edit files, and "
+        "return only existing manifest-declared artifacts."
+        if step.persona == "planner"
+        else ""
+    )
+    reviewer_contract = (
+        " This reviewer card is read-only: inspect and run only non-mutating commands in the "
+        "Candidate checkout. If candidate_checkout is present, change into that relative directory "
+        "before every repository command. Execute the verification or review now; do not create a plan or ask "
+        "for approval. Return report bodies inline; Manager alone writes report files, binding "
+        "frontmatter, job IDs, Candidate and launch identities."
+        if step.persona == "reviewer"
+        else ""
+    )
+    commit_required_contract = (
+        f" Before the final commit, update {tasks_path} checkboxes for work completed by this card, "
+        "and never modify pinned input files such as the plan document."
+        if effective_commit_policy == "required"
+        else ""
+    )
+    repair_findings_contract = (
+        _repair_findings_prompt_suffix(run, coordinator_root=coordinator_root)
+        if effective_commit_policy == "required"
+        else ""
+    )
+    return (
+        "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
+        "path or hash because Manager will canonicalize it. For workflow-card outputs, return only "
+        "repo-relative artifact path strings matching declared_outputs; when declared_outputs is "
+        "empty, outputs must be exactly []. Never put action, summary, or other descriptive objects "
+        "in outputs. For build cards, candidate must be the full 40-hex commit SHA of the worktree "
+        "HEAD after the card completes (use `git rev-parse HEAD`); commit-forbidden cards must "
+        "report the current HEAD, build candidates must never be null, and plan candidates must be "
+        "null."
+        + planner_contract
+        + reviewer_contract
+        + commit_required_contract
+        + repair_findings_contract
+        + " Contract: "
+        + json.dumps(contract, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def _plan_frontmatter_artifact_classes(text: str) -> frozenset[str] | None:
+    """讀 plan 自己宣告的 ``artifact_classes``（複用 ``_report_binding`` 的 frontmatter
+    抽取手法），供 ``planning.plan_review_gate()`` 的 ``acceptance_surfaces`` 輸入
+    ——與 ``_plan_review_envelope`` 消費同一個宣告欄位語意一致：plan 說它覆蓋哪些
+    artifact classes，completeness 檢查 Tasks 是否真的每個都有對應項目。缺席或
+    格式錯誤一律回傳 ``None``（fail-soft，呼叫端據此判斷 gate 是否可跑）。
+    """
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        closing = next(
+            index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"
+        )
+    except StopIteration:
+        return None
+    try:
+        payload = safe_load("\n".join(lines[1:closing]))
+    except YAMLError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    classes = payload.get("artifact_classes")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or any(not isinstance(item, str) or not item.strip() for item in classes)
+    ):
+        return None
+    return frozenset(item.strip() for item in classes)
+
+
+def _plan_review_envelope_lookup(run, identities: IdentityRegistry):
+    """#452 C：`planning._plan_review_envelope` 的 envelope_lookup provider。
+
+    投影對象是「本 run 將解析到的 builder 身分」（#205 覆寫優先，與 dispatch
+    同一條解析路徑）。#453 R5／#454 R5：投影所需兩鍵任一來源為 default 即回
+    ``None``——v1 映射不量測這兩欄，現況恆回 None，seam 證據字節與
+    ``envelope_lookup=None`` 逐位元相同；實測值落地後自動開始真值過濾。
+    """
+
+    def _lookup():
+        try:
+            candidates = _workflow_identity_candidates_for_persona(run, "builder", identities)
+        except ValueError:
+            return None
+        from .model_identities import plan_review_envelope_projection
+
+        return plan_review_envelope_projection(candidates[0], persona="builder")
+
+    return _lookup
+
+
+def _evaluate_yellow_plan_review(
+    artifacts: tuple[PlanningArtifact, ...] | None,
+    envelope_lookup=None,
+):
+    """#208 收口 wiring 2：Yellow band 推進 build 前的機械 plan review 判定。
+
+    輸入不可得（沒有 plan artifact、或它缺少 ``artifact_classes`` 宣告）一律
+    fail-soft 回傳 ``None``——呼叫端據此維持現行為（正常推進），不得讓既有
+    測試變紅。``applicable_contract_rules`` 固定餵 ``ACCEPTANCE_SURFACE_RULES``
+    全集，理由同 ``work_bridge.current_sizing_snapshot``。
+
+    ``envelope_lookup``（#452 C）由呼叫端以 :func:`_plan_review_envelope_lookup`
+    注入；預設 ``None`` 維持 #209 未接線時的既有 bypass 語意。
+    """
+
+    if artifacts is None:
+        return None
+    plan_artifact = next((item for item in artifacts if item.kind == "plan"), None)
+    if plan_artifact is None:
+        return None
+    acceptance_surfaces = _plan_frontmatter_artifact_classes(plan_artifact.text)
+    if acceptance_surfaces is None:
+        return None
+    try:
+        return plan_review_gate(
+            plan_artifact=plan_artifact,
+            acceptance_surfaces=acceptance_surfaces,
+            applicable_contract_rules=ACCEPTANCE_SURFACE_RULES,
+            envelope_lookup=envelope_lookup,
+        )
+    except ValueError:
+        return None
+
+
+def _dispatch_workflow_card(
+    dispatcher,
+    *,
+    run,
+    identities: IdentityRegistry,
+    launcher_factory: Callable[[object], object],
+    coordinator_root: str | Path,
+    retry_failed: bool = False,
+    operator_recovery_job_id: str | None = None,
+    force_new_build: bool = False,
+    forced_identity: object | None = None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
+) -> dict[str, object] | None:
+    """#381：workflow lane 的實際 spawn 點。spawn_admission 未注入時解析為
+    零間隔 no-op（見 spawn_admission.resolve_limiter）——只有 resume_workflow_run
+    /manager_daemon periodic tick 顯式注入同一個 instance 時，兩條 lane 才會
+    對同一 provider 共用節流時間軸。"""
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        raise RuntimeError("workflow dispatch requires dispatcher registry")
+    step = _current_workflow_step(run)
+    if step is None or run.current_phase not in {"plan", "build", "verify", "review"}:
+        return None
+    if force_new_build and (step.phase != "build" or step.persona != "builder"):
+        raise ValueError("forced workflow retry requires builder card")
+    matching = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_card") == step.card
+        and job.get("workflow_phase") == step.phase
+        and (
+            step.phase not in {"verify", "review"}
+            or job.get("subject_head") == run.candidate_head
+        )
+    ]
+    retryable_latest = bool(
+        matching
+        and (
+            (
+                retry_failed
+                and (
+                    _is_stale_terminalized_failed_job(matching[-1])
+                    or _retryable_nonpassing_workflow_terminal(matching[-1])
+                    or _malformed_workflow_card_terminal(matching[-1])
+                    or _is_rejected_workflow_review_evidence(
+                        matching[-1],
+                        run=run,
+                        coordinator_root=coordinator_root,
+                    )
+                )
+            )
+            or (
+                operator_recovery_job_id == matching[-1].get("job_id")
+                and (
+                    _is_exact_legacy_agy_recovery(
+                        matching[-1], run=run, step=step, identities=identities
+                    )
+                    or _is_exact_reviewer_terminal_recovery(
+                        registry,
+                        matching[-1],
+                        run=run,
+                        step=step,
+                        identities=identities,
+                        coordinator_root=coordinator_root,
+                    )
+                )
+            )
+            or (force_new_build and matching[-1].get("status") in TERMINAL_STATUSES)
+        )
+    )
+    if matching and not retryable_latest:
+        return matching[-1]
+    if matching and step.persona == "planner":
+        _discard_failed_planner_sandbox(
+            matching[-1],
+            run_id=run.run_id,
+            card=step.card,
+            coordinator_root=coordinator_root,
+        )
+    if step.persona == "planner" and step.phase == "plan":
+        artifacts = _load_run_planning_artifacts(run)
+        try:
+            planning_complete = artifacts is not None and assess_planning_completeness(artifacts).complete
+        except ValueError:
+            planning_complete = False
+        if planning_complete:
+            pending_phase_steps = [
+                item
+                for item in run.steps
+                if item.phase == run.current_phase and item.gate_result != "passed"
+            ]
+            is_last_pending = bool(pending_phase_steps) and step.card == pending_phase_steps[-1].card
+            if is_last_pending and run.current_phase == "plan" and run.sizing_band == "red":
+                # #223（design #208 H.3）：Red band 收斂到 needs_decomposition，
+                # 不推進到 build；current_phase 刻意保持在 plan
+                # （validate_workflow_phase_transition 只允許單調 +1，Red 決策
+                # 不是合法的 phase transition，見 #223 讀碼地圖）。拆分深度逾限
+                # （decomposition_depth 已達上限）改轉 needs_human（驗收條件
+                # 3）。每次 dispatch 都會重新檢查 sizing_band，band 跨帶上升
+                # 至 red 時同樣在此攔下、不會以原身分繼續推進（驗收條件 4）。
+                route = decomposition_route(decomposition_depth=run.decomposition_depth)
+                updated = registry._manager_update_workflow_run(
+                    run.run_id,
+                    facets=tuple(dict.fromkeys((*run.facets, route))),
+                )
+                return {
+                    "run_id": updated.run_id,
+                    "current_phase": updated.current_phase,
+                    "reason": (
+                        "decomposition-depth-exceeded"
+                        if route == "needs_human"
+                        else "needs-decomposition"
+                    ),
+                }
+            plan_review_passed_now = False
+            if is_last_pending and run.current_phase == "plan" and run.sizing_band == "yellow":
+                # #208 收口 wiring 2：Yellow 先機械 plan review 再放行進 build
+                # （#212 的判定機制，這裡只接線）。Green／Red／None band 不呼叫
+                # gate（Red 已在上面攔下；Green/None 維持現行為，#223 已定案的
+                # fail-soft 慣例）。
+                gate_outcome = _evaluate_yellow_plan_review(
+                    artifacts,
+                    envelope_lookup=_plan_review_envelope_lookup(run, identities),
+                )
+                if gate_outcome is not None and not gate_outcome.ready:
+                    if gate_outcome.terminal:
+                        updated = registry._manager_update_workflow_run(
+                            run.run_id, facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+                        )
+                        return {
+                            "run_id": updated.run_id,
+                            "current_phase": updated.current_phase,
+                            "reason": f"plan-review-{gate_outcome.failed_check}",
+                        }
+                    # non-terminal：不推進，記錄可重試原因；不動 run（下次
+                    # dispatch 對同一份 plan 重跑同一個判定，plan 修訂後即可
+                    # 通過——與 Red 的 needs_decomposition 不同，這裡不是終局
+                    # 路由，run 狀態原樣保留）。
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "reason": f"plan-review-retry-{gate_outcome.failed_check}",
+                    }
+                if gate_outcome is not None and gate_outcome.ready:
+                    plan_review_passed_now = True
+                # gate_outcome is None：輸入不可得（fail-soft），落到下面正常推進，
+                # 維持現行為，不掛 plan_review_passed。
+            # #414：deterministic pass 這張 plan 卡之前，先驗證卡片宣告的
+            # outputs glob 是否已在 workspace_root 命中實檔——不對稱地只驗
+            # build 端 declared input、卻放過 plan 端 declared output，正是
+            # 生產事故（run workflow-e18785ac）的根因。缺席時嘗試
+            # materialize；不可 materialize 時 fail-closed 不跳過（詳見
+            # `_materialize_plan_card_output` docstring）。
+            workspace_root = Path(run.workspace_root).resolve()
+            new_authority: PlanningArtifactAuthority | None = None
+            publication: _PlanningPublicationTransaction | None = None
+            if not _plan_card_declared_outputs_present(workspace_root, step.outputs):
+                materialize_result = _materialize_plan_card_output(
+                    run=run, step=step, artifacts=artifacts, workspace_root=workspace_root,
+                )
+                if materialize_result is None:
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "reason": "plan-outputs-missing",
+                    }
+                artifacts, new_authority, publication = materialize_result
+            next_phase = run.current_phase
+            attempts = run.attempts
+            if is_last_pending:
+                next_phase = WORKFLOW_PHASES[WORKFLOW_PHASES.index(run.current_phase) + 1]
+                attempts = {
+                    **run.attempts,
+                    next_phase: run.attempts.get(next_phase, 0) + 1,
+                }
+            try:
+                registry._manager_update_workflow_run(
+                    run.run_id,
+                    current_phase=next_phase,
+                    steps=_audit_phase_steps(
+                        run.steps,
+                        phase=run.current_phase,
+                        executor="cortex-manager",
+                        model="deterministic",
+                        domain="cortex",
+                        outputs=tuple(artifact.ref for artifact in artifacts),
+                        card_id=step.card,
+                    ),
+                    attempts=attempts,
+                    **({"plan_review_passed": True} if plan_review_passed_now else {}),
+                    **(
+                        {"planning_authority": run.planning_authority + (new_authority,)}
+                        if new_authority is not None
+                        else {}
+                    ),
+                )
+            except BaseException:
+                if publication is not None:
+                    publication.rollback()
+                raise
+            return None
+    # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
+    # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
+    # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
+    # #384：`forced_identity` 提供時（provider 失敗 bounded retry 的 re-route
+    # 決策，見 `resume_workflow_run`／`_provider_failure_reroute`）代表呼叫端
+    # 已經跑過一次針對「剛剛觀察到的失敗」的 evaluate_dispatch_gate 決策，這裡
+    # 不再重跑一次通用 preflight（重跑不會產生更好的答案，只是多付一次探測
+    # 成本）。
+    gate = (
+        None
+        if forced_identity is not None
+        else _runtime_preflight_gate(
+            run,
+            step,
+            identities=identities,
+            launcher_factory=launcher_factory,
+        )
+    )
+    if gate is not None and gate.action == "needs_human":
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": f"runtime-preflight-{gate.result.outcome.value}",
+            "runtime_preflight": gate.to_dict(),
+        }
+    if gate is not None:
+        # gate.launcher 已由 _runtime_preflight_gate 套過執行契約，不再 specialize。
+        identity = gate.identity
+        launcher = gate.launcher
+        if launcher is None:
+            raise ValueError("workflow launcher unavailable")
+    elif forced_identity is not None:
+        identity = forced_identity
+        launcher = launcher_factory(identity)
+        if launcher is None:
+            raise ValueError("workflow launcher unavailable")
+        launcher = _specialize_workflow_launcher(launcher, step)
+    else:
+        identity = _select_workflow_identity(run, step, identities)
+        launcher = launcher_factory(identity)
+        if launcher is None:
+            raise ValueError("workflow launcher unavailable")
+        launcher = _specialize_workflow_launcher(launcher, step)
+    # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
+    # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
+    _record_resolved_model_chain(registry, run, step, identity)
+    builder_jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and (
+            job.get("persona") == "builder"
+            or (
+                job.get("persona") == "manager"
+                and job.get("workflow_phase") == "ship"
+                and job.get("workflow_card") == "openspec-archive"
+            )
+        )
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+        and (
+            run.candidate_head is None
+            or job.get("subject_head") == run.candidate_head
+        )
+    ]
+    builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
+    if step.persona == "reviewer" and builder_job_id is None:
+        raise ValueError("workflow reviewer builder job unavailable")
+    planner_sandbox: Path | None = None
+    reviewer_sandbox: Path | None = None
+    sandbox_hash: str | None = None
+    repo_root = run.workspace_root
+    if step.persona == "planner":
+        sandbox_parent = Path(coordinator_root).resolve() / "planning-sandboxes"
+        try:
+            sandbox_parent.relative_to(Path(run.workspace_root).resolve())
+        except ValueError:
+            pass
+        else:
+            sandbox_parent = (
+                Path(coordinator_root).resolve().parent
+                / f".{Path(coordinator_root).resolve().name}-planning-sandboxes"
+            )
+        sandbox_parent.mkdir(parents=True, exist_ok=True)
+        sandbox_name = hashlib.sha256(f"{run.run_id}:{step.card}".encode()).hexdigest()[:32]
+        planner_sandbox = sandbox_parent / sandbox_name
+        if planner_sandbox.exists() or planner_sandbox.is_symlink():
+            raise ValueError("stale planner sandbox requires reconciliation")
+        planning_runtime._copy_planning_sandbox(Path(run.workspace_root), planner_sandbox)
+        sandbox_hash = planning_runtime._tree_snapshot(planner_sandbox)
+        worktree = str(planner_sandbox)
+    elif builder_jobs:
+        worktree = str(builder_jobs[-1]["worktree"])
+    elif step.phase == "build":
+        creator = getattr(dispatcher, "_worktree_creator", None)
+        workspace_root = Path(run.workspace_root)
+        if creator is None:
+            try:
+                creator = seams.ScriptWorktreeCreator(
+                    repo=workspace_root,
+                    wt_root=worktree_root_for(workspace_root),
+                    base="main",
+                )
+            except BaseException as exc:
+                raise ValueError("workflow builder worktree creator unavailable") from exc
+        elif isinstance(creator, seams.ScriptWorktreeCreator) and (
+            str(Path(creator.repo_root).resolve()) != str(workspace_root.resolve())
+        ):
+            try:
+                creator = seams.ScriptWorktreeCreator(
+                    repo=workspace_root,
+                    wt_root=worktree_root_for(workspace_root),
+                    base="main",
+                )
+            except BaseException as exc:
+                raise ValueError("workflow builder worktree creator unavailable") from exc
+        issue_numbers = [
+            int(match.group(1))
+            for ref in run.issue_refs
+            if (match := re.fullmatch(rf"{re.escape(run.repo)}#([1-9][0-9]*)", ref))
+        ]
+        primary_issue = min(issue_numbers) if issue_numbers else None
+        builder_branch = (
+            f"feature/{primary_issue}-{run.work_id}"
+            if primary_issue is not None
+            else f"feature/{run.work_id}"
+        )
+        # #208 收口 wiring 5（#211 閉環）：凍結集存在時 worktree 必須以
+        # frozen_readiness["base_sha"] 為基底，不得讓 dispatch 自行重新推導
+        # 一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2 的 stale-base
+        # 缺陷）。無凍結集時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
+        # WorktreeCreator 實作 without base_sha 亦不受影響）。
+        frozen_base_sha = None
+        if isinstance(run.frozen_readiness, dict):
+            candidate_base_sha = run.frozen_readiness.get("base_sha")
+            if isinstance(candidate_base_sha, str) and candidate_base_sha:
+                frozen_base_sha = candidate_base_sha
+        if frozen_base_sha is not None:
+            worktree = str(creator.create(builder_branch, base_sha=frozen_base_sha))
+        else:
+            worktree = str(creator.create(builder_branch))
+    else:
+        worktree = run.workspace_root
+    effective_repo_root = Path(worktree).resolve()
+    effective_inputs = _effective_workflow_inputs(run, step)
+    if step.persona == "reviewer":
+        reviewer_target = effective_repo_root
+        # #310 補遺：checkbox 容忍成立的 tasks/todo 以候選實際 hash 為 pinned 期望值。
+        authority_map = _authority_map_with_checkbox_tolerance(
+            run, candidate_root=reviewer_target
+        )
+        effective_inputs = _reviewer_input_patterns(run, effective_inputs)
+        input_snapshot = _workflow_input_snapshot(
+            run=run,
+            repo_root=reviewer_target,
+            patterns=effective_inputs,
+            coordinator_root=coordinator_root,
+        )
+        # Snapshot construction already proves every bound row against frozen
+        # authority (including EOL and checkbox-only normalization).  Reviewers
+        # must attest the exact bytes they receive, so pin the terminal contract
+        # to those proven snapshot digests.
+        snapshot_hashes = {
+            str(row["path"]): str(row["sha256"])
+            for row in input_snapshot
+            if row.get("authority") == "planning-authority"
+        }
+        authority_map = {
+            ref: snapshot_hashes.get(ref, digest)
+            for ref, digest in authority_map.items()
+        }
+        foreign_review.verify_authority_in_input_snapshot(
+            authority=authority_map,
+            input_snapshot=input_snapshot,
+        )
+        output_baseline = _workflow_output_baseline(reviewer_target, step.outputs)
+        try:
+            reviewer_sandbox, reviewer_checkout = _create_reviewer_sandbox(
+                run=run,
+                step=step,
+                executor=identity.executor,
+                candidate_root=reviewer_target,
+                coordinator_root=coordinator_root,
+                input_snapshot=input_snapshot,
+            )
+            sandbox_hash = planning_runtime._tree_snapshot(reviewer_target)
+            repo_root = str(reviewer_target)
+            worktree = str(reviewer_sandbox)
+            effective_repo_root = reviewer_checkout
+            _validate_workflow_input_snapshot(
+                effective_repo_root,
+                list(input_snapshot),
+                coordinator_root=coordinator_root,
+            )
+        except BaseException:
+            if reviewer_sandbox is not None:
+                shutil.rmtree(reviewer_sandbox, ignore_errors=True)
+            raise
+    else:
+        input_snapshot = _workflow_input_snapshot(
+            run=run,
+            repo_root=effective_repo_root,
+            patterns=effective_inputs,
+            coordinator_root=coordinator_root,
+        )
+        output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
+    dispatch_base: str | None = None
+    if step.phase == "build":
+        if builder_jobs:
+            persisted_base = builder_jobs[0].get("dispatch_head")
+            if (
+                not isinstance(persisted_base, str)
+                or verification.SAFE_SHA_RE.fullmatch(persisted_base) is None
+            ):
+                raise ValueError("workflow build phase base is unavailable")
+            dispatch_base = persisted_base
+        else:
+            base_result = verification._run_git(
+                ["-C", str(effective_repo_root), "rev-parse", "HEAD"],
+                getattr(dispatcher, "_git_runner", None),
+            )
+            base_value = str(base_result.get("stdout", "")).strip().lower()
+            if (
+                base_result.get("status") != "ok"
+                or verification.SAFE_SHA_RE.fullmatch(base_value) is None
+            ):
+                raise ValueError("workflow build phase base is unavailable")
+            dispatch_base = base_value
+    task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
+    try:
+        branch = (
+            (
+                str(builder_jobs[-1]["branch"])
+                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                else builder_branch
+            )
+            if step.phase == "build"
+            else (
+                str(builder_jobs[-1]["branch"])
+                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                else f"feature/{run.work_id}"
+            )
+        )
+        job = registry.create_job(
+            task=task,
+            persona=step.persona,
+            kind="review" if step.persona == "reviewer" else "build",
+            branch=branch,
+            pane="",
+            worktree=worktree,
+            dispatch_head=dispatch_base,
+            executor=identity.executor,
+            model_id=identity.model_id,
+            independence_domain=identity.independence_domain,
+            subject_head=run.candidate_head if step.phase in {"verify", "review"} else None,
+            workflow_run_id=run.run_id,
+            workflow_claim_key=run.claim_key,
+            workflow_repo=run.repo,
+            workflow_card=step.card,
+            workflow_phase=step.phase,
+            workflow_repo_root=(
+                repo_root if step.persona in {"planner", "reviewer"} else worktree
+            ),
+            workflow_input_root=str(effective_repo_root),
+            workflow_inputs=effective_inputs,
+            workflow_input_snapshot=input_snapshot,
+            workflow_outputs=step.outputs,
+            source_revision=run.source_revision,
+            workflow_sandbox_hash=sandbox_hash,
+            workflow_output_baseline=output_baseline,
+            workflow_builder_job_id=builder_job_id if step.persona == "reviewer" else None,
+            # #379：派工當下 pin 住這張卡的驗收判準（test_policy），供 harvest 時
+            # 與 registry 現有 WorkflowRun.steps 的現值比對出 drift（見
+            # manager._workflow_acceptance_definition_drifted）。
+            workflow_test_policy=step.test_policy,
+        )
+    except BaseException:
+        if planner_sandbox is not None:
+            shutil.rmtree(planner_sandbox, ignore_errors=True)
+        if reviewer_sandbox is not None:
+            shutil.rmtree(reviewer_sandbox, ignore_errors=True)
+        raise
+    try:
+        # #381：真正 spawn 前才 admit，不佔住這張卡接下來的整個執行期。
+        resolve_limiter(spawn_admission).admit(resolve_provider(identity=identity, launcher=launcher))
+        handle = launcher.launch(
+            slice_id=str(job["job_id"]),
+            prompt=_workflow_job_prompt(
+                run,
+                step,
+                builder_job_id=builder_job_id,
+                coordinator_root=coordinator_root,
+                input_snapshot=input_snapshot,
+                candidate_checkout=(
+                    "candidate"
+                    if step.persona == "reviewer" and identity.executor == "claude"
+                    else None
+                ),
+            ),
+            worktree=worktree,
+            log_dir=str(Path(coordinator_root).resolve() / "logs" / "workflow"),
+        )
+        return registry.attach_launch_handle(
+            str(job["job_id"]),
+            executor=identity.executor,
+            model_id=identity.model_id,
+            session_name=handle.session_name,
+            pid=handle.pid,
+            log_path=handle.log_path,
+            executable_path=handle.executable_path,
+        )
+    except BaseException as launch_exc:
+        registry.update_headless_result(str(job["job_id"]), status="failed", exit_code=1)
+        if planner_sandbox is not None:
+            shutil.rmtree(planner_sandbox, ignore_errors=True)
+        if reviewer_sandbox is not None:
+            try:
+                _discard_reviewer_sandbox(
+                    registry.get_job(str(job["job_id"])),
+                    coordinator_root=coordinator_root,
+                    require_candidate_unchanged=True,
+                )
+            except Exception as cleanup_exc:
+                raise cleanup_exc from launch_exc
+        raise
+
+
+def dispatch_workflow_card(
+    dispatcher,
+    *,
+    run,
+    identities: IdentityRegistry,
+    launcher_factory: Callable[[object], object],
+    coordinator_root: str | Path,
+    retry_failed: bool = False,
+    force_new_build: bool = False,
+    forced_identity: object | None = None,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
+) -> dict[str, object] | None:
+    """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
+
+    return _dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=identities,
+        launcher_factory=launcher_factory,
+        coordinator_root=coordinator_root,
+        retry_failed=retry_failed,
+        force_new_build=force_new_build,
+        forced_identity=forced_identity,
+        spawn_admission=spawn_admission,
+    )
+
+
+def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path) -> bool:
+    """Detect the narrow terminal closure path without granting ship authority."""
+    terminal_refresh = (
+        run.current_phase == "ship" and getattr(run, "status", None) == "done"
+    )
+    if (
+        run.current_phase != "review" and not terminal_refresh
+    ) or not isinstance(run.candidate_head, str):
+        return False
+    journal_path = Path(coordinator_root) / "delivery-journal.json"
+    if journal_path.is_symlink() or not journal_path.is_file():
+        return False
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    rows = journal.get("runs") if isinstance(journal, dict) else None
+    row = rows.get(run.run_id) if isinstance(rows, dict) else None
+    ship = row.get("ship") if isinstance(row, dict) else None
+    authorization = ship.get("merge_authorization") if isinstance(ship, dict) else None
+    authorization_body = (
+        authorization.get("payload") if isinstance(authorization, dict) else None
+    )
+    return bool(
+        isinstance(journal, dict)
+        and journal.get("schema") == "cortex-delivery-journal/v1"
+        and isinstance(row, dict)
+        and row.get("run_id") == run.run_id
+        and row.get("repo") == run.repo
+        and row.get("work_id") == run.work_id
+        and isinstance(ship, dict)
+        and ship.get("phase") in {"merged", "done"}
+        and ship.get("head") == run.candidate_head
+        and isinstance(ship.get("merge_commit"), str)
+        and verification.SAFE_SHA_RE.fullmatch(ship["merge_commit"]) is not None
+        and isinstance(authorization, dict)
+        and isinstance(authorization.get("path"), str)
+        and is_absolute_any(authorization["path"])
+        and isinstance(authorization.get("hash"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", authorization["hash"]) is not None
+        and isinstance(authorization_body, dict)
+        and authorization_body.get("run_id") == run.run_id
+        and authorization_body.get("repo") == run.repo
+        and authorization_body.get("work_id") == run.work_id
+        and authorization_body.get("head") == run.candidate_head
+    )
+
+
+def _provider_rate_limit_result(
+    exc: BaseException, *, run_id: str, current_phase: str, coordinator_root: str | Path
+) -> dict[str, object] | None:
+    """#370: translate a canonical-authority rate-limit failure into a soft,
+    non-raising resume result instead of the generic needs_human+re-raise
+    path used for every other ship_validator/authority failure.
+
+    Returns ``None`` (meaning: "not this case, handle it the old way") for
+    every exception except an :class:`AuthorityValidationError` carrying
+    :data:`REASON_PROVIDER_RATE_LIMITED_CANONICAL` -- a real authority
+    defect (malformed row, missing provider, genuine auth failure upstream,
+    ...) still needs_human+raises exactly as before.
+
+    Records a durable backoff deadline (survives daemon restart -- see
+    ``provider_backoff.py``) so the *next* resume attempt, operator-driven
+    or periodic-tick, can short-circuit before the window has passed
+    instead of re-hitting the same rate limit immediately.
+    """
+    if not (isinstance(exc, AuthorityValidationError) and exc.reason_code == REASON_PROVIDER_RATE_LIMITED_CANONICAL):
+        return None
+    provider_id = exc.provider_id or "github"
+    backoff = provider_backoff.record_backoff(coordinator_root, provider_id, now=time.time())
+    return {
+        "run_id": run_id,
+        "current_phase": current_phase,
+        "reason": "provider-rate-limited",
+        "retry_after_epoch": backoff.deadline_epoch,
+    }
+
+
+def resume_workflow_run(
+    dispatcher,
+    *,
+    run_id: str,
+    identities: IdentityRegistry,
+    launcher_factory: Callable[[object], object],
+    coordinator_root: str | Path,
+    ship_validator: Callable[..., object] | None = None,
+    operator_resume: bool = False,
+    spawn_admission: SpawnAdmissionLimiter | None = None,
+) -> dict[str, object]:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        raise RuntimeError("workflow resume requires dispatcher registry")
+    run = registry.get_workflow_run(run_id)
+    if ship_validator is not None:
+        # #370: a prior resume already recorded a durable rate-limit
+        # backoff for this run's GitHub provider (see
+        # `_provider_rate_limit_result` below) -- short-circuit *before*
+        # doing any work, so an operator retrying early (or a periodic
+        # tick landing before the window clears) gets an explicit "still
+        # rate limited, retry after <time>" instead of walking the whole
+        # resume flow only to hit ship_validator and the same wall again.
+        # Gated on `ship_validator is not None` because that's the only
+        # thing in this function that can ever touch GitHub provider
+        # authority; canonical claim:v1 runs are wired with one uniformly
+        # regardless of phase, so this deliberately pauses all phases for
+        # a rate-limited repo, not just the review->ship transition.
+        active = provider_backoff.active_backoff(
+            coordinator_root, f"github:{run.repo}", now=time.time()
+        )
+        if active is not None:
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "provider-rate-limited",
+                "retry_after_epoch": active.deadline_epoch,
+            }
+    pre_resume_gate_status = run.gate_status
+    retry_failed = False
+    recovery_job_id: str | None = None
+    if "needs_human" in run.facets and run.status == "ongoing":
+        if not operator_resume:
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "operator-resume-required",
+            }
+        recovery_step = _current_workflow_step(run)
+        if recovery_step is not None:
+            recovery_jobs = [
+                job
+                for job in registry.list_jobs()
+                if job.get("workflow_run_id") == run.run_id
+                and job.get("workflow_card") == recovery_step.card
+                and job.get("workflow_phase") == recovery_step.phase
+            ]
+            latest_recovery = recovery_jobs[-1] if recovery_jobs else None
+            if (
+                latest_recovery is not None
+                and recovery_step.phase == "review"
+                and latest_recovery.get("workflow_evidence") is not None
+                and _workflow_review_evidence_state(
+                    latest_recovery,
+                    run=run,
+                    coordinator_root=coordinator_root,
+                ) is None
+            ):
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "job_id": latest_recovery.get("job_id"),
+                    "reason": "rejected-review-recovery-mismatch",
+                }
+            if latest_recovery is not None and (
+                _is_exact_legacy_agy_recovery(
+                    latest_recovery, run=run, step=recovery_step, identities=identities
+                )
+                or _is_exact_reviewer_terminal_recovery(
+                    registry,
+                    latest_recovery,
+                    run=run,
+                    step=recovery_step,
+                    identities=identities,
+                    coordinator_root=coordinator_root,
+                )
+            ):
+                recovery_job_id = str(latest_recovery["job_id"])
+            if recovery_job_id is not None:
+                try:
+                    _discard_reviewer_sandbox(
+                        latest_recovery,
+                        coordinator_root=coordinator_root,
+                        require_candidate_unchanged=True,
+                    )
+                except ValueError:
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "job_id": recovery_jobs[-1].get("job_id"),
+                        "reason": "reviewer-candidate-drift",
+                    }
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(facet for facet in run.facets if facet != "needs_human"),
+            gate_status="running",
+        )
+        retry_failed = True
+    try:
+        _PlanningPublicationTransaction.reconcile(
+            root=Path(run.workspace_root),
+            journal_root=Path(coordinator_root),
+            run=run,
+        )
+    except PlanningPublicationDrift:
+        updated = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), gate_status="running"
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "planning-publication-drift",
+        }
+    post_merge_closure = _merged_delivery_reconciliation_pending(
+        run, coordinator_root=coordinator_root
+    )
+    if not post_merge_closure:
+        try:
+            planning_authority, planning_source_revision = (
+                _validated_brainstorm_planning_authority(
+                    run,
+                    coordinator_root=coordinator_root,
+                )
+            )
+        except ValueError:
+            current = registry.get_workflow_run(run.run_id)
+            updated = registry._manager_update_workflow_run(
+                run.run_id,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                gate_status=pre_resume_gate_status,
+            )
+            return {
+                "run_id": updated.run_id,
+                "current_phase": updated.current_phase,
+                "reason": "planning-authority-reconciliation-failed",
+            }
+        if (
+            planning_authority != run.planning_authority
+            or planning_source_revision != run.planning_source_revision
+        ):
+            run = registry._manager_update_workflow_run(
+                run.run_id,
+                planning_authority=planning_authority,
+                planning_source_revision=planning_source_revision,
+            )
+
+    def dispatch_or_stop(
+        bound_run,
+        *,
+        retry: bool = False,
+        retry_recovery_job_id: str | None = None,
+    ):
+        try:
+            if retry_recovery_job_id is not None:
+                return _dispatch_workflow_card(
+                    dispatcher,
+                    run=bound_run,
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                    retry_failed=retry,
+                    operator_recovery_job_id=retry_recovery_job_id,
+                    spawn_admission=spawn_admission,
+                )
+            return dispatch_workflow_card(
+                dispatcher,
+                run=bound_run,
+                identities=identities,
+                launcher_factory=launcher_factory,
+                coordinator_root=coordinator_root,
+                retry_failed=retry,
+                spawn_admission=spawn_admission,
+            )
+        except Exception:
+            current = registry.get_workflow_run(bound_run.run_id)
+            registry._manager_update_workflow_run(
+                bound_run.run_id,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                gate_status="running",
+            )
+            raise
+
+    step = _current_workflow_step(run)
+    if step is None:
+        if run.current_phase == "review" and post_merge_closure and ship_validator is None:
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "ship-validator-unavailable",
+            }
+        if run.current_phase == "review" and ship_validator is not None:
+            last = [item for item in run.steps if item.phase == "review"][-1]
+            try:
+                return apply_workflow_action(
+                    registry,
+                    args={
+                        "action": "advance",
+                        "run_id": run.run_id,
+                        "card_id": last.card,
+                        "current_phase": "ship",
+                    },
+                    identity_registry=identities,
+                    ship_validator=ship_validator,
+                    git_runner=getattr(dispatcher, "_git_runner", None),
+                    coordinator_root=coordinator_root,
+                    trusted_terminal=True,
+                )
+            except Exception as exc:
+                rate_limited = _provider_rate_limit_result(
+                    exc,
+                    run_id=run.run_id,
+                    current_phase=run.current_phase,
+                    coordinator_root=coordinator_root,
+                )
+                if rate_limited is not None:
+                    return rate_limited
+                current = registry.get_workflow_run(run.run_id)
+                registry._manager_update_workflow_run(
+                    run.run_id,
+                    facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                    gate_status="failed",
+                )
+                raise
+        if run.current_phase == "ship" and run.status == "done" and post_merge_closure:
+            if ship_validator is None:
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "reason": "ship-validator-unavailable",
+                }
+            try:
+                return apply_workflow_action(
+                    registry,
+                    args={"action": "refresh-completion", "run_id": run.run_id},
+                    identity_registry=identities,
+                    ship_validator=ship_validator,
+                    git_runner=getattr(dispatcher, "_git_runner", None),
+                    coordinator_root=coordinator_root,
+                    trusted_terminal=True,
+                )
+            except Exception as exc:
+                rate_limited = _provider_rate_limit_result(
+                    exc,
+                    run_id=run.run_id,
+                    current_phase=run.current_phase,
+                    coordinator_root=coordinator_root,
+                )
+                if rate_limited is not None:
+                    return rate_limited
+                raise
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
+    jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_card") == step.card
+        and job.get("workflow_phase") == step.phase
+        and (
+            step.phase not in {"verify", "review"}
+            or job.get("subject_head") == run.candidate_head
+        )
+    ]
+    job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
+    if job is not None and recovery_job_id == job.get("job_id"):
+        job = dispatch_or_stop(run, retry_recovery_job_id=recovery_job_id)
+    elif retry_failed and job is not None and (
+        _is_stale_terminalized_failed_job(job)
+        or _retryable_nonpassing_workflow_terminal(job)
+        or _is_rejected_workflow_review_evidence(
+            job,
+            run=run,
+            coordinator_root=coordinator_root,
+        )
+    ):
+        job = dispatch_or_stop(run, retry=True)
+    if job is None:
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
+    if job.get("status") in IN_FLIGHT_STATUSES:
+        job = dispatcher.poll_headless_done(str(job["job_id"]))
+    if job.get("status") in IN_FLIGHT_STATUSES:
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "job_id": job["job_id"], "reason": "in-flight"}
+    if job.get("status") != "exited" or job.get("exit_code") != 0:
+        failure_reason = "job-failed"
+        sandbox_ok = True
+        try:
+            _discard_reviewer_sandbox(
+                job,
+                coordinator_root=coordinator_root,
+                require_candidate_unchanged=True,
+            )
+        except ValueError:
+            failure_reason = "reviewer-candidate-drift"
+            sandbox_ok = False
+        # #260 R6：失敗回報附帶唯讀 terminal 診斷（observed HEAD／job id／失敗
+        # 原因），沿用 #261 的 `_terminal_parse_diagnostics`；診斷與授權分離，
+        # 不得因此授予任何 candidate authority。
+        diagnostics = _terminal_parse_diagnostics(job)
+        # #384：不再一律壓平成 "job-failed"。`job` 已在
+        # `Dispatcher._finalize_headless` 分類過（provider_outcome.py）；沙箱
+        # drift 時（sandbox_ok is False）刻意不看分類、不重試——candidate 已被
+        # reviewer 動過，跟 provider 是哪一種失敗無關，必須 fail closed。
+        classification = (
+            provider_outcome.classification_from_job(job) if sandbox_ok else None
+        )
+        status_fields: dict[str, object] = {}
+        if classification is not None:
+            status_fields["provider_outcome"] = classification.outcome.value
+            status_fields["provider_outcome_authority"] = classification.authority.value
+            failure_reason = f"job-failed-{classification.outcome.value}"
+        if sandbox_ok and classification is not None and classification.retryable:
+            retry_key = _provider_retry_attempt_key(step.card)
+            attempts = dict(run.attempts)
+            seen = attempts.get(retry_key, 0)
+            status_fields["provider_retry_count"] = seen
+            status_fields["provider_retry_limit"] = terminal_contract.MAX_PROVIDER_RETRIES
+            if seen < terminal_contract.MAX_PROVIDER_RETRIES:
+                rerouted_identity = _provider_failure_reroute(
+                    run, step, identities, failed_job=job, classification=classification,
+                )
+                replacement = dispatch_workflow_card(
+                    dispatcher,
+                    run=run,
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                    retry_failed=True,
+                    forced_identity=rerouted_identity,
+                )
+                if replacement is None:
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "reason": "not-dispatchable",
+                    }
+                current = registry.get_workflow_run(run.run_id)
+                attempts = dict(current.attempts)
+                attempts[retry_key] = seen + 1
+                registry._manager_update_workflow_run(run.run_id, attempts=attempts)
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "job_id": replacement["job_id"],
+                    "reason": "provider-failure-retry",
+                    **{**status_fields, "provider_retry_count": seen + 1},
+                    "terminal_diagnostics": diagnostics.as_dict(),
+                }
+            failure_reason = "provider-retry-exhausted"
+        updated = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), gate_status="running"
+        )
+        return {
+            "run_id": run.run_id,
+            "current_phase": updated.current_phase,
+            "job_id": job["job_id"],
+            "reason": failure_reason,
+            **status_fields,
+            "terminal_diagnostics": diagnostics.as_dict(),
+        }
+    if _malformed_workflow_card_terminal(job):
+        # #261 R3／D5：同一個確定性 schema mismatch 不得無限回派模型。計數持久化在
+        # run.attempts（既有的可觀測欄位），逾限即停止並讓 operator 接手。
+        diagnostics = _terminal_parse_diagnostics(job)
+        retry_key = _schema_retry_attempt_key(step.card)
+        attempts = dict(run.attempts)
+        seen = attempts.get(retry_key, 0)
+        status_fields = {
+            "schema_retry_count": seen,
+            "schema_retry_limit": terminal_contract.MAX_SCHEMA_RETRIES,
+            "last_validation_path": diagnostics.validation_path,
+            "last_validation_reason": diagnostics.reason,
+        }
+        if seen >= terminal_contract.MAX_SCHEMA_RETRIES:
+            current = registry.get_workflow_run(run.run_id)
+            registry._manager_update_workflow_run(
+                run.run_id,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                gate_status="running",
+            )
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "job_id": job["job_id"],
+                "reason": "card-terminal-schema-retry-exhausted",
+                **status_fields,
+                # #261 R4／D6：唯讀診斷與授權欄位分離；operator 看得到 observed
+                # HEAD／job id／失敗原因，但 candidate 並未因此取得 authority。
+                "terminal_diagnostics": diagnostics.as_dict(),
+            }
+        replacement = dispatch_workflow_card(
+            dispatcher,
+            run=run,
+            identities=identities,
+            launcher_factory=launcher_factory,
+            coordinator_root=coordinator_root,
+            retry_failed=True,
+        )
+        if replacement is None:
+            return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
+        current = registry.get_workflow_run(run.run_id)
+        attempts = dict(current.attempts)
+        attempts[retry_key] = seen + 1
+        registry._manager_update_workflow_run(run.run_id, attempts=attempts)
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "job_id": replacement["job_id"],
+            "reason": "card-terminal-malformed-retry",
+            **{**status_fields, "schema_retry_count": seen + 1},
+            "terminal_diagnostics": diagnostics.as_dict(),
+        }
+    try:
+        job = terminalize_workflow_job(
+            registry,
+            job_id=str(job["job_id"]),
+            coordinator_root=coordinator_root,
+        )
+    except Exception:
+        _discard_reviewer_sandbox(
+            registry.get_job(str(job["job_id"])),
+            coordinator_root=coordinator_root,
+            require_candidate_unchanged=True,
+        )
+        current = registry.get_workflow_run(run.run_id)
+        registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+        )
+        raise
+    phase_steps = [item for item in run.steps if item.phase == run.current_phase]
+    is_last = step.card == phase_steps[-1].card
+    next_phase = (
+        WORKFLOW_PHASES[WORKFLOW_PHASES.index(run.current_phase) + 1]
+        if is_last
+        else run.current_phase
+    )
+    try:
+        result = apply_workflow_action(
+            registry,
+            args={
+                "action": "advance",
+                "run_id": run.run_id,
+                "card_id": step.card,
+                "job_id": job["job_id"],
+                "current_phase": next_phase,
+            },
+            identity_registry=identities,
+            ship_validator=ship_validator,
+            git_runner=getattr(dispatcher, "_git_runner", None),
+            coordinator_root=coordinator_root,
+            trusted_terminal=True,
+        )
+    except Exception as exc:
+        rate_limited = _provider_rate_limit_result(
+            exc,
+            run_id=run.run_id,
+            current_phase=run.current_phase,
+            coordinator_root=coordinator_root,
+        )
+        if rate_limited is not None:
+            return rate_limited
+        current = registry.get_workflow_run(run.run_id)
+        registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+        )
+        raise
+    updated = registry.get_workflow_run(run.run_id)
+    if "needs_human" in updated.facets:
+        return result
+    next_job = dispatch_or_stop(updated)
+    if next_job is not None:
+        result["job_id"] = next_job["job_id"]
+    return result
+
+
+def _write_planning_failure_evidence(
+    *,
+    coordinator_root: Path,
+    run_id: str,
+    classification: str,
+    reason: str,
+) -> str:
+    """#393：define needs_human 三條靜默失敗路徑落 `cortex-planning-failure/v1`
+    evidence，供 `work_actions._read_planning_failure_record`／
+    `_planning_failure_hint` 消費，讓 `recover-planning` 對 define 失敗結構性
+    可用（過去全庫只有 reader、沒有任何 producer，recover-planning 對這個
+    它最該覆蓋的場景永遠 fail-closed）。
+
+    原子寫入模式與 `work_bridge._write_json_evidence` 一致（tmp、fsync、
+    rename、0400）；body 直接落 reader 要求的頂層欄位（不套 envelope），
+    因為 reader 直接讀 `schema`/`run_id`/`classification`/`reason`，
+    `_write_json_evidence` 的 `{"payload": ..., "hash": ...}` envelope 與
+    content-hash 檔名不符這裡的讀取契約，故不直接共用、改用同樣手法的
+    小工廠避免跨模組奇怪依賴。目錄名必須是 `planning-recovery`——
+    reader 用 `path.parent.name` 判斷。
+    """
+
+    body = {
+        "schema": "cortex-planning-failure/v1",
+        "run_id": run_id,
+        "classification": classification,
+        "reason": reason,
+        "created_at": _utcnow(),
+    }
+    digest = verification.canonical_json_hash(body)
+    directory = coordinator_root.resolve() / "evidence" / "planning-recovery"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{run_id}-{digest}.json"
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content:
+            raise RuntimeError("workflow planning failure evidence conflict")
+        return str(target)
+    temporary = directory / f".{target.name}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        target.chmod(0o400)
+        fsync_directory(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(target)
+
+
+def _record_planning_failure_evidence(
+    run,
+    *,
+    coordinator_root: Path,
+    classification: str,
+    reason: str,
+) -> tuple[str, ...]:
+    """呼叫端 wrapper：evidence 寫入失敗不得讓 define 路徑爆炸（fail-open
+    僅限 evidence 記錄本身），失敗時只 log 註記、`run.evidence_refs` 原樣
+    帶回，needs_human 仍照舊落地——不因為記不下證據就讓整個 define
+    請求跟著炸。
+    """
+
+    try:
+        evidence_path = _write_planning_failure_evidence(
+            coordinator_root=coordinator_root,
+            run_id=run.run_id,
+            classification=classification,
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence 記錄本身 fail-open
+        logger.error(
+            "planning-failure-evidence-write-failed run_id=%s classification=%s error=%s: %s",
+            run.run_id,
+            classification,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return run.evidence_refs
+    return (*run.evidence_refs, evidence_path)
+
+
+def apply_workflow_action(
+    registry,
+    *,
+    args: Mapping[str, object],
+    identity_registry: IdentityRegistry | None = None,
+    probes: Mapping[tuple[str, str], CapabilityProbe] | None = None,
+    primary_questioner: Callable[[Mapping[str, object]], object] | None = None,
+    secondary_planner: Callable[[Mapping[str, object], object], object] | None = None,
+    primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object] | None = None,
+    runtime_factory: Callable[..., object] | None = None,
+    ship_validator: Callable[..., object] | None = None,
+    git_runner=None,
+    coordinator_root: str | Path | None = None,
+    trusted_terminal: bool = False,
+) -> dict[str, object]:
+    """Apply the sole production mutation API for Manager-owned workflows.
+
+    Callers reach this function through the durable control queue. Registry
+    mutation methods are intentionally private so CLI/socket clients cannot
+    bypass Manager orchestration.
+    """
+
+    action = _required_workflow_string(args, "action")
+
+    def validate_ship_result(value: object, *, candidate: str | None) -> tuple[str, dict]:
+        if not isinstance(value, dict) or value.get("trusted") is not True:
+            raise ValueError("ship validator returned no trusted result")
+        status = value.get("status")
+        if (
+            status not in {"pending", "passed", "needs_human"}
+            or not isinstance(candidate, str)
+            or value.get("head") != candidate
+            or value.get("commit_id") != candidate
+            or not isinstance(value.get("ref"), str)
+            or not value["ref"]
+            or not isinstance(value.get("hash"), str)
+            or len(value["hash"]) != 64
+        ):
+            raise ValueError("ship validator current-HEAD result invalid")
+        normalized = dict(value)
+        normalized.setdefault("review_kind", "copilot")
+        normalized.setdefault("review_ref", value.get("ref"))
+        normalized.setdefault("review_hash", value.get("hash"))
+        if (
+            normalized["review_kind"] not in {"copilot", "maintainer-review"}
+            or not isinstance(normalized["review_ref"], str)
+            or not normalized["review_ref"]
+            or not isinstance(normalized["review_hash"], str)
+            or len(normalized["review_hash"]) != 64
+        ):
+            raise ValueError("ship validator delivery review result invalid")
+        completion = normalized.get("completion")
+        if status == "passed" and completion is not None:
+            if (
+                not isinstance(completion, dict)
+                or set(completion)
+                != {
+                    "record_path",
+                    "record_hash",
+                    "record_revision",
+                    "source_revisions",
+                    "pr_candidate",
+                    "merge_revision",
+                }
+                or completion.get("record_revision") != candidate
+                or completion.get("pr_candidate") != candidate
+                or not isinstance(completion.get("record_path"), str)
+                or not isinstance(completion.get("record_hash"), str)
+                or len(completion["record_hash"]) != 64
+                or not isinstance(completion.get("source_revisions"), dict)
+                or not completion["source_revisions"]
+                or not isinstance(completion.get("merge_revision"), str)
+                or verification.SAFE_SHA_RE.fullmatch(completion["merge_revision"])
+                is None
+            ):
+                raise ValueError("ship validator completion binding invalid")
+        return str(status), normalized
+
+    if action == "refresh-completion":
+        if not trusted_terminal:
+            raise ValueError("workflow completion refresh is internal to terminal polling")
+        run_id = _required_workflow_string(args, "run_id")
+        current = registry.get_workflow_run(run_id)
+        if current.current_phase != "ship" or current.status != "done":
+            raise ValueError("workflow completion refresh requires a done ship run")
+        if ship_validator is None:
+            return {
+                "run_id": current.run_id,
+                "current_phase": current.current_phase,
+                "reason": "ship-validator-unavailable",
+            }
+        status, trusted = validate_ship_result(
+            ship_validator(run=current, candidate=current.candidate_head),
+            candidate=current.candidate_head,
+        )
+        if status != "passed":
+            return {
+                "run_id": current.run_id,
+                "current_phase": current.current_phase,
+                "reason": trusted.get("reason")
+                or ("delivery-in-progress" if status == "pending" else "delivery-needs-human"),
+            }
+        completion_binding = trusted.get("completion")
+        if completion_binding is None:
+            raise ValueError("workflow completion refresh requires completion binding")
+        if coordinator_root is None:
+            raise ValueError("workflow ship audit root unavailable")
+        refs = {item.kind: item for item in current.gate_refs}
+        review_kind = trusted["review_kind"]
+        refs.pop("maintainer-review" if review_kind == "copilot" else "copilot", None)
+        refs[review_kind] = GateEvidenceRef(
+            review_kind, trusted["review_ref"], trusted["review_hash"]
+        )
+        updated = registry._manager_update_workflow_run(
+            run_id,
+            steps=_validated_ship_steps(
+                registry,
+                run=current,
+                candidate=str(current.candidate_head),
+                coordinator_root=coordinator_root,
+            ),
+            gate_refs=tuple(
+                refs[kind]
+                for kind in ("brainstorm", "foreign-review", "copilot", "maintainer-review")
+                if kind in refs
+            ),
+            gate_status="passed",
+            facets=(),
+            status="done",
+            completion_record_path=completion_binding["record_path"],
+            completion_record_hash=completion_binding["record_hash"],
+            completion_record_revision=completion_binding["record_revision"],
+            completion_source_revisions=completion_binding["source_revisions"],
+            pr_candidate=completion_binding["pr_candidate"],
+            merge_revision=completion_binding["merge_revision"],
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "completion-refreshed",
+        }
+
+    if action == "advance":
+        if not trusted_terminal:
+            raise ValueError("workflow advance is internal to terminal polling")
+        run_id = _required_workflow_string(args, "run_id")
+        current = registry.get_workflow_run(run_id)
+        card_id = _required_workflow_string(args, "card_id")
+        matches = [step for step in current.steps if step.card == card_id]
+        if len(matches) != 1 or matches[0].phase != current.current_phase:
+            raise ValueError("workflow card is not in current phase")
+        step = matches[0]
+        if step.gate_result == "passed":
+            if current.current_phase == "review" and args.get("current_phase") == "ship":
+                if args.get("gate_refs"):
+                    raise ValueError("local Copilot evidence is never trusted")
+                if ship_validator is None:
+                    updated = registry._manager_update_workflow_run(
+                        run_id, facets=("needs_human",), gate_status="running"
+                    )
+                    return {
+                        "run_id": updated.run_id,
+                        "current_phase": updated.current_phase,
+                        "reason": "ship-validator-unavailable",
+                    }
+                status, trusted = validate_ship_result(
+                    ship_validator(run=current, candidate=current.candidate_head),
+                    candidate=current.candidate_head,
+                )
+                if status == "pending":
+                    persisted = registry.get_workflow_run(run_id)
+                    if (
+                        persisted.current_phase != current.current_phase
+                        or persisted.candidate_head != current.candidate_head
+                    ):
+                        return {
+                            "run_id": persisted.run_id,
+                            "current_phase": persisted.current_phase,
+                            "reason": trusted.get("reason") or "delivery-in-progress",
+                        }
+                    registry._manager_update_workflow_run(
+                        run_id, facets=(), gate_status="running"
+                    )
+                    return {
+                        "run_id": current.run_id,
+                        "current_phase": "review",
+                        "reason": "delivery-in-progress",
+                    }
+                if status == "needs_human":
+                    updated = registry._manager_update_workflow_run(
+                        run_id, facets=("needs_human",), gate_status="running"
+                    )
+                    return {
+                        "run_id": updated.run_id,
+                        "current_phase": updated.current_phase,
+                        "reason": trusted.get("reason") or "delivery-needs-human",
+                    }
+                refs = {item.kind: item for item in current.gate_refs}
+                review_kind = trusted["review_kind"]
+                refs.pop("maintainer-review" if review_kind == "copilot" else "copilot", None)
+                refs[review_kind] = GateEvidenceRef(
+                    review_kind, trusted["review_ref"], trusted["review_hash"]
+                )
+                ship_steps = current.steps
+                if trusted.get("completion") is not None:
+                    if coordinator_root is None:
+                        raise ValueError("workflow ship audit root unavailable")
+                    ship_steps = _validated_ship_steps(
+                        registry,
+                        run=current,
+                        candidate=str(current.candidate_head),
+                        coordinator_root=coordinator_root,
+                    )
+                updated = registry._manager_update_workflow_run(
+                    run_id,
+                    current_phase="ship",
+                    steps=ship_steps,
+                    gate_refs=tuple(
+                        refs[kind]
+                        for kind in ("brainstorm", "foreign-review", "copilot", "maintainer-review")
+                        if kind in refs
+                    ),
+                    gate_status="passed",
+                    facets=(),
+                    status=("done" if trusted.get("completion") is not None else None),
+                    completion_record_path=(
+                        trusted["completion"]["record_path"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    completion_record_hash=(
+                        trusted["completion"]["record_hash"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    completion_record_revision=(
+                        trusted["completion"]["record_revision"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    completion_source_revisions=(
+                        trusted["completion"]["source_revisions"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    pr_candidate=(
+                        trusted["completion"]["pr_candidate"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    merge_revision=(
+                        trusted["completion"]["merge_revision"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                )
+                return {"run_id": updated.run_id, "current_phase": "ship", "reason": None}
+            raise ValueError("workflow card evidence replay rejected")
+        identities = identity_registry or load_model_identities()
+        job, identity = _job_for_workflow_card(
+            registry,
+            run=current,
+            card_id=card_id,
+            job_id=args.get("job_id"),
+            expected_persona=step.persona,
+            identities=identities,
+        )
+        if coordinator_root is None:
+            raise ValueError("workflow canonical coordinator root unavailable")
+        evidence, outputs, evidence_path, evidence_hash = _read_job_workflow_evidence(
+            job,
+            run=current,
+            coordinator_root=coordinator_root,
+        )
+        candidate = current.candidate_head
+        if current.current_phase == "build":
+            candidate = _verify_build_candidate_transition(
+                job,
+                previous_candidate=candidate,
+                git_runner=git_runner,
+            )
+        elif current.current_phase in {"verify", "review"}:
+            job_candidate = _verify_exact_candidate(job, git_runner=git_runner)
+            if candidate != job_candidate:
+                raise ValueError("workflow card candidate mismatch")
+            candidate = job_candidate
+        builder_domains = {
+            item.domain
+            for item in current.steps
+            if item.phase == "build" and item.gate_result == "passed" and item.domain is not None
+        }
+        if current.current_phase in {"verify", "review"} and identity.independence_domain in builder_domains:
+            raise ValueError("workflow reviewer must use a foreign independence domain")
+        by_kind = {item.kind: item for item in current.gate_refs}
+        verified = current.verified_head
+        review_state: str | None = None
+        if current.current_phase == "verify":
+            report_outputs = evidence.get("outputs")
+            evidence_payload = dict(evidence)
+            evidence_payload.pop("outputs", None)
+            evidence = verification.validate_verification_evidence(evidence_payload)
+            evidence["outputs"] = report_outputs
+            if (
+                evidence.get("slice_id") != f"{current.run_id}-{card_id}"
+                or evidence.get("candidate") != candidate
+                or evidence.get("status") not in {"verified", "reviewing"}
+            ):
+                raise ValueError("verification evidence workflow/card/candidate mismatch")
+            verified = candidate
+        if current.current_phase == "review":
+            evidence_payload = dict(evidence)
+            evidence_payload.pop("outputs", None)
+            evaluation = foreign_review.validate_gate_evaluation(evidence_payload)
+            if (
+                evaluation.get("slice_id") != f"{current.run_id}-{card_id}"
+                or evaluation.get("candidate") != candidate
+                or evaluation.get("state") not in {"passed", "rejected"}
+                or evaluation.get("reviewer_job_id") != job.get("job_id")
+            ):
+                raise ValueError("review evaluation workflow/card/candidate mismatch")
+            review_state = str(evaluation["state"])
+            builder_job_id = evaluation.get("builder_job_id")
+            _builder_job, builder_identity = _review_builder_job(
+                registry,
+                run=current,
+                builder_job_id=builder_job_id,
+                candidate=str(candidate),
+                identities=identities,
+            )
+            launch_identity = evaluation.get("launch_identity", {})
+            if (
+                launch_identity.get("builder") != builder_identity.legacy_dict()
+                or launch_identity.get("reviewer") != identity.legacy_dict()
+                or builder_identity.independence_domain == identity.independence_domain
+            ):
+                raise ValueError("review evaluation identity/domain mismatch")
+            foreign = GateEvidenceRef("foreign-review", evidence_path, evidence_hash)
+            by_kind[foreign.kind] = foreign
+        if step.outputs and not outputs:
+            raise ValueError("workflow card declares outputs but no verified artifact was supplied")
+        updated_steps = _audit_phase_steps(
+            current.steps,
+            phase=current.current_phase,
+            executor=identity.executor,
+            model=identity.model_id,
+            domain=identity.independence_domain,
+            outputs=outputs,
+            gate_result=("needs_human" if review_state == "rejected" else "passed"),
+            card_id=card_id,
+        )
+        if review_state == "rejected":
+            updated = registry._manager_update_workflow_run(
+                run_id,
+                current_phase=current.current_phase,
+                steps=updated_steps,
+                gate_refs=tuple(
+                    by_kind[kind]
+                    for kind in (
+                        "brainstorm", "foreign-review", "copilot", "maintainer-review",
+                    )
+                    if kind in by_kind
+                ),
+                gate_status="failed",
+                candidate_head=candidate,
+                verified_head=verified,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            )
+            return {
+                "run_id": updated.run_id,
+                "current_phase": updated.current_phase,
+                "reason": "blocking-findings",
+            }
+        phase_done = all(
+            item.gate_result == "passed"
+            for item in updated_steps
+            if item.phase == current.current_phase
+        )
+        requested_phase = _required_workflow_string(args, "current_phase")
+        if not phase_done:
+            if requested_phase != current.current_phase:
+                raise ValueError("workflow phase still has incomplete cards")
+            next_phase = current.current_phase
+        else:
+            next_phase = requested_phase
+            validate_workflow_phase_transition(current.current_phase, next_phase)
+        facets = current.facets
+        gate_status = current.gate_status
+        if current.current_phase == "review" and phase_done and next_phase == "ship":
+            if ship_validator is None:
+                next_phase = "review"
+                facets = ("needs_human",)
+                gate_status = "running"
+            else:
+                status, trusted = validate_ship_result(
+                    ship_validator(run=current, candidate=candidate),
+                    candidate=candidate,
+                )
+                if status in {"pending", "needs_human"}:
+                    persisted = registry.get_workflow_run(run_id)
+                    if (
+                        persisted.current_phase != current.current_phase
+                        or persisted.candidate_head != current.candidate_head
+                    ):
+                        return {
+                            "run_id": persisted.run_id,
+                            "current_phase": persisted.current_phase,
+                            "reason": trusted.get("reason")
+                            or ("delivery-in-progress" if status == "pending" else "delivery-needs-human"),
+                        }
+                if status == "passed":
+                    review_kind = trusted["review_kind"]
+                    by_kind.pop("maintainer-review" if review_kind == "copilot" else "copilot", None)
+                    by_kind[review_kind] = GateEvidenceRef(
+                        review_kind, trusted["review_ref"], trusted["review_hash"]
+                    )
+                    gate_status = "passed"
+                    facets = ()
+                elif status == "pending":
+                    next_phase = "review"
+                    gate_status = "running"
+                    facets = ()
+                else:
+                    next_phase = "review"
+                    gate_status = "running"
+                    facets = ("needs_human",)
+        updated = registry._manager_update_workflow_run(
+            run_id,
+            current_phase=next_phase,
+            steps=(
+                _validated_ship_steps(
+                    registry,
+                    run=current,
+                    candidate=str(candidate),
+                    coordinator_root=coordinator_root,
+                )
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else updated_steps
+            ),
+            gate_refs=tuple(
+                by_kind[kind]
+                for kind in ("brainstorm", "foreign-review", "copilot", "maintainer-review")
+                if kind in by_kind
+            ),
+            gate_status=gate_status,
+            candidate_head=candidate,
+            verified_head=verified,
+            facets=facets,
+            status=(
+                "done"
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            completion_record_path=(
+                trusted["completion"]["record_path"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            completion_record_hash=(
+                trusted["completion"]["record_hash"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            completion_record_revision=(
+                trusted["completion"]["record_revision"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            completion_source_revisions=(
+                trusted["completion"]["source_revisions"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            pr_candidate=(
+                trusted["completion"]["pr_candidate"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            merge_revision=(
+                trusted["completion"]["merge_revision"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+        )
+        reason = (
+            "ship-validator-unavailable"
+            if current.current_phase == "review" and phase_done and requested_phase == "ship" and ship_validator is None
+            else (
+                "delivery-in-progress"
+                if current.current_phase == "review"
+                and phase_done
+                and requested_phase == "ship"
+                and ship_validator is not None
+                and next_phase == "review"
+                and not facets
+                else (
+                    str(trusted.get("reason") or "delivery-needs-human")
+                    if current.current_phase == "review"
+                    and phase_done
+                    and requested_phase == "ship"
+                    and ship_validator is not None
+                    and facets == ("needs_human",)
+                    else None
+                )
+            )
+        )
+        return {"run_id": updated.run_id, "current_phase": updated.current_phase, "reason": reason}
+    if action != "start":
+        raise ValueError(f"unsupported workflow action: {action}")
+
+    manifest = _load_workflow_manifest(_required_workflow_string(args, "manifest_path"))
+    manifest.validate_manager_spine()
+    # #208 收口 wiring 1：work_bridge.start_canonical_workflow 在呼叫端已算好
+    # （fail-soft，可能是 None）的 claim-time sizing 快照透過 args 帶進來，這裡
+    # 只負責原樣轉交給 _manager_create_workflow_run；不在 manager.py 重算。
+    start_sizing_score = args.get("sizing_score")
+    start_sizing_band = args.get("sizing_band")
+    start_combo_selection = args.get("combo_selection")
+    # #205 R1/R2：run-scoped 模型鏈覆寫在 claim 當下（本次 `_manager_create_
+    # workflow_run` 呼叫，若同 claim_key 已存在 ongoing run 則此呼叫是
+    # no-op，覆寫沿用既有 run，見 registry.py 的 idempotent 短路）一併凍結。
+    start_model_chain_override = args.get("model_chain_override")
+    run = registry._manager_create_workflow_run(
+        work_id=_required_workflow_string(args, "work_id"),
+        repo=_required_workflow_string(args, "repo"),
+        claim_key=_required_workflow_string(args, "claim_key"),
+        source_revision=_required_workflow_string(args, "source_revision"),
+        workspace_root=str(Path(_required_workflow_string(args, "artifact_root")).resolve()),
+        combo=manifest.combo,
+        current_phase="claim",
+        issue_refs=tuple(args.get("issue_refs", ())),
+        openspec_refs=tuple(args.get("openspec_refs", ())),
+        pr_refs=tuple(args.get("pr_refs", ())),
+        attempts={"claim": 1},
+        steps=_audit_phase_steps(
+            manifest.steps,
+            phase="claim",
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            outputs=(),
+        ),
+        gate_status="running",
+        sizing_score=start_sizing_score,
+        sizing_band=start_sizing_band,
+        model_chain_override=start_model_chain_override,
+        combo_selection=start_combo_selection,
+    )
+    artifact_root = Path(_required_workflow_string(args, "artifact_root")).resolve()
+    transaction_root = (
+        Path(coordinator_root).resolve()
+        if coordinator_root is not None
+        else Path(_required_workflow_string(args, "evidence_dir")).resolve().parent
+    )
+    try:
+        _PlanningPublicationTransaction.reconcile(
+            root=artifact_root,
+            journal_root=transaction_root,
+            run=run,
+        )
+    except PlanningPublicationDrift:
+        run = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), gate_status="running"
+        )
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "planning-publication-drift",
+        }
+    if run.current_phase not in {"claim", "define"}:
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "already-claimed"}
+    if run.current_phase == "claim":
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            current_phase="define",
+            attempts={**run.attempts, "define": 1},
+        )
+    artifacts, authority = _load_planning_artifacts(
+        args,
+        work_id=run.work_id,
+        persisted=run.planning_authority,
+    )
+    if not run.planning_authority and authority:
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            planning_authority=authority,
+        )
+    report = assess_planning_completeness(artifacts)
+    if report.complete:
+        primary_executor = str(args.get("primary_executor") or "cortex-manager")
+        primary_model = str(args.get("primary_model") or "deterministic")
+        primary_domain = str(args.get("primary_domain") or "cortex")
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            current_phase="plan",
+            attempts={**run.attempts, "plan": 1},
+            steps=_audit_phase_steps(
+                run.steps,
+                phase="define",
+                executor=primary_executor,
+                model=primary_model,
+                domain=primary_domain,
+                outputs=tuple(artifact.ref for artifact in artifacts),
+            ),
+            brainstorm_required=False,
+            primary_domain=primary_domain,
+            facets=(),
+        )
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "planning-complete"}
+
+    primary = (
+        _required_workflow_string(args, "primary_executor"),
+        _required_workflow_string(args, "primary_model"),
+    )
+    if (
+        runtime_factory is not None
+        and (primary_questioner is None or secondary_planner is None or primary_integrator is None)
+    ):
+        try:
+            runtime = runtime_factory(
+                primary=primary,
+                worktree=_required_workflow_string(args, "artifact_root"),
+            )
+        except Exception as exc:
+            # #393：recover-planning 靠 `cortex-planning-failure/v1` evidence
+            # 判定能不能恢復——過去全庫只有 reader（work_actions.
+            # _read_planning_failure_record）、這三條 needs_human 路徑沒有任何
+            # 一條寫 evidence，導致 recover-planning 對 define 靜默失敗結構性
+            # 不可用。這裡歸類 `environment`（runtime 初始化本身出問題，非
+            # 內容缺陷），reason 沿用 #392 已組好的字串再併上例外摘要。
+            failure_reason = (
+                f"planning-runtime-initialization-failed: {type(exc).__name__}: {str(exc)[:200]}"
+            )
+            evidence_refs = _record_planning_failure_evidence(
+                run,
+                coordinator_root=transaction_root,
+                classification="environment",
+                reason=failure_reason,
+            )
+            run = registry._manager_update_workflow_run(
+                run.run_id,
+                facets=("needs_human",),
+                brainstorm_required=True,
+                evidence_refs=evidence_refs,
+            )
+            # #391：needs_human 的 reason 過去只塞進回傳值——daemon periodic
+            # tick 觸發時（未經活人在旁的 request/response）沒人消費回傳值，
+            # reason 隨呼叫堆疊蒸發，run row 只留下一個查不出原因的
+            # needs_human facet。這裡結構化落一筆 log（run_id／reason／底層
+            # exception 型別與訊息前 200 字），至少留下可追查的軌跡；exception
+            # 本身仍整段吞掉不重拋，維持既有 fail-soft 行為不變。
+            logger.error(
+                "planning-runtime-initialization-failed run_id=%s reason=%s error=%s: %s",
+                run.run_id,
+                "planning-runtime-initialization-failed",
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "planning-runtime-initialization-failed",
+            }
+        identity_registry = runtime.identity_registry
+        probes = runtime.probes
+        primary_questioner = runtime.primary_questioner
+        secondary_planner = runtime.secondary_planner
+        primary_integrator = runtime.primary_integrator
+    if primary_questioner is None or secondary_planner is None or primary_integrator is None:
+        # #393：同上一條路徑，補 evidence 才能讓 recover-planning 對這條
+        # needs_human 出口可用；沒有底層 exception 可附，classification 仍歸
+        # `environment`（runtime 元件缺失，非內容缺陷）。
+        evidence_refs = _record_planning_failure_evidence(
+            run,
+            coordinator_root=transaction_root,
+            classification="environment",
+            reason="planning-runtime-unavailable",
+        )
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=("needs_human",),
+            brainstorm_required=True,
+            evidence_refs=evidence_refs,
+        )
+        # #391：runtime_factory 沒被呼叫（或呼叫成功但沒補齊三個角色）時同樣
+        # 落一筆 log，理由同上——reason 不能只活在回傳值裡。
+        logger.error(
+            "planning-runtime-unavailable run_id=%s reason=%s",
+            run.run_id,
+            "planning-runtime-unavailable",
+        )
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "planning-runtime-unavailable",
+        }
+
+    identities = identity_registry or load_model_identities()
+    publication = _PlanningPublicationTransaction(
+        root=artifact_root,
+        run_id=run.run_id,
+        journal_root=transaction_root,
+    )
+    result = run_heterogeneous_brainstorm(
+        report=report,
+        primary=primary,
+        registry=identities,
+        probes=probes or {},
+        evidence_dir=_required_workflow_string(args, "evidence_dir"),
+        artifact_root=_required_workflow_string(args, "artifact_root"),
+        scope=PlanningScope(
+            repo=run.repo,
+            work_id=run.work_id,
+            source_revision=_required_workflow_string(args, "source_revision"),
+        ),
+        primary_questioner=primary_questioner,
+        secondary_planner=secondary_planner,
+        primary_integrator=primary_integrator,
+        artifact_writer=lambda rows: _publish_planning_artifacts(
+            _required_workflow_string(args, "artifact_root"),
+            rows,
+            work_id=run.work_id,
+            allowed_refs=tuple(
+                ref for step in manifest.steps for ref in step.outputs
+            ),
+            authorities=run.planning_authority,
+            transaction=publication,
+        ),
+        evidence_writer=publication.write_evidence,
+    )
+    if result.state != "ready" or result.gate_refs.brainstorm_peer is None:
+        publication.rollback()
+        # #393：brainstorm 未收斂預設歸內容缺陷（非 runtime 環境問題），
+        # classification 落 `content`——`_read_planning_failure_record` 仍接受
+        # 此值，但 `_resume_decision` 對 `content` 一律不浮現 recover-planning
+        # （見 claim.py 的 fail-closed 判準），行為與 issue 393 的 fail-closed
+        # 意圖一致。`result.reason` 理論上不應為空，仍防禦性 fallback 避免
+        # evidence 的 reason 欄位落空字串。
+        # #416：唯一例外——reason 命中 `_is_planning_authority_residue_failure`
+        # 判準時（abandon 未回滾的發佈殘留撞見 `_publish_planning_artifacts`
+        # 的 authority fail-closed），這其實是環境／狀態殘留而非模型內容
+        # 缺陷，改歸 `environment`，讓 `_resume_decision` 可以浮現
+        # recover-planning，不必再燒一個世代改名重識別才能繞過。
+        brainstorm_not_ready_reason = result.reason or "brainstorm-not-ready"
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=("needs_human",),
+            brainstorm_required=True,
+            evidence_refs=_record_planning_failure_evidence(
+                run,
+                coordinator_root=transaction_root,
+                classification=(
+                    "environment"
+                    if _is_planning_authority_residue_failure(brainstorm_not_ready_reason)
+                    else "content"
+                ),
+                reason=brainstorm_not_ready_reason,
+            ),
+        )
+        # #391：run_heterogeneous_brainstorm 沒能收斂到 ready 狀態時，同樣的
+        # reason-只活在回傳值裡問題——比照上面兩條 runtime 缺失路徑補一筆 log。
+        logger.error(
+            "brainstorm-not-ready run_id=%s state=%s reason=%s",
+            run.run_id,
+            result.state,
+            result.reason,
+        )
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": result.reason}
+    try:
+        planning_authority, planning_source_revision = _validated_brainstorm_planning_authority(
+            run,
+            coordinator_root=transaction_root,
+            brainstorm_ref=result.gate_refs.brainstorm_peer,
+        )
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            current_phase="plan",
+            attempts={**run.attempts, "plan": 1},
+            gate_refs=result.gate_refs.as_tuple(),
+            planning_authority=planning_authority,
+            planning_source_revision=planning_source_revision,
+            brainstorm_required=True,
+            primary_domain=identities.require(*primary).independence_domain,
+            steps=_audit_phase_steps(
+                run.steps,
+                phase="define",
+                executor=primary[0],
+                model=primary[1],
+                domain=identities.require(*primary).independence_domain,
+                outputs=tuple(
+                    ref
+                    for resolution in (result.integration or {}).get("resolutions", [])
+                    if isinstance(resolution, dict)
+                    for ref in resolution.get("artifact_refs", [])
+                    if isinstance(ref, str)
+                ),
+            ),
+            facets=(),
+        )
+    except BaseException:
+        persisted = registry.get_workflow_run(run.run_id)
+        expected = publication.expected_gate_ref
+        committed = False
+        if expected is not None:
+            try:
+                expected_ref = GateEvidenceRef.from_dict(expected)
+            except ValueError:
+                expected_ref = None
+            committed = expected_ref is not None and any(
+                ref == expected_ref for ref in persisted.gate_refs
+            )
+        if committed:
+            _PlanningPublicationTransaction.reconcile(
+                root=artifact_root,
+                journal_root=transaction_root,
+                run=persisted,
+            )
+        else:
+            publication.rollback()
+        raise
+    publication.commit()
+    return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "brainstorm-complete"}
+
+
+def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None):
+    """唯一 production mutation seam；daemon control request 之外不直接呼叫。"""
+    from .work_actions import execute_work_action
+    from .registry import JobRegistry
+    from .work_bridge import extract_model_chain_override, start_canonical_workflow
+
+    active_registry = registry or JobRegistry()
+    state_path = getattr(active_registry, "_state_path", None)
+    coordinator_root = (
+        Path(state_path).resolve().parent if state_path is not None else paths.coordinator_root().resolve()
+    )
+    # #205 R1：operator 在 `cortex run work start/resume/...` 帶入的 run-scoped
+    # 模型鏈覆寫語法層抽取；是否合法留給 dispatch 時 fail closed（D4）。
+    work_action_model_chain_override = extract_model_chain_override(args)
+    # combo 只在 start／intake action 有效（issue #203：intake 內部等價於
+    # start）——resume 等動作即使夾帶 combo（不論來自上游疏漏或 --payload
+    # 繞過）也不得轉交 start_canonical_workflow，避免已在 define phase 之外
+    # resume 時被未預期的 combo override 影響（contract.validate_request 已
+    # fail-closed 擋掉此請求，這裡是 manager 層的縱深防禦，行為不依賴上游
+    # 有沒有先擋下）。
+    work_action_combo_override = (
+        args.get("combo") if args.get("action") in {"start", "intake"} else None
+    )
+
+    def starter(authority, claim_key, reason):
+        return start_canonical_workflow(
+            registry=active_registry,
+            authority=authority,
+            claim_key=claim_key,
+            coordinator_root=coordinator_root,
+            explicit_repo_root=args.get("repo_root"),
+            runtime_factory=runtime_factory or planning_runtime.build_production_planning_runtime,
+            needs_human_reason=reason,
+            model_chain_override=work_action_model_chain_override,
+            combo_override=work_action_combo_override,
+        )
+
+    return execute_work_action(
+        args=args,
+        requested_by=requested_by,
+        workflow_registry=active_registry,
+        workflow_starter=starter,
+    )
+
+
+def run_auto_claim_scan(*, registry=None, runtime_factory=None):
+    """Periodic Manager-owned durable work claim projection."""
+    from .work_actions import run_auto_claim_scan as scan
+    from .registry import JobRegistry
+    from .work_bridge import start_canonical_workflow
+
+    active_registry = registry or JobRegistry()
+    state_path = getattr(active_registry, "_state_path", None)
+    coordinator_root = (
+        Path(state_path).resolve().parent if state_path is not None else paths.coordinator_root().resolve()
+    )
+
+    def starter(authority, claim_key, reason):
+        return start_canonical_workflow(
+            registry=active_registry,
+            authority=authority,
+            claim_key=claim_key,
+            coordinator_root=coordinator_root,
+            runtime_factory=runtime_factory or planning_runtime.build_production_planning_runtime,
+            needs_human_reason=reason,
+        )
+
+    return scan(workflow_registry=active_registry, workflow_starter=starter)

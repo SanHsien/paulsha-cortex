@@ -1,0 +1,16 @@
+name: Policy Check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@a764806046c410eb4f254ac0b6a8aec8b7559dab  # v1.0.15
+    with:
+      policy_profile: flat
+      policy_version: "1.0.15"
+      policy_engine_ref: a764806046c410eb4f254ac0b6a8aec8b7559dab

@@ -1,0 +1,210 @@
+# 轉錄真相源：custom-skills/feature-delivery-pipeline SKILL.md（11 phases）
+# produces 僅寫可機械驗證 glob；佔位符白名單：<task-slug>、<change>
+version: 0
+cards:
+  - id: workflow-claim
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "coordinator:workflow-claim"
+    phase: claim
+    requires: []
+    produces: []
+    persona_binding: manager
+
+  - id: brainstorming
+    kind: skill
+    type: interactive
+    class: core
+    skill_ref: "superpowers:brainstorming"
+    phase: define
+    requires: []
+    produces:
+      - "docs/superpowers/specs/*<task-slug>*-spec.md"
+      - "docs/superpowers/specs/*<task-slug>*-design.md"
+    persona_binding: planner
+
+  - id: openspec-propose
+    kind: skill
+    type: interactive
+    class: core
+    skill_ref: "openspec-propose"
+    phase: define
+    requires: ["docs/superpowers/specs/*<task-slug>*-design.md"]
+    produces:
+      - "openspec/changes/<change>/proposal.md"
+      - "openspec/changes/<change>/tasks.md"
+    persona_binding: planner
+
+  - id: writing-plans
+    kind: skill
+    type: interactive
+    class: core
+    skill_ref: "superpowers:writing-plans"
+    phase: plan
+    requires: ["openspec/changes/<change>/proposal.md"]
+    produces: ["docs/superpowers/plans/*<task-slug>*.md"]
+    persona_binding: planner
+
+  # #324：與 writing-plans 同一 skill_ref，只差 requires——只吃 spec/design
+  # doc，不依賴 openspec proposal，供不需要 openspec 全鏈的輕量 combo（如
+  # small-fix）使用，打斷 issue #324 描述的 requires DAG 斷鏈。
+  - id: writing-plans-light
+    kind: skill
+    type: interactive
+    class: core
+    skill_ref: "superpowers:writing-plans"
+    phase: plan
+    requires: ["docs/superpowers/specs/*<task-slug>*-design.md"]
+    produces: ["docs/superpowers/plans/*<task-slug>*.md"]
+    persona_binding: planner
+
+  - id: worktree-isolation
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:using-git-worktrees"
+    phase: build
+    slice_group: build
+    requires: ["docs/superpowers/plans/*<task-slug>*.md"]
+    produces: []          # worktree 由 coordinator 派工時自建（feature/<slice_id>）
+    persona_binding: builder
+    execution:
+      action: "確認 Manager provision 的 builder worktree，並依 accepted plan 回報隔離狀態；不得另建第二個 worktree"
+      commit_policy: forbidden
+      test_policy: none
+
+  - id: tdd-red
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:test-driven-development"
+    phase: build
+    slice_group: build
+    requires: ["docs/superpowers/plans/*<task-slug>*.md"]
+    produces: []          # RED 證據在 build session log／commits，Phase A 不機驗
+    persona_binding: builder
+    execution:
+      action: "以 accepted plan 為唯一需求來源，新增可重現缺口的 RED regression test"
+      commit_policy: required
+      test_policy: red-required
+    # #262：RED 證據需要在 executor 環境內實際跑 pytest。
+    runtime_capabilities: ["module:pytest"]
+
+  - id: subagent-build
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:subagent-driven-development"
+    phase: build
+    slice_group: build
+    requires: ["docs/superpowers/plans/*<task-slug>*.md"]
+    produces: []          # 完成偵測 = manager exit sentinel + branch commits
+    persona_binding: builder
+    execution:
+      action: "依 accepted plan 以最小 diff 實作，讓 RED test 轉綠並提交候選 HEAD"
+      commit_policy: required
+      test_policy: focused
+    # #262：轉綠判定需要在 executor 環境內實際跑 pytest。
+    runtime_capabilities: ["module:pytest"]
+
+  - id: code-review
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:requesting-code-review"
+    phase: review
+    requires: []
+    produces: ["reports/review/*<task-slug>*.md"]
+    persona_binding: reviewer
+
+  - id: verification
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:verification-before-completion"
+    phase: verify
+    requires: []
+    produces: ["reports/verify/*<task-slug>*.md"]
+    persona_binding: reviewer
+    # #262：verification 要在 executor 環境內跑完整套件。
+    runtime_capabilities: ["module:pytest"]
+
+  - id: openspec-archive
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "openspec-archive-change"
+    phase: ship
+    slice_group: ship
+    requires: ["openspec/changes/<change>/tasks.md"]
+    produces: ["openspec/changes/archive/*<change>*"]
+    persona_binding: manager
+    # #369：ship phase 落地變更需要 GitHub 可達（issue/PR 狀態核對、archive
+    # 與 remote 一致性）；provider snapshot degraded 時擋在 dispatch 前，避免
+    # 耗費一整個 session 後才因連線問題失敗。
+    # #442：小範圍試啟用 `provider:executor` 動態 sentinel（#369 建立、已測但
+    # 一直無卡宣告）——dispatch 前對「該 identity candidate 實際使用的 executor」
+    # 做登入態探測（coordinator.executor_auth），限流／登出擋在 spawn 之前。
+    # 先只在 ship-phase 兩張卡觀測，其餘卡待觀測無誤再擴大。
+    runtime_capabilities:
+      - "provider:github:hamanpaul/paulsha-cortex"
+      - "provider:executor"
+
+  - id: policy-commit
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "conventional-commit"
+    phase: ship
+    slice_group: ship
+    requires: []
+    produces: []          # 證據 = conventional commit 本身（不機驗檔案）
+    persona_binding: manager
+    # #369：conventional commit 落地後緊接著就是 push／PR 流程，同樣需要
+    # GitHub 可達；宣告與 openspec-archive 相同的 provider 需求。
+    # #442：與 openspec-archive 一致，試啟用 `provider:executor` 登入態閘門
+    # （範圍與擴大條件見 openspec-archive 的說明）。
+    runtime_capabilities:
+      - "provider:github:hamanpaul/paulsha-cortex"
+      - "provider:executor"
+
+  # issue #378：builder 的「實證」交付可能是 rigged setup（兩條對照臂共用可變
+  # 狀態、差異由 setup 順序而非被測性質產生、verdict 判準為恆真式）——現有
+  # verification gate（persona-scope／command／artifacts exists）只驗「跑得起來
+  # 且測試綠」，不驗「結論站不站得住腳」。本卡的任務不是覆核 builder 結論，而是
+  # 主動嘗試推翻它；命中時走 review.py 既有的 BLOCKING_FINDING_CATEGORIES
+  # fail-closed 通道（verification-bypass／acceptance），不新建機制。
+  - id: adversarial-review
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "codex:adversarial-review"
+    phase: review
+    requires: ["reports/review/*<task-slug>*.md"]
+    produces: ["reports/review/*<task-slug>*-adversarial.md"]
+    persona_binding: reviewer
+    execution:
+      action: "對抗式檢視本次交付的 evidence／實證主張（含 benchmark／research／hardware 對照實驗）是否為 rigged setup：目標不是確認 builder 結論，而是主動嘗試推翻——(a) 兩條對照臂是否共用 mutable state 或一次性資源，使差異由 setup 順序（setup-order dependency）而非被測性質產生；(b) verdict 判準是否為恆真式（tautological verdict，把兩臂互換順序或改為各自獨立執行後結論是否仍成立）；(c) 結論是否真由觀測值導出，而非預設寫死或由 selection bias 保證。任一項成立即為 rigged evidence，MUST 以 verification-bypass 或 acceptance category 回報 blocking finding，不得放行。"
+
+  - id: receiving-code-review
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:receiving-code-review"
+    phase: build
+    requires: ["reports/review/*<task-slug>*.md"]
+    produces: []          # findings 處理證據 = fix commits + re-review，Phase A 不機驗
+    persona_binding: builder
+
+  # 註：hw-evidence.md 為 deck 投影新造的 artifact 契約（SKILL 硬體證據規則的
+  # 可機驗載體）；內容正確性由 mcu-coding-skill 執行時自律，deck 只驗存在。
+  - id: mcu-hw-evidence
+    kind: skill
+    type: interactive
+    class: niche
+    skill_ref: "mcu-coding-skill"
+    phase: define
+    requires: []
+    produces: ["docs/superpowers/specs/*<task-slug>*-hw-evidence.md"]
+    persona_binding: planner

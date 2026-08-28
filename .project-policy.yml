@@ -1,0 +1,30 @@
+policy_profile: flat
+policy_version: 1.0.15
+tier: shareable
+code_paths:
+  - ".project-policy.yml"
+  - "VERSION"
+  - "pyproject.toml"
+  - "paulsha_cortex/**"
+  - "tests/**"
+  - "**/*.md"
+  - "**/*.yml"
+  - "**/*.yaml"
+  - ".github/**"
+agent_files:
+  mode: symlink
+conventions_engine:
+  repo: hamanpaul/paulsha-conventions
+preflight:
+  steps:
+    - name: openspec
+      kind: validation
+      # main 仍有多個未完成 active changes；本 migration 只驗 canonical specs，
+      # 不以無關 WIP change 的缺 delta 阻擋 manifest rollout。
+      argv: ["openspec", "validate", "--specs"]
+      when_path_exists: "openspec"
+      timeout_seconds: 300
+    - name: tests
+      kind: tests
+      argv: ["python3", "-m", "pytest", "tests/", "-q"]
+      timeout_seconds: 1800

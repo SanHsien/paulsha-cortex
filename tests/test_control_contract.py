@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import re
+import pytest
+from uuid import UUID
+
+from paulsha_cortex.control import constants, contract
+
+
+def test_control_plane_paths_share_single_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+
+    assert constants.control_root() == tmp_path
+    assert constants.requests_dir() == tmp_path / "requests"
+    assert constants.done_dir() == tmp_path / "done"
+    assert constants.status_path() == tmp_path / "status.json"
+    assert constants.SCHEMA_VERSION == 1
+
+
+def test_generate_req_id_uses_utc_timestamp_and_uuid():
+    req_id = contract.generate_req_id()
+    match = re.fullmatch(r"(\d{8}T\d{6}Z)-([0-9a-f]{32})", req_id)
+
+    assert match is not None
+    UUID(match.group(2))
+
+
+def test_request_done_and_status_round_trip_include_schema_version(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+
+    request = contract.build_request(
+        req_type="tick",
+        args={"executor": "copilot", "allow_unsafe": False},
+        requested_by="cockpit",
+    )
+    done = contract.build_done(
+        req_id=request["req_id"],
+        status="ok",
+        result={"dispatched": [], "completed": [], "errors": []},
+        started_at="2026-07-03T09:00:00+00:00",
+    )
+    status = contract.build_status(
+        ready=["slice-a"],
+        in_flight=[{"job_id": "job-1", "slice_id": "slice-b", "state": "running"}],
+        recent_done=[{"slice_id": "slice-c", "gate_status": "passed", "at": "2026-07-03T09:05:00+00:00"}],
+        daemon={"pid": 1234, "last_tick_at": "2026-07-03T09:05:00+00:00", "idle": True},
+        updated_at="2026-07-03T09:05:00+00:00",
+    )
+
+    request_path = constants.requests_dir() / f"{request['req_id']}.json"
+    done_path = constants.done_dir() / f"{request['req_id']}.json"
+    status_path = constants.status_path()
+
+    contract.atomic_write_json(request_path, request)
+    contract.atomic_write_json(done_path, done)
+    contract.atomic_write_json(status_path, status)
+
+    assert contract.read_json(request_path) == request
+    assert contract.read_json(done_path) == done
+    assert contract.read_json(status_path) == status
+    assert request["schema_version"] == constants.SCHEMA_VERSION
+    assert done["schema_version"] == constants.SCHEMA_VERSION
+    assert status["schema_version"] == constants.SCHEMA_VERSION
+
+
+def test_build_dispatch_request():
+    req = contract.build_request(
+        req_type="dispatch",
+        args={"slice_id": "s1", "handoff_dir": "runtime/handoff", "force_hold": True},
+        requested_by="telegram:42",
+    )
+    assert req["type"] == "dispatch" and req["args"]["slice_id"] == "s1"
+    assert req["args"]["handoff_dir"] == "runtime/handoff"
+
+
+def test_build_complete_request():
+    req = contract.build_request(
+        req_type="complete",
+        args={"handoff_dir": "runtime/handoff", "specs_dir": "specs"},
+        requested_by="telegram:42",
+    )
+    assert req["type"] == "complete"
+    assert req["args"]["handoff_dir"] == "runtime/handoff"
+
+
+def test_build_slice_action_request():
+    req = contract.build_request(
+        req_type="slice-action",
+        args={"slice_id": "slice-a", "action": "retry-build", "actor": "operator"},
+        requested_by="telegram:42",
+    )
+    assert req["type"] == "slice-action"
+    assert req["args"] == {"slice_id": "slice-a", "action": "retry-build", "actor": "operator"}
+
+
+def test_work_action_contract_requires_typed_routing_fields():
+    req = contract.build_request(
+        req_type="work-action",
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+    )
+    assert contract.validate_request(req)["args"]["action"] == "start"
+    req["args"]["action"] = "delete"
+    with pytest.raises(ValueError, match="action invalid"):
+        contract.validate_request(req)
+
+    typed = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "link",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "kind": "path",
+            "ref": "docs/demo.md",
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(typed)["args"]["kind"] == "path"
+    typed["args"]["issue"] = 12
+    with pytest.raises(ValueError, match="exactly one"):
+        contract.validate_request(typed)
+
+    retry = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "retry-build",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "expected_candidate": "a" * 40,
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(retry)["args"]["action"] == "retry-build"
+    retry["args"]["expected_candidate"] = "A" * 40
+    assert contract.validate_request(retry)["args"]["expected_candidate"] == "A" * 40
+    retry["args"]["expected_candidate"] = "short"
+    with pytest.raises(ValueError, match="exact expected_candidate"):
+        contract.validate_request(retry)
+
+    abandon = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "abandon",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "expected_run_id": "workflow-" + "a" * 20,
+            "actor": "operator",
+            "reason": "Superseded by a clean terminal canary.",
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(abandon)["args"]["action"] == "abandon"
+    abandon["args"]["reason"] = "bad\nreason"
+    with pytest.raises(ValueError, match="bounded reason"):
+        contract.validate_request(abandon)
+
+
+def test_unknown_type_still_raises():
+    with pytest.raises(ValueError):
+        contract.build_request(req_type="nope", args={}, requested_by="x")
+
+
+def test_work_action_intake_accepts_bare_or_typed_link_syntax_and_allows_omission():
+    """issue #203：intake 的 issue/kind+ref 是可省略的（work_id 已有 confirmed
+    authority 時不需再帶），但一旦帶了就必須符合與 link 相同的恰好擇一語法。
+    """
+    bare = contract.build_request(
+        req_type="work-action",
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+    )
+    assert contract.validate_request(bare)["args"]["action"] == "intake"
+
+    legacy = contract.build_request(
+        req_type="work-action",
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo", "issue": 12},
+        requested_by="operator",
+    )
+    assert contract.validate_request(legacy)["args"]["issue"] == 12
+
+    typed = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "kind": "path",
+            "ref": "docs/todo.md",
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(typed)["args"]["kind"] == "path"
+
+
+def test_work_action_intake_rejects_conflicting_or_partial_link_args():
+    both = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "issue": 12,
+            "kind": "path",
+            "ref": "docs/todo.md",
+        },
+        requested_by="operator",
+    )
+    with pytest.raises(ValueError, match="恰好擇一"):
+        contract.validate_request(both)
+
+    partial = contract.build_request(
+        req_type="work-action",
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo", "kind": "path"},
+        requested_by="operator",
+    )
+    with pytest.raises(ValueError, match="恰好擇一"):
+        contract.validate_request(partial)
+
+
+def test_work_action_intake_accepts_combo_like_start():
+    request = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "combo": "fix-standard",
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(request)["args"]["combo"] == "fix-standard"
+
+    invalid_combo = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "combo": "Bad Combo",
+        },
+        requested_by="operator",
+    )
+    with pytest.raises(ValueError, match="intake combo invalid"):
+        contract.validate_request(invalid_combo)

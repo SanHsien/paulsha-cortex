@@ -1,0 +1,43 @@
+# paulsha-cortex 現行決策
+
+最後修訂：2026-08-11
+
+本檔只保留仍影響本 fork 維護與實作的取捨。操作步驟見 [`DEVELOPMENT.md`](DEVELOPMENT.md)，來源與同步方法見 [`FORK.md`](FORK.md)，版本歷史見 [`CHANGELOG.md`](../CHANGELOG.md)。
+
+## 1. 保留 GitHub fork 關係
+
+- `origin` 指向 `SanHsien/paulsha-cortex`，`upstream` 指向 `hamanpaul/paulsha-cortex`。
+- 目前不改產品名稱、不重寫歷史、不離開 fork network；先保留低成本追蹤 upstream 的能力。
+- 初始評估水位為 upstream `b868760`／v0.1.4。每次同步只從這個水位之後評估，並更新本節。
+- 最新已評估水位為 upstream `b79c74a`／v0.1.5；逐 PR 決策與下次起點見 [`UPSTREAM.md`](UPSTREAM.md)。
+
+## 2. 定位為 research/development fork
+
+- 值得投資的核心是 artifact-backed state transition、exact Candidate verification、independent review 與 completion authority，不是增加 agent 數量。
+- 在公開高嚴重度 issues、授權與平台邊界收斂前，不把 CI success、agent 自報或 PR 存在視為 production readiness。
+- 若本 fork 修正通用缺陷，優先整理為可回饋 upstream 的小型 PR；個人工作流偏好留在 fork 文件或薄包裝層。
+
+## 3. 原生 Windows 是本 fork 的第一級環境
+
+- PowerShell、repo-local `.venv`、native manager/monitor、Windows Startup service backend 與 Windows CI 是權威開發路徑。
+- POSIX `fcntl`、directory fsync、Unix socket、process signal 與 mode semantics 均有顯式 platform adapter，不在 import/collection 階段假設 Linux。
+- `.gitattributes` 仍強制 LF，保護跨平台 evidence hash 與保留的 Bash/systemd 相容檔案。
+- Linux/systemd 保持支援；bubblewrap foreign-review sandbox 明確列為 Linux-only，不偽裝成 Windows 已具備的隔離保證。
+
+## 4. 不替 upstream 擅自決定授權
+
+- 評估水位沒有 LICENSE；本 fork 不新增一張看似涵蓋 upstream 程式碼的授權檔。
+- GitHub 內 fork、研究與修正不延伸解讀成任意再散布權。在 upstream 補授權或取得作者明確同意前，不對外發佈衍生 wheel／sdist。
+- 新增貢獻與安全政策只描述協作方式，不更改既有程式碼的著作權狀態。
+
+## 5. 驗證仍由 repo 契約決定
+
+- `tools/dev_check.ps1`／`.sh` 是一致入口，不取代 `CLAUDE.md` 的 changelog、PR-context policy check 與 Candidate evidence 規則。
+- 每次只接受同一 Candidate 的一次權威 full gate；失敗後只重跑受影響的 focused test，再做一次完整收尾。
+- WSL `/mnt/c` 的慢速不是測試失敗；但 timeout 或 skipped checks 必須如實記錄，不能包裝成通過。
+
+## 6. Issue #442 採 ship-phase executor auth canary
+
+- `cg` 維持 zero-tool，只能用於 read-only planning／review；Windows 由 typed-argv Python wrapper 經 stdin 傳 prompt，不退回 Bash wrapper。
+- `provider:executor` 只先啟用於 `openspec-archive`／`policy-commit`。在 GitHub side effect 前檢查登入態、可用時依既有 identity 順序 reroute，全部不可用才進 `needs_human`。
+- 不自動從 `gh` keyring 抽取 Copilot token，也不把 token 寫入 repository。只有 deployment runtime env 已安全提供 `COPILOT_GITHUB_TOKEN`／`GH_TOKEN`／`GITHUB_TOKEN` 時才使用；自動 secret-store 整合需另案具備 rotation、ACL、redaction 與 restart 證據。

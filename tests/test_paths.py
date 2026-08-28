@@ -1,0 +1,143 @@
+import os
+from pathlib import Path
+
+import pytest
+
+from paulsha_cortex.config import paths
+
+
+def test_defaults_under_agents(monkeypatch, tmp_path):
+    for var in ("PSC_AGENTS_ROOT", "PSC_CONTROL_ROOT", "PSC_COORDINATOR_ROOT", "PSC_SPECS_ROOT"):
+        monkeypatch.delenv(var, raising=False)
+    # #303：本測試驗證「無 PSC_* 時預設落在 <home>/.agents」，會走 fallback
+    # 讀 <home>/.agents/core/runtime/cortex-manager.env；不隔離 HOME 就會讀到
+    # operator 的真實 bootstrap 檔。改用假 HOME，驗證意圖（相對於 home 的預設
+    # 路徑組成）完全不變。
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    home = Path(os.environ["HOME"])
+    assert paths.control_root() == home / ".agents" / "control"
+    assert paths.coordinator_root() == home / ".agents" / "coordinator"
+    assert paths.specs_root() == home / ".agents" / "specs"
+
+
+def test_env_override_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path / "ctl"))
+    assert paths.control_root() == tmp_path / "ctl"
+
+
+def test_repo_root_uses_env_and_fails_closed_without_it(monkeypatch, tmp_path):
+    """`PSC_REPO_ROOT` 未宣告時**不得**退回 cwd，必須 fail-closed。
+
+    舊契約是 `repo_root() == Path.cwd()`。Windows service 的工作目錄正是 operator
+    的真實 checkout，所以那個預設值等同「解析不出目標就打在 operator 的樹上」
+    ——不是失敗，是靜默落在錯的 repo。取自上游 59a7a9b（#612）。
+    """
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path))
+    assert paths.repo_root() == tmp_path
+
+    monkeypatch.delenv("PSC_REPO_ROOT")
+    with pytest.raises(paths.RepoRootUnresolvedError):
+        paths.repo_root()
+
+
+def test_repo_root_cwd_requires_explicit_opt_in(monkeypatch, tmp_path):
+    """cwd 語意仍可用，但必須由呼叫端**顯式**表態（operator 手動 CLI）。"""
+    monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    assert paths.repo_root(allow_cwd=True) == Path.cwd()
+
+
+def test_configured_repo_root_reports_whether_it_was_declared(monkeypatch, tmp_path):
+    """「沒宣告」與「宣告成 cwd」必須分得出來，呼叫端才有辦法 fail-closed。"""
+    monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
+    assert paths.configured_repo_root() is None
+
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path))
+    assert paths.configured_repo_root() == tmp_path
+
+
+def test_worktree_root_is_repo_sibling(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_WORKTREE_ROOT", raising=False)
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path / "myrepo"))
+    assert paths.worktree_root() == tmp_path / "myrepo-worktrees"
+
+
+def test_run_root_default_and_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_INSTANCE", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    # #303：本測試驗證「無 PSC_* 時預設落在 <home>/.agents」，會走 fallback
+    # 讀 <home>/.agents/core/runtime/cortex-manager.env；不隔離 HOME 就會讀到
+    # operator 的真實 bootstrap 檔。改用假 HOME，驗證意圖（相對於 home 的預設
+    # 路徑組成）完全不變。
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert paths.run_root() == Path(os.environ["HOME"]) / ".agents" / "run" / "cortex"
+    monkeypatch.setenv("PSC_RUN_ROOT", str(tmp_path / "run"))
+    assert paths.run_root() == tmp_path / "run"
+
+
+def test_run_root_discovers_selected_installed_instance(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    runtime = home / ".agents" / "core" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "beta-manager.env").write_text(
+        f"PSC_AGENTS_ROOT={tmp_path / 'agents'}\n"
+        f"PSC_RUN_ROOT={tmp_path / 'custom-run'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    monkeypatch.setenv("PSC_INSTANCE", "beta")
+
+    assert paths.run_root() == tmp_path / "custom-run"
+
+
+def test_run_root_rejects_malformed_installed_environment(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    runtime = home / ".agents" / "core" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "cortex-manager.env").write_text("PSC_RUN_ROOT=relative/run\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    monkeypatch.delenv("PSC_INSTANCE", raising=False)
+
+    with pytest.raises(ValueError, match="絕對路徑"):
+        paths.run_root()
+
+
+def test_run_root_accepts_quoted_values_in_selected_installed_instance(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    runtime = home / ".agents" / "core" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "beta-manager.env").write_text(
+        'PSC_MANAGER_EXECUTOR="claude"\n'
+        f'PSC_RUN_ROOT="{tmp_path / "custom-run"}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    monkeypatch.setenv("PSC_INSTANCE", "beta")
+
+    assert paths.run_root() == tmp_path / "custom-run"
+
+
+def test_config_path_default(monkeypatch):
+    monkeypatch.delenv("PSC_CONFIG_ROOT", raising=False)
+    assert paths.config_path("paulshaclaw.yaml") == Path.home() / ".config" / "paulshaclaw" / "paulshaclaw.yaml"
+
+
+def test_project_config_root(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_PROJECT_CONFIG_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    # #303：本測試驗證「無 PSC_* 時預設落在 <home>/.agents」，會走 fallback
+    # 讀 <home>/.agents/core/runtime/cortex-manager.env；不隔離 HOME 就會讀到
+    # operator 的真實 bootstrap 檔。改用假 HOME，驗證意圖（相對於 home 的預設
+    # 路徑組成）完全不變。
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert paths.project_config_root() == Path(os.environ["HOME"]) / ".agents" / "config" / "paulsha"
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "pc"))
+    assert paths.project_config_root() == tmp_path / "pc"

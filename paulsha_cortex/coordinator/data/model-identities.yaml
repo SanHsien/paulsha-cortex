@@ -1,0 +1,27 @@
+# #452 B／#456 R3：候選身分 roster（capabilities 為候選宣告，benchmark 前）。
+# 封套欄位「沒寫＝預設、有寫＝實測」（#453 R4：registry 永不寫入預設值）；
+# 實測值由 `cortex model profile` 產 diff、經人工複核 --apply 後落地。
+# 列序即候選優先序：agy 維持首位，保住既有 planner 熱路徑選擇不變。
+schema_version: 3
+identities:
+  - executor: agy
+    model_id: gemini-3.1-pro-high
+    independence_domain: google
+    capabilities: [planning, review]
+    live_probe: agy-plan-sandbox
+  - executor: copilot
+    model_id: gpt-5.4
+    independence_domain: openai
+    capabilities: [build]
+  - executor: claude
+    model_id: sonnet
+    independence_domain: anthropic
+    capabilities: [planning, build, review]
+  - executor: codex
+    model_id: gpt-5.3-codex-spark
+    independence_domain: openai
+    capabilities: [planning, build, review]
+  - executor: cg
+    model_id: glm-5.2
+    independence_domain: zhipu
+    capabilities: [planning, review]

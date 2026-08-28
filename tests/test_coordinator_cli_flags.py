@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+from paulsha_cortex.control import client as control_client, contract as control_contract
+from paulsha_cortex.coordinator import cli
+from paulsha_cortex.coordinator.cli import _build_parser, _refuse_unsafe_fanout, _resolve_launcher
+from paulsha_cortex.coordinator.launcher import SubprocessLauncher
+
+
+def _meta(slice_id: str) -> dict:
+    return {"slice_id": slice_id, "dispatch": "auto", "plan": "p.md", "depends_on": []}
+
+
+class ResolveLauncherTests(unittest.TestCase):
+    def test_builds_subprocess_launcher_with_flags(self) -> None:
+        lr = _resolve_launcher("copilot", None, allow_unsafe=True, model="claude-haiku-4.5")
+        self.assertIsInstance(lr, SubprocessLauncher)
+        self.assertTrue(lr._allow_unsafe)
+        self.assertEqual(lr._model, "claude-haiku-4.5")
+        self.assertEqual(lr._executor, "copilot")
+
+    def test_respects_injected_launcher(self) -> None:
+        sentinel = object()
+        self.assertIs(_resolve_launcher("copilot", sentinel, allow_unsafe=True, model="x"), sentinel)
+
+    def test_none_executor_returns_none(self) -> None:
+        self.assertIsNone(_resolve_launcher(None, None, allow_unsafe=False, model=None))
+
+
+class RefuseUnsafeFanoutTests(unittest.TestCase):
+    def test_unsafe_refuses_multiple_ready(self) -> None:
+        metas = [_meta("a"), _meta("b")]
+        with self.assertRaises(ValueError):
+            _refuse_unsafe_fanout(metas, lambda s: True, allow_unsafe=True)
+
+    def test_unsafe_allows_single_ready(self) -> None:
+        _refuse_unsafe_fanout([_meta("a")], lambda s: True, allow_unsafe=True)  # 不 raise
+
+    def test_safe_mode_unbounded(self) -> None:
+        metas = [_meta(f"s{i}") for i in range(5)]
+        _refuse_unsafe_fanout(metas, lambda s: True, allow_unsafe=False)  # 不 raise
+
+
+class ReapBrokerFlagTests(unittest.TestCase):
+    def test_reap_brokers_help_mentions_apply_and_cwd_root(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["reap-brokers", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("--apply", buf.getvalue())
+        self.assertIn("--cwd-root", buf.getvalue())
+
+    def test_tick_help_no_longer_mentions_no_reap(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["tick", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertNotIn("--no-reap", buf.getvalue())
+
+
+class SliceActionFlagTests(unittest.TestCase):
+    def test_slice_action_help_mentions_actor_and_actions(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["slice-action", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("--actor", buf.getvalue())
+        self.assertIn("retry-build", buf.getvalue())
+        self.assertIn("retry-review", buf.getvalue())
+
+    def test_slice_action_requires_actor(self) -> None:
+        parser = _build_parser()
+        with self.assertRaises(SystemExit) as exc:
+            parser.parse_args(["slice-action", "slice-a", "retry-build"])
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_slice_action_parses_required_arguments(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(["slice-action", "slice-a", "retry-build", "--actor", "operator"])
+        self.assertEqual(args.cmd, "slice-action")
+        self.assertEqual(args.slice_id, "slice-a")
+        self.assertEqual(args.action, "retry-build")
+        self.assertEqual(args.actor, "operator")
+        self.assertIsNone(args.review_executor)
+        self.assertIsNone(args.review_model)
+
+    def test_slice_action_help_mentions_review_identity_override(self) -> None:
+        # #396 item 4：retry-review 落 needs_human(reviewer-identity-missing) 時，
+        # slice-action 介面先前沒有 --review-executor/--review-model 可帶——
+        # 比照 complete/tick 既有的 identity override 機制補上。
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["slice-action", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("--review-executor", buf.getvalue())
+        self.assertIn("--review-model", buf.getvalue())
+        self.assertIn("foreign reviewer", buf.getvalue())
+
+    def test_slice_action_parses_review_identity_override(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "slice-action", "slice-a", "retry-review", "--actor", "operator",
+                "--review-executor", "codex", "--review-model", "gpt-5.4",
+            ]
+        )
+        self.assertEqual(args.review_executor, "codex")
+        self.assertEqual(args.review_model, "gpt-5.4")
+
+    def test_slice_action_review_identity_choices_reject_unknown_executor(self) -> None:
+        # issue #442：`cg` 由「未知 executor」範例改為真正的合法選項（見
+        # test_coordinator_launcher.py 的 cg 回歸測試），這裡改用一個確定不在
+        # `_ARGV_BUILDERS` 的字面值，繼續守住「未知 executor 一律被 argparse
+        # choices 拒絕」這條契約本身，而不是巧合地依賴 cg 曾經未支援。
+        parser = _build_parser()
+        with self.assertRaises(SystemExit) as exc:
+            parser.parse_args(
+                [
+                    "slice-action", "slice-a", "retry-review", "--actor", "operator",
+                    "--review-executor", "not-a-real-executor",
+                ]
+            )
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_slice_action_forwards_review_identity_into_submitted_request(self) -> None:
+        submitted = []
+        rc = cli.main(
+            [
+                "slice-action", "slice-a", "retry-review", "--actor", "operator",
+                "--review-executor", "codex", "--review-model", "gpt-5.4",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=lambda kind, args, actor: submitted.append(
+                (kind, args, actor)
+            )
+            or "req-slice-1",
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"launched": True},
+            },
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "slice-action")
+        self.assertEqual(
+            submitted[0][1],
+            {
+                "slice_id": "slice-a",
+                "action": "retry-review",
+                "actor": "operator",
+                "review_executor": "codex",
+                "review_model": "gpt-5.4",
+            },
+        )
+
+    def test_slice_action_omits_review_identity_when_not_provided(self) -> None:
+        # 沒帶 --review-executor/--review-model 時 request args 維持既有形狀
+        # （不夾帶 None 值），不影響既有 daemon 端測試對 args 字典的精確比對。
+        submitted = []
+        rc = cli.main(
+            ["slice-action", "slice-a", "retry-build", "--actor", "operator"],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=lambda kind, args, actor: submitted.append(
+                (kind, args, actor)
+            )
+            or "req-slice-2",
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {},
+            },
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            submitted[0][1],
+            {"slice_id": "slice-a", "action": "retry-build", "actor": "operator"},
+        )
+
+
+class WorkActionFlagTests(unittest.TestCase):
+    def test_work_retry_build_accepts_exact_candidate_payload(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "work", "retry-build", "demo", "--repo", "acme/demo",
+                "--issue", "12", "--actor", "operator", "--payload", "repair.json",
+            ]
+        )
+        self.assertEqual(args.action, "retry-build")
+        self.assertEqual(args.payload, "repair.json")
+
+    def test_work_ship_enqueues_payload_without_executing_delivery(self) -> None:
+        submitted = []
+        with tempfile.TemporaryDirectory() as root:
+            payload = f"{root}/ship.json"
+            with open(payload, "w", encoding="utf-8") as handle:
+                json.dump({"pr_number": 8, "change": "demo"}, handle)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = cli.main(
+                    ["work", "ship", "demo", "--repo", "acme/demo", "--payload", payload],
+                    control_read_status=lambda: {"degraded": False},
+                    control_submit_request=lambda kind, args, actor: submitted.append(
+                        (kind, args, actor)
+                    )
+                    or "req-1",
+                    control_poll_done=lambda *_args, **_kwargs: {
+                        "status": "ok",
+                        "result": {"action": "awaiting-copilot"},
+                    },
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "work-action")
+        self.assertEqual(submitted[0][1]["action"], "ship")
+        self.assertEqual(submitted[0][1]["pr_number"], 8)
+
+    def test_review_attest_parser_writes_valid_durable_control_request(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            payload_path = Path(root) / "review.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "verdict": "approved",
+                        "summary": "Exact-HEAD review passed.",
+                        "findings": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            req_ids: list[str] = []
+
+            def done(req_id, *_args, **_kwargs):
+                req_ids.append(req_id)
+                return {"status": "ok", "result": {"action": "review-attested"}}
+
+            with mock.patch.dict(os.environ, {"PSC_CONTROL_ROOT": root}, clear=False):
+                with redirect_stdout(io.StringIO()):
+                    rc = cli.main(
+                        [
+                            "work", "review-attest", "demo", "--repo", "acme/demo",
+                            "--actor", "maintainer", "--payload", str(payload_path),
+                        ],
+                        control_read_status=lambda: {"degraded": False},
+                        control_submit_request=control_client.submit_request,
+                        control_poll_done=done,
+                    )
+
+            self.assertEqual(rc, 0)
+            request = control_contract.read_json(
+                Path(root) / "requests" / f"{req_ids[0]}.json"
+            )
+            self.assertIsNotNone(request)
+            self.assertEqual(request["args"]["action"], "review-attest")
+            self.assertEqual(request["args"]["actor"], "maintainer")
+            self.assertEqual(request["args"]["verdict"], "approved")
+            self.assertEqual(request["args"]["findings"], [])
+
+    def test_work_abandon_parser_writes_exact_run_cas_and_reason(self) -> None:
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "abandon", "demo", "--repo", "acme/demo",
+                "--actor", "operator",
+                "--expected-run-id", "workflow-" + "a" * 20,
+                "--reason", "Superseded by the terminal canary.",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "abandoned"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "work-action")
+        self.assertEqual(submitted[0][1]["action"], "abandon")
+        self.assertEqual(
+            submitted[0][1]["expected_run_id"], "workflow-" + "a" * 20
+        )
+        self.assertEqual(
+            submitted[0][1]["reason"], "Superseded by the terminal canary."
+        )
+
+    def test_work_start_forwards_combo(self) -> None:
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "start", "demo", "--repo", "acme/demo",
+                "--combo", "fix-standard",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "started"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][1]["combo"], "fix-standard")
+
+    def test_work_resume_drops_combo(self) -> None:
+        """--combo 標註為 start 專用；resume 帶 --combo 時 CLI 不得轉送，
+
+        否則未經驗證的 combo 可能經 manager 一路滲透到
+        ``start_canonical_workflow``（code review finding）。
+        """
+
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "resume", "demo", "--repo", "acme/demo",
+                "--combo", "fix-standard",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "resumed"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertNotIn("combo", submitted[0][1])
+
+    def test_work_intake_forwards_combo(self) -> None:
+        """issue #203：intake 內部等價於 start，--combo 一樣要轉送（見
+        test_work_start_forwards_combo 的對稱案例）。
+        """
+
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "intake", "demo", "--repo", "acme/demo",
+                "--combo", "fix-standard",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "intake"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "work-action")
+        self.assertEqual(submitted[0][1]["action"], "intake")
+        self.assertEqual(submitted[0][1]["combo"], "fix-standard")
+
+    def test_work_link_parses_typed_kind_and_ref(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "work",
+                "link",
+                "demo",
+                "--repo",
+                "acme/demo",
+                "--kind",
+                "openspec",
+                "--ref",
+                "unified-work-lifecycle",
+            ]
+        )
+        self.assertEqual(args.kind, "openspec")
+        self.assertEqual(args.ref, "unified-work-lifecycle")
+
+    def test_work_help_exposes_typed_link_contract(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(buf):
+                parser.parse_args(["work", "--help"])
+        output = buf.getvalue()
+        self.assertIn("--kind", output)
+        self.assertIn("--ref", output)
+        self.assertIn("--issue", output)
+
+
+if __name__ == "__main__":
+    unittest.main()

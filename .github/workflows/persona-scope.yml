@@ -1,0 +1,42 @@
+name: Persona Scope
+
+# persona-scope guardrail（#135：shadow → enforce）。
+# 實際阻擋與否由 `paulsha_cortex/persona/personas.yaml` 頂層 `enforcement` 決定
+# （scope_ci.py 讀取，非本 workflow 寫死）；production 現為 `enforce`，違規時
+# job 以非零 exit code 收尾。此 job name（`persona-scope`）即為 GitHub 上要設成
+# main required status check 的名稱，設定步驟見
+# docs/superpowers/plans/persona-enforce-required-check.md 與
+# docs/superpowers/specs/persona-enforce-required-check-spec.md。
+#
+# 豁免：PR 帶 `policy-exempt:persona-scope` label 時不阻擋合併，但違規內容仍會
+# 印出（不靜音，供事後稽核）。
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  persona-scope:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -m pip install -e .
+
+      - name: Run persona-scope
+        env:
+          PERSONA_SCOPE_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: python -m paulsha_cortex.persona.scope_ci

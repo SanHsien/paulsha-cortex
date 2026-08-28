@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from paulsha_cortex import cli as umbrella_cli
+from paulsha_cortex.coordinator.cli import _build_parser as build_coordinator_parser
+from paulsha_cortex.deck.cli import _build_parser as build_deck_parser
+from paulsha_cortex.deploy import installer
+from paulsha_cortex.monitor.__main__ import build_parser as build_monitor_parser
+
+
+def test_umbrella_help_lists_public_command_families(capsys) -> None:
+    assert umbrella_cli.main(["--help"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "usage: cortex" in captured.out
+    assert "install service" in captured.out
+    assert "doctor" in captured.out
+    assert "deck" in captured.out
+    assert "monitor" in captured.out
+    assert "tick" in captured.out
+    assert "work             透過 Manager 單一 writer" in captured.out
+    assert "dispatch         已停用" in captured.out
+
+
+def test_coordinator_help_uses_cortex_and_describes_disabled_dispatch(capsys) -> None:
+    parser = build_coordinator_parser()
+    assert parser.prog == "cortex"
+    assert "已停用的舊低階入口" in parser.format_help()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["dispatch", "--help"])
+    assert exc.value.code == 0
+    assert "固定拒絕執行" in capsys.readouterr().out
+
+
+def test_fanout_help_uses_daemon_default_not_legacy_tmux(capsys) -> None:
+    parser = build_coordinator_parser()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["fanout", "--help"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "daemon 預設值" in output
+    assert "舊 tmux pane" not in output
+    assert "旁路 executor approval/sandbox" in output
+
+
+def test_subcommand_help_uses_installed_cortex_invocations() -> None:
+    assert build_deck_parser().prog == "cortex deck"
+    assert build_monitor_parser().prog == "cortex monitor"
+
+
+def test_work_help_lists_gc_subcommand() -> None:
+    assert "gc" in umbrella_cli._WORK_HELP
+    assert "回收" in umbrella_cli._WORK_HELP
+
+
+def test_work_help_lists_intake_and_claim_precondition() -> None:
+    # #389：`cortex work intake` 先前完全缺席於 umbrella `_WORK_HELP`（雖然
+    # 實際呼叫會透傳給 coordinator CLI 執行），且 claim 的 lifecycle 前置
+    # 條件（只 link issue 不足以變成可 claim，需要 active Todo 來源）未曾
+    # 記載在任何 CLI help 裡。
+    assert "intake" in umbrella_cli._WORK_HELP
+    assert "todo" in umbrella_cli._WORK_HELP
+    assert "Todo 來源" in umbrella_cli._WORK_HELP
+
+
+def test_unified_lifecycle_docs_use_typed_repo_scoped_work_mutations() -> None:
+    docs = (Path(__file__).parents[1] / "docs" / "unified-work-lifecycle.md").read_text(
+        encoding="utf-8"
+    )
+    assert "cortex work link unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14" in docs
+    assert "cortex work unlink unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14" in docs
+    assert "cortex work start unified-work-lifecycle --repo owner/repo" in docs
+    assert "cortex work resume unified-work-lifecycle --repo owner/repo" in docs
+    assert "cortex work auto unified-work-lifecycle --repo owner/repo --enable" in docs
+    assert "cortex work auto unified-work-lifecycle --repo owner/repo --disable" in docs
+
+
+def test_install_help_explains_enable_start_and_interval_semantics(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        installer.main(["service", "--help"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "usage: cortex install service" in output
+    assert "PSC_MANAGER_INTERVAL_SECONDS" in output
+    assert "被治理的目標 git repo" in output

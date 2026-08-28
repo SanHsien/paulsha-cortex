@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
+
+# feature-delivery-pipeline SKILL.md 的 11 個 phase → card id（1:1）
+PHASE_CARDS = [
+    "workflow-claim",      # 0 Manager durable claim
+    "brainstorming",        # 1 scope/brainstorm
+    "openspec-propose",     # 2 propose
+    "writing-plans",        # 3 plan
+    "worktree-isolation",   # 4 worktree（slice_group: build）
+    "tdd-red",              # 5 TDD（slice_group: build）
+    "subagent-build",       # 6 subagent execution（slice_group: build）
+    "verification",         # 7 deterministic verify
+    "code-review",          # 8 foreign review
+    "adversarial-review",   # 9 adversarial review
+    "openspec-archive",     # 9 archive（slice_group: ship）
+    "policy-commit",        # 10 policy gate + commit（slice_group: ship）
+]
+
+# issue #378：mcu-feature 是本 repo 現有的 evidence-claim 類 combo（硬體證據
+# hw-evidence.md），adversarial-review 強制掛在 code-review 之後、不透過
+# band_triggered（此 combo 本無 band 概念）——evidence-claim 類 slice 不論 band
+# 都要對抗式檢視 rigged setup。
+MCU_FEATURE_CARDS = [
+    "mcu-hw-evidence",
+    "writing-plans",
+    "worktree-isolation",
+    "tdd-red",
+    "subagent-build",
+    "code-review",
+    "adversarial-review",
+    "receiving-code-review",
+    "verification",
+]
+
+
+def test_cards_yaml_loads_and_covers_11_phases():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    for cid in PHASE_CARDS:
+        assert cid in cards, f"缺 phase 卡: {cid}"
+
+
+# issue #378：builder 產出的「實證」可能是 rigged setup（兩條對照臂共用可變狀態、
+# 差異由 setup 順序而非被測性質產生、verdict 判準為恆真式），既有 verification
+# gate（persona-scope／command／artifacts exists）不驗證「結論是否站得住腳」。
+# adversarial-review 卡的任務描述必須明確指示對抗式檢視 rigging，且指向
+# review.py 既有的 fail-closed blocking category。
+def test_adversarial_review_card_task_description_covers_rigged_evidence_review():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    card = cards["adversarial-review"]
+
+    assert card.action is not None, "adversarial-review 缺 execution.action 任務描述"
+    action = card.action
+    assert "rigged" in action.lower()
+    assert "verification-bypass" in action
+    assert "acceptance" in action
+    # 三個具體 rigging 檢查面向都要點名，不能只是空泛提醒
+    assert "setup" in action.lower()  # setup-order dependency / 共用狀態
+    assert "恆真" in action or "tautolog" in action.lower()  # 恆真式判準
+    assert "觀測" in action  # 結論須由觀測值導出，不得預設寫死
+
+
+def test_interactive_headless_typing():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    interactive = {c.id for c in cards.values() if c.type == "interactive"}
+    assert interactive == {
+        "brainstorming",
+        "openspec-propose",
+        "writing-plans",
+        "writing-plans-light",
+        "mcu-hw-evidence",
+    }
+    assert {c.id for c in cards.values() if c.type == "headless"} == (set(PHASE_CARDS) - interactive) | {"receiving-code-review"}
+    assert cards["worktree-isolation"].slice_group == "build"
+    assert cards["tdd-red"].slice_group == "build"
+    assert cards["subagent-build"].slice_group == "build"
+    assert cards["openspec-archive"].slice_group == "ship"
+    assert cards["policy-commit"].slice_group == "ship"
+
+
+# gate_spine 兩層制（#221）：adversarial-review 搬到 band_triggered 加掛層，
+# 核心層（combo.cards / combo.gate_spine）不再含它。
+CORE_PHASE_CARDS = [cid for cid in PHASE_CARDS if cid != "adversarial-review"]
+
+
+def test_feature_oneshot_combo_loads():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "feature-oneshot.yaml", cards)
+    assert combo.id == "feature-oneshot"
+    assert combo.task_type == "feature"
+    assert [c.ref for c in combo.cards] == CORE_PHASE_CARDS
+    assert [(gate.after, gate.exists) for gate in combo.gate_spine] == [
+        ("writing-plans", ("docs/superpowers/plans/*<task-slug>*.md",)),
+        ("verification", ("reports/verify/*<task-slug>*.md",)),
+        ("code-review", ("reports/review/*<task-slug>*.md",)),
+        ("openspec-archive", ("openspec/changes/archive/*<change>*",)),
+    ]
+    assert combo.band_triggered is not None
+    assert combo.band_triggered.trigger == "yellow"
+    assert [entry.ref for entry in combo.band_triggered.cards] == ["adversarial-review"]
+    assert combo.band_triggered.cards[0].depends_on == ("code-review",)
+    assert [(gate.after, gate.exists) for gate in combo.band_triggered.gate_spine] == [
+        ("adversarial-review", ("reports/review/*<task-slug>*-adversarial.md",)),
+    ]
+
+
+def test_mcu_feature_combo_loads():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "mcu-feature.yaml", cards)
+    assert combo.id == "mcu-feature"
+    assert combo.task_type == "mcu-feature"
+    assert cards["mcu-hw-evidence"].card_class == "niche"
+    assert cards["mcu-hw-evidence"].skill_ref == "mcu-coding-skill"
+    assert [entry.ref for entry in combo.cards] == MCU_FEATURE_CARDS
+    assert [(gate.after, gate.exists) for gate in combo.gate_spine] == [
+        ("mcu-hw-evidence", ("docs/superpowers/specs/*<task-slug>*-hw-evidence.md",)),
+        ("adversarial-review", ("reports/review/*<task-slug>*-adversarial.md",)),
+    ]
+    # #378：無 band_triggered 加掛層——adversarial-review 直接落在核心層，
+    # 不論 band 評估結果都會派工，不能被 band 評估跳過。
+    assert combo.band_triggered is None
+    adversarial_entry = next(entry for entry in combo.cards if entry.ref == "adversarial-review")
+    assert adversarial_entry.depends_on == ("code-review",)
+
+
+def test_mcu_feature_real_data_compiles_to_hold_specs(tmp_path):
+    from paulsha_cortex.coordinator.autonomy import detect_cycles, ready_units, scan_specs
+    from paulsha_cortex.deck.compile import compile_combo, emit
+
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "mcu-feature.yaml", cards)
+    result = compile_combo(combo, cards, "cc2674 pwm led bring-up", allow_external=True)
+    slug = result.task_slug
+    # 對抗審查補強：鎖定 slice 結構（build 三卡合組 + 四個獨立 slice，
+    # #378 起 adversarial-review 落在 code-review 與 receiving-code-review 之間）
+    assert [s.slice_id for s in result.slices] == [
+        f"{slug}-build",
+        f"{slug}-code-review",
+        f"{slug}-adversarial-review",
+        f"{slug}-receiving-code-review",
+        f"{slug}-verification",
+    ]
+    # external 精確內容：mcu 任務接續既有 plan，writing-plans 的 proposal requires
+    # 無上游（combo 無 openspec-propose）→ 誠實標記為 external
+    assert result.external == (
+        "writing-plans: openspec/changes/<change>/proposal.md",
+    )
+    assert f"cortex deck verify mcu-hw-evidence --task-slug {slug}" in result.verify_commands
+    assert f"cortex deck verify adversarial-review --task-slug {slug}" in result.verify_commands
+    # hw-evidence gate 與卡 produces 一致
+    assert combo.gate_spine[0].exists == cards["mcu-hw-evidence"].produces
+    # adversarial-review gate 與卡 produces 一致（#378：evidence-claim 類 slice
+    # 強制掛的對抗式檢視，不論 band 都需 exists 這份報告）
+    assert combo.gate_spine[1].exists == cards["adversarial-review"].produces
+    out = tmp_path / "specs"
+    emit(result, out)
+    metas = scan_specs(out)
+    assert len(metas) == len(result.slices)
+    detect_cycles(metas)
+    assert ready_units(metas, lambda sid: True) == []
+
+
+# #324 缺口 C：small-fix 是輕量 combo 參考實作，7 張卡覆蓋 WORKFLOW_PHASES
+# 各恰一張（claim/define/plan/build/verify/review/ship）。
+SMALL_FIX_CARDS = [
+    "workflow-claim",
+    "brainstorming",
+    "writing-plans-light",
+    "subagent-build",
+    "verification",
+    "code-review",
+    "policy-commit",
+]
+
+
+def test_writing_plans_light_card_does_not_require_openspec():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    card = cards["writing-plans-light"]
+
+    assert card.phase == "plan"
+    assert card.persona_binding == "planner"
+    assert card.skill_ref == "superpowers:writing-plans"
+    assert card.requires == ("docs/superpowers/specs/*<task-slug>*-design.md",)
+    assert not any("openspec" in require for require in card.requires)
+    assert card.produces == ("docs/superpowers/plans/*<task-slug>*.md",)
+
+
+def test_small_fix_combo_loads_with_7_cards_and_2_gates():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "small-fix.yaml", cards)
+
+    assert combo.id == "small-fix"
+    assert [entry.ref for entry in combo.cards] == SMALL_FIX_CARDS
+    assert len(combo.cards) == 7
+    assert len(combo.gate_spine) == 2
+    assert [(gate.after, gate.exists) for gate in combo.gate_spine] == [
+        ("verification", ("reports/verify/*<task-slug>*.md",)),
+        ("code-review", ("reports/review/*<task-slug>*.md",)),
+    ]
+
+
+def test_small_fix_combo_covers_each_workflow_phase_exactly_once():
+    from paulsha_cortex.coordinator.workflow import WORKFLOW_PHASES
+
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "small-fix.yaml", cards)
+    phases = [cards[entry.ref].phase for entry in combo.cards]
+
+    assert phases == list(WORKFLOW_PHASES)
+
+
+def test_small_fix_combo_manifest_passes_manager_spine():
+    from paulsha_cortex.deck.compile import compile_combo
+
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "small-fix.yaml", cards)
+    result = compile_combo(combo, cards, "small fix demo", change="small-fix-demo")
+
+    assert result.workflow_manifest is not None
+    # 非空性自證：拿掉任一 phase 的卡（例如刪 brainstorming）會讓
+    # validate_manager_spine() 拋例外，見 tests/test_combo_search_path.py 姊妹
+    # 案例；此處鎖定「現況必須通過」。
+    result.workflow_manifest.validate_manager_spine()
+
+
+def test_feature_oneshot_real_data_compiles_to_hold_specs(tmp_path):
+    # W7 整合驗證：真實資料 feature-oneshot 全鏈 compile→emit→parse-level
+    from paulsha_cortex.coordinator.autonomy import detect_cycles, ready_units, scan_specs
+    from paulsha_cortex.deck.compile import compile_combo, emit
+
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "feature-oneshot.yaml", cards)
+    result = compile_combo(combo, cards, "w7 closeout demo", change="deck-cards-combo-phase-a")
+    slug = result.task_slug
+    assert result.external == ()  # 全鏈 requires 覆蓋，無需 --allow-external
+    assert [s.slice_id for s in result.slices] == [
+        f"{slug}-build",
+        f"{slug}-verification",
+        f"{slug}-code-review",
+        f"{slug}-adversarial-review",
+        f"{slug}-ship",
+    ]
+    assert len(result.checklist) == 3  # 三張 interactive 前置卡
+    out = tmp_path / "specs"
+    emit(result, out)
+    metas = scan_specs(out)
+    assert len(metas) == 5
+    assert {meta["slice_id"] for meta in metas} == {
+        f"{slug}-build",
+        f"{slug}-verification",
+        f"{slug}-code-review",
+        f"{slug}-adversarial-review",
+        f"{slug}-ship",
+    }
+    detect_cycles(metas)
+    assert ready_units(metas, lambda sid: True) == []  # 全 hold 不誤觸發
