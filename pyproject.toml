@@ -20,7 +20,7 @@ classifiers = [
 [project.optional-dependencies]
 test = ["pytest>=9.1"]
 dev = [
-    "build>=1.5",
+    "build>=1.6",
     "pytest>=9.1",
     "twine>=7",
 ]
