@@ -339,3 +339,18 @@ tag」。**那個結論漏掉一件事**：等 tag 的期間，上游已經修�
 
 **判準補一條**：PR 與 issue 一律用 `--state all` 查。未合併就關閉的 PR 永遠不會出現在 commit
 清單裡，而那正是「上游拒收、但可能對本 fork 有價值」的那一類。
+
+
+## 2026-08-30：PR／issue 軸清空，release 軸仍待審
+
+PR 水位 787 → 816、issue 781 → 815；**commit 水位維持 `dc8a968`（v0.1.8）**。
+
+17 個 PR 全部經由 release 軸抵達——12 筆已 merged，5 筆 CLOSED 未合併的逐筆用 `Closes` 的 issue
+編號回查 `upstream/main`，確認是改用別的 PR 重新落地（`#716`→`4200012`／`0e91ed6`、
+`#763`→`da32375`、`#692`→`e22ef78`／`ad3f832`；`#681`／`#695` 的 issue 為 CLOSED/COMPLETED），
+不是被上游拒收。12 個 issue 是上游自己的缺陷回報，修正落在 `main`、隨 release 抵達。
+
+逐項理由與證據見 [`DECISIONS.md`](DECISIONS.md) 同日條目。
+
+**真正待做**：v0.1.8 → v0.1.10 的 **358 個 commit** 審查。那是一次獨立的 release 同步，
+不是 ticket triage 的範圍。在那之前每週的 upstream-check 會是紅的。

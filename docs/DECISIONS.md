@@ -74,3 +74,46 @@ commit 水位。那兩個面向不是「查過沒發現」，是根本沒查，�
 **本 repo 額外一點**：這裡追蹤的是 release tag，兩個 release 之間 commit 軸本來就是空的——
 而那正是「open PR 或 issue 是上游動態唯一可見處」的時候。所以 ticket 收集放在 release 判斷
 **之外**，不能只在有新 tag 時才跑，否則那幾個月照樣看不見。
+
+
+## 2026-08-30：上游 #788–#816 與 #799–#815 的判定（commit 水位不推進）
+
+PR 水位 787 → 816；issue 水位 781 → 815。**commit 水位維持 `dc8a968`（v0.1.8）**——上游已發
+v0.1.10，兩版之間 **358 個 commit** 尚未逐筆審，推進等於宣稱審過。
+
+### 結論：這 17 個 PR 全部經由 release 軸抵達，不需要在 PR 軸另行決定
+
+本 fork 的追蹤單位是 **release tag**（`track: release`）。17 筆裡：
+
+- **12 筆已 merged**（`#788`／`#794`–`#798`／`#801`／`#804`／`#806`／`#809`／`#811`／`#816`）——
+  依定義會進 `main`、隨下一個 release tag 抵達。
+- **5 筆 CLOSED 未合併**（`#789`–`#793`）。這是本來最需要小心的一類（未合併就關閉的永遠不會經由
+  commit 軸抵達），所以逐筆用它們 `Closes` 的 issue 編號回查 `upstream/main`：
+
+| PR | Closes | 在 `upstream/main` 的落地 |
+| --- | --- | --- |
+| `#791` | `#716` | `4200012`（builder-workspace-write 改發 `-s danger-full-access`）、`0e91ed6`（出口網路管制） |
+| `#792` | `#763` | `da32375`（recover-repair-commit gate ledger 缺席時 fail-closed） |
+| `#793` | `#692` | `e22ef78`（HOME lstat traceback 洩漏）、`ad3f832`（downgraded job HOME fail closed） |
+| `#789` | `#681` | commit 訊息查不到編號，但 **issue #681 狀態是 CLOSED / COMPLETED** |
+| `#790` | `#695` | 同上，**issue #695 CLOSED / COMPLETED** |
+
+也就是說這 5 筆是**改用別的 PR 重新落地**後被關掉的，不是被上游拒收——內容已經在 `main` 裡，
+落在那 358 個 commit 的範圍內。這正是 `PLAYBOOK` 判準三講的 squash／re-land 假象：
+`ahead` 不等於「有未合併的東西」，要用主旨或 issue 編號回查。
+
+### issue 面向：12 筆都是上游自己的缺陷回報，修正走同一條 release 軸
+
+`#799`–`#815` 全是上游 coordinator／porcelain／trust-root 的缺陷單（builder 卡零產出、
+install service 整檔取代共享設定、verifier 在唯讀 sandbox 跑不綠、agy fallback 的 terminal
+不可採信…）。本 fork **確實有** `paulsha_cortex/coordinator/`（47 檔）與 `porcelain/`（13 檔），
+所以這些缺陷本線多半也有；但它們是**回報**不是修正，對應的修正落在 `main`、隨 release 抵達。
+在 PR/issue 軸重複決定一次沒有意義，也會與 release 審查的結論分岔。
+
+（`trust_root/` 本 fork 沒有，那一批 issue 對本線不適用。）
+
+### 下一步
+
+真正的工作是 **v0.1.8 → v0.1.10 的 358 個 commit 審查**，那是一次獨立的 release 同步，
+不是這一輪 ticket triage 的範圍。在那之前每週的 upstream-check 會是紅的——紅燈的意思是
+「有一個 release 還沒有人讀」，不是故障。

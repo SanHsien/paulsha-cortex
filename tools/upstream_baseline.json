@@ -2,13 +2,13 @@
   "repo": "https://github.com/hamanpaul/paulsha-cortex.git",
   "branch": "main",
   "reviewed_through": "dc8a968742ce587fba0ec013232a8a9ff1597596",
-  "reviewed_date": "2026-08-23",
+  "reviewed_date": "2026-08-30",
   "decision_log": "docs/UPSTREAM.md",
-  "notes": "以 release 為追蹤單位（tag 才是整批取用點），但 2026-08-23 補上一條例外：上游 main 上的修正，只要對照本 fork 程式碼確認缺陷仍在，就不等 tag、選擇性移植。已依此引用 59a7a9b（repo root fail-closed）。dc8a968（v0.1.8）之後的 202 個 commit 已逐條掃過主旨與檔案，其餘不引用的理由與觸發條件逐項記在 docs/UPSTREAM.md。 2026-08-23（補）：PR 盤點原本只查 open；--state all 後逐筆看過 5 筆未合併就關閉的 PR（#787 是本 fork 端誤開後關閉，#239/#236/#233 與 #171 已被上游自己的 #240/#174 取代），水位 764 → 787。判準補上一律 --state all。",
+  "notes": "以 release 為追蹤單位（tag 才是整批取用點），但 2026-08-23 補上一條例外：上游 main 上的修正，只要對照本 fork 程式碼確認缺陷仍在，就不等 tag、選擇性移植。已依此引用 59a7a9b（repo root fail-closed）。dc8a968（v0.1.8）之後的 202 個 commit 已逐條掃過主旨與檔案，其餘不引用的理由與觸發條件逐項記在 docs/UPSTREAM.md。 2026-08-23（補）：PR 盤點原本只查 open；--state all 後逐筆看過 5 筆未合併就關閉的 PR（#787 是本 fork 端誤開後關閉，#239/#236/#233 與 #171 已被上游自己的 #240/#174 取代），水位 764 → 787。判準補上一律 --state all。 2026-08-30：PR 水位 787 → 816、issue 781 → 815。commit 水位維持 dc8a968（v0.1.8）——上游已發 v0.1.10，兩版間 358 個 commit 尚未逐筆審。17 個 PR 全部經由 release 軸抵達：12 筆 merged，5 筆 CLOSED 未合併的逐筆用 Closes 的 issue 編號回查 main，確認是改用別的 PR 重新落地（#716/#763/#692 找到對應 commit，#681/#695 的 issue 為 CLOSED/COMPLETED），不是被拒收。12 個 issue 是上游自己的缺陷回報，修正走同一條 release 軸。逐項見 docs/DECISIONS.md 同日條目。",
   "track": "release",
   "reviewed_release": "v0.1.8",
-  "reviewed_pr_through": 787,
-  "reviewed_issue_through": 781,
+  "reviewed_pr_through": 816,
+  "reviewed_issue_through": 815,
   "selective_adopted": [
     {
       "commit": "59a7a9b",
