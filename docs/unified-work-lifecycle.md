@@ -15,6 +15,27 @@ Provider 失敗時會保留 last-good snapshot 並標 `degraded`。GitHub provid
 
 GitHub terminal closure scan 會以 authenticated default revision 的 Contents API 讀取 remote Todo，並重驗 path、blob SHA 與 base64 encoding；production 只對 canonical WorkflowRegistry 已連結的 PR 做 merge ancestry compare。只有 HTTP 502/503/504 會有限次 backoff retry，auth、rate-limit、其他 HTTP error、malformed JSON 或 identity mismatch 都立即保留 last-good 並標 degraded。
 
+## Intent 進件前置層
+
+`intent.md` 位於四態 read model 之前，保存問題、目標、使用者／系統邊界與限制。它是
+產品 repo 內的人類決策 artifact，不是第五種 lifecycle state。規範格式見
+[Cortex Intent Contract v1](intent-contract.md)。
+
+```text
+idea / ticket / incident
+          ↓
+intent draft ──人類核准 exact SHA──> topic / proposed evidence
+                                      ↓
+                         confirmed Todo / spec / plan
+                                      ↓
+                                     todo
+```
+
+Intent 檔案內的 `status: accepted` 不構成 mutation authority；必須另有綁定 exact SHA、
+approver、時間與 durable decision reference 的核准證據。即使證據完整，accepted intent
+最多也只屬 `topic`／proposed 階段，不能取代下方 correlation authority 或 active Todo
+來源。現行 CLI 不接受 `kind=intent`，也不會因發現 intent 自動 claim、start 或 dispatch。
+
 ## Correlation authority
 
 可授權 mutation 的關聯只來自：

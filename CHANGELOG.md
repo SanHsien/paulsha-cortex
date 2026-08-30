@@ -17,6 +17,7 @@
 - repo root 解析 fail-closed：未宣告 `PSC_REPO_ROOT` 時不再退回 `Path.cwd()`，避免 daemon 把 git 動作打在 operator 的真實 checkout 上（取自上游 #612／#630）。
 
 ### Added
+- 新增 `cortex-intent/v1` docs/schema-first 契約與 repo-local 範例：把問題、目標、限制及 open questions 固定成可追溯格式，核准綁定 exact Git SHA；accepted intent 仍只屬 topic/proposed evidence，不能取代 confirmed Todo/spec/plan 或直接派工。
 - 依賴新鮮度檢查補上「已評估但不該升」的兩條正當出口：宣告行上的 `# freshness-hold: <理由>`，以及 `.github/dependency-deferrals.json` 的 `deferredLatest` + `reason`（PyPI 超過該版本即自動失效）。沒有出口時，下一個人只剩「永遠紅」或「調高下限壓下去」，而後者是把相容性宣告當消音鍵。
 - `.cursor/rules/no-upstream-pr.mdc`：Cursor 規則是 per-project 的，補上「對外只打本 fork」，與 `docs/FORK.md` 及 Codex／Antigravity 的全域規則同一套判準。
 
