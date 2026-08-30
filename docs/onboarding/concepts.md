@@ -22,6 +22,20 @@
 `work`
 : 跨 PR / issue 的統一生命週期 read model，給人類與 monitor 看整體工作狀態。
 
+## 進入 runtime 之前：intent
+
+`intent.md` 是 repo-local 的 proto-spec，記錄問題、預期結果、受影響對象、限制與未決問題。
+它不是第五個 runtime object，也不是派工單。人類接受 intent 後，仍需形成 confirmed
+Todo、accepted spec/plan 或 active OpenSpec，work 才能從 `topic` 進入 `todo`。
+
+```text
+intent (project artifact; exact-SHA approval)
+  -> spec / plan / confirmed Todo
+  -> job -> slice -> work
+```
+
+格式、核准證據與 fail-closed 邊界見 [Cortex Intent Contract v1](../intent-contract.md)。
+
 ## 一句話串起來
 
 從使用者角度，可以把它看成：

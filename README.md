@@ -14,7 +14,9 @@
 當多個 coding agents、worktrees、reviewers 與 retry 同時存在時，最危險的不是「模型不會寫 code」，而是不同工具各自宣稱自己的局部狀態就是整體真相。Cortex 將這些狀態收斂成一條可驗證 lifecycle：
 
 ```text
-spec / work
+intent (human-reviewed exact SHA; project artifact)
+    ↓
+spec / confirmed Todo authority
     ↓
 plan → dispatch → candidate
                     ↓
@@ -30,6 +32,7 @@ plan → dispatch → candidate
 核心原則：
 
 - **單一 lifecycle authority**：`work / WorkflowRun / Job / Slice` 的狀態由 Cortex 管理；domain tools 只提供 artifacts。
+- **意圖與派工權限分離**：`intent.md` 保存問題、目標與限制；只有 confirmed Todo/spec/plan authority 才能讓工作進入可 claim 狀態。
 - **Executor-neutral**：builder / reviewer 可以來自不同 headless executors，不把 workflow 綁死在單一模型供應商。
 - **Evidence before completion**：process exit code 0 不等於任務完成；verification、review 與 target-branch delivery 必須一致。
 - **Fail-closed delivery**：authority、repo、Candidate、PR、checks 或 review evidence 無法證明一致時，不把工作投影為完成。
@@ -96,7 +99,7 @@ python -m pip install .
 6. [Upgrade](docs/onboarding/upgrade.md) — 升級與 pipx snapshot 更新。
 7. [Rollback](docs/onboarding/rollback.md) — 回到上一個已知可用版本。
 
-延伸閱讀：[Development](docs/DEVELOPMENT.md)、[Unified Work Lifecycle](docs/unified-work-lifecycle.md)、[Monitor config](docs/monitor-config.md)、[Fork maintenance](docs/FORK.md)、[Upstream ledger](docs/UPSTREAM.md)、[Decisions](docs/DECISIONS.md)。
+延伸閱讀：[Intent contract](docs/intent-contract.md)、[Development](docs/DEVELOPMENT.md)、[Unified Work Lifecycle](docs/unified-work-lifecycle.md)、[Monitor config](docs/monitor-config.md)、[Fork maintenance](docs/FORK.md)、[Upstream ledger](docs/UPSTREAM.md)、[Decisions](docs/DECISIONS.md)。
 
 ## Usage
 
@@ -160,6 +163,7 @@ cortex inspect work <work-id> --repo owner/repo
 | --- | --- |
 | 第一次建立 workflow | [Quickstart](docs/onboarding/quickstart.md) |
 | 名詞：spec / job / slice / work | [Concepts](docs/onboarding/concepts.md) |
+| intent 格式、人工核准與 authority 邊界 | [Intent contract](docs/intent-contract.md) |
 | service / inspect / request / model profiling / digest delivery | [Admin](docs/onboarding/admin.md) |
 | unified work read model、delivery closure、遷移 | [Unified Work Lifecycle](docs/unified-work-lifecycle.md) |
 | monitor config precedence 與 ambient projects | [Monitor config](docs/monitor-config.md) |
@@ -176,7 +180,8 @@ cortex inspect work <work-id> --repo owner/repo
 
 ## 安全與目前邊界
 
-- 沒有 Web UI；工作意圖仍以 spec / Markdown / structured files 為主。
+- 沒有 Web UI；工作意圖仍以 `intent.md`、spec、Markdown 與 structured files 為主。
+- `cortex-intent/v1` 目前是 docs/schema-first contract，不新增 `kind=intent`、自動 claim 或 dispatch。
 - verification 的 sanitized environment 不等於 network 或 filesystem sandbox。
 - Windows 不提供 Linux bubblewrap foreign-review sandbox；此能力會明確 skip，不冒充已隔離。
 - v1 自動 foreign review 仍受 tier / policy 邊界約束。
