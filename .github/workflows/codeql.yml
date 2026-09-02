@@ -27,7 +27,9 @@ jobs:
         uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4
         with:
           languages: python
-          queries: security-and-quality
+          # Keep the Security tab focused on security findings; quality checks
+          # belong in the repository's lint and test gates.
+          queries: security-extended
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4
