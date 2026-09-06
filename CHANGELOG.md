@@ -9,6 +9,7 @@
 
 ### Changed
 
+- 「相關工具」交叉連結由四層改為五層：補上供應鏈層 `SkillSpector`（agent skill 在裝進來之前的掃描），這一層原本缺席，讓整條鏈從「已經裝好之後才開始管」開始講。旁註同時區分 `agent-governance-toolkit` 治理的是上線後自主運行的 agent，與這五層治理的 coding agent 是不同範圍。
 - CodeQL 改用 `security-extended`：Security 分頁只保留安全告警，品質問題由既有 lint 與測試 gate 負責。
 - `build` 開發依賴下限 1.5 → 1.6（依賴新鮮度檢查唯一一筆待審視；實裝 1.6.0 後 2545 passed / 63 skipped）。
 - 上游 PR 盤點補查 `--state all`：原本只查 open，看不到未合併就關閉的 PR——而那正是「上游拒收、但可能對本 fork 有價值」的一類。5 筆逐條查過皆不需動作，`reviewed_pr_through` 推進到 #787。
