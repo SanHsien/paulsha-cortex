@@ -117,3 +117,8 @@ install service 整檔取代共享設定、verifier 在唯讀 sandbox 跑不綠�
 真正的工作是 **v0.1.8 → v0.1.10 的 358 個 commit 審查**，那是一次獨立的 release 同步，
 不是這一輪 ticket triage 的範圍。在那之前每週的 upstream-check 會是紅的——紅燈的意思是
 「有一個 release 還沒有人讀」，不是故障。
+
+## 2026-09-01：release-boundary defer
+
+僅檢視 coordinator/CI 入口三筆；其餘 401 commits 含 release/deployment/policy contract，故不採用、
+不推進 `dc8a968`。下一切片為 v0.1.9 tag 的 bounded diff，需通過 dev check 與 release qualification。

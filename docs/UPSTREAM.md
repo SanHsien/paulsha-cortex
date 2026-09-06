@@ -354,3 +354,12 @@ PR 水位 787 → 816、issue 781 → 815；**commit 水位維持 `dc8a968`（v0
 
 **真正待做**：v0.1.8 → v0.1.10 的 **358 個 commit** 審查。那是一次獨立的 release 同步，
 不是 ticket triage 的範圍。在那之前每週的 upstream-check 會是紅的。
+
+## 2026-09-01：bounded release review
+
+Fork `ee98595f0b33`；upstream `002196d70c508ba2bccff3804345b42591ac623b`。從 v0.1.8
+`dc8a968742ce587fba0ec013232a8a9ff1597596` 到 upstream 有 401 commits；本輪只看
+`64297c5`、`4137711`、`34aa54f` 的 coordinator provenance/CI policy 入口。範圍另含 release、
+deployment、work-items 與 policy contract，不能 raw merge，baseline 維持 v0.1.8。下一切片是
+v0.1.9 tag/range 的 coordinator/policy diff；採用前跑 `pwsh -NoProfile -File tools\dev_check.ps1`
+及該 release 的 qualification gate。
